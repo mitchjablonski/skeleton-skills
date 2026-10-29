@@ -20,7 +20,7 @@ CLI: `{{SKEL}}` (written below as `skel`).
 skel init "<short feature title>"
 ```
 
-If it says a skeleton is already in progress, stop and ask the human whether to replace it (`--force`) or continue that one.
+If it says a skeleton is already in progress, stop and ask the human whether to replace it (`--force`, which Claude Code will ask them to allow) or continue that one.
 
 ## 3. Write the skeleton
 

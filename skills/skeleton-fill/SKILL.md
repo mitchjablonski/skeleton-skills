@@ -45,5 +45,5 @@ If the hook refuses an edit, don't retry it in another form or with a shell comm
 `skel next` reports that all steps are filled. Run the full test suite, then ask the human whether to finalize. On a yes:
 
 ```
-skel finalize    # strips the SKEL marker lines
+skel finalize    # strips the SKEL marker lines; Claude Code asks them to allow it
 ```

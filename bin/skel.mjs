@@ -2,6 +2,7 @@
 // skel — plan as code skeleton, fill it one fenced step at a time.
 // Run `skel help` for commands.
 
+import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -12,7 +13,7 @@ import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writ
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, mergeRecords, newServeSession,
-  historyDir, pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
+  addSession, clearSessions, historyDir, pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -70,6 +71,23 @@ function printFences(step) {
   }
 }
 
+/**
+ * The review server named in serve.json, if it is really ours and running:
+ * a 127.0.0.1 URL that answers with the serverId we recorded. A bare pid (or
+ * a serve.json shipped in a repo) is never trusted, killed or handed out.
+ */
+async function liveServer(root) {
+  const s = readServe(root);
+  if (!s?.url || !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(s.url) || !s.serverId) return null;
+  try {
+    const res = await fetch(new URL("api/version", s.url), { signal: AbortSignal.timeout(1500) });
+    const v = await res.json();
+    return v.serverId === s.serverId && Number.isInteger(v.pid) ? { url: s.url, pid: v.pid } : null;
+  } catch {
+    return null;
+  }
+}
+
 function setActive(root, state, step, force = false) {
   if (step.status !== "todo" && !force) die(`step ${step.id} is already filled; \`skel start ${step.id} --force\` reopens it for rework`);
   writeState(root, { ...state, phase: "fill", activeStep: step.id });
@@ -83,7 +101,7 @@ const commands = {
     console.log(HELP);
   },
 
-  init(args) {
+  async init(args) {
     const gate = flag(args, "gate", "ask");
     if (!["ask", "deny"].includes(gate)) die("--gate must be ask or deny");
     const force = args.includes("--force");
@@ -96,9 +114,12 @@ const commands = {
     }
     initState(root, title);
     writeState(root, { ...readState(root), gate });
-    // A new skeleton starts with no feedback: nothing left over (or shipped in
-    // the repo) can pose as this review's verdict.
+    // A new skeleton starts with no feedback and no review server: nothing
+    // left over (or shipped in the repo) can pose as this review's notes.
+    const old = await liveServer(root);
+    if (old) { try { process.kill(old.pid); } catch {} }
     for (const f of [queueDir(root), historyDir(root), servePath(root)]) fs.rmSync(f, { force: true, recursive: true });
+    clearSessions(root);
     console.log(`skel: "${title}" started in ${root} (phase: scaffold, gate: ${gate})`);
   },
 
@@ -148,41 +169,46 @@ const commands = {
     console.log(`file://${out}`);
   },
 
-  serve(args) {
+  async serve(args) {
     const root = requireRoot();
-    const running = readServe(root);
-    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const running = await liveServer(root);
     if (args.includes("--stop")) {
-      if (running?.pid && alive(running.pid)) { process.kill(running.pid); console.log(`stopped the review server (${running.url})`); }
+      if (running) { process.kill(running.pid); console.log(`stopped the review server (${running.url})`); }
       else console.log("no review server running");
-      // Keep the session list: notes sent to the stopped server are still the human's.
-      if (running) writeFileAtomic(servePath(root), JSON.stringify({ ...running, pid: null, url: null }), 0o600);
+      fs.rmSync(servePath(root), { force: true });
       return;
     }
-    if (running?.pid && running.pid !== process.pid && alive(running.pid)) {
+    if (running) {
       console.log(`skel review: ${running.url} (already running; \`skel serve --stop\` stops it)`);
       return;
     }
-    const port = Number(flag(args, "port", "0"));
     const { session, token } = newServeSession();
-    // Page loads search the repo; the 2s polls only re-stat the skeleton's own
-    // files (cheap even on slow mounts), with a full search every 30s to pick
-    // up fences in new files. Parses are cached by mtime and size.
+    const serverId = crypto.randomBytes(12).toString("hex");
+    addSession(root, session);
+    // Polls re-stat only the skeleton's own files; finding fences in NEW files
+    // takes a full search, which runs in a child process every 30s so it never
+    // blocks a request (a git grep on WSL's /mnt/c can take seconds).
     const cache = new Map();
-    let known = null;
-    let lastFull = 0;
-    const current = (full) => {
+    let known = scanRepo(root, cache).files.map((f) => path.join(root, f));
+    let searching = false;
+    const refresh = () => {
+      if (searching) return;
+      searching = true;
+      execFile(process.execPath, [SELF, "__candidates"], { cwd: root, maxBuffer: 64 * 1024 * 1024, timeout: 120_000 }, (err, out) => {
+        searching = false;
+        if (!err) { try { known = JSON.parse(out); } catch {} }
+      });
+    };
+    setInterval(refresh, 30_000).unref();
+    const current = () => {
       const state = readState(root);
       const tracked = (state.files ?? []).map((f) => path.join(root, String(f)));
-      const rescan = full || !known || Date.now() - lastFull > 30_000;
-      const data = buildReviewData(root, state, cache, rescan ? null : [...known, ...tracked]);
-      if (rescan) {
-        known = [...data.files.map((f) => f.path), ...data.errored].map((f) => path.join(root, f));
-        lastFull = Date.now();
-      }
+      const data = buildReviewData(root, state, cache, [...new Set([...known, ...tracked])]);
+      known = [...new Set([...known, ...data.files.map((f) => path.join(root, f.path))])];
       const { generatedAt, errored, ...stable } = data;
       return { data, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
     };
+    const superseded = () => readServe(root)?.serverId !== serverId;
     let origin = "";
     const hosts = new Set();
     const server = http.createServer((req, res) => {
@@ -190,16 +216,17 @@ const commands = {
         // DNS rebinding: only answer requests addressed to us by name.
         if (!hosts.has(String(req.headers.host ?? "").toLowerCase())) return void res.writeHead(421).end("misdirected request");
         if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/?"))) {
+          const { data, version } = current();
           res.writeHead(200, {
             "content-type": "text/html; charset=utf-8",
             "cache-control": "no-store",
             "x-frame-options": "DENY",
             "referrer-policy": "no-referrer",
           });
-          res.end(renderHtml(current(true).data, { token }));
+          res.end(renderHtml({ ...data, version }, { token }));
         } else if (req.method === "GET" && req.url === "/api/version") {
           res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-          res.end(JSON.stringify({ version: current(false).version }));
+          res.end(JSON.stringify({ version: current().version, serverId, pid: process.pid }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
           // Cross-site writes: same origin, a JSON content type (forces a CORS
           // preflight we never answer), and the per-run token from the page.
@@ -207,6 +234,9 @@ const commands = {
           const json = String(req.headers["content-type"] ?? "").split(";")[0].trim() === "application/json";
           const tokenOk = String(req.headers["x-skeleton-token"] ?? "") === token;
           if (!sameOrigin || !json || !tokenOk) return void res.writeHead(403).end("forbidden");
+          // A newer server (or a new skeleton) took over: don't accept notes
+          // the agent would no longer trust.
+          if (superseded()) return void res.writeHead(409).end(`this review page is out of date; reload ${readServe(root)?.url ?? "the new review URL"}`);
           let body = "";
           req.on("data", (c) => { body += c; if (body.length > 2_000_000) req.destroy(); });
           req.on("end", () => {
@@ -224,14 +254,27 @@ const commands = {
         res.writeHead(500).end("internal error");
       }
     });
-    server.listen(port, "127.0.0.1", () => {
+    // A stable port per project keeps the page's origin, and with it the
+    // viewer's unsent drafts, across restarts.
+    const preferred = Number(flag(args, "port", "0")) || 41000 + (Number.parseInt(crypto.createHash("sha1").update(root).digest("hex").slice(0, 6), 16) % 8000);
+    const onListening = () => {
       const p = server.address().port;
       for (const h of [`127.0.0.1:${p}`, `localhost:${p}`]) hosts.add(h);
       origin = `http://127.0.0.1:${p}`;
-      const sessions = [...new Set([...(running?.sessions ?? []), running?.session, session].filter(Boolean))].slice(-20);
-      writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, pid: process.pid, session, sessions }), 0o600);
+      writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, port: p, pid: process.pid, serverId }), 0o600);
       console.log(`skel review: ${origin}/`);
+    };
+    server.once("error", (err) => {
+      if (err.code !== "EADDRINUSE") throw err;
+      server.listen(0, "127.0.0.1", onListening);
     });
+    server.listen(preferred, "127.0.0.1", onListening);
+  },
+
+  // Internal: the full fence search, run by `serve` in a child process.
+  __candidates() {
+    const root = requireRoot();
+    console.log(JSON.stringify(scanRepo(root).files.map((f) => path.join(root, f))));
   },
 
   async feedback(args) {
@@ -343,7 +386,7 @@ const commands = {
     const files = [...new Set(fences.map((f) => f.file))];
     for (const rel of files) {
       const abs = path.join(root, rel);
-      fs.writeFileSync(abs, stripMarkers(fs.readFileSync(abs, "utf-8")));
+      writeFileAtomic(abs, stripMarkers(fs.readFileSync(abs, "utf-8")), fs.statSync(abs).mode & 0o777);
     }
     writeState(root, { ...readState(root), phase: "done", activeStep: null });
     console.log(`finalized: stripped markers from ${files.length} file(s)`);
@@ -402,6 +445,6 @@ const commands = {
 };
 
 const [cmd = "help", ...rest] = process.argv.slice(2);
-const run = commands[cmd];
+const run = Object.hasOwn(commands, cmd) ? commands[cmd] : null;
 if (!run) die(`unknown command "${cmd}"\n\n${HELP}`);
 await run(rest);
