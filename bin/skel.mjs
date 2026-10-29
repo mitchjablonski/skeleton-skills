@@ -9,11 +9,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writeFileAtomic } from "../lib/state.mjs";
-import { buildReviewData, renderHtml, writeReview } from "../lib/review.mjs";
+import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import { evaluate, evaluateBash } from "../lib/gate.mjs";
 import {
   cleanFeedback, feedbackMarkdown, latestVerified, mergeRecords, newServeSession,
-  pendingCount, queueDir, servePath, storeFeedback, takeFeedback,
+  pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -21,16 +21,18 @@ const SELF = path.join(PKG_ROOT, "bin", "skel.mjs");
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
-  init "<title>" [--gate ask|deny]   start a skeleton in this project
+  init "<title>" [--gate ask|deny] [--force]
+                                     start a skeleton in this project (--force replaces an existing one)
   track <file...>                    show unfenced skeleton files (types, wiring) in the review too
   status [--json]                    phase, active step, every step's status
   review                             write .skeleton/review.html (static; copy feedback by hand)
-  serve [--port N]                   serve the review live; feedback is sent back to the agent
-  feedback [--wait SECONDS]          print (and archive) the human's latest feedback
+  serve [--port N] [--stop]          serve the review live (reuses a running server); feedback is sent back
+  feedback [--wait SECONDS]          print (and archive) the human's latest feedback (waits up to 110s)
   approve [--confirm]                enter the fill phase: needs the human's APPROVED verdict from the
                                      review page, or --confirm typed by the human in their own terminal
   next                               start the first pending step and print its fences
-  start <id>                         start a specific step
+  start <id> [--force]               start a specific step (--force abandons an unfinished active step,
+                                     or reopens a filled one for rework)
   done                               finish the active step (fails if SKEL_TODO remains)
   reshape [--confirm]                back to skeleton review: needs a "Request changes" verdict sent
                                      after approval, or --confirm typed by the human in their terminal
@@ -111,8 +113,8 @@ function humanSays(root, state, verdict, args, question) {
   return null;
 }
 
-function setActive(root, state, step) {
-  if (step.status !== "todo") die(`step ${step.id} is already filled`);
+function setActive(root, state, step, force = false) {
+  if (step.status !== "todo" && !force) die(`step ${step.id} is already filled; \`skel start ${step.id} --force\` reopens it for rework`);
   writeState(root, { ...state, phase: "fill", activeStep: step.id });
   console.log(`STEP ${step.id} active: ${step.title}`);
   console.log(`Edit only inside these fences; replace each SKEL_TODO stub. Leave the marker lines in place.`);
@@ -127,9 +129,14 @@ const commands = {
   init(args) {
     const gate = flag(args, "gate", "ask");
     if (!["ask", "deny"].includes(gate)) die("--gate must be ask or deny");
-    const title = args.join(" ").trim();
+    const force = args.includes("--force");
+    const title = args.filter((a) => a !== "--force").join(" ").trim();
     if (!title) die('usage: skel init "<title>"');
     const root = findRoot(process.cwd()) ?? process.cwd();
+    const existing = readState(root);
+    if (existing && existing.phase !== "done" && !force) {
+      die(`a skeleton is already in progress here: "${existing.title}" (phase: ${existing.phase}). Use --force to replace it.`);
+    }
     initState(root, title);
     writeState(root, { ...readState(root), gate });
     // A new skeleton starts with no feedback: nothing left over (or shipped in
@@ -139,6 +146,7 @@ const commands = {
   },
 
   track(args) {
+    if (!args.length) die("usage: skel track <file...>");
     const root = requireRoot();
     const state = readState(root);
     const rels = args.map((a) => path.relative(root, path.resolve(a)).split(path.sep).join("/"));
@@ -167,6 +175,13 @@ const commands = {
       console.log(`  ${mark} ${s.id.padEnd(5)} ${s.title}  (${s.fences.map((f) => `${f.file}:${f.openLine}`).join(", ")})`);
     }
     for (const e of errors) console.log(`  ! ${e}`);
+    // Diagram nodes named step_<id> that match no step are silently uncolored
+    // on the page; say so here.
+    for (const d of readDiagrams(root)) {
+      const ids = [...d.source.matchAll(/\bstep_([A-Za-z0-9_]+)/g)].map((m) => m[1].replace(/_/g, "."));
+      const unknown = [...new Set(ids)].filter((id) => !steps.some((st) => st.id === id));
+      if (unknown.length) console.log(`  ! diagram ${d.name}: node${unknown.length > 1 ? "s" : ""} ${unknown.map((i) => `step_${i.replace(/\./g, "_")}`).join(", ")} match no step`);
+    }
   },
 
   review() {
@@ -178,6 +193,18 @@ const commands = {
 
   serve(args) {
     const root = requireRoot();
+    const running = readServe(root);
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    if (args.includes("--stop")) {
+      if (running?.pid && alive(running.pid)) { process.kill(running.pid); console.log(`stopped the review server (${running.url})`); }
+      else console.log("no review server running");
+      fs.rmSync(servePath(root), { force: true });
+      return;
+    }
+    if (running?.pid && running.pid !== process.pid && alive(running.pid)) {
+      console.log(`skel review: ${running.url} (already running; \`skel serve --stop\` stops it)`);
+      return;
+    }
     const port = Number(flag(args, "port", "0"));
     const { session, token } = newServeSession();
     const current = () => {
@@ -258,6 +285,7 @@ const commands = {
   approve(args) {
     const root = requireRoot();
     const state = readState(root);
+    if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
     const { steps, errors } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     if (!steps.length) die("no SKEL[...] fences found — nothing to approve");
@@ -293,13 +321,23 @@ const commands = {
     setActive(root, state, step);
   },
 
-  start([id]) {
+  start(args) {
+    const force = args.includes("--force");
+    const id = args.find((a) => a !== "--force");
+    if (!id) die("usage: skel start <id> [--force]");
     const root = requireRoot();
     const state = readState(root);
     if (state.phase !== "fill") die(`phase is ${state.phase} — the skeleton must be approved first (skel approve)`);
-    const step = snapshot(root).steps.find((s) => s.id === id);
-    if (!step) die(`no step ${id}`);
-    setActive(root, state, step);
+    const { steps } = snapshot(root);
+    const step = steps.find((s) => s.id === id);
+    if (!step) die(`no step ${id}; steps are ${steps.map((s) => s.id).join(", ") || "(none)"}`);
+    const active = steps.find((s) => s.id === state.activeStep);
+    if (active && active.id !== id && active.status === "todo" && !force) {
+      die(`step ${active.id} is still active with SKEL_TODO left; finish it (skel done) or abandon it with --force`);
+    }
+    const skipped = steps.slice(0, steps.indexOf(step)).filter((s) => s.status === "todo" && s.id !== id);
+    if (skipped.length) console.log(`note: starting out of build order; ${skipped.map((s) => s.id).join(", ")} still pending before it`);
+    setActive(root, state, step, force);
   },
 
   done() {
@@ -335,6 +373,8 @@ const commands = {
 
   finalize() {
     const root = requireRoot();
+    const phase = readState(root).phase;
+    if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");
     const { fences, errors } = scanRepo(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     const pending = fences.filter((f) => f.status === "todo");

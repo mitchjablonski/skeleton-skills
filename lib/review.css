@@ -13,6 +13,8 @@
   --filled-soft: #e6f4ec;
   --active: #3b5bdb;
   --comment: #fff8db;
+  --changed: #fff1b8;
+  --on-accent: #ffffff;
   --tok-kw: #8a3ffc;
   --tok-str: #1b7f5b;
   --tok-com: #8d8a84;
@@ -37,6 +39,8 @@
     --filled-soft: #17291f;
     --active: #8ea6ff;
     --comment: #2f2a17;
+    --changed: #3a3214;
+    --on-accent: #141413;
     --tok-kw: #c4a2ff;
     --tok-str: #7fd1ae;
     --tok-com: #77756f;
@@ -106,11 +110,14 @@ textarea { font: inherit; color: inherit; }
 .code { overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; }
 .code table { border-collapse: collapse; width: 100%; }
 .code td { padding: 0; vertical-align: top; }
-.ln {
-  width: 1%; min-width: 44px; text-align: right; padding: 0 10px 0 8px !important;
-  color: var(--muted); user-select: none; cursor: pointer; white-space: nowrap;
+.ln { width: 1%; min-width: 44px; text-align: right; padding: 0 !important; white-space: nowrap; }
+.lnbtn {
+  all: unset; box-sizing: border-box; display: block; width: 100%; padding: 0 10px 0 8px;
+  color: var(--muted); user-select: none; cursor: pointer; font: inherit; text-align: right;
 }
-.ln:hover { color: var(--accent); }
+.lnbtn:hover { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 3px; }
+.lnbtn:focus-visible { outline-offset: -2px; color: var(--accent); }
 .src { white-space: pre; padding-right: 16px !important; }
 tr.fence-todo td.src { background: var(--todo-soft); }
 tr.fence-filled td.src { background: var(--filled-soft); }
@@ -136,7 +143,7 @@ tr.note td { padding: 6px 12px 8px 54px !important; background: var(--comment); 
 .verdicts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .btn { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 8px; padding: 8px 10px; }
 .btn:hover { background: var(--surface-2); }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .btn.on.approve { border-color: var(--filled); background: var(--filled-soft); color: var(--filled); }
 .btn.on.changes { border-color: var(--todo); background: var(--todo-soft); color: var(--todo); }
 .hint { font-size: 12px; color: var(--muted); }
@@ -152,3 +159,34 @@ tr.note td { padding: 6px 12px 8px 54px !important; background: var(--comment); 
 .dd-step.dd-todo :is(rect, polygon, circle, ellipse, path) { fill: var(--todo-soft) !important; stroke: var(--todo) !important; }
 .dd-step.dd-filled :is(rect, polygon, circle, ellipse, path) { fill: var(--filled-soft) !important; stroke: var(--filled) !important; }
 .dd-step.dd-active :is(rect, polygon, circle, ellipse, path) { fill: var(--accent-soft) !important; stroke: var(--active) !important; stroke-width: 2px !important; }
+
+tr.changed td.src { box-shadow: inset 3px 0 var(--todo); background-image: linear-gradient(var(--changed), var(--changed)); }
+tr.fold td { padding: 4px 12px 4px 54px !important; background: var(--surface-2); font-family: var(--sans); }
+.changed-count { color: var(--todo); }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; padding: 4px 14px 12px; font-size: 11px; color: var(--muted); }
+.legend > span { display: inline-flex; align-items: center; gap: 5px; }
+.legend .dot { margin-top: 0; }
+.outdated { border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.outdated-item code { font-family: var(--mono); color: var(--muted); }
+.toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 20;
+  background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 8px; font-size: 13px;
+  box-shadow: 0 4px 16px rgb(0 0 0 / .2);
+}
+details.diagram > summary {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer;
+  border-bottom: 1px solid var(--border); background: var(--surface-2); font-family: var(--mono); font-size: 12.5px;
+}
+details.diagram > summary button { margin-left: auto; background: none; border: 0; color: var(--muted); font-size: 12px; }
+.diagram-host { max-height: 70vh; overflow: auto; }
+.diagram-hint { text-align: left; margin-bottom: 8px; }
+.dd-step:focus-visible { outline: 2px solid var(--accent); }
+.mobile-jump { display: none; }
+@media (max-width: 720px) {
+  .diagram-host svg { max-width: none; min-width: 640px; }
+  .mobile-jump {
+    display: block; position: fixed; right: 16px; bottom: 16px; z-index: 10;
+    background: var(--accent); color: var(--on-accent); padding: 10px 14px; border-radius: 999px;
+    text-decoration: none; font-size: 13px; box-shadow: 0 4px 16px rgb(0 0 0 / .2);
+  }
+}

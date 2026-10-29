@@ -91,9 +91,16 @@ const gate = (toolName, toolInput, state = fill, text = SRC) =>
     activeFences: () => scanText(text ?? "", "src/a.ts").filter((f) => f.id === state.activeStep),
   });
 
-test("gate has no opinion outside the fill phase or with no active step (for project files)", () => {
+test("gate has no opinion while scaffolding", () => {
   assert.equal(gate("Edit", { old_string: "import", new_string: "x" }, { phase: "scaffold" }), null);
-  assert.equal(gate("Edit", { old_string: "import", new_string: "x" }, { phase: "fill", activeStep: null }), null);
+});
+
+test("UX #8: between steps, the skeleton's files ask; everything else is free", () => {
+  const between = { phase: "fill", activeStep: null, gate: "ask", files: ["src/types.ts"] };
+  assert.match(gate("Edit", { old_string: "import", new_string: "x" }, between).reason, /no step is active/);
+  assert.equal(gate("Edit", { old_string: "x", new_string: "y" }, between, "const x = 1;\n"), null);
+  const tracked = evaluate({ toolName: "Edit", toolInput: { file_path: "/proj/src/types.ts", old_string: "a", new_string: "b" }, root, state: between, resolve: (p) => p, readFile: () => "a", activeFences: [] });
+  assert.equal(tracked?.decision, "ask");
 });
 
 test("gate allows replacing the stub inside the active fence", () => {
@@ -358,4 +365,28 @@ test("security M3: review and install never write through symlinks, and install 
   const settings = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"));
   assert.equal(settings.hooks.PreToolUse[0].matcher, "Write|Edit|MultiEdit|NotebookEdit|Bash");
   assert.match(fs.readFileSync(path.join(target, ".gitignore"), "utf-8"), /^\.skeleton\/$/m);
+});
+
+test("UX #10/#11: init won't replace a skeleton silently; start won't abandon one or skip quietly", async () => {
+  const { dir, a, run } = project();
+  run("init", "First");
+  assert.throws(() => run("init", "Second"), /already in progress here: "First"/);
+  run("init", "Second", "--force");
+  const srv = await serve(dir);
+  try {
+    await post(srv.url, { verdict: "approve", general: "", comments: [] }, { "content-type": "application/json", "x-skeleton-token": srv.token });
+  } finally {
+    srv.stop();
+  }
+  run("approve");
+  assert.throws(() => run("start"), /usage: skel start <id>/);
+  assert.throws(() => run("start", "9"), /no step 9; steps are 1, 2/);
+  const out = run("start", "2");
+  assert.match(out, /out of build order; 1 still pending/);
+  assert.throws(() => run("start", "1"), /step 2 is still active with SKEL_TODO/);
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(/throw new Error\("SKEL_TODO"\);(\n  \/\/ \/SKEL\[2\])/, "return [a, b];$1"));
+  run("done");
+  assert.throws(() => run("start", "2"), /already filled; `skel start 2 --force` reopens it/);
+  assert.match(run("start", "2", "--force"), /STEP 2 active/);
+  assert.throws(() => run("approve"), /already approved and being filled/);
 });
