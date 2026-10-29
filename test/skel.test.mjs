@@ -237,19 +237,13 @@ async function serve(dir) {
 
 const post = (url, body, headers) => fetch(new URL("/api/feedback", url), { method: "POST", headers, body: JSON.stringify(body) });
 
-test("CLI: approval needs the human's verdict; then next → gate → done → finalize", async () => {
+test("CLI: approve (the hook asks the human first) → next → gate → done → finalize", () => {
   const { dir, a, run, hook } = project();
   run("init", "Stroke smoothing");
-  assert.throws(() => run("approve"), /approval has to come from the human/);
-
-  const srv = await serve(dir);
-  try {
-    const res = await post(srv.url, { verdict: "approve", general: "", comments: [] }, { "content-type": "application/json", "x-skeleton-token": srv.token });
-    assert.equal(res.status, 204);
-    assert.match(run("approve"), /approved \(in the review page\)/);
-  } finally {
-    srv.stop();
-  }
+  const ask = JSON.parse(hook({ tool_name: "Bash", tool_input: { command: `node "${BIN}" approve` } }));
+  assert.equal(ask.hookSpecificOutput.permissionDecision, "ask");
+  assert.match(ask.hookSpecificOutput.permissionDecisionReason, /Claude wants to approve the skeleton "Stroke smoothing"/);
+  assert.match(run("approve"), /skeleton approved: 2 steps/);
   assert.match(run("next"), /STEP 1 active/);
 
   assert.equal(hook({ tool_name: "Edit", tool_input: { file_path: a, old_string: STUB, new_string: "return raw;" } }), "");
@@ -262,9 +256,9 @@ test("CLI: approval needs the human's verdict; then next → gate → done → f
   assert.match(run("next"), /STEP 2 active/);
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
   run("done");
-  assert.throws(() => run("reshape"), /has to come from the human/);
   assert.match(run("finalize"), /stripped markers from 1 file/);
   assert.ok(!fs.readFileSync(a, "utf-8").includes("SKEL"));
+  assert.throws(() => run("reshape"), /finalized/);
 });
 
 test("security H4: serve refuses cross-site posts, bad hosts, and missing tokens", async () => {
@@ -320,7 +314,6 @@ test("security M1: a stale, committed or hand-written feedback file is never rea
   const out = run("feedback");
   assert.match(out, /ignored 1 feedback file/);
   assert.doesNotMatch(out, /forged/);
-  assert.throws(() => run("approve"), /has to come from the human/);
 });
 
 test("security M2: tracked files must resolve inside the project, and the review never reads outside", () => {
@@ -367,17 +360,11 @@ test("security M3: review and install never write through symlinks, and install 
   assert.match(fs.readFileSync(path.join(target, ".gitignore"), "utf-8"), /^\.skeleton\/$/m);
 });
 
-test("UX #10/#11: init won't replace a skeleton silently; start won't abandon one or skip quietly", async () => {
+test("UX #10/#11: init won't replace a skeleton silently; start won't abandon one or skip quietly", () => {
   const { dir, a, run } = project();
   run("init", "First");
   assert.throws(() => run("init", "Second"), /already in progress here: "First"/);
   run("init", "Second", "--force");
-  const srv = await serve(dir);
-  try {
-    await post(srv.url, { verdict: "approve", general: "", comments: [] }, { "content-type": "application/json", "x-skeleton-token": srv.token });
-  } finally {
-    srv.stop();
-  }
   run("approve");
   assert.throws(() => run("start"), /usage: skel start <id>/);
   assert.throws(() => run("start", "9"), /no step 9; steps are 1, 2/);
@@ -389,4 +376,76 @@ test("UX #10/#11: init won't replace a skeleton silently; start won't abandon on
   assert.throws(() => run("start", "2"), /already filled; `skel start 2 --force` reopens it/);
   assert.match(run("start", "2", "--force"), /STEP 2 active/);
   assert.throws(() => run("approve"), /already approved and being filled/);
+});
+
+// ---- re-review (N1–N11) ----
+
+test("N1: approve/reshape always ask, even in deny mode and however skel is spelled", () => {
+  for (const command of ["skel approve", "node bin/skel.mjs approve", 'node "/x/skel.mjs" reshape', "cd p && skel reshape"]) {
+    assert.equal(evaluateBash({ command, state: { ...fill, gate: "deny", title: "T" } })?.decision, "ask", command);
+  }
+  assert.equal(evaluateBash({ command: "skel status", state: fill }), null);
+});
+
+test("N3: the .skeleton/ guard is case-insensitive, for edits and for Bash", () => {
+  const scaffold = { phase: "scaffold", activeStep: null, gate: "ask" };
+  const v = evaluate({ toolName: "Write", toolInput: { file_path: "/proj/.SKELETON/state.json", content: "{}" }, root, state: scaffold, resolve: (x) => x, readFile: () => null, activeFences: [] });
+  assert.equal(v?.decision, "ask");
+  assert.equal(evaluateBash({ command: "cd .Skeleton && cat serve.json", state: scaffold })?.decision, "ask");
+});
+
+test("N7: between steps, creating a file asks", () => {
+  const between = { phase: "fill", activeStep: null, gate: "ask", files: [] };
+  assert.match(gate("Write", { content: "// SKEL[0] sneaky\n" }, between, null).reason, /creates a new file/);
+});
+
+test("N8: the containment heuristic accepts ordinary code in several languages, and only ever asks", () => {
+  const ok = [
+    ["    total = max(1, n // size)", "    # SKEL[1] x", "f.py"],
+    ['    q = """\nSELECT (a\n  FROM t\n"""', "    # SKEL[1] x", "f.py"],
+    ["  case $1 in\n    a) echo a;;\n  esac", "  # SKEL[1] x", "f.sh"],
+    ["    fn h<'a>(x: &'a str) -> &'a str { x }", "    // SKEL[1] x", "f.rs"],
+    ["#ifdef DEBUG\n  log();\n#endif", "  // SKEL[1] x", "f.c"],
+    ["  /* } not a brace */ return 1;", "  // SKEL[1] x", "a.ts"],
+  ];
+  for (const [body, marker, file] of ok) assert.equal(bodyEscapesFence(body, marker, file), null, `${file}: ${body}`);
+  const deny = { ...fill, gate: "deny" };
+  assert.equal(gate("Edit", { old_string: STUB, new_string: "return raw; } export function x() { return [];" }, deny).decision, "ask");
+});
+
+test("N5: projects in an ignored dir of a parent repo, or holding a nested repo, still find their fences", () => {
+  const parent = tmp("skel-parent-");
+  execFileSync("git", ["init", "-q", parent]);
+  fs.writeFileSync(path.join(parent, ".gitignore"), "*\n");
+  const dir = path.join(parent, "proj");
+  fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "src", "a.ts"), SRC);
+  execFileSync("git", ["init", "-q", path.join(dir, "nested")]);
+  fs.writeFileSync(path.join(dir, "nested", "b.ts"), "// SKEL[9] n\nthrow 'SKEL_TODO';\n// /SKEL[9]\n");
+  execFileSync("node", [BIN, "init", "T"], { cwd: dir });
+  assert.match(execFileSync("node", [BIN, "status"], { cwd: dir, encoding: "utf-8" }), /0\/3 filled/);
+});
+
+test("N6: the hook finds the skeleton from the edited file, not just the session cwd", () => {
+  const { dir, a, run } = project();
+  run("init", "T");
+  run("approve");
+  run("next");
+  const out = execFileSync("node", [BIN, "hook"], { cwd: path.dirname(dir), input: JSON.stringify({ cwd: path.dirname(dir), tool_name: "Write", tool_input: { file_path: a, content: "gone" } }), encoding: "utf-8" });
+  assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+test("N10: notes sent to a server that has since restarted are still the human's", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const first = await serve(dir);
+  try {
+    await post(first.url, { verdict: null, general: "kept", comments: [] }, { "content-type": "application/json", "x-skeleton-token": first.token });
+  } finally {
+    first.stop();
+  }
+  await new Promise((r) => setTimeout(r, 300));
+  const second = await serve(dir);
+  second.stop();
+  assert.match(run("feedback"), /kept/);
 });

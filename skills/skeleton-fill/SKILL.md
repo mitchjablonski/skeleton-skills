@@ -16,7 +16,7 @@ Arguments:
 
 ## For each step
 
-1. **Start it.** Run `skel next` (or `skel start <id>`). It prints the fence bodies you're allowed to change.
+1. **Start it.** Make sure the review page is up: `skel serve` in the background (it reuses a running server and prints the URL; share it if the human doesn't have it). Then run `skel next` (or `skel start <id>`). It prints the fence bodies you're allowed to change.
 2. **State your opinion first, in 2–4 lines:** how you'll do it and the one non-obvious choice in it (e.g. "Keep this pure and do the dedupe in one pass. Mutating the input would be faster, but the signature promises a new array."). In step-by-step mode this is the human's moment to redirect, so keep it short and concrete.
 3. **Write it.** Replace the `SKEL_TODO` stub with the real code. Use the stub line(s) as `old_string`; when the same stub appears in several fences, include this fence's `SKEL[id]` marker line to make it unique, and keep that line unchanged in `new_string`. Never alter, add or remove marker lines; they stay until finalize.
    - Match the surrounding code's style. Keep it small, since the human is reading every line.
@@ -30,10 +30,10 @@ Between steps (after `done`, before the next `start`), edits to the skeleton's f
 
 ## When the skeleton is wrong
 
-You'll sometimes find that a step needs something the skeleton doesn't have: a new helper, a changed signature, another file, a parameter. **Don't work around the fence.** Stop and propose the change: what, where, and why, in a few lines. Reopening the skeleton is the human's call: they click **Reopen skeleton** and Send in the review page, or run `skel reshape --confirm` in their own terminal. Then:
+You'll sometimes find that a step needs something the skeleton doesn't have: a new helper, a changed signature, another file, a parameter. **Don't work around the fence.** Stop and propose the change: what, where, and why, in a few lines. Reopening the skeleton is the human's call. Once they agree (in chat, or with **Reopen skeleton** in the review page):
 
 ```
-skel reshape     # back to skeleton review (checks the human's verdict)
+skel reshape     # back to skeleton review; Claude Code asks them to allow it
 ```
 
 Make the structural edit (new code gets its own fence and id), refresh the review (the served page reloads by itself), and get approval again before `skel approve` and `skel next`.

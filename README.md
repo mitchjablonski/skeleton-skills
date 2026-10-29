@@ -49,7 +49,7 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
    → skel init, writes stubs + diagram, `skel serve` → review URL
    → you comment / request changes / approve in the page
    → skel feedback --wait 110   (Claude picks up your feedback)
-   → skel approve               (checks that the Approve came from you)
+   → skel approve               (Claude Code asks you to allow it)
 /skeleton-fill            (one step, then stop)
 /skeleton-fill all        (every step, still fenced)
    → skel next → edit inside the fence → tests → skel done → skel feedback
@@ -67,8 +67,8 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
 | `skel serve [--port N] [--stop]` | Live review page; feedback is sent back to Claude. Reuses a running server |
 | `skel review` | Static `.skeleton/review.html`; copy the feedback by hand |
 | `skel feedback [--wait S]` | Print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise) |
-| `skel approve [--confirm]` | Enter the fill phase. Needs the human's Approve from the review page, or `--confirm` typed in their own terminal |
-| `skel reshape [--confirm]` | Back to skeleton review. Needs the human's "Reopen skeleton" from the page, or `--confirm` in their terminal |
+| `skel approve` | Enter the fill phase. When Claude runs it, the hook asks you to allow it: that prompt is your approval |
+| `skel reshape` | Back to skeleton review (also asks you) |
 | `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one |
 | `skel finalize` | All filled: strip the markers |
 | `skel hook` | The `PreToolUse` scope gate |
@@ -77,17 +77,18 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
 
 ## Security model
 
-The fence is a **drift guard for a cooperative agent**, not a sandbox. What it does:
+The fence is a **drift guard for a cooperative agent**: it keeps an agent that means well from quietly widening its own scope. It is not a sandbox against a hostile one, which could always write files from a shell.
 
-- **Edits are judged by their result.** An Edit, MultiEdit (applied in order) or Write is allowed during a fill only if the SKEL markers come out identical, every line outside the active fence is unchanged, and the filled body stays inside its block (no closing brace or dedent past the fence). The containment check is a heuristic, not a parser.
-- **Between steps,** edits to fenced or tracked files ask. **NotebookEdit** asks during a fill.
-- **The tool's state is the human's.** Agent edits to `.skeleton/` (except `diagrams/`), and Bash commands naming its state files, ask. `approve` and `reshape` need a verdict sent from the review page or a `--confirm` typed on the human's own terminal, which an agent's Bash tool can't answer.
-- **The review server** binds to 127.0.0.1, answers only requests addressed to `127.0.0.1`/`localhost` (no DNS rebinding), and accepts feedback only same-origin, as JSON, with a per-run token embedded in the page. The markdown Claude reads is rebuilt server-side and framed as review notes, not instructions.
-- **Feedback is tied to the serve run** that received it. Leftover, committed or hand-written feedback files are quarantined, not shown as the human's. `install` adds `.skeleton/` to `.gitignore`.
+- **Your approval is Claude Code's permission prompt.** The hook always asks before `skel approve` or `skel reshape` runs, even in `deny` mode. That prompt is the one channel the agent can't answer for you. Review-page verdicts and feedback files are only signals to the agent; anything on disk or on a local port can be forged from a shell, so none of it counts as approval. (In `bypassPermissions` mode, Claude Code skips prompts, and with them this one.)
+- **Edits are judged by their result.** During a fill, an Edit, MultiEdit (applied in order) or Write is allowed only if the SKEL markers come out identical, every line outside the active fence is unchanged, and the filled body stays inside its block. The last check is a language-aware heuristic, not a parser, so a hit always asks rather than refuses.
+- **Between steps,** edits to fenced or tracked files, and new files, ask. NotebookEdit asks during a fill.
+- **The tool's state is off-limits.** Agent edits to `.skeleton/` (except `diagrams/`) ask, matched case-insensitively. So do Bash commands that mention `.skeleton`.
+- **The review server** binds to 127.0.0.1, answers only requests addressed to `127.0.0.1`/`localhost` (no DNS rebinding), and accepts feedback only same-origin, as JSON, with a per-run token. So other websites can't post to it. The markdown Claude reads is rebuilt server-side and framed as review notes, not instructions.
+- **Feedback is tied to this skeleton's serve runs.** Leftover, committed or hand-written feedback files are quarantined; `init` clears old history. `install` adds `.skeleton/` to `.gitignore`.
 - **Files:** tracked files must resolve inside the project; writes go through temp-file-and-rename (never through a symlink); `install` refuses symlinked or unparseable settings rather than overwrite them.
 - **Mermaid** is pinned to a patched release (past CVE-2025-54881) with Subresource Integrity, and loads without blocking the page.
 
-What it doesn't cover: arbitrary Bash (an agent can still write files from a shell), and anything once a fault makes the hook fail open. Pair it with Claude Code's permission rules if you need hard limits.
+Not covered: arbitrary Bash, and anything once a hook fault makes it fail open. Pair it with Claude Code's permission rules if you need hard limits.
 
 ## Prior art
 

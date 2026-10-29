@@ -11,8 +11,8 @@ import { scanRepo, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writeFileAtomic } from "../lib/state.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
-  cleanFeedback, feedbackMarkdown, latestVerified, mergeRecords, newServeSession,
-  pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
+  cleanFeedback, feedbackMarkdown, mergeRecords, newServeSession,
+  historyDir, pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -28,14 +28,12 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   review                             write .skeleton/review.html (static; copy feedback by hand)
   serve [--port N] [--stop]          serve the review live (reuses a running server); feedback is sent back
   feedback [--wait SECONDS]          print (and archive) the human's latest feedback (waits up to 110s)
-  approve [--confirm]                enter the fill phase: needs the human's APPROVED verdict from the
-                                     review page, or --confirm typed by the human in their own terminal
+  approve                            enter the fill phase (inside Claude Code the hook asks the human first)
   next                               start the first pending step and print its fences
   start <id> [--force]               start a specific step (--force abandons an unfinished active step,
                                      or reopens a filled one for rework)
   done                               finish the active step (fails if SKEL_TODO remains)
-  reshape [--confirm]                back to skeleton review: needs a "Request changes" verdict sent
-                                     after approval, or --confirm typed by the human in their terminal
+  reshape                            back to skeleton review (inside Claude Code the hook asks the human first)
   finalize                           all steps filled: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
   install [projectDir]               install skills + hook into a project's .claude/
@@ -72,47 +70,6 @@ function printFences(step) {
   }
 }
 
-/**
- * Ask the human directly, on their terminal. An agent's Bash tool has no
- * controlling terminal, so it can't answer this for them.
- */
-function confirmOnTerminal(question) {
-  let fd;
-  try {
-    fd = fs.openSync("/dev/tty", "r+");
-  } catch {
-    return false;
-  }
-  try {
-    fs.writeSync(fd, `${question} Type "yes" to confirm: `);
-    const buf = Buffer.alloc(256);
-    let answer = "";
-    for (;;) {
-      const n = fs.readSync(fd, buf, 0, buf.length, null);
-      if (n <= 0) break;
-      answer += buf.toString("utf-8", 0, n);
-      if (answer.includes("\n")) break;
-    }
-    return answer.trim().toLowerCase() === "yes";
-  } catch {
-    return false;
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-/** The human's authority for a phase change: a verified verdict, or the terminal. */
-function humanSays(root, state, verdict, args, question) {
-  if (pendingCount(root) > 0) {
-    const taken = takeFeedback(root);
-    if (taken.status === "ok") console.log(feedbackMarkdown(state.title, mergeRecords(taken.records)) + "\n");
-  }
-  const fb = latestVerified(root, state.reviewEpoch ?? 0);
-  if (fb?.verdict === verdict) return "review";
-  if (args.includes("--confirm") && confirmOnTerminal(question)) return "terminal";
-  return null;
-}
-
 function setActive(root, state, step, force = false) {
   if (step.status !== "todo" && !force) die(`step ${step.id} is already filled; \`skel start ${step.id} --force\` reopens it for rework`);
   writeState(root, { ...state, phase: "fill", activeStep: step.id });
@@ -141,7 +98,7 @@ const commands = {
     writeState(root, { ...readState(root), gate });
     // A new skeleton starts with no feedback: nothing left over (or shipped in
     // the repo) can pose as this review's verdict.
-    for (const f of [queueDir(root), servePath(root)]) fs.rmSync(f, { force: true, recursive: true });
+    for (const f of [queueDir(root), historyDir(root), servePath(root)]) fs.rmSync(f, { force: true, recursive: true });
     console.log(`skel: "${title}" started in ${root} (phase: scaffold, gate: ${gate})`);
   },
 
@@ -198,7 +155,8 @@ const commands = {
     if (args.includes("--stop")) {
       if (running?.pid && alive(running.pid)) { process.kill(running.pid); console.log(`stopped the review server (${running.url})`); }
       else console.log("no review server running");
-      fs.rmSync(servePath(root), { force: true });
+      // Keep the session list: notes sent to the stopped server are still the human's.
+      if (running) writeFileAtomic(servePath(root), JSON.stringify({ ...running, pid: null, url: null }), 0o600);
       return;
     }
     if (running?.pid && running.pid !== process.pid && alive(running.pid)) {
@@ -219,10 +177,10 @@ const commands = {
       const rescan = full || !known || Date.now() - lastFull > 30_000;
       const data = buildReviewData(root, state, cache, rescan ? null : [...known, ...tracked]);
       if (rescan) {
-        known = data.files.map((f) => path.join(root, f.path));
+        known = [...data.files.map((f) => f.path), ...data.errored].map((f) => path.join(root, f));
         lastFull = Date.now();
       }
-      const { generatedAt, ...stable } = data;
+      const { generatedAt, errored, ...stable } = data;
       return { data, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
     };
     let origin = "";
@@ -270,7 +228,8 @@ const commands = {
       const p = server.address().port;
       for (const h of [`127.0.0.1:${p}`, `localhost:${p}`]) hosts.add(h);
       origin = `http://127.0.0.1:${p}`;
-      writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, pid: process.pid, session }), 0o600);
+      const sessions = [...new Set([...(running?.sessions ?? []), running?.session, session].filter(Boolean))].slice(-20);
+      writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, pid: process.pid, session, sessions }), 0o600);
       console.log(`skel review: ${origin}/`);
     });
   },
@@ -302,15 +261,10 @@ const commands = {
     const { steps, errors } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     if (!steps.length) die("no SKEL[...] fences found — nothing to approve");
-    const by = humanSays(root, state, "approve", args, `Approve the skeleton "${state.title}" (${steps.length} steps)?`);
-    if (!by) {
-      die(
-        "approval has to come from the human: they click Approve skeleton and Send in the review page (`skel serve`), " +
-          "or run `skel approve --confirm` in their own terminal.",
-      );
-    }
-    writeState(root, { ...state, phase: "fill", activeStep: null, approvedBy: by, reviewEpoch: Date.now() });
-    console.log(`skeleton approved (${by === "review" ? "in the review page" : "on the terminal"}): ${steps.length} steps. Run \`skel next\` to start filling.`);
+    // The human's say-so is Claude Code's permission prompt: the hook always
+    // asks before an agent runs `skel approve` (see evaluateBash).
+    writeState(root, { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() });
+    console.log(`skeleton approved: ${steps.length} steps. Run \`skel next\` to start filling.`);
   },
 
   next() {
@@ -373,14 +327,8 @@ const commands = {
   reshape(args) {
     const root = requireRoot();
     const state = readState(root);
-    const by = humanSays(root, state, "changes", args, `Reopen the skeleton "${state.title}" for structural changes?`);
-    if (!by) {
-      die(
-        "reopening the skeleton has to come from the human: they click Request changes and Send in the review page, " +
-          "or run `skel reshape --confirm` in their own terminal.",
-      );
-    }
-    writeState(root, { ...state, phase: "scaffold", activeStep: null, approvedBy: null, reviewEpoch: Date.now() });
+    if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
+    writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now() });
     console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
   },
 
