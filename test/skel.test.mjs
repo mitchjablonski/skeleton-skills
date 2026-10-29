@@ -449,3 +449,66 @@ test("N10: notes sent to a server that has since restarted are still the human's
   second.stop();
   assert.match(run("feedback"), /kept/);
 });
+
+// ---- verification round (R1–R6) ----
+
+test("R1/R2: approve/reshape ask from any cwd and in ordinary spellings", () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const outside = path.dirname(dir);
+  const hookAt = (cwd, command) => {
+    const out = execFileSync("node", [BIN, "hook"], { cwd, input: JSON.stringify({ cwd, tool_name: "Bash", tool_input: { command } }), encoding: "utf-8" });
+    return out ? JSON.parse(out).hookSpecificOutput.permissionDecision : null;
+  };
+  for (const command of [
+    `cd ${dir} && node "${BIN}" approve`,
+    `(cd ${dir}; skel approve)`,
+    `node "${BIN}" 'approve'`,
+    `S="${BIN}"; node "$S" approve`,
+    "A=approve; node bin/skel.mjs $A",
+    "echo approve | xargs node skel.mjs",
+    `node skel.mjs \\\n  reshape`,
+  ]) {
+    assert.equal(hookAt(outside, command), "ask", command);
+  }
+  assert.equal(hookAt(outside, "npm test"), null);
+});
+
+test("R3: a .skeleton dir at any depth is state, and a planted nested one can't take over the fence", () => {
+  const scaffold = { phase: "scaffold", activeStep: null, gate: "ask" };
+  const nested = evaluate({ toolName: "Write", toolInput: { file_path: "/proj/src/.skeleton/state.json", content: "{}" }, root, state: scaffold, resolve: (x) => x, readFile: () => null, activeFences: [] });
+  assert.equal(nested?.decision, "ask");
+
+  const { dir, a, run } = project();
+  run("init", "T");
+  run("approve");
+  run("next");
+  fs.mkdirSync(path.join(dir, "src", ".skeleton"));
+  fs.writeFileSync(path.join(dir, "src", ".skeleton", "state.json"), '{"phase":"scaffold"}');
+  const out = execFileSync("node", [BIN, "hook"], { cwd: dir, input: JSON.stringify({ cwd: dir, tool_name: "Write", tool_input: { file_path: a, content: "evil" } }), encoding: "utf-8" });
+  assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+test("R5: a regex containing /* doesn't open a comment that hides an escape", () => {
+  assert.notEqual(bodyEscapesFence("  const r = /\\/*/;\n  return 1;\n}\nexport function evil() {", "  // SKEL[1] x", "a.ts"), null);
+});
+
+test("R6: the Bash state guard doesn't fire on lookalikes or on diagrams", () => {
+  assert.equal(evaluateBash({ command: "cat my.skeleton.json", state: fill }), null);
+  assert.equal(evaluateBash({ command: "ls .skeleton/diagrams", state: fill }), null);
+  assert.equal(evaluateBash({ command: "cat .skeleton/state.json", state: fill })?.decision, "ask");
+});
+
+test("N5/R4: fences in a nested repo are found alongside the outer repo's; big ignored files aren't read", () => {
+  const dir = tmp("skel-nested-");
+  execFileSync("git", ["init", "-q", dir]);
+  fs.mkdirSync(path.join(dir, "src", "inner"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "src", "a.ts"), SRC);
+  execFileSync("git", ["init", "-q", path.join(dir, "src", "inner")]);
+  fs.writeFileSync(path.join(dir, "src", "inner", "b.ts"), "// SKEL[5] inner\nthrow 'SKEL_TODO';\n// /SKEL[5]\n");
+  fs.writeFileSync(path.join(dir, ".gitignore"), "data/\n");
+  fs.mkdirSync(path.join(dir, "data"));
+  fs.writeFileSync(path.join(dir, "data", "big.bin"), Buffer.alloc(5_000_000, 65));
+  execFileSync("node", [BIN, "init", "T"], { cwd: dir });
+  assert.match(execFileSync("node", [BIN, "status"], { cwd: dir, encoding: "utf-8" }), /0\/3 filled/);
+});
