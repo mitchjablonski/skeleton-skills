@@ -190,3 +190,6 @@ details.diagram > summary button { margin-left: auto; background: none; border: 
     text-decoration: none; font-size: 13px; box-shadow: 0 4px 16px rgb(0 0 0 / .2);
   }
 }
+
+/* Off-screen chunks of a long file skip layout and paint until scrolled to. */
+tbody.chunk { content-visibility: auto; contain-intrinsic-size: auto 3200px; }

@@ -10,7 +10,6 @@ import { fileURLToPath } from "node:url";
 import { scanRepo, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writeFileAtomic } from "../lib/state.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
-import { evaluate, evaluateBash } from "../lib/gate.mjs";
 import {
   cleanFeedback, feedbackMarkdown, latestVerified, mergeRecords, newServeSession,
   pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
@@ -18,6 +17,7 @@ import {
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SELF = path.join(PKG_ROOT, "bin", "skel.mjs");
+const HOOK = path.join(PKG_ROOT, "bin", "skel-hook.mjs");
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
@@ -207,8 +207,21 @@ const commands = {
     }
     const port = Number(flag(args, "port", "0"));
     const { session, token } = newServeSession();
-    const current = () => {
-      const data = buildReviewData(root, readState(root));
+    // Page loads search the repo; the 2s polls only re-stat the skeleton's own
+    // files (cheap even on slow mounts), with a full search every 30s to pick
+    // up fences in new files. Parses are cached by mtime and size.
+    const cache = new Map();
+    let known = null;
+    let lastFull = 0;
+    const current = (full) => {
+      const state = readState(root);
+      const tracked = (state.files ?? []).map((f) => path.join(root, String(f)));
+      const rescan = full || !known || Date.now() - lastFull > 30_000;
+      const data = buildReviewData(root, state, cache, rescan ? null : [...known, ...tracked]);
+      if (rescan) {
+        known = data.files.map((f) => path.join(root, f.path));
+        lastFull = Date.now();
+      }
       const { generatedAt, ...stable } = data;
       return { data, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
     };
@@ -225,10 +238,10 @@ const commands = {
             "x-frame-options": "DENY",
             "referrer-policy": "no-referrer",
           });
-          res.end(renderHtml(current().data, { token }));
+          res.end(renderHtml(current(true).data, { token }));
         } else if (req.method === "GET" && req.url === "/api/version") {
           res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-          res.end(JSON.stringify({ version: current().version }));
+          res.end(JSON.stringify({ version: current(false).version }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
           // Cross-site writes: same origin, a JSON content type (forces a CORS
           // preflight we never answer), and the per-run token from the page.
@@ -389,37 +402,8 @@ const commands = {
   },
 
   async hook() {
-    // Fail open: a broken gate must never wedge the session.
-    try {
-      let raw = "";
-      for await (const chunk of process.stdin) raw += chunk;
-      const input = JSON.parse(raw || "{}");
-      const root = findRoot(input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd());
-      if (!root) return;
-      const state = readState(root);
-      if (!state) return;
-      const verdict = input.tool_name === "Bash"
-        ? evaluateBash({ command: input.tool_input?.command, state })
-        : evaluate({
-          toolName: input.tool_name,
-          toolInput: input.tool_input,
-          root,
-          state,
-          // Only needed to word a refusal; scanning the repo on every edit isn't.
-          activeFences: () => scanRepo(root).fences.filter((f) => f.id === state.activeStep),
-          readFile: (abs) => { try { return fs.readFileSync(abs, "utf-8"); } catch { return null; } },
-        });
-      if (!verdict) return;
-      process.stdout.write(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: verdict.decision,
-          permissionDecisionReason: verdict.reason,
-        },
-      }));
-    } catch {
-      // no opinion
-    }
+    const { runHook } = await import("../lib/hook.mjs");
+    await runHook();
   },
 
   install([dir = process.cwd()]) {
@@ -427,7 +411,7 @@ const commands = {
     const claudeDir = path.join(target, ".claude");
     // The hook command runs through a shell: refuse an install path that a
     // shell would interpret rather than quote it and hope.
-    if (/["'`$\\\n\r]/.test(SELF)) die(`can't install from a path containing quotes, $, backticks or backslashes: ${SELF}`);
+    if (/["'`$\\\n\r]/.test(PKG_ROOT)) die(`can't install from a path containing quotes, $, backticks or backslashes: ${SELF}`);
     const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
     const settingsPath = path.join(claudeDir, "settings.local.json");
     for (const p of [claudeDir, settingsPath, path.join(target, ".gitignore")]) {
@@ -446,13 +430,18 @@ const commands = {
       const dest = path.join(claudeDir, "skills", name, "SKILL.md");
       writeFileAtomic(dest, fs.readFileSync(src, "utf-8").replaceAll("{{SKEL}}", `node "${SELF}"`));
     }
-    const command = `node "${SELF}" hook`;
+    const command = `node "${HOOK}"`;
+    const legacy = `node "${SELF}" hook`;
     settings.hooks ??= {};
     settings.hooks.PreToolUse ??= [];
     const matcher = "Write|Edit|MultiEdit|NotebookEdit|Bash";
-    const ours = settings.hooks.PreToolUse.find((m) => m.hooks?.some((hk) => hk.command === command));
-    if (ours) ours.matcher = matcher;
-    else settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
+    const ours = settings.hooks.PreToolUse.find((m) => m.hooks?.some((hk) => hk.command === command || hk.command === legacy));
+    if (ours) {
+      ours.matcher = matcher;
+      for (const hk of ours.hooks) if (hk.command === legacy) hk.command = command;
+    } else {
+      settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
+    }
     writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
     // .skeleton/ is per-run state (and holds the human's feedback): keep it
     // out of commits, so a repo can't ship a verdict.
