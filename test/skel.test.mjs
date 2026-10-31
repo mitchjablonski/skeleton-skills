@@ -390,6 +390,48 @@ test("security M3: review and install never write through symlinks, and install 
   assert.match(fs.readFileSync(path.join(target, ".gitignore"), "utf-8"), /^\.skeleton\/$/m);
 });
 
+test("issue #3: install writes the restricted filler subagent, idempotently, and never through a symlink", () => {
+  const { dir, run } = project();
+  const target = tmp("skel-install-");
+  const agentPath = path.join(target, ".claude", "agents", "skeleton-filler.md");
+  run("install", target);
+  const agent = fs.readFileSync(agentPath, "utf-8");
+  const front = /^---\n([\s\S]*?)\n---\n/.exec(agent)[1];
+  const field = (name) => new RegExp(`^${name}: (.*)$`, "m").exec(front)?.[1];
+  assert.equal(field("name"), "skeleton-filler");
+  const tools = field("tools").split(",").map((t) => t.trim());
+  assert.deepEqual(tools, ["Read", "Grep", "Glob", "Edit", "MultiEdit"]);
+  for (const t of ["Bash", "Write"]) assert.ok(field("disallowedTools").split(",").map((x) => x.trim()).includes(t));
+  assert.match(agent, /STATUS: filled \| blocked/);
+  // The fill skill delegates to it by name.
+  const fill = fs.readFileSync(path.join(target, ".claude", "skills", "skeleton-fill", "SKILL.md"), "utf-8");
+  assert.match(fill, /subagent_type: "skeleton-filler"/);
+  assert.doesNotMatch(fill, /\{\{SKEL\}\}/);
+
+  // Idempotent: a second install leaves the same files and one hook entry.
+  const before = fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8");
+  run("install", target);
+  assert.equal(fs.readFileSync(agentPath, "utf-8"), agent);
+  assert.equal(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"), before);
+  assert.equal(fs.readFileSync(path.join(target, ".gitignore"), "utf-8").match(/\.skeleton\//g).length, 1);
+
+  // A symlinked agent file or agents folder is refused, and its target is untouched.
+  if (!canSymlink) return;
+  const victim = path.join(dir, "victim.md");
+  fs.writeFileSync(victim, "original");
+  fs.rmSync(agentPath);
+  fs.symlinkSync(victim, agentPath);
+  assert.throws(() => run("install", target), /skeleton-filler\.md is a symlink/);
+  assert.equal(fs.readFileSync(victim, "utf-8"), "original");
+  assert.ok(fs.lstatSync(agentPath).isSymbolicLink());
+
+  const elsewhere = tmp("skel-elsewhere-");
+  fs.rmSync(path.join(target, ".claude", "agents"), { recursive: true });
+  fs.symlinkSync(elsewhere, path.join(target, ".claude", "agents"));
+  assert.throws(() => run("install", target), /agents is a symlink/);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+});
+
 test("UX #10/#11: init won't replace a skeleton silently; start won't abandon one or skip quietly", () => {
   const { dir, a, run } = project();
   run("init", "First");
