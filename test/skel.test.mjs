@@ -688,5 +688,6 @@ test("installed skills' example fences are documentation, not steps (walk and gi
     const v = askOf({ tool_name: "Edit", tool_input: { file_path: skill, old_string: 'throw new Error("SKEL_TODO");', new_string: "return 1;" } });
     assert.equal(v?.permissionDecision, "ask", git ? "git" : "walk");
     assert.match(v.permissionDecisionReason, /outside the skeleton/);
+    assert.doesNotMatch(v.permissionDecisionReason, /its fences? (are|is) .*\.claude/, "never points the agent back at the docs");
   }
 });
