@@ -4,7 +4,7 @@
   "description": "Plan as code skeleton for Claude Code: review the shape in a local page, then fill one fenced step at a time.",
   "type": "module",
   "bin": { "skel": "bin/skel.mjs" },
-  "files": ["bin", "lib", "skills"],
+  "files": ["bin", "lib", "skills", "agents"],
   "scripts": { "test": "node --test test/skel.test.mjs" },
   "engines": { "node": ">=20" },
   "license": "MIT"
