@@ -7,7 +7,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { scanText, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
-import { cleanFeedback, configPath, feedbackMarkdown, projectKey } from "../lib/feedback.mjs";
+import { cleanFeedback, configPath, feedbackMarkdown, projectKey, sessionStorePath } from "../lib/feedback.mjs";
 import { exterior, lineDiff, readSnapshot, scanSkeleton, snapshotPath, whitespaceOnly } from "../lib/snapshot.mjs";
 import { buildReviewData } from "../lib/review.mjs";
 
@@ -242,8 +242,8 @@ function project() {
 }
 
 /** Start `skel serve`, return its url, the page token, and a stop function. */
-async function serve(dir, env = {}) {
-  const child = spawn("node", [BIN, "serve"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } });
+async function serve(dir, args = ["--send"], env = {}) {
+  const child = spawn("node", [BIN, "serve", ...args], { cwd: dir, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
   let err = "";
   child.stderr.on("data", (d) => { err += d; });
   const url = await new Promise((resolve, reject) => {
@@ -253,16 +253,75 @@ async function serve(dir, env = {}) {
       const m = /skel review: (http:\/\/\S+)/.exec(out);
       if (m) resolve(m[1]);
     });
+    child.stderr.on("data", (d) => { out += d; });
     child.on("exit", () => reject(new Error("serve exited: " + out)));
   });
   const html = await (await fetch(url)).text();
-  const token = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<")).token;
+  const data = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<"));
+  const token = data.token;
   // Wait for the server to exit, so no keep-alive socket outlives the test.
   const stop = () => new Promise((resolve) => { if (child.exitCode !== null || child.signalCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
-  return { url, token, html, stderr: () => err, stop };
+  return { url, token, html, data, stderr: () => err, stop };
 }
 
 const post = (url, body, headers) => fetch(new URL("/api/feedback", url), { method: "POST", headers, body: JSON.stringify(body) });
+
+test("serve defaults to read-only without a feedback session and tolerates unavailable config", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const blockedConfig = path.join(dir, "config-file");
+  fs.writeFileSync(blockedConfig, "not a directory");
+  const srv = await serve(dir, [], { ...process.env, XDG_CONFIG_HOME: blockedConfig });
+  try {
+    assert.equal(srv.token, null);
+    assert.equal(srv.data.feedbackEnabled, false);
+    const version = await (await fetch(new URL("api/version", srv.url))).json();
+    assert.equal(version.feedbackEnabled, false);
+    fs.appendFileSync(path.join(dir, "src", "a.ts"), "\n// live read-only edit\n");
+    const changed = await (await fetch(new URL("api/version", srv.url))).json();
+    assert.notEqual(changed.version, version.version);
+    assert.match(await (await fetch(srv.url)).text(), /live read-only edit/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".skeleton", "serve.json"))).feedbackEnabled, false);
+    assert.equal(fs.existsSync(sessionStorePath(dir)), false);
+    assert.equal((await post(srv.url, { verdict: "approve", general: "valid", comments: [] }, {
+      "content-type": "application/json", origin: new URL(srv.url).origin, "x-skeleton-token": "guess",
+    })).status, 405);
+    assert.equal(fs.existsSync(path.join(dir, ".skeleton", "feedback")), false);
+  } finally { await srv.stop(); }
+});
+
+test("serve reuses the same mode and restarts when feedback mode changes", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const readonly = await serve(dir, []);
+  try {
+    const first = await (await fetch(new URL("api/version", readonly.url))).json();
+    assert.match(run("serve"), /read-only; already running/);
+    assert.equal((await (await fetch(new URL("api/version", readonly.url))).json()).serverId, first.serverId);
+    const sending = await serve(dir);
+    try {
+      const second = await (await fetch(new URL("api/version", sending.url))).json();
+      assert.equal(second.feedbackEnabled, true);
+      assert.equal(sending.data.feedbackEnabled, true);
+      assert.equal(typeof sending.token, "string");
+      assert.notEqual(second.serverId, first.serverId);
+      assert.match(run("serve", "--send"), /feedback enabled; already running/);
+      assert.equal((await post(sending.url, { verdict: "approve", comments: [] }, {
+        "content-type": "application/json", "x-skeleton-token": sending.token,
+      })).status, 204);
+      const again = await serve(dir, []);
+      try {
+        const third = await (await fetch(new URL("api/version", again.url))).json();
+        assert.equal(third.feedbackEnabled, false);
+        assert.notEqual(third.serverId, second.serverId);
+        assert.match(run("serve"), /read-only; already running/);
+        assert.equal((await post(again.url, { verdict: "approve", comments: [] }, {
+          "content-type": "application/json", "x-skeleton-token": sending.token,
+        })).status, 405);
+      } finally { await again.stop(); }
+    } finally { await sending.stop(); }
+  } finally { await readonly.stop(); }
+});
 
 test("CLI: approve (the hook asks the human first) → next → gate → done → finalize", () => {
   const { dir, a, run, hook } = project();
@@ -390,6 +449,172 @@ test("security M3: review and install never write through symlinks, and install 
   const settings = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"));
   assert.equal(settings.hooks.PreToolUse[0].matcher, "Write|Edit|MultiEdit|NotebookEdit|Bash");
   assert.match(fs.readFileSync(path.join(target, ".gitignore"), "utf-8"), /^\.skeleton\/$/m);
+});
+
+// ---- install: native permission rules (issue #4) ----
+
+const STATE_PATHS = ["state.json", "serve.json", "review.html", "feedback/**", "feedback-history/**"];
+const LEGACY_DENY = STATE_PATHS.map((p) => `Edit(/.skeleton/${p})`);
+/** The rules install should write for a project: its absolute real path, POSIX form (C:\x -> /c/x). */
+const denyFor = (target) => {
+  let real = fs.realpathSync.native(target);
+  if (process.platform === "win32") real = "/" + real[0].toLowerCase() + real.slice(2).split("\\").join("/");
+  real = real.replace(/[[\]*?]/g, (c) => `\\${c}`);
+  return STATE_PATHS.map((p) => `Edit(/${real}/.skeleton/${p})`);
+};
+const installTarget = () => {
+  const target = tmp("skel-install-");
+  const settingsPath = path.join(target, ".claude", "settings.local.json");
+  const read = () => JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+  const write = (s) => { fs.mkdirSync(path.dirname(settingsPath), { recursive: true }); fs.writeFileSync(settingsPath, JSON.stringify(s)); };
+  const run = (...args) => execFileSync("node", [BIN, ...args, target], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  return { target, settingsPath, read, write, run, SKEL_DENY: denyFor(target) };
+};
+
+test("issue #4: install adds deny rules for .skeleton/ state to a fresh project, never for diagrams/", () => {
+  const { read, run, SKEL_DENY } = installTarget();
+  assert.match(run("install"), /added 5 permission deny rule/);
+  const s = read();
+  assert.deepEqual(s.permissions.deny, SKEL_DENY);
+  assert.ok(s.permissions.deny.every((r) => r.startsWith("Edit(") && !r.includes("diagrams")), "only Edit rules match paths; diagrams stay writable");
+  assert.ok(s.permissions.deny.every((r) => !r.replace(/\/\*\*\)$/, ")").includes("*")), "no wildcard but a trailing /** (the Linux sandbox ignores others)");
+  assert.equal(s.hooks.PreToolUse.length, 1);
+  assert.equal(s.sandbox, undefined, "install doesn't switch the sandbox on for you");
+});
+
+test("issue #4: install preserves the user's settings and rules, and a re-run changes nothing", () => {
+  const { read, write, run, settingsPath, SKEL_DENY } = installTarget();
+  const mine = {
+    model: "opus",
+    permissions: { allow: ["Bash(npm test)"], deny: ["Read(./.env)", SKEL_DENY[0]], ask: ["Bash(git push *)"] },
+    hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo mine" }] }], Stop: [{ hooks: [{ type: "command", command: "echo stop" }] }] },
+    sandbox: { enabled: true },
+  };
+  write(mine);
+  assert.match(run("install"), /added 4 permission deny rule/);
+  const once = read();
+  assert.equal(once.model, "opus");
+  assert.deepEqual(once.permissions.allow, mine.permissions.allow);
+  assert.deepEqual(once.permissions.ask, mine.permissions.ask);
+  assert.deepEqual(once.permissions.deny, ["Read(./.env)", ...SKEL_DENY], "user rules kept in place; no duplicates");
+  assert.deepEqual(once.hooks.Stop, mine.hooks.Stop);
+  assert.deepEqual(once.hooks.PreToolUse[0], mine.hooks.PreToolUse[0]);
+  assert.equal(once.hooks.PreToolUse.length, 2);
+  assert.deepEqual(once.sandbox, { enabled: true });
+
+  const text = fs.readFileSync(settingsPath, "utf-8");
+  assert.match(run("install"), /already present/);
+  assert.equal(fs.readFileSync(settingsPath, "utf-8"), text, "idempotent: byte-identical on a re-run");
+
+  // A hook from an older or moved checkout is updated in place, not duplicated.
+  const moved = read();
+  moved.hooks.PreToolUse[1].hooks[0].command = 'node "/old/clone/bin/skel.mjs" hook';
+  write(moved);
+  run("install");
+  assert.equal(read().hooks.PreToolUse.length, 2);
+  assert.match(read().hooks.PreToolUse[1].hooks[0].command, /skel-hook\.mjs"$/);
+});
+
+test("issue #4: install refuses symlinked or oddly shaped settings, leaving them untouched", () => {
+  const { target, settingsPath, write, run } = installTarget();
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  if (canSymlink) {
+    const victim = path.join(tmp("skel-victim-"), "settings.json");
+    fs.writeFileSync(victim, "{}");
+    fs.symlinkSync(victim, settingsPath);
+    assert.throws(() => run("install"), /symlink/);
+    assert.throws(() => run("uninstall"), /symlink/);
+    assert.equal(fs.readFileSync(victim, "utf-8"), "{}");
+    fs.rmSync(settingsPath);
+
+    fs.symlinkSync(path.dirname(victim), path.join(target, ".claude", "skills"), "junction");
+    assert.throws(() => run("install"), /skills is a symlink/);
+    fs.rmSync(path.join(target, ".claude", "skills"));
+  }
+
+  for (const odd of [[], { permissions: [] }, { permissions: { deny: "Edit(x)" } }, { hooks: { PreToolUse: {} } }]) {
+    write(odd);
+    assert.throws(() => run("install"), /isn't shaped the way Claude Code expects/);
+    assert.equal(fs.readFileSync(settingsPath, "utf-8"), JSON.stringify(odd));
+  }
+});
+
+test("issue #4: uninstall removes only what install added", () => {
+  const { target, read, write, run } = installTarget();
+  const mine = { permissions: { deny: ["Read(./.env)"] }, hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo mine" }] }] } };
+  write(mine);
+  run("install");
+  fs.writeFileSync(path.join(target, ".claude", "skills", "mine.md"), "x");
+  assert.ok(fs.existsSync(path.join(target, ".claude", "agents", "skeleton-filler.md")));
+  fs.writeFileSync(path.join(target, ".claude", "agents", "mine.md"), "x");
+  assert.match(run("uninstall"), /left in place/);
+  assert.deepEqual(read(), mine);
+  assert.ok(!fs.existsSync(path.join(target, ".claude", "skills", "skeleton")));
+  assert.ok(fs.existsSync(path.join(target, ".claude", "skills", "mine.md")));
+  assert.ok(!fs.existsSync(path.join(target, ".claude", "agents", "skeleton-filler.md")), "the filler agent file is removed");
+  assert.ok(fs.existsSync(path.join(target, ".claude", "agents", "mine.md")), "the user's own subagents and the agents folder stay");
+
+  const fresh = installTarget();
+  fresh.run("install");
+  fresh.run("uninstall");
+  assert.deepEqual(fresh.read(), {}, "a settings file install created is left empty, not deleted");
+});
+
+test("PR#11 P1: deny rules name the project's absolute real path, whatever cwd install runs from", () => {
+  const { target, read, SKEL_DENY } = installTarget();
+  fs.mkdirSync(path.join(target, "src", "deep"), { recursive: true });
+  // From a subdirectory, by a relative path: the rules still name the project root.
+  execFileSync("node", [BIN, "install", path.join("..", "..")], { cwd: path.join(target, "src", "deep"), encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  const deny = read().permissions.deny;
+  assert.deepEqual(deny, SKEL_DENY);
+  assert.ok(deny.every((r) => r.startsWith("Edit(//")), "absolute (//) rules: a /path rule in local settings anchors at the session's cwd");
+  assert.ok(deny.every((r) => !r.includes("\\") && !r.includes("/src/")), deny.join(" "));
+  if (canSymlink) {
+    // Through a symlinked path: the rules name the real directory.
+    const link = path.join(tmp("skel-link-"), "proj");
+    fs.symlinkSync(target, link, "junction");
+    execFileSync("node", [BIN, "install", link], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.deepEqual(read().permissions.deny, SKEL_DENY);
+  }
+});
+
+test("PR#11 P1: install migrates the old project-relative rules it wrote, and keeps a user's own", () => {
+  const { read, write, run, SKEL_DENY } = installTarget();
+  const hook = { matcher: "Write|Edit|MultiEdit|NotebookEdit|Bash", hooks: [{ type: "command", command: 'node "/old/clone/bin/skel-hook.mjs"' }] };
+  write({ permissions: { deny: ["Read(./.env)", ...LEGACY_DENY] }, hooks: { PreToolUse: [hook] } });
+  run("install");
+  assert.deepEqual(read().permissions.deny, ["Read(./.env)", ...SKEL_DENY], "old-form rules from a pre-ownership install replaced");
+  run("uninstall");
+  assert.deepEqual(read(), { permissions: { deny: ["Read(./.env)"] } });
+
+  // A lone old-form rule without skel's hook is the user's: never taken.
+  const other = installTarget();
+  other.write({ permissions: { deny: [LEGACY_DENY[0]] } });
+  other.run("install");
+  assert.deepEqual(other.read().permissions.deny, [LEGACY_DENY[0], ...other.SKEL_DENY]);
+  other.run("uninstall");
+  assert.deepEqual(other.read(), { permissions: { deny: [LEGACY_DENY[0]] } });
+});
+
+test("PR#11 P2: uninstall removes only the rules install added; identical pre-existing rules survive", () => {
+  const { read, write, run, SKEL_DENY } = installTarget();
+  const mine = { permissions: { deny: [SKEL_DENY[0], "Read(./.env)", SKEL_DENY[3]] } };
+  write(mine);
+  assert.match(run("install"), /added 3 permission deny rule/);
+  assert.match(run("install"), /already present/);
+  assert.match(run("install"), /already present/, "repeated installs keep ownership");
+  assert.deepEqual(read().permissions.deny, [...mine.permissions.deny, SKEL_DENY[1], SKEL_DENY[2], SKEL_DENY[4]]);
+  run("uninstall");
+  assert.deepEqual(read(), mine, "the user's identical rules survive install + uninstall");
+
+  // Ownership lives outside the project, and uninstall clears it.
+  const store = path.join(process.env.XDG_CONFIG_HOME, "skel");
+  run("install");
+  assert.ok(fs.readdirSync(store).some((f) => f.endsWith("-install.json")));
+  const before = fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).length;
+  run("uninstall");
+  assert.equal(fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).length, before - 1);
+  assert.deepEqual(read(), mine);
 });
 
 test("issue #3: install writes the restricted filler subagent, idempotently, and never through a symlink", () => {
@@ -901,7 +1126,7 @@ test("issue #6 N6: serve warns and keeps serving when the session store can't be
   run("init", "T");
   const blocked = path.join(tmp(), "not-a-dir");
   fs.writeFileSync(blocked, "");
-  const srv = await serve(dir, { XDG_CONFIG_HOME: blocked });
+  const srv = await serve(dir, ["--send"], { XDG_CONFIG_HOME: blocked });
   try {
     assert.equal((await fetch(new URL("/api/version", srv.url))).status, 200);
     assert.match(srv.stderr(), /can't record this review session/);
@@ -974,6 +1199,94 @@ test("installed skills' example fences are documentation, not steps (walk and gi
     assert.equal(v?.permissionDecision, "ask", git ? "git" : "walk");
     assert.match(v.permissionDecisionReason, /outside the skeleton/);
     assert.doesNotMatch(v.permissionDecisionReason, /its fences? (are|is) .*\.claude/, "never points the agent back at the docs");
+  }
+});
+
+test("PR#11 review #2: project paths with ( ) { } [ ] keep their rules; [ ] * ? are escaped, an unspellable path still gets the hook", () => {
+  const parent = tmp("skel-chars-");
+  const target = path.join(parent, "Program Files (x86)", "proj{a}[1]");
+  fs.mkdirSync(target, { recursive: true });
+  const out = execFileSync("node", [BIN, "install", target], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.match(out, /added 5 permission deny rule/);
+  const deny = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8")).permissions.deny;
+  assert.deepEqual(deny, denyFor(target));
+  assert.ok(deny.every((r) => r.includes("/Program Files (x86)/proj{a}\\[1\\]/.skeleton/")), deny[0]);
+  assert.match(execFileSync("node", [BIN, "uninstall", target], { encoding: "utf-8" }), /removed 5 \.skeleton\/ permission deny rule/);
+
+  if (process.platform !== "win32") {
+    // A literal backslash can't be spelled in a rule on POSIX: no rules, but the hook and skills go in, and install says so.
+    const odd = path.join(parent, "back\\slash");
+    fs.mkdirSync(odd);
+    const r = execFileSync("node", [BIN, "install", odd], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.match(r, /warning: no permission deny rules/);
+    const s = JSON.parse(fs.readFileSync(path.join(odd, ".claude", "settings.local.json"), "utf-8"));
+    assert.equal(s.permissions.deny.length, 0);
+    assert.equal(s.hooks.PreToolUse.length, 1);
+    assert.ok(fs.existsSync(path.join(odd, ".claude", "skills", "skeleton", "SKILL.md")));
+  }
+});
+
+test("PR#11 review #3: a moved project's rules are reported as left in place, and uninstall counts what it really removed", () => {
+  const parent = tmp("skel-move-");
+  const oldDir = path.join(parent, "old");
+  const newDir = path.join(parent, "new");
+  fs.mkdirSync(oldDir);
+  const run = (...a) => execFileSync("node", [BIN, ...a], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  run("install", oldDir);
+  const oldRules = denyFor(oldDir);
+  fs.renameSync(oldDir, newDir);
+  const inst = run("install", newDir);
+  assert.match(inst, /added 5 permission deny rule/);
+  assert.match(inst, /left in place: 5 \.skeleton\/ deny rule/);
+  for (const r of oldRules) assert.ok(inst.includes(r), r);
+  const un = run("uninstall", newDir);
+  assert.match(un, /removed 5 \.skeleton\/ permission deny rule/);
+  assert.match(un, /left in place: 5 \.skeleton\/ deny rule/);
+  for (const r of oldRules) assert.ok(un.includes(r), r);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(newDir, ".claude", "settings.local.json"), "utf-8")).permissions.deny, oldRules);
+  // A second uninstall removes nothing, and says so.
+  assert.match(run("uninstall", newDir), /removed 0 \.skeleton\/ permission deny rule/);
+  // Clean up the old path's ownership record (it outlives the move by design).
+  fs.mkdirSync(oldDir);
+  run("uninstall", oldDir);
+});
+
+test("PR#11 review #1: install warns when Claude Code won't load the settings from a subdirectory launch", () => {
+  const run = (...a) => execFileSync("node", [BIN, ...a], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  const plain = tmp("skel-nogit-");
+  const warnsAt = (dir) => /warning: the hook and the deny rules live in \.claude\/settings\.local\.json/.test(run("install", dir));
+  assert.ok(warnsAt(plain), "not a git repo");
+  const repo = tmp("skel-repo-");
+  execFileSync("git", ["init", "-q", repo]);
+  fs.mkdirSync(path.join(repo, "pkg"));
+  assert.ok(warnsAt(path.join(repo, "pkg")), "a project nested in a repo");
+  assert.equal(warnsAt(repo), process.platform === "win32", "the repo root warns only on native Windows");
+});
+
+test("PR#11 review nits: install creates a missing project dir; uninstall of a missing one says so; uninstall ignores a symlinked .gitignore", () => {
+  const run = (...a) => execFileSync("node", [BIN, ...a], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  const missing = path.join(tmp("skel-missing-"), "a", "b");
+  assert.throws(() => run("uninstall", missing), (e) => /doesn't exist/.test(e.stderr) && !/at .*node:/.test(e.stderr));
+  run("install", missing);
+  assert.ok(fs.existsSync(path.join(missing, ".claude", "settings.local.json")));
+  const store = path.join(process.env.XDG_CONFIG_HOME, "skel");
+  const rec = fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).map((f) => JSON.parse(fs.readFileSync(path.join(store, f), "utf-8"))).find((r) => r.ownedDeny[0] === denyFor(missing)[0]);
+  assert.equal(rec.root, fs.realpathSync.native(missing), "ownership record names the real path");
+  if (process.platform === "win32") {
+    // Another spelling of the same path is the same project: no second rule set, one ownership record.
+    const records = () => fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).length;
+    const n = records();
+    assert.match(run("install", missing.toUpperCase()), /already present/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(missing, ".claude", "settings.local.json"), "utf-8")).permissions.deny.length, 5);
+    assert.equal(records(), n);
+  }
+  if (canSymlink) {
+    const gi = path.join(missing, ".gitignore");
+    const real = path.join(tmp("skel-gi-"), "gitignore");
+    fs.renameSync(gi, real);
+    fs.symlinkSync(real, gi);
+    assert.match(run("uninstall", missing), /removed 5/);
+    assert.throws(() => run("install", missing), /\.gitignore is a symlink/);
   }
 });
 
@@ -1304,6 +1617,60 @@ test("issue #25 (4): a missing path is a new file only for Write or an empty old
         fs.chmodSync(locked, 0o644);
         fs.rmSync(locked);
       }
+    }
+  }
+});
+
+test("read-only feedback wait returns immediately, drains pending sends, and stops", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const sending = await serve(dir);
+  try {
+    assert.equal((await post(sending.url, { general: "queued before downgrade", comments: [] }, {
+      "content-type": "application/json", "x-skeleton-token": sending.token,
+    })).status, 204);
+    const readonly = await serve(dir, []);
+    try {
+      const version = await (await fetch(new URL("api/version", readonly.url))).json();
+      assert.equal(readonly.data.serverId, version.serverId);
+      assert.equal(readonly.data.feedbackEnabled, false);
+      const feedback = () => execFileSync("node", [BIN, "feedback", "--wait", "110"], {
+        cwd: dir, encoding: "utf-8", timeout: 5000,
+      });
+      assert.match(feedback(), /queued before downgrade/);
+      const readonlyFeedback = feedback();
+      assert.match(readonlyFeedback, /READ_ONLY/);
+      assert.match(readonlyFeedback, /Wait for it; don't poll/);
+      assert.match(readonlyFeedback, /Only if the human asks for direct Send/);
+      assert.match(run("serve", "--stop"), /stopped the review server/);
+      assert.equal(fs.existsSync(path.join(dir, ".skeleton", "serve.json")), false);
+      assert.match(run("serve", "--stop"), /no review server running/);
+    } finally { await readonly.stop(); }
+  } finally { await sending.stop(); }
+});
+
+test("legacy version metadata without feedbackEnabled is send-mode and restarts for read-only", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const legacy = spawn(process.execPath, ["-e", `const http=require('node:http'); const server=http.createServer((req,res)=>res.end(JSON.stringify({serverId:'legacy',pid:process.pid})));server.listen(0,'127.0.0.1',()=>console.log(server.address().port));`], { stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    const port = await new Promise((resolve, reject) => {
+      legacy.stdout.once("data", (d) => resolve(Number(String(d).trim())));
+      legacy.once("error", reject);
+    });
+    fs.writeFileSync(path.join(dir, ".skeleton", "serve.json"), JSON.stringify({
+      url: `http://127.0.0.1:${port}/`, serverId: "legacy", pid: legacy.pid,
+    }));
+    assert.match(run("serve", "--send"), /feedback enabled; already running/);
+    const readonly = await serve(dir, []);
+    try {
+      const version = await (await fetch(new URL("api/version", readonly.url))).json();
+      assert.notEqual(version.serverId, "legacy");
+      assert.equal(version.feedbackEnabled, false);
+    } finally { await readonly.stop(); }
+  } finally {
+    if (legacy.exitCode === null && legacy.signalCode === null) {
+      await new Promise((resolve) => { legacy.once("exit", resolve); legacy.kill(); });
     }
   }
 });
