@@ -73,6 +73,8 @@ textarea { font: inherit; color: inherit; }
   background: var(--surface-2); color: var(--muted); border: 1px solid var(--border);
 }
 .pill.fill { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.pill.version { font-family: var(--mono); }
+.pill.version.stale { background: var(--todo-soft); color: var(--todo); border-color: var(--todo); }
 .progress { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; margin-left: auto; }
 .bar { width: 140px; height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
 .bar > i { display: block; height: 100%; background: var(--filled); }
