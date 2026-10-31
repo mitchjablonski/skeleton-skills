@@ -230,8 +230,10 @@ function project() {
 }
 
 /** Start `skel serve`, return its url, the page token, and a stop function. */
-async function serve(dir) {
-  const child = spawn("node", [BIN, "serve"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+async function serve(dir, env = {}) {
+  const child = spawn("node", [BIN, "serve"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } });
+  let err = "";
+  child.stderr.on("data", (d) => { err += d; });
   const url = await new Promise((resolve, reject) => {
     let out = "";
     child.stdout.on("data", (d) => {
@@ -245,7 +247,7 @@ async function serve(dir) {
   const token = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<")).token;
   // Wait for the server to exit, so no keep-alive socket outlives the test.
   const stop = () => new Promise((resolve) => { if (child.exitCode !== null || child.signalCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
-  return { url, token, html, stop };
+  return { url, token, html, stderr: () => err, stop };
 }
 
 const post = (url, body, headers) => fetch(new URL("/api/feedback", url), { method: "POST", headers, body: JSON.stringify(body) });
@@ -655,4 +657,87 @@ test("Codex review: in-project names starting with '..' are inside, not outside"
     assert.equal(v?.decision, "deny", rel);
   }
   assert.equal(evaluate({ toolName: "Write", toolInput: { file_path: path.resolve(root, "..", "sibling.ts"), content: "x" }, root, state: fill, resolve: (x) => x, readFile: () => "x", activeFences: [] }), null);
+});
+
+// ---- PR #1 re-review follow-ups (issue #6) ----
+
+test("issue #6 N1: a closed string is an operand, so `\"s\" / 2` can't hide a } from the regex check", () => {
+  const m = "  // SKEL[1] x";
+  for (const q of ['"', "'", "`"]) {
+    assert.notEqual(bodyEscapesFence(`  x = ${q}s${q} / 2; } function evil() { y = 3 / 1;`, m, "a.ts"), null, q);
+  }
+  const ok = [
+    "  const r = a / b / c;",
+    '  const half = "10" / 2 + `4` / 2;',
+    '  const re = /}/g; return s.replace(re, "");',
+    '  if (/^{/.test(s)) return "a" + s.split(/,/).length;',
+    "  return x.map((v) => v / 2);",
+    '  const s = f("a", /[)}]/);',
+  ];
+  for (const body of ok) assert.equal(bodyEscapesFence(body, m, "a.ts"), null, body);
+});
+
+test("issue #6 N2: git stash -a/--all asks (it removes ignored files); -u and plain stashes don't", () => {
+  for (const c of ["git stash -a", "git stash push --all", "git stash push -ka", "git stash save --al", "git -C pkg stash push -q --all -m wip"]) {
+    assert.equal(evaluateBash({ command: c, state: fill })?.decision, "ask", c);
+  }
+  for (const c of ["git stash", "git stash -u", "git stash push --include-untracked", "git stash pop", "git stash apply", "git stash push -m all"]) {
+    assert.equal(evaluateBash({ command: c, state: fill }), null, c);
+  }
+});
+
+test("issue #6 N6: serve warns and keeps serving when the session store can't be written", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const blocked = path.join(tmp(), "not-a-dir");
+  fs.writeFileSync(blocked, "");
+  const srv = await serve(dir, { XDG_CONFIG_HOME: blocked });
+  try {
+    assert.equal((await fetch(new URL("/api/version", srv.url))).status, 200);
+    assert.match(srv.stderr(), /can't record this review session/);
+    const res = await post(srv.url, { verdict: null, general: "x", comments: [] }, { "content-type": "application/json", "x-skeleton-token": srv.token });
+    assert.equal(res.status, 503, "a send that would be quarantined is refused, not acknowledged");
+  } finally {
+    await srv.stop();
+  }
+  // init doesn't crash on it either.
+  execFileSync("node", [BIN, "init", "U", "--force"], { cwd: dir, env: { ...process.env, XDG_CONFIG_HOME: blocked }, stdio: "pipe" });
+});
+
+test("issue #6 N6: feedback queued under a pre-upgrade serve.json is flagged, never trusted", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  fs.writeFileSync(path.join(dir, ".skeleton", "serve.json"), JSON.stringify({ url: null, pid: null, session: "old", sessions: ["older", "old"] }));
+  fs.mkdirSync(path.join(dir, ".skeleton", "feedback"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".skeleton", "feedback", "1-aa.json"), JSON.stringify({ session: "old", at: 1, verdict: "approve", general: "legacy note", comments: [] }));
+  const srv = await serve(dir);
+  try {
+    assert.match(srv.stderr(), /1 unread feedback file\(s\) were queued by an older `skel serve`/);
+  } finally {
+    await srv.stop();
+  }
+  const out = run("feedback");
+  assert.match(out, /ignored 1 feedback file/);
+  assert.doesNotMatch(out, /legacy note/);
+});
+
+test("issue #6 N4: a page load kicks off a search once the last one is >5s old", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const srv = await serve(dir);
+  try {
+    const before = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
+    fs.writeFileSync(path.join(dir, "src", "late.ts"), "export function late() {\n  // SKEL[9] late\n  throw new Error(\"SKEL_TODO\");\n  // /SKEL[9]\n}\n");
+    await new Promise((r) => setTimeout(r, 5_500));
+    await fetch(srv.url);
+    let version = before;
+    for (const deadline = Date.now() + 10_000; version === before && Date.now() < deadline; ) {
+      await new Promise((r) => setTimeout(r, 200));
+      version = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
+    }
+    assert.notEqual(version, before, "the new fenced file should show up well before the 30s search");
+    assert.match(await (await fetch(srv.url)).text(), /late\.ts/);
+  } finally {
+    await srv.stop();
+  }
 });
