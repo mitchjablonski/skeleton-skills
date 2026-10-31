@@ -2,10 +2,11 @@
 // skel — plan as code skeleton, fill it one fenced step at a time.
 // Run `skel help` for commands.
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, toSteps, stripMarkers } from "../lib/markers.mjs";
@@ -14,8 +15,8 @@ import { bodyEscapesFence } from "../lib/gate.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
-  addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath, sessionStorePath,
-  storeFeedback, takeFeedback,
+  addSession, clearSessions, configPath, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
+  sessionStorePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
 import {
   clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
@@ -47,7 +48,9 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
   stop-hook [--block]                Stop hook: reports drift from the approved skeleton during a fill
-  install [projectDir]               install skills, filler subagent + hooks into a project's .claude/
+  install [projectDir]               install skills, filler subagent, hooks and .skeleton/ deny rules into a
+                                     project's .claude/
+  uninstall [projectDir]             remove what install added (leaves .skeleton/ and .gitignore alone)
 `;
 
 function die(msg) {
@@ -136,6 +139,186 @@ function setActive(root, state, step, force = false) {
   console.log(`STEP ${step.id} active: ${step.title}`);
   console.log(`Edit only inside these fences; replace each SKEL_TODO stub. Leave the marker lines in place.`);
   printFences(step);
+}
+
+const SKILLS = ["skeleton", "skeleton-fill"];
+// The fill skill delegates each step's edits to this subagent (Read, Grep,
+// Glob, Edit, MultiEdit only: no shell, no Write).
+const AGENT = "skeleton-filler";
+
+/** [source, destination] for every file install writes into .claude/. */
+function installedFiles(claudeDir) {
+  return [
+    ...SKILLS.map((name) => [path.join(PKG_ROOT, "skills", name, "SKILL.md"), path.join(claudeDir, "skills", name, "SKILL.md")]),
+    [path.join(PKG_ROOT, "agents", `${AGENT}.md`), path.join(claudeDir, "agents", `${AGENT}.md`)],
+  ];
+}
+
+/**
+ * Claude Code permission rules `install` adds, so the agent's own file tools
+ * can't write the tool's state: Claude Code enforces deny rules before any
+ * hook (a hook's "allow" can't lift them), and the Bash sandbox, when enabled,
+ * turns them into OS-level write denials. Only `Edit(...)` path rules match
+ * (they cover Write, MultiEdit and NotebookEdit too; `Write(path)` rules
+ * never match). A `!` carve-out can't reopen diagrams/ inside a denied
+ * .skeleton/**, so the state is listed path by path, with no wildcard but a
+ * trailing /** (the only kind the Linux sandbox honours).
+ *
+ * The rules name the project by its ABSOLUTE real path (`//abs/path/...`): a
+ * `/path` rule in .claude/settings.local.json anchors at the session's primary
+ * working directory, not the project, so a session launched from a
+ * subdirectory would protect <subdir>/.skeleton and miss the real state. On
+ * Windows Claude Code matches POSIX-normalized paths (C:\x becomes /c/x).
+ */
+const STATE_PATHS = ["state.json", "serve.json", "review.html", "feedback/**", "feedback-history/**"];
+const LEGACY_DENY_RULES = STATE_PATHS.map((p) => `Edit(/${STATE_DIR}/${p})`);
+
+/** The project's real path, as Windows spells it on disk (true case) or as POSIX does. */
+const realDir = (target) => fs.realpathSync.native(target);
+
+/**
+ * The deny rules for a project, or a reason they can't be written. The rule
+ * path is a gitignore pattern: `[ ] * ?` are backslash-escaped so they match
+ * literally (`( ) { }` aren't pattern characters and match as they are). A
+ * path a rule can't spell (a newline, a literal backslash on POSIX, a Windows
+ * path without a drive letter) gets no rules rather than rules that guard
+ * something else; install still adds the hook and the skills.
+ */
+function denyRules(target) {
+  let real = realDir(target);
+  if (process.platform === "win32") {
+    const m = /^([A-Za-z]):[\\/](.*)$/.exec(real);
+    if (!m) return { rules: [], why: "only drive-letter paths can be written as rules on Windows" };
+    real = `/${m[1].toLowerCase()}/${m[2].split("\\").join("/")}`;
+  }
+  real = real.replace(/\/+$/, "");
+  if (/[\n\r\\]/.test(real)) return { rules: [], why: "the path contains a newline or a backslash, which a rule can't spell" };
+  const escaped = real.replace(/[[\]*?]/g, (c) => `\\${c}`);
+  return { rules: STATE_PATHS.map((p) => `Edit(/${escaped}/${STATE_DIR}/${p})`), why: null };
+}
+
+/**
+ * Any deny rule shaped like one skel writes, for any project: the absolute
+ * form or the old project-relative one. Used to report rules install and
+ * uninstall leave alone (a moved project's, or ones whose ownership record
+ * was lost), never to remove them.
+ */
+const SKEL_SHAPED = new RegExp(`^Edit\\((//.*)?/\\.skeleton/(${STATE_PATHS.map((p) => p.replace(/[.*]/g, (c) => `\\${c}`)).join("|")})\\)$`);
+function reportLeftInPlace(settings, notOurs) {
+  const left = (settings.permissions?.deny ?? []).filter((r) => typeof r === "string" && SKEL_SHAPED.test(r) && !notOurs.includes(r));
+  if (!left.length) return;
+  console.log(`left in place: ${left.length} ${STATE_DIR}/ deny rule(s) this install didn't add (a moved project's, a lost ownership record's, or your own); remove any you no longer want by hand:`);
+  for (const r of left) console.log(`  ${r}`);
+}
+
+/**
+ * Where Claude Code loads .claude/settings.local.json from: the git root on
+ * Linux/macOS/WSL, but the launch directory outside git, on native Windows, in
+ * a home-directory repo, or when the root isn't the user's. Warn when the
+ * project isn't a place both agree on, so a launch from a subdirectory would
+ * load neither the rules nor the hook.
+ */
+function launchWarning(target) {
+  const real = realDir(target);
+  const same = (a, b) => (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+  const git = (...args) => execFileSync("git", ["-C", real, ...args], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  let why = null;
+  if (process.platform === "win32") {
+    why = "on native Windows, Claude Code loads it from the directory you start in";
+  } else {
+    let top = null;
+    try { top = realDir(git("rev-parse", "--show-toplevel")); } catch {}
+    if (!top) why = "outside a git repository, Claude Code loads it from the directory you start in";
+    else if (same(top, realDir(os.homedir()))) why = "in a repository rooted at your home directory, Claude Code loads it from the directory you start in"
+    else if (!same(top, real)) why = `the project isn't its git repository's root (${top}), and Claude Code loads it from the root, or from the directory you start in`;
+    else {
+      try {
+        if (!same(path.resolve(real, git("rev-parse", "--git-dir")), path.resolve(real, git("rev-parse", "--git-common-dir")))) why = "in a git worktree, Claude Code loads it from the main checkout's root";
+      } catch {}
+    }
+  }
+  if (why) console.log(`warning: the hook and the deny rules live in .claude/settings.local.json, and ${why}. Start Claude Code in ${real} itself, not a subdirectory.`);
+}
+
+/**
+ * Which deny rules this install added, kept OUTSIDE the project (next to the
+ * serve-session store), so uninstall removes only those: a rule the user
+ * already had survives install + uninstall.
+ */
+const ownedStorePath = (target) => configPath(target, "-install");
+function readOwned(target) {
+  try {
+    const o = JSON.parse(fs.readFileSync(ownedStorePath(target), "utf-8")).ownedDeny;
+    return Array.isArray(o) ? o.filter((x) => typeof x === "string") : null;
+  } catch {
+    return null;
+  }
+}
+function writeOwned(target, owned) {
+  if (!owned.length) return fs.rmSync(ownedStorePath(target), { force: true });
+  writeFileAtomic(ownedStorePath(target), JSON.stringify({ root: realDir(target), ownedDeny: owned }, null, 2) + "\n", 0o600);
+}
+
+/**
+ * Rules an install from before ownership tracking wrote: the old
+ * project-relative set, claimed only when no ownership record exists, the
+ * scope gate hook is installed and all five are present (a user's own lone
+ * `Edit(/.skeleton/state.json)` is never taken).
+ */
+function legacyOwned(settings, owned) {
+  if (owned) return [];
+  const deny = settings.permissions?.deny ?? [];
+  const hooked = (settings.hooks?.PreToolUse ?? []).some((m) => m?.hooks?.some?.((hk) => isSkelHook(hk?.command)));
+  return hooked && LEGACY_DENY_RULES.every((r) => deny.includes(r)) ? LEGACY_DENY_RULES : [];
+}
+
+/** Our Stop hook (bin/skel-stop.mjs, or `skel.mjs stop-hook`), with any flags after it, else null. */
+const skelStopHook = (cmd) => {
+  const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?: --block)?)$/.exec(cmd);
+  return m ? { flags: m[1] } : null;
+};
+/** The scope-gate hook command from any skel checkout (current or legacy form). */
+const isSkelHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](skel-hook\.mjs"|skel\.mjs" hook)$/.test(cmd);
+
+/**
+ * A project's .claude/settings.local.json, parsed, for install/uninstall to
+ * merge into. Dies rather than risk the user's settings: a symlink on the way
+ * (we'd write through it), JSON we can't parse (we'd drop it), or a shape we
+ * don't understand (we'd clobber it).
+ */
+function openProjectSettings(dir, { forInstall = false } = {}) {
+  const target = path.resolve(dir);
+  if (!fs.existsSync(target)) {
+    if (!forInstall) die(`${target} doesn't exist`);
+    fs.mkdirSync(target, { recursive: true }); // as install always has: it creates the project dir
+  } else if (!fs.statSync(target).isDirectory()) die(`${target} isn't a directory`);
+  const claudeDir = path.join(target, ".claude");
+  const settingsPath = path.join(claudeDir, "settings.local.json");
+  const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
+  // A symlinked folder would aim our writes outside the project, and a
+  // symlinked file may be someone's live checkout: refuse both.
+  const dests = installedFiles(claudeDir).flatMap(([, dest]) => [path.dirname(path.dirname(dest)), path.dirname(dest), dest]);
+  for (const p of new Set([claudeDir, settingsPath, ...(forInstall ? [path.join(target, ".gitignore")] : []), ...dests])) {
+    if (isLink(p)) die(`${p} is a symlink; refusing to write through it`);
+  }
+  let settings = {};
+  if (fs.existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    } catch {
+      die(`${settingsPath} isn't valid JSON; fix it first (overwriting it would drop your settings)`);
+    }
+  }
+  const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  const bad = !isObj(settings) ? "the file"
+    : settings.permissions !== undefined && !isObj(settings.permissions) ? '"permissions"'
+    : settings.permissions?.deny !== undefined && !Array.isArray(settings.permissions.deny) ? '"permissions.deny"'
+    : settings.hooks !== undefined && !isObj(settings.hooks) ? '"hooks"'
+    : settings.hooks?.PreToolUse !== undefined && !Array.isArray(settings.hooks.PreToolUse) ? '"hooks.PreToolUse"'
+    : settings.hooks?.Stop !== undefined && !Array.isArray(settings.hooks.Stop) ? '"hooks.Stop"'
+    : null;
+  if (bad) die(`${settingsPath}: ${bad} isn't shaped the way Claude Code expects; fix it first (we won't overwrite it)`);
+  return { target, claudeDir, settingsPath, settings };
 }
 
 const commands = {
@@ -533,8 +716,6 @@ const commands = {
   },
 
   install([dir = process.cwd()]) {
-    const target = path.resolve(dir);
-    const claudeDir = path.join(target, ".claude");
     // The hook command runs through a shell: refuse an install path that a
     // shell would interpret rather than quote it and hope. Windows paths are
     // written with forward slashes (Node accepts them), so their backslashes
@@ -542,51 +723,46 @@ const commands = {
     if (/["'`$\n\r]/.test(PKG_ROOT) || (process.platform !== "win32" && PKG_ROOT.includes("\\"))) {
       die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
     }
-    const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
-    const settingsPath = path.join(claudeDir, "settings.local.json");
-    const skills = ["skeleton", "skeleton-fill"].map((name) => [
-      path.join(PKG_ROOT, "skills", name, "SKILL.md"), path.join(claudeDir, "skills", name, "SKILL.md"),
-    ]);
-    // The fill skill delegates each step's edits to this subagent (Read, Grep,
-    // Glob, Edit, MultiEdit only: no shell, no Write).
-    const agent = [path.join(PKG_ROOT, "agents", "skeleton-filler.md"), path.join(claudeDir, "agents", "skeleton-filler.md")];
-    // A symlinked folder would aim our writes outside the project, and a
-    // symlinked file may be someone's live checkout: refuse both.
-    const dests = [...skills, agent].flatMap(([, dest]) => [path.dirname(path.dirname(dest)), path.dirname(dest), dest]);
-    for (const p of new Set([claudeDir, ...dests, settingsPath, path.join(target, ".gitignore")])) {
-      if (isLink(p)) die(`${p} is a symlink; refusing to write through it`);
-    }
-    let settings = {};
-    if (fs.existsSync(settingsPath)) {
-      try {
-        settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
-      } catch {
-        die(`${settingsPath} isn't valid JSON; fix it first (overwriting it would drop your settings)`);
-      }
-    }
-    for (const [src, dest] of [...skills, agent]) {
+    const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
+    const { rules, why } = denyRules(target);
+    const prevOwned = readOwned(target);
+    const stale = [...legacyOwned(settings, prevOwned), ...(prevOwned ?? []).filter((r) => !rules.includes(r))];
+    for (const [src, dest] of installedFiles(claudeDir)) {
       writeFileAtomic(dest, fs.readFileSync(src, "utf-8").replaceAll("{{SKEL}}", `node "${SELF}"`));
     }
     const command = `node "${HOOK}"`;
-    const legacy = `node "${SELF}" hook`;
     settings.hooks ??= {};
     settings.hooks.PreToolUse ??= [];
     const matcher = "Write|Edit|MultiEdit|NotebookEdit|Bash";
-    const ours = settings.hooks.PreToolUse.find((m) => m.hooks?.some((hk) => hk.command === command || hk.command === legacy));
+    const ours = settings.hooks.PreToolUse.find((m) => m?.hooks?.some?.((hk) => isSkelHook(hk?.command)));
     if (ours) {
       ours.matcher = matcher;
-      for (const hk of ours.hooks) if (hk.command === legacy) hk.command = command;
+      for (const hk of ours.hooks) if (isSkelHook(hk?.command)) hk.command = command; // legacy or moved clone
     } else {
       settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
     }
     // The Stop hook checks for drift at the end of every turn during a fill.
-    // Matched by its script, so a `--block` someone added survives a reinstall.
+    // Found by its script, so a moved clone is updated in place and a
+    // `--block` someone added survives a reinstall.
     const stopCommand = `node "${STOP_HOOK}"`;
     settings.hooks.Stop ??= [];
-    const isStop = (hk) => typeof hk.command === "string" && (hk.command === stopCommand || hk.command.startsWith(`${stopCommand} `));
-    const stopOurs = settings.hooks.Stop.some((m) => m.hooks?.some(isStop));
+    let stopOurs = false;
+    for (const m of settings.hooks.Stop) {
+      for (const hk of Array.isArray(m?.hooks) ? m.hooks : []) {
+        const found = skelStopHook(hk?.command);
+        if (found) { stopOurs = true; hk.command = stopCommand + found.flags; }
+      }
+    }
     if (!stopOurs) settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand }] });
+    settings.permissions ??= {};
+    settings.permissions.deny = (settings.permissions.deny ?? []).filter((r) => !stale.includes(r));
+    const added = rules.filter((r) => !settings.permissions.deny.includes(r));
+    settings.permissions.deny.push(...added);
+    // Ours: what we add now, plus what an earlier install added and still owns.
+    // A rule that was already there and isn't recorded stays the user's.
+    // Settings first: a failed write must never record rules that weren't added.
     writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+    writeOwned(target, rules.filter((r) => added.includes(r) || prevOwned?.includes(r)));
     // .skeleton/ is per-run state (and holds the human's feedback): keep it
     // out of commits, so a repo can't ship a verdict.
     const gi = path.join(target, ".gitignore");
@@ -595,7 +771,53 @@ const commands = {
     console.log(`installed /skeleton and /skeleton-fill into ${claudeDir}/skills`);
     console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
-    console.log(stopOurs ? "drift check (Stop) hook already installed" : `added drift check (Stop) hook to ${settingsPath}`);
+    console.log(stopOurs ? "drift check (Stop) hook updated" : `added drift check (Stop) hook to ${settingsPath}`);
+    if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
+    else console.log(added.length ? `added ${added.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
+    reportLeftInPlace(settings, rules);
+    launchWarning(target);
+    console.log(`optional: Claude Code's Bash sandbox can enforce those rules at the OS level; see "Security model" in the README (skel needs "excludedCommands": ["node \\"${SELF}\\" *"])`);
+  },
+
+  uninstall([dir = process.cwd()]) {
+    const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir);
+    const prevOwned = readOwned(target);
+    const owned = [...(prevOwned ?? []), ...legacyOwned(settings, prevOwned)];
+    const groups = settings.hooks?.PreToolUse ?? [];
+    for (const m of groups) if (Array.isArray(m?.hooks)) m.hooks = m.hooks.filter((hk) => !isSkelHook(hk?.command));
+    if (settings.hooks?.PreToolUse) {
+      settings.hooks.PreToolUse = groups.filter((m) => !Array.isArray(m?.hooks) || m.hooks.length);
+      if (!settings.hooks.PreToolUse.length) delete settings.hooks.PreToolUse;
+    }
+    // The drift check (Stop) hook, with or without --block.
+    const stops = settings.hooks?.Stop ?? [];
+    for (const m of stops) if (Array.isArray(m?.hooks)) m.hooks = m.hooks.filter((hk) => !skelStopHook(hk?.command));
+    if (settings.hooks?.Stop) {
+      settings.hooks.Stop = stops.filter((m) => !Array.isArray(m?.hooks) || m.hooks.length);
+      if (!settings.hooks.Stop.length) delete settings.hooks.Stop;
+    }
+    if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
+    let removed = 0;
+    if (settings.permissions?.deny) {
+      const before = settings.permissions.deny.length;
+      settings.permissions.deny = settings.permissions.deny.filter((r) => !owned.includes(r));
+      removed = before - settings.permissions.deny.length;
+      if (!settings.permissions.deny.length) delete settings.permissions.deny;
+      if (!Object.keys(settings.permissions).length) delete settings.permissions;
+    }
+    if (fs.existsSync(settingsPath)) writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+    writeOwned(target, []);
+    for (const name of SKILLS) {
+      const skillDir = path.join(claudeDir, "skills", name);
+      fs.rmSync(path.join(skillDir, "SKILL.md"), { force: true });
+      try { fs.rmdirSync(skillDir); } catch {} // only if we left it empty
+    }
+    // The agents folder may hold the user's own subagents: leave it.
+    fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
+    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook and the drift check (Stop) hook from ${claudeDir}`);
+    console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
+    reportLeftInPlace(settings, []);
+    console.log(`left in place: ${STATE_DIR}/ (delete it once you're done with it) and the ${STATE_DIR}/ line in .gitignore`);
   },
 };
 
