@@ -1,0 +1,4 @@
+# Keep LF everywhere: the gate, the scanner and the tests compare text line by line,
+# and Windows-side and WSL-side git (Codex and Claude Code) share these checkouts.
+* text=auto eol=lf
+*.png binary
