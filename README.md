@@ -28,7 +28,8 @@ export function smoothStroke(raw: Point[], tension: number): Point[] {
 - A fence whose body contains `SKEL_TODO` is pending; otherwise it's filled. Progress is read from the code, so there's no status file to drift out of date.
 - One id can fence several places (an implementation and its test).
 - Ids sort naturally (`1`, `2`, `2.1`, `10`) and set the build order.
-- The scan (and the gate) skip tool and build directories wherever they appear: `node_modules`, `.git`, `.claude`, `.skeleton`, `dist`, `build`, `out`, `coverage`, `target` and friends. Fences under a directory with one of those names are ignored, so keep skeleton code elsewhere.
+- The scan (and the gate) skip tool and build directories wherever they appear: `node_modules`, `.git`, `.claude`, `.skeleton`, `dist`, `build`, `out`, `coverage`, `target` and friends. Fences under a directory with one of those names are ignored, so keep skeleton code elsewhere. The names match as spelled on disk: on a filesystem that ignores case (macOS, Windows, WSL's `/mnt/c`) an edit to `.Claude/...` is an edit to `.claude/`, while a real `Build/` folder is code.
+- A file you `skel track` under one of those directories is context only. It's shown on the page and recorded at approve (so editing it during the fill is drift), but its fences are never steps: `status`, `done` and `finalize` ignore them, and the gate won't let a step be "filled" there.
 
 ## Architecture diagrams
 
