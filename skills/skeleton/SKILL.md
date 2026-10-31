@@ -77,7 +77,7 @@ If the human changes the structure during review, update the diagram to match.
 skel serve        # run in the background; it prints the review URL
 ```
 
-Give the human the URL. On WSL, Windows browsers reach `127.0.0.1` directly. If serving isn't possible, run `skel review` and give them the `file://` path; they'll paste their feedback back to you.
+Give the human the URL. On WSL, Windows browsers reach `127.0.0.1` directly. If serving isn't possible, run `skel review` and give them the `file://` path; they'll paste their feedback back to you (it names the skeleton version they reviewed; keep it for `skel approve --reviewed`). Re-run `skel review` after each revision so the file shows the current version.
 
 Then wait for feedback. Each call waits up to 110 seconds (under the Bash tool's default timeout); repeat while it prints `NO_FEEDBACK`:
 
@@ -94,6 +94,9 @@ In the terminal, give a short summary of the shape (files, the step list, and th
 - Apply every comment. Feedback quotes `file:line`, so re-read those lines first. After editing, the served page reloads by itself.
 - If you disagree with a comment, say so once with your reason, then do what they decide.
 - When the verdict is **APPROVED** (or they approve in chat), run `skel approve`. Claude Code will ask them to allow it: that permission prompt is their approval, so run it only after they've said yes, and never try to approve another way.
+  - Every review is of one **skeleton version** (the page shows it; feedback has a `Reviewed skeleton version: …` line). `skel approve` prints the version it is about to record and refuses if it isn't the one the human last reviewed. With `skel serve` it reads that from their last send. If they pasted copied feedback instead, pass its version: `skel approve --reviewed <version>`.
+  - Don't edit the skeleton between their approval and `skel approve`. If you did (or approve refuses with a diff), tell them what changed and ask them to look at the page again; it reloads by itself. Never pass a version they haven't seen, and never pass `--reviewed` with a version you computed yourself.
+  - If it says they sent feedback you haven't read, run `skel feedback` first.
 - Then tell them they can run `/skeleton-fill` to fill one step at a time, or `/skeleton-fill all` to fill every step without stopping (still fenced).
 - `.skeleton/` is the tool's own state (phase, the human's feedback). Don't edit or write files there except `.skeleton/diagrams/`; the hook will ask the human if you try.
 

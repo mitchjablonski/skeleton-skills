@@ -13,10 +13,12 @@ import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writ
 import { bodyEscapesFence } from "../lib/gate.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
-  cleanFeedback, feedbackMarkdown, mergeRecords, newServeSession,
+  cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
   addSession, clearSessions, historyDir, pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
-import { clearSnapshot, formatDrift, scanSkeleton, verifySnapshot, writeSnapshot } from "../lib/snapshot.mjs";
+import {
+  clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
+} from "../lib/snapshot.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Forward slashes on every platform: these land in shell commands and skill text.
@@ -32,7 +34,8 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   review                             write .skeleton/review.html (static; copy feedback by hand)
   serve [--port N] [--stop]          serve the review live (reuses a running server); feedback is sent back
   feedback [--wait SECONDS]          print (and archive) the human's latest feedback (waits up to 110s)
-  approve                            enter the fill phase (inside Claude Code the hook asks the human first)
+  approve [--reviewed VERSION]       enter the fill phase (inside Claude Code the hook asks the human first);
+                                     refuses if the version the human last reviewed isn't the current one
   next                               start the first pending step and print its fences
   start <id> [--force]               start a specific step (--force abandons an unfinished active step,
                                      or reopens a filled one for rework)
@@ -72,6 +75,16 @@ function snapshot(root) {
 function requireNoDrift(root, state, fencedFiles, what) {
   const drift = verifySnapshot(root, state, fencedFiles);
   if (!drift.ok) die(`can't ${what}: ${formatDrift(drift)}`);
+}
+
+/** Why approve refuses a stale review: what changed since the version the human saw. */
+function staleReview(root, state, files, reviewed, now) {
+  const head = `can't approve: the human reviewed skeleton version ${reviewed}, but it is now ${now}.`;
+  const tail = `Ask the human to look at the review page again (it reloads by itself and shows version ${now}) and send their verdict, or paste fresh feedback; then approve. Don't pass a version they haven't seen.`;
+  const seen = readRendered(root).find((r) => r.version === reviewed);
+  if (!seen) return `${head}\nVersion ${reviewed} isn't one this project's review page rendered recently, so there is no diff to show.\n${tail}`;
+  const diff = compareWith(seen, root, state, files);
+  return `${head}\n${formatDrift(diff, 8, { header: "Changed since that version (outside the fence bodies):", footer: tail })}`;
 }
 
 function printFences(step) {
@@ -131,6 +144,7 @@ const commands = {
     for (const f of [queueDir(root), historyDir(root), servePath(root)]) fs.rmSync(f, { force: true, recursive: true });
     clearSessions(root);
     clearSnapshot(root);
+    clearRendered(root);
     console.log(`skel: "${title}" started in ${root} (phase: scaffold, gate: ${gate})`);
   },
 
@@ -216,10 +230,10 @@ const commands = {
     const current = () => {
       const state = readState(root);
       const tracked = (state.files ?? []).map((f) => path.join(root, String(f)));
-      const data = buildReviewData(root, state, cache, [...new Set([...known, ...tracked])]);
+      const { record, ...data } = buildReviewData(root, state, cache, [...new Set([...known, ...tracked])]);
       known = [...new Set([...known, ...data.files.map((f) => path.join(root, f.path))])];
       const { generatedAt, errored, ...stable } = data;
-      return { data, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
+      return { data, record, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
     };
     const superseded = () => readServe(root)?.serverId !== serverId;
     let origin = "";
@@ -232,7 +246,10 @@ const commands = {
         // DNS rebinding: only answer requests addressed to us by name.
         if (!hosts.has(String(req.headers.host ?? "").toLowerCase())) return void refuse(421, "misdirected request");
         if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/?"))) {
-          const { data, version } = current();
+          const { data, record, version } = current();
+          // Remember what the human was shown, so `skel approve` can diff
+          // against the version they reviewed.
+          noteRendered(root, record);
           res.writeHead(200, {
             "content-type": "text/html; charset=utf-8",
             "cache-control": "no-store",
@@ -257,8 +274,14 @@ const commands = {
           req.on("data", (c) => { body += c; if (body.length > 2_000_000) req.destroy(); });
           req.on("end", () => {
             try {
-              storeFeedback(root, session, cleanFeedback(JSON.parse(body)));
-              res.writeHead(204).end();
+              const fb = cleanFeedback(JSON.parse(body));
+              const now = current().data.skeletonVersion;
+              storeFeedback(root, session, fb, now);
+              // A page that was already out of date is told so (the notes are
+              // still delivered, marked stale).
+              if (fb.version && fb.version !== now) {
+                res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ stale: true, reviewed: fb.version, current: now }));
+              } else res.writeHead(204).end();
             } catch {
               res.writeHead(400).end("bad feedback payload");
             }
@@ -314,6 +337,8 @@ const commands = {
   },
 
   approve(args) {
+    const given = flag(args, "reviewed", null);
+    if (given !== null && !isVersion(given)) die('--reviewed takes the 12-character version the human reviewed (the "Reviewed skeleton version: …" line of their feedback)');
     const root = requireRoot();
     const state = readState(root);
     if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
@@ -321,12 +346,22 @@ const commands = {
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     if (!steps.length) die("no SKEL[...] fences found — nothing to approve");
     // The human's say-so is Claude Code's permission prompt: the hook always
-    // asks before an agent runs `skel approve` (see evaluateBash). What they
-    // approved is recorded, so done/finalize can check the fill against it.
+    // asks before an agent runs `skel approve` (see evaluateBash). This checks
+    // freshness, not authority: that what is approved is the version the human
+    // last reviewed, so an edit made after their "looks good" can't ride along.
+    const record = recordSkeleton(root, state, files);
+    console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
+    const { record: last, unread } = lastReview(root, state.reviewEpoch);
+    if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
+    // What the human reviewed: the version named in the feedback the agent
+    // was given (copied markdown → --reviewed), else the page's latest send.
+    const reviewed = given ?? last?.version ?? null;
+    if (reviewed && reviewed !== record.version) die(staleReview(root, state, files, reviewed, record.version));
+    if (!reviewed) console.log("note: no review of this version is on record (no send from the review page this round, and no --reviewed). Approving on the human's word alone.");
     const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
-    writeSnapshot(root, next, files);
+    writeSnapshot(root, next, files, record, reviewed ? { version: reviewed, source: given ? "reviewed-flag" : "review-page", at: given ? null : last.at } : null);
     writeState(root, next);
-    console.log(`skeleton approved: ${steps.length} steps. Run \`skel next\` to start filling.`);
+    console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${reviewed ? " (the version the human reviewed)" : ""}. Run \`skel next\` to start filling.`);
   },
 
   next() {
