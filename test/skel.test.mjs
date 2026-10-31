@@ -1,11 +1,12 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { scanText, toSteps, stripMarkers } from "../lib/markers.mjs";
+import { scanText, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
 import { cleanFeedback, configPath, feedbackMarkdown, projectKey, sessionStorePath } from "../lib/feedback.mjs";
 import { compareWith, exterior, lineDiff, readRendered, readSnapshot, recordSkeleton, renderedPath, safeKey, scanSkeleton, snapshotPath, whitespaceOnly } from "../lib/snapshot.mjs";
@@ -1604,7 +1605,8 @@ test("review #10 nit 1: a tracked file the scan excludes never becomes a step af
   const snap = readSnapshot(dir);
   assert.deepEqual(snap.fenced, ["src/a.ts"], "the record lists the approve-time fenced files");
   assert.ok(snap.files["n.ts"], "the tracked file is still recorded whole");
-  assert.ok(snap.fences.some((f) => f.file === "n.ts"), "its fences are in the exterior record");
+  assert.ok(!snap.fences.some((f) => f.file === "n.ts"), "issue #25 (2): its fences aren't the skeleton's fences");
+  assert.ok(snap.files["n.ts"].lines.includes('  throw new Error("SKEL_TODO");'), "issue #25 (2): its fence body is recorded");
   const status = run("status");
   assert.match(status, /0\/2 filled/, "still the approve-time step count");
   assert.doesNotMatch(status, /\bg\b.*ignored helper/);
@@ -1913,7 +1915,7 @@ test("legacy version metadata without feedbackEnabled is send-mode and restarts 
 // ---- review of PR #20 (after #14's read-only default) ----
 
 /** The page's poll decision (lib/review-poll.js), as the browser runs it. */
-const skelPollDecision = new Function(fs.readFileSync(path.join(path.dirname(BIN), "..", "lib", "review-poll.js"), "utf-8") + "\nreturn skelPollDecision;")();
+const { skelPollDecision, skelModeDecision } = new Function(fs.readFileSync(path.join(path.dirname(BIN), "..", "lib", "review-poll.js"), "utf-8") + "\nreturn { skelPollDecision, skelModeDecision };")();
 
 test("B1/NIT3: the page's poll, fed the live server's real /api/version, leaves a fresh page alone; only a shape change says outdated", async () => {
   const { dir, a, run } = project();
@@ -1945,7 +1947,7 @@ test("B1/NIT3: the page's poll, fed the live server's real /api/version, leaves 
     assert.deepEqual(skelPollDecision(built, shape, false), { reload: true, stale: false });
   } finally { await srv.stop(); }
   // The page runs exactly this function: inlined ahead of the client, called by its poll.
-  assert.match(srv.html, /function skelPollDecision\(built, next, busy\)[\s\S]*skelPollDecision\(built, next, typing \|\| !!openEditor\)/);
+  assert.match(srv.html, /function skelPollDecision\(built, next, busy\)[\s\S]*skelPollDecision\(built, next, typing\(\) \|\| !!openEditor\)/);
 });
 
 test("S1: plain approve under the read-only default checks the version the page last rendered", () => {
@@ -2222,4 +2224,196 @@ test("#26: the gate asks about edits into skel's config dir from any project, de
   for (const command of ["ls ~/.config/skeleton-tools", "ls ~/.config", "npm test", `ls ${cfg}/skel-other`]) {
     assert.equal(hook({ tool_name: "Bash", tool_input: { command } }), null, command);
   }
+});
+
+// ---- follow-ups from #25 and #14's review ----
+
+const FENCED_N = 'export function g() {\n  // SKEL[g] helper\n  throw new Error("SKEL_TODO");\n  // /SKEL[g]\n}\n';
+
+test("issue #25 (1): searchable keeps tracked files the search would read: not gitignored, not under a skipped dir, not binary", () => {
+  const { dir } = project();
+  const rels = ["src/a.ts", "n.ts", ".claude/notes.md", "build/gen/t.ts", "logo.png"];
+  assert.deepEqual(searchable(dir, rels), ["src/a.ts", "n.ts"], "outside git, only skipped dirs and binaries are left out");
+  execFileSync("git", ["init", "-q", dir]);
+  fs.writeFileSync(path.join(dir, ".gitignore"), "n.ts\n");
+  assert.deepEqual(searchable(dir, rels), ["src/a.ts"], "in a repo, a gitignored file is left out too");
+  assert.deepEqual(searchable(dir, ["src/a.ts", "../outside.ts"]), ["src/a.ts"], "a path git can't answer for is left to the search");
+});
+
+test("issue #25 (1): serve picks up a tracked file that gains fences on the next poll, not the next search; excluded ones stay out", async () => {
+  const { dir, run } = project();
+  execFileSync("git", ["init", "-q", dir]);
+  for (const f of ["types.ts", "ignored.ts"]) fs.writeFileSync(path.join(dir, "src", f), "export type P = number;\n");
+  fs.writeFileSync(path.join(dir, ".gitignore"), "src/ignored.ts\n");
+  fs.mkdirSync(path.join(dir, ".claude"));
+  fs.writeFileSync(path.join(dir, ".claude", "notes.md"), "notes\n");
+  run("init", "T");
+  for (const f of ["src/types.ts", "src/ignored.ts", ".claude/notes.md"]) run("track", f);
+  const srv = await serve(dir, []);
+  try {
+    // Within 5s of the server's search, so a page load doesn't start another:
+    // only the poll can find the new fences.
+    for (const f of ["src/types.ts", "src/ignored.ts", ".claude/notes.md"]) fs.writeFileSync(path.join(dir, f), FENCED_N.replace("SKEL[g]", `SKEL[${f.length}]`).replace("/SKEL[g]", `/SKEL[${f.length}]`));
+    const ids = pageData(await (await fetch(srv.url)).text()).steps.map((s) => s.id);
+    assert.ok(ids.includes(String("src/types.ts".length)), `the tracked file's fence is a step at once (${ids})`);
+    assert.ok(!ids.includes(String("src/ignored.ts".length)), "a gitignored tracked file's fences aren't steps (the CLI agrees)");
+    assert.ok(!ids.includes(String(".claude/notes.md".length)), "nor a tracked doc's under .claude/");
+    assert.deepEqual(ids, toSteps(scanSkeleton(dir, readState(dir)).fences).map((s) => s.id), "the page and the CLI agree");
+  } finally { await srv.stop(); }
+});
+
+test("issue #25 (2): a gitignored tracked file's fence bodies are recorded: editing one is drift, and the version moves", () => {
+  const { dir, run } = project();
+  execFileSync("git", ["init", "-q", dir]);
+  fs.writeFileSync(path.join(dir, ".gitignore"), "n.ts\n");
+  const n = path.join(dir, "n.ts");
+  fs.writeFileSync(n, FENCED_N);
+  run("init", "T");
+  run("track", "n.ts");
+  const v1 = recordSkeleton(dir, readState(dir), ["src/a.ts"]).version;
+  fs.writeFileSync(n, FENCED_N.replace('throw new Error("SKEL_TODO");', "return 1;"));
+  assert.notEqual(recordSkeleton(dir, readState(dir), ["src/a.ts"]).version, v1, "a body edit in a non-step file is a shape change");
+  fs.writeFileSync(n, FENCED_N);
+  run("approve");
+  assert.deepEqual(readSnapshot(dir).fenced, ["src/a.ts"]);
+  run("next");
+  fs.writeFileSync(n, FENCED_N.replace('throw new Error("SKEL_TODO");', "return 1;"));
+  const err = failure(() => run("finalize"));
+  assert.match(err, /n\.ts:3\n\s+- {3}throw new Error\("SKEL_TODO"\);\n\s+\+ {3}return 1;/);
+  assert.doesNotMatch(err, /fence set/, "its fences aren't counted in the fence set");
+  fs.writeFileSync(n, FENCED_N);
+  // A step's fence body still isn't recorded: filling it is no drift.
+  fs.writeFileSync(path.join(dir, "src", "a.ts"), SRC.replaceAll(STUB, "return [];"));
+  assert.match(run("status"), /phase: fill/);
+  assert.doesNotMatch(run("status"), /drift/);
+});
+
+/** A project with a gitignored tracked file whose fences aren't steps (gen/n.ts), approved and on step 1. */
+function genProject() {
+  const { dir, run, a } = project();
+  execFileSync("git", ["init", "-q", dir]);
+  fs.writeFileSync(path.join(dir, ".gitignore"), "gen/\n");
+  const n = path.join(dir, "gen", "n.ts");
+  fs.mkdirSync(path.dirname(n));
+  fs.writeFileSync(n, "// SKEL[9] example\nbody line\n// /SKEL[9]\n");
+  run("init", "T");
+  run("track", "gen/n.ts");
+  run("approve");
+  run("next");
+  return { dir, run, a, n };
+}
+
+test("issue #25 (2) review S1: a record in main's format (no `format` marker, `fenced` present) is compared the way main recorded it", () => {
+  const { dir, run, a, n } = genProject();
+  // Rewrite the record exactly as main's recordSkeleton/writeSnapshot did:
+  // every file's exterior (gen/n.ts's body dropped, its fence in the set), no `format`.
+  const snap = readSnapshot(dir);
+  const hash = (lines) => crypto.createHash("sha256").update(lines.join("\n")).digest("hex");
+  const files = {};
+  const fences = [];
+  for (const rel of Object.keys(snap.files)) {
+    const ext = exterior(fs.readFileSync(path.join(dir, rel), "utf-8"), rel);
+    files[rel] = { sha256: hash(ext.lines), lines: ext.lines };
+    for (const f of ext.fences) fences.push({ file: rel, id: f.id, title: f.title });
+  }
+  const { format, ...rest } = snap;
+  assert.equal(format, 2, "this PR writes the marker");
+  fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...rest, files, fences }));
+  assert.ok(readSnapshot(dir) && readSnapshot(dir).format === undefined && Array.isArray(readSnapshot(dir).fenced));
+  assert.doesNotMatch(run("status"), /drift/, "no false drift after the upgrade");
+  assert.equal(stopHook(dir), "", "the Stop hook agrees");
+  fs.writeFileSync(a, SRC.replaceAll(STUB, "return [];"));
+  assert.doesNotMatch(run("status"), /drift/, "step bodies still dropped");
+  // An unknown format fails closed.
+  fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...rest, files, fences, format: 3 }));
+  assert.equal(readSnapshot(dir), null);
+  assert.ok(n);
+});
+
+test("issue #25 (2) review B1: the Stop hook is silent on a clean fill with a whole-recorded tracked file, and reports a body edit in it", () => {
+  const { dir, run, a, n } = genProject();
+  assert.doesNotMatch(run("status"), /drift/);
+  assert.equal(stopHook(dir), "", "clean: silent");
+  assert.equal(stopHook(dir, {}, ["--block"]), "", "clean with --block: Claude isn't sent back");
+  fs.writeFileSync(a, SRC.replaceAll(STUB, "return [];"));
+  assert.equal(stopHook(dir), "", "filling a step's fence isn't drift");
+  fs.writeFileSync(n, "// SKEL[9] example\nedited body\n// /SKEL[9]\n");
+  const out = JSON.parse(stopHook(dir));
+  assert.match(out.systemMessage, /gen\/n\.ts:2\n\s+- body line\n\s+\+ edited body/);
+  assert.doesNotMatch(out.systemMessage, /fence set/);
+  assert.match(failure(() => run("done")), /gen\/n\.ts:2/, "done agrees");
+});
+
+test("#14 N4: feedback --wait with no review server returns NO_SERVER after a short grace, not the full wait", () => {
+  const { dir, run } = project();
+  run("init", "T");
+  run("review");
+  const started = Date.now();
+  const out = execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 30_000 });
+  const took = Date.now() - started;
+  assert.ok(took >= 9_500 && took < 25_000, `waited the ~10s grace, not 110s (${took}ms)`);
+  assert.match(out, /^NO_SERVER: /);
+  assert.match(out, /chat message\. Wait for it; don't poll\./, "the READ_ONLY wording");
+  assert.doesNotMatch(out, /--send/, "never suggests enabling Send");
+  assert.match(run("feedback"), /NO_FEEDBACK/, "without --wait it's unchanged");
+  for (const skill of ["skeleton", "skeleton-fill"]) {
+    assert.match(fs.readFileSync(path.join(path.dirname(BIN), "..", "skills", skill, "SKILL.md"), "utf-8"), /NO_SERVER/, `${skill} names NO_SERVER`);
+  }
+});
+
+test("#14 N4: feedback queued before the server stopped is still delivered by --wait", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const srv = await serve(dir);
+  try {
+    assert.equal((await post(srv.url, { general: "sent before stop", comments: [] }, { "content-type": "application/json", "x-skeleton-token": srv.token })).status, 204);
+  } finally { await srv.stop(); }
+  const out = execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 10_000 });
+  assert.match(out, /sent before stop/);
+  assert.match(execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 30_000 }), /^NO_SERVER/);
+});
+
+test("#14 N4 review S2: feedback --wait started alongside `skel serve --send &` waits for it, then delivers a Send", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  // Both at once, as the skill's Send block runs them: serve hasn't written serve.json yet.
+  const fb = spawn("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  let out = "";
+  fb.stdout.on("data", (d) => { out += d; });
+  const done = new Promise((resolve) => fb.on("exit", resolve));
+  const srv = await serve(dir);
+  try {
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(fb.exitCode, null, `still waiting (${out})`);
+    assert.equal((await post(srv.url, { general: "sent while waiting", comments: [] }, { "content-type": "application/json", "x-skeleton-token": srv.token })).status, 204);
+    await done;
+    assert.match(out, /sent while waiting/);
+    assert.doesNotMatch(out, /NO_SERVER/);
+  } finally {
+    if (fb.exitCode === null) { try { process.kill(fb.pid); } catch {} }
+    await srv.stop();
+  }
+});
+
+test("#14 N2/N3: a mode change defers its reload while a note is typed, Overall notes included, and the page says why", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const sending = await serve(dir);
+  try {
+    const page = { serverId: sending.data.serverId, feedbackEnabled: sending.data.feedbackEnabled };
+    const same = await (await fetch(new URL("api/version", sending.url))).json();
+    for (const busy of [false, true]) assert.deepEqual(skelModeDecision(page, same, busy), { changed: false, reload: false });
+    const readonly = await serve(dir, []);
+    try {
+      const next = await (await fetch(new URL("api/version", readonly.url))).json();
+      assert.deepEqual(skelModeDecision(page, next, false), { changed: true, reload: true });
+      assert.deepEqual(skelModeDecision(page, next, true), { changed: true, reload: false }, "typing (inline editor or Overall notes): wait");
+      assert.deepEqual(skelModeDecision(page, { ...same, serverId: "other" }, true), { changed: true, reload: false }, "a same-mode restart also waits");
+      // The page calls it with the same busy flag as the version check, and
+      // a changed mode never falls back to the static page's hint.
+      assert.match(readonly.html, /skelModeDecision\(data, next, typing\(\) \|\| !!openEditor\)/);
+      assert.match(readonly.html, /canSend \? "" : h\("div", \{ class: "hint", "data-send-hint": true \}, modeChanged\s*\? MODE_CHANGED_HINT/);
+      assert.match(readonly.html, /if \(!hint && sendButton\) \{ hint = h\("div"[^]*sendButton\.after\(hint\)/, "a deferred Send page gets the hint in place");
+    } finally { await readonly.stop(); }
+  } finally { await sending.stop(); }
 });

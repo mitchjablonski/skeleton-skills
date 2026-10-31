@@ -9,7 +9,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { scanRepo, toSteps, stripMarkers } from "../lib/markers.mjs";
+import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, skelConfigDir, writeFileAtomic } from "../lib/state.mjs";
 import { bodyEscapesFence } from "../lib/gate.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
@@ -107,6 +107,9 @@ function printFences(step) {
  * a 127.0.0.1 URL that answers with the serverId we recorded. A bare pid (or
  * a serve.json shipped in a repo) is never trusted, killed or handed out.
  */
+/** How long `skel feedback --wait` waits for a review server to answer before saying there's none. */
+const NO_SERVER_GRACE = 10_000;
+
 async function liveServer(root) {
   const s = readServe(root);
   if (!s?.url || !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(s.url) || !s.serverId) return null;
@@ -476,15 +479,30 @@ const commands = {
       );
     }
     warnLegacyQueue(root);
-    // Polls re-stat only the skeleton's own files; finding fences in NEW files
-    // takes a full search, which runs in a child process so it never blocks a
-    // request (a git grep on WSL's /mnt/c can take seconds). It runs every 30s
-    // while a page is polling, and on a page load once the last one is >5s old.
+    // Polls re-stat only the skeleton's own files (fenced and tracked); finding
+    // fences in NEW files takes a full search, which runs in a child process
+    // so it never blocks a request (a git grep on WSL's /mnt/c can take
+    // seconds). It runs every 30s while a page is polling, and on a page load
+    // once the last one is >5s old.
     const cache = new Map();
     let known = scanRepo(root, cache).files.map((f) => path.join(root, f));
     let searching = false;
     let lastSearch = Date.now();
     let lastPoll = 0;
+    // Tracked files the search would look in (not gitignored, not under a
+    // skipped dir), so one that gains fences shows up on the next poll, not
+    // the next search. Ones the search excludes stay out: the page and the
+    // CLI agree on the steps. Asked once per file between searches.
+    const trackedSearchable = new Map();
+    const pollTracked = (state) => {
+      const rels = (state.files ?? []).map(String).filter((rel) => insideRoot(root, path.join(root, rel)));
+      const fresh = rels.filter((rel) => !trackedSearchable.has(rel));
+      if (fresh.length) {
+        const ok = new Set(searchable(root, fresh));
+        for (const rel of fresh) trackedSearchable.set(rel, ok.has(rel));
+      }
+      return rels.filter((rel) => trackedSearchable.get(rel)).map((rel) => path.join(root, rel));
+    };
     const refresh = () => {
       if (searching) return;
       searching = true;
@@ -492,16 +510,18 @@ const commands = {
         searching = false;
         lastSearch = Date.now();
         if (!err) { try { known = JSON.parse(out); } catch {} }
+        // .gitignore may have changed: ask again about tracked files.
+        trackedSearchable.clear();
       });
     };
     setInterval(() => { if (Date.now() - lastPoll < 60_000) refresh(); }, 30_000).unref();
     const current = () => {
       const state = readState(root);
-      // Tracked files aren't polled for fences: the CLI's search doesn't see
-      // the ones it excludes (gitignored, under .claude/), so neither does the
-      // page. buildReviewData reads their text itself. Keep watching files
-      // that have fences or malformed markers until the next search.
-      const { record, ...data } = buildReviewData(root, state, cache, known);
+      // Tracked files are polled for fences only if the search would look in
+      // them (pollTracked); buildReviewData reads the others' text itself.
+      // Keep watching files that have fences or malformed markers until the
+      // next search.
+      const { record, ...data } = buildReviewData(root, state, cache, [...new Set([...known, ...pollTracked(state)])]);
       const watched = [...data.steps.flatMap((st) => st.locations.map((l) => l.file)), ...data.errored];
       known = [...new Set([...known, ...watched.map((f) => path.join(root, f))])];
       const { generatedAt, errored, ...stable } = data;
@@ -602,8 +622,18 @@ const commands = {
     const wait = Math.min(Number(flag(args, "wait", "0")) || 0, 110);
     const deadline = Date.now() + wait * 1000;
     let readonly = false;
+    // No server (a static review, or it stopped): nothing can send, so don't
+    // sit out the wait. Only once none has answered for NO_SERVER_GRACE in a
+    // row: `skel serve` scans the project before it listens (and only then
+    // writes serve.json), so one just started in the background, or
+    // restarting, must not be mistaken for none.
+    let noServer = false;
+    let missingSince = null;
     while (pendingCount(root) === 0) {
-      if ((await liveServer(root))?.feedbackEnabled === false) { readonly = true; break; }
+      const live = await liveServer(root);
+      if (live?.feedbackEnabled === false) { readonly = true; break; }
+      missingSince = live ? null : missingSince ?? Date.now();
+      if (wait && missingSince !== null && Date.now() - missingSince >= NO_SERVER_GRACE) { noServer = true; break; }
       if (Date.now() >= deadline) break;
       await new Promise((r) => setTimeout(r, 1000));
     }
@@ -617,6 +647,7 @@ const commands = {
     }
     if (taken.status === "ok") console.log(feedbackMarkdown(readState(root).title, mergeRecords(taken.records)));
     else if (readonly) console.log("READ_ONLY: the review is read-only; the human's feedback arrives as a chat message. Wait for it; don't poll. Only if the human asks for direct Send: skel serve --send.");
+    else if (noServer) console.log("NO_SERVER: no review server is running (a static review, or it stopped), so nothing can be sent; the human's feedback arrives as a chat message. Wait for it; don't poll.");
     else console.log(`NO_FEEDBACK${wait ? ` (waited ${wait}s)` : ""}`);
   },
 
