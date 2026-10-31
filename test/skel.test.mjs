@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -7,12 +7,24 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { scanText, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
-import { cleanFeedback, feedbackMarkdown } from "../lib/feedback.mjs";
+import { cleanFeedback, configPath, feedbackMarkdown, projectKey } from "../lib/feedback.mjs";
+import { exterior, lineDiff, readSnapshot, scanSkeleton, snapshotPath, whitespaceOnly } from "../lib/snapshot.mjs";
+import { buildReviewData } from "../lib/review.mjs";
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "skel.mjs");
 
 // The serve-session store lives in the user's config dir; keep tests out of the real one.
-process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "skel-config-"));
+// Every temp dir the suite makes is removed when it finishes.
+const TEMPS = [];
+after(() => {
+  // One locked dir (antivirus, an indexer, a straggling child on Windows) must
+  // not stop the rest from being removed.
+  for (const d of TEMPS) {
+    try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 5 }); } catch (err) { console.warn(`left ${d}: ${err.code ?? err.message}`); }
+  }
+});
+const mkTemp = (prefix) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); TEMPS.push(d); return d; };
+process.env.XDG_CONFIG_HOME = mkTemp("skel-config-");
 
 const SRC = `import { Point } from "./types";
 
@@ -30,7 +42,13 @@ export function interpolate(a: Point, b: Point): Point[] {
 `;
 const STUB = 'throw new Error("SKEL_TODO");';
 
-const tmp = (prefix = "skel-") => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+/** Can this platform/user create symlinks? (Windows needs a privilege.) */
+const canSymlink = (() => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "skel-ln-"));
+  try { fs.symlinkSync(path.join(d, "x"), path.join(d, "y")); return true; } catch { return false; } finally { fs.rmSync(d, { recursive: true, force: true }); }
+})();
+
+const tmp = (prefix = "skel-") => fs.realpathSync(mkTemp(prefix));
 
 // ---- markers ----
 
@@ -80,8 +98,10 @@ test("stripMarkers removes only marker lines", () => {
 
 // ---- gate ----
 
-const root = "/proj";
-const file = "/proj/src/a.ts";
+// Platform paths: on Windows "/proj" resolves to a drive-rooted path.
+const root = path.resolve("/proj");
+const P = (rel) => path.join(root, ...rel.split("/"));
+const file = P("src/a.ts");
 const fill = { phase: "fill", activeStep: "1", gate: "ask" };
 const gate = (toolName, toolInput, state = fill, text = SRC) =>
   evaluate({
@@ -102,7 +122,7 @@ test("UX #8: between steps, the skeleton's files ask; everything else is free", 
   const between = { phase: "fill", activeStep: null, gate: "ask", files: ["src/types.ts"] };
   assert.match(gate("Edit", { old_string: "import", new_string: "x" }, between).reason, /no step is active/);
   assert.equal(gate("Edit", { old_string: "x", new_string: "y" }, between, "const x = 1;\n"), null);
-  const tracked = evaluate({ toolName: "Edit", toolInput: { file_path: "/proj/src/types.ts", old_string: "a", new_string: "b" }, root, state: between, resolve: (p) => p, readFile: () => "a", activeFences: [] });
+  const tracked = evaluate({ toolName: "Edit", toolInput: { file_path: P("src/types.ts"), old_string: "a", new_string: "b" }, root, state: between, resolve: (p) => p, readFile: () => "a", activeFences: [] });
   assert.equal(tracked?.decision, "ask");
 });
 
@@ -174,11 +194,11 @@ test("bodyEscapesFence catches the Python dedent and a bracket left open", () =>
 
 test("security H3: the tool's own state is off-limits to agent edits in every phase; diagrams aren't", () => {
   for (const state of [fill, { phase: "scaffold", activeStep: null, gate: "ask" }]) {
-    for (const p of ["/proj/.skeleton/state.json", "/proj/.skeleton/feedback/1-ab.json", "/proj/.skeleton/serve.json"]) {
+    for (const p of [P(".skeleton/state.json"), P(".skeleton/feedback/1-ab.json"), P(".skeleton/serve.json")]) {
       const v = evaluate({ toolName: "Write", toolInput: { file_path: p, content: '{"phase":"scaffold"}' }, root, state, resolve: (x) => x, readFile: () => null, activeFences: [] });
       assert.equal(v?.decision, "ask", `${state.phase} ${p}`);
     }
-    assert.equal(evaluate({ toolName: "Write", toolInput: { file_path: "/proj/.skeleton/diagrams/a.mmd", content: "flowchart LR" }, root, state, resolve: (x) => x, readFile: () => null, activeFences: [] }), null);
+    assert.equal(evaluate({ toolName: "Write", toolInput: { file_path: P(".skeleton/diagrams/a.mmd"), content: "flowchart LR" }, root, state, resolve: (x) => x, readFile: () => null, activeFences: [] }), null);
   }
   assert.equal(evaluateBash({ command: "echo '{}' > .skeleton/state.json", state: fill })?.decision, "ask");
   assert.equal(evaluateBash({ command: "cat .skeleton//feedback/x.json", state: fill })?.decision, "ask");
@@ -186,7 +206,7 @@ test("security H3: the tool's own state is off-limits to agent edits in every ph
 });
 
 test("security L2: NotebookEdit is gated during a fill", () => {
-  assert.equal(gate("NotebookEdit", { notebook_path: "/proj/nb.ipynb", new_source: "x" }).decision, "ask");
+  assert.equal(gate("NotebookEdit", { notebook_path: P("nb.ipynb"), new_source: "x" }).decision, "ask");
 });
 
 test("gate honours gate: deny", () => {
@@ -194,7 +214,7 @@ test("gate honours gate: deny", () => {
 });
 
 test("gate ignores files outside the project", () => {
-  const v = evaluate({ toolName: "Edit", toolInput: { file_path: "/elsewhere/x.ts", old_string: "a" }, root, state: fill, resolve: (x) => x, readFile: () => "a", activeFences: [] });
+  const v = evaluate({ toolName: "Edit", toolInput: { file_path: path.resolve("/elsewhere/x.ts"), old_string: "a" }, root, state: fill, resolve: (x) => x, readFile: () => "a", activeFences: [] });
   assert.equal(v, null);
 });
 
@@ -222,8 +242,10 @@ function project() {
 }
 
 /** Start `skel serve`, return its url, the page token, and a stop function. */
-async function serve(dir) {
-  const child = spawn("node", [BIN, "serve"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+async function serve(dir, env = {}) {
+  const child = spawn("node", [BIN, "serve"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } });
+  let err = "";
+  child.stderr.on("data", (d) => { err += d; });
   const url = await new Promise((resolve, reject) => {
     let out = "";
     child.stdout.on("data", (d) => {
@@ -235,7 +257,9 @@ async function serve(dir) {
   });
   const html = await (await fetch(url)).text();
   const token = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<")).token;
-  return { url, token, html, stop: () => child.kill() };
+  // Wait for the server to exit, so no keep-alive socket outlives the test.
+  const stop = () => new Promise((resolve) => { if (child.exitCode !== null || child.signalCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
+  return { url, token, html, stderr: () => err, stop };
 }
 
 const post = (url, body, headers) => fetch(new URL("/api/feedback", url), { method: "POST", headers, body: JSON.stringify(body) });
@@ -284,7 +308,7 @@ test("security H4: serve refuses cross-site posts, bad hosts, and missing tokens
     assert.doesNotMatch(srv.html, new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "page never carries the project path");
     assert.equal((await post(srv.url, body, ok)).status, 204);
   } finally {
-    srv.stop();
+    await srv.stop();
   }
 });
 
@@ -297,7 +321,7 @@ test("UX #2: two sends before the agent reads are both delivered; the latest ver
     await post(srv.url, { verdict: "changes", general: "first", comments: [{ file: "src/a.ts", line: 3, text: "rename" }] }, h);
     await post(srv.url, { verdict: null, general: "second", comments: [] }, h);
   } finally {
-    srv.stop();
+    await srv.stop();
   }
   const md = run("feedback");
   assert.match(md, /first/);
@@ -326,8 +350,10 @@ test("security M2: tracked files must resolve inside the project, and the review
   try {
     run("init", "T");
     assert.throws(() => run("track", secret), /only files inside the project/);
-    fs.symlinkSync(secret, path.join(dir, "link.txt"));
-    assert.throws(() => run("track", "link.txt"), /only files inside the project/);
+    if (canSymlink) {
+      fs.symlinkSync(secret, path.join(dir, "link.txt"));
+      assert.throws(() => run("track", "link.txt"), /only files inside the project/);
+    }
     const state = JSON.parse(fs.readFileSync(path.join(dir, ".skeleton", "state.json"), "utf-8"));
     fs.writeFileSync(path.join(dir, ".skeleton", "state.json"), JSON.stringify({ ...state, files: [`../${path.basename(secret)}`, "link.txt"] }));
     const html = fs.readFileSync(run("review").split("\n")[0], "utf-8");
@@ -342,9 +368,11 @@ test("security M3: review and install never write through symlinks, and install 
   const victim = path.join(dir, "victim.txt");
   fs.writeFileSync(victim, "original");
   run("init", "T");
-  fs.symlinkSync(victim, path.join(dir, ".skeleton", "review.html"));
-  run("review");
-  assert.equal(fs.readFileSync(victim, "utf-8"), "original");
+  if (canSymlink) {
+    fs.symlinkSync(victim, path.join(dir, ".skeleton", "review.html"));
+    run("review");
+    assert.equal(fs.readFileSync(victim, "utf-8"), "original");
+  }
 
   const target = tmp("skel-install-");
   fs.mkdirSync(path.join(target, ".claude"));
@@ -352,15 +380,58 @@ test("security M3: review and install never write through symlinks, and install 
   assert.throws(() => run("install", target), /isn't valid JSON/);
   assert.match(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"), /deny/);
   fs.rmSync(path.join(target, ".claude", "settings.local.json"));
-  fs.symlinkSync(victim, path.join(target, ".claude", "settings.local.json"));
-  assert.throws(() => run("install", target), /symlink/);
-  assert.equal(fs.readFileSync(victim, "utf-8"), "original");
-
-  fs.rmSync(path.join(target, ".claude", "settings.local.json"));
+  if (canSymlink) {
+    fs.symlinkSync(victim, path.join(target, ".claude", "settings.local.json"));
+    assert.throws(() => run("install", target), /symlink/);
+    assert.equal(fs.readFileSync(victim, "utf-8"), "original");
+    fs.rmSync(path.join(target, ".claude", "settings.local.json"));
+  }
   run("install", target);
   const settings = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"));
   assert.equal(settings.hooks.PreToolUse[0].matcher, "Write|Edit|MultiEdit|NotebookEdit|Bash");
   assert.match(fs.readFileSync(path.join(target, ".gitignore"), "utf-8"), /^\.skeleton\/$/m);
+});
+
+test("issue #3: install writes the restricted filler subagent, idempotently, and never through a symlink", () => {
+  const { dir, run } = project();
+  const target = tmp("skel-install-");
+  const agentPath = path.join(target, ".claude", "agents", "skeleton-filler.md");
+  run("install", target);
+  const agent = fs.readFileSync(agentPath, "utf-8");
+  const front = /^---\n([\s\S]*?)\n---\n/.exec(agent)[1];
+  const field = (name) => new RegExp(`^${name}: (.*)$`, "m").exec(front)?.[1];
+  assert.equal(field("name"), "skeleton-filler");
+  const tools = field("tools").split(",").map((t) => t.trim());
+  assert.deepEqual(tools, ["Read", "Grep", "Glob", "Edit", "MultiEdit"]);
+  for (const t of ["Bash", "Write"]) assert.ok(field("disallowedTools").split(",").map((x) => x.trim()).includes(t));
+  assert.match(agent, /STATUS: filled \| blocked/);
+  // The fill skill delegates to it by name.
+  const fill = fs.readFileSync(path.join(target, ".claude", "skills", "skeleton-fill", "SKILL.md"), "utf-8");
+  assert.match(fill, /subagent_type: "skeleton-filler"/);
+  assert.doesNotMatch(fill, /\{\{SKEL\}\}/);
+
+  // Idempotent: a second install leaves the same files and one hook entry.
+  const before = fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8");
+  run("install", target);
+  assert.equal(fs.readFileSync(agentPath, "utf-8"), agent);
+  assert.equal(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"), before);
+  assert.equal(fs.readFileSync(path.join(target, ".gitignore"), "utf-8").match(/\.skeleton\//g).length, 1);
+
+  // A symlinked agent file or agents folder is refused, and its target is untouched.
+  if (!canSymlink) return;
+  const victim = path.join(dir, "victim.md");
+  fs.writeFileSync(victim, "original");
+  fs.rmSync(agentPath);
+  fs.symlinkSync(victim, agentPath);
+  assert.throws(() => run("install", target), /skeleton-filler\.md is a symlink/);
+  assert.equal(fs.readFileSync(victim, "utf-8"), "original");
+  assert.ok(fs.lstatSync(agentPath).isSymbolicLink());
+
+  const elsewhere = tmp("skel-elsewhere-");
+  fs.rmSync(path.join(target, ".claude", "agents"), { recursive: true });
+  fs.symlinkSync(elsewhere, path.join(target, ".claude", "agents"));
+  assert.throws(() => run("install", target), /agents is a symlink/);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
 });
 
 test("UX #10/#11: init won't replace a skeleton silently; start won't abandon one or skip quietly", () => {
@@ -392,7 +463,7 @@ test("N1: approve/reshape always ask, even in deny mode and however skel is spel
 
 test("N3: the .skeleton/ guard is case-insensitive, for edits and for Bash", () => {
   const scaffold = { phase: "scaffold", activeStep: null, gate: "ask" };
-  const v = evaluate({ toolName: "Write", toolInput: { file_path: "/proj/.SKELETON/state.json", content: "{}" }, root, state: scaffold, resolve: (x) => x, readFile: () => null, activeFences: [] });
+  const v = evaluate({ toolName: "Write", toolInput: { file_path: P(".SKELETON/state.json"), content: "{}" }, root, state: scaffold, resolve: (x) => x, readFile: () => null, activeFences: [] });
   assert.equal(v?.decision, "ask");
   assert.equal(evaluateBash({ command: "cd .Skeleton && cat serve.json", state: scaffold })?.decision, "ask");
 });
@@ -445,11 +516,11 @@ test("N10: notes sent to a server that has since restarted are still the human's
   try {
     await post(first.url, { verdict: null, general: "kept", comments: [] }, { "content-type": "application/json", "x-skeleton-token": first.token });
   } finally {
-    first.stop();
+    await first.stop();
   }
   await new Promise((r) => setTimeout(r, 300));
   const second = await serve(dir);
-  second.stop();
+  await second.stop();
   assert.match(run("feedback"), /kept/);
 });
 
@@ -479,7 +550,7 @@ test("R1/R2: approve/reshape ask from any cwd and in ordinary spellings", () => 
 
 test("R3: a .skeleton dir at any depth is state, and a planted nested one can't take over the fence", () => {
   const scaffold = { phase: "scaffold", activeStep: null, gate: "ask" };
-  const nested = evaluate({ toolName: "Write", toolInput: { file_path: "/proj/src/.skeleton/state.json", content: "{}" }, root, state: scaffold, resolve: (x) => x, readFile: () => null, activeFences: [] });
+  const nested = evaluate({ toolName: "Write", toolInput: { file_path: P("src/.skeleton/state.json"), content: "{}" }, root, state: scaffold, resolve: (x) => x, readFile: () => null, activeFences: [] });
   assert.equal(nested?.decision, "ask");
 
   const { dir, a, run } = project();
@@ -560,7 +631,7 @@ test("PR#1 B2: init stops the old server, and a superseded server refuses sends"
     const res = await post(old.url, { verdict: null, general: "late", comments: [] }, { "content-type": "application/json", "x-skeleton-token": old.token }).catch(() => null);
     assert.ok(!res || res.status === 409, `old server must be gone or refuse (got ${res?.status})`);
   } finally {
-    old.stop();
+    await old.stop();
   }
 });
 
@@ -597,14 +668,14 @@ test("PR#1 #6/#9: the page embeds its version, serves fresh tracked files, and k
     assert.match(html, /NEW_VERSION/);
     assert.match(html, /"version":"[0-9a-f]{12}"/);
   } finally {
-    first.stop();
+    await first.stop();
   }
   await new Promise((r) => setTimeout(r, 300));
   const second = await serve(dir);
   try {
     assert.equal(new URL(second.url).port, port);
   } finally {
-    second.stop();
+    await second.stop();
   }
 });
 
@@ -632,4 +703,502 @@ test("PR#1 G2: an enclosing skeleton mid-fill outranks a nested state file", () 
   const src = path.join(dir, "src");
   const out = execFileSync("node", [BIN, "hook"], { cwd: src, input: JSON.stringify({ cwd: src, tool_name: "Write", tool_input: { file_path: a, content: "evil" } }), encoding: "utf-8" });
   assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+test("Codex review: in-project names starting with '..' are inside, not outside", () => {
+  for (const rel of ["..settings.ts", "..internal/file.ts"]) {
+    const v = evaluate({ toolName: "Write", toolInput: { file_path: P(rel), content: "x" }, root, state: { ...fill, gate: "deny" }, resolve: (x) => x, readFile: () => "const x = 1;\n", activeFences: [] });
+    assert.equal(v?.decision, "deny", rel);
+  }
+  assert.equal(evaluate({ toolName: "Write", toolInput: { file_path: path.resolve(root, "..", "sibling.ts"), content: "x" }, root, state: fill, resolve: (x) => x, readFile: () => "x", activeFences: [] }), null);
+});
+
+// ---- issue #2: fills are verified against a snapshot of the approved skeleton ----
+
+/** An approved project with step 1 active. */
+function approved(src = SRC) {
+  const p = project();
+  fs.writeFileSync(p.a, src);
+  p.run("init", "T");
+  p.run("approve");
+  p.run("next");
+  p.fill = (step, code) => fs.writeFileSync(p.a, fs.readFileSync(p.a, "utf-8").replace(new RegExp(`(SKEL\\[${step}\\][^\\n]*\\n\\s*)throw new Error\\("SKEL_TODO"\\);`), `$1${code}`));
+  p.page = () => buildReviewData(p.dir, JSON.parse(fs.readFileSync(path.join(p.dir, ".skeleton", "state.json"), "utf-8")));
+  return p;
+}
+const failure = (fn) => { try { fn(); } catch (err) { return String(err.stderr ?? err.message); } assert.fail("expected the command to fail"); };
+
+test("snapshot: exterior drops fence bodies and keeps markers; lineDiff finds the changed region", () => {
+  const ext = exterior(SRC.replace(/\n/g, "\r\n"), "a.ts");
+  assert.ok(!ext.lines.some((l) => l.includes("SKEL_TODO")));
+  assert.ok(ext.lines.includes("  // SKEL[1] drop near-duplicate points"), "LF-compared, markers kept");
+  assert.equal(ext.at[ext.lines.indexOf("  // /SKEL[1]")], 6, "file line numbers survive the blanking");
+  assert.deepEqual(lineDiff(["a", "b", "c", "d"], ["a", "B", "c", "d", "e"]), [
+    { aStart: 1, removed: ["b"], bStart: 1, added: ["B"] },
+    { aStart: 4, removed: [], bStart: 4, added: ["e"] },
+  ]);
+});
+
+test("snapshot: approve records it outside the project; a fill inside the fences passes done and finalize", () => {
+  const { dir, run, fill } = approved();
+  assert.ok(fs.existsSync(snapshotPath(dir)));
+  assert.ok(snapshotPath(dir).startsWith(process.env.XDG_CONFIG_HOME), "in the config dir, not the project");
+  fill("1", "return raw.filter(Boolean);\n  // a second line is fine");
+  run("done");
+  run("next");
+  fill("2", "return [a, b];");
+  run("done");
+  assert.match(run("finalize"), /stripped markers/);
+  assert.ok(!fs.existsSync(snapshotPath(dir)), "finalize forgets it");
+});
+
+test("snapshot: an Edit the hook asked about and the human allowed still blocks done", () => {
+  const { a, run, hook, fill } = approved();
+  const input = { file_path: a, old_string: "smooth(raw: Point[])", new_string: "smooth(raw: Point[], k = 1)" };
+  const asked = JSON.parse(hook({ tool_name: "Edit", tool_input: input })).hookSpecificOutput;
+  assert.equal(asked.permissionDecision, "ask");
+  // Review #10 finding 3: the prompt says what allowing it means.
+  assert.match(asked.permissionDecisionReason, /If the human allows this edit anyway, it lands as drift[^.]*: skel done and skel finalize refuse until they skel reshape and approve/);
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(input.old_string, input.new_string)); // allowed
+  fill("1", "return raw;");
+  const err = failure(() => run("done"));
+  assert.match(err, /drift from the approved skeleton/);
+  assert.match(err, /src\/a\.ts:3\n\s+- export function smooth\(raw: Point\[\]\): Point\[\] \{\n\s+\+ export function smooth\(raw: Point\[\], k = 1\): Point\[\] \{/);
+});
+
+test("snapshot: a Bash sed -i outside the fence blocks done and finalize with file:line, and shows on the page", () => {
+  const { a, run, fill, page } = approved();
+  fill("1", "return raw;");
+  // An out-of-band edit the hook never sees (what `sed -i` would do), from a
+  // separate process so it runs on every platform.
+  execFileSync(process.execPath, ["-e", "const fs=require('fs');const f=process.argv[1];fs.writeFileSync(f,fs.readFileSync(f,'utf8').replace('import { Point } from','import { Point, Evil } from'))", a]);
+  const err = failure(() => run("done"));
+  assert.match(err, /can't finish step 1: drift/);
+  assert.match(err, /src\/a\.ts:1\n.*- import \{ Point \}.*\n.*\+ import \{ Point, Evil \}/);
+  const data = page();
+  assert.deepEqual(data.drift.items, [{ file: "src/a.ts", line: 1, lines: [1], removed: ['import { Point } from "./types";'], added: ['import { Point, Evil } from "./types";'] }]);
+  const html = fs.readFileSync(run("review").split("\n")[0], "utf-8");
+  assert.match(html, /"drift":\{"reason":null,"items":\[\{"file":"src\/a\.ts","line":1/);
+  assert.match(run("status"), /drift from the approved skeleton[\s\S]*src\/a\.ts:1/);
+  // finalize refuses too, even with every step filled (bypassing done)
+  fill("2", "return [a, b];");
+  assert.match(failure(() => run("finalize")), /can't finalize: drift[\s\S]*src\/a\.ts:1/);
+  assert.match(fs.readFileSync(a, "utf-8"), /SKEL\[1\]/, "nothing was stripped");
+});
+
+test("snapshot: a Write that fills the fence and appends code outside it blocks; new fenced files and deleted tracked files are drift", () => {
+  const { dir, a, run, hook } = approved();
+  const content = SRC.replace(STUB, "return raw;") + "export const leak = 1;\n";
+  assert.equal(JSON.parse(hook({ tool_name: "Write", tool_input: { file_path: a, content } })).hookSpecificOutput.permissionDecision, "ask");
+  fs.writeFileSync(a, content);
+  assert.match(failure(() => run("done")), /src\/a\.ts:14\n\s+\+ export const leak = 1;/);
+  fs.writeFileSync(a, SRC.replace(STUB, "return raw;"));
+  fs.writeFileSync(path.join(dir, "src", "b.ts"), "// SKEL[9] sneaky\nthrow 'SKEL_TODO';\n// /SKEL[9]\n");
+  const err = failure(() => run("done"));
+  assert.match(err, /src\/b\.ts: has fences but isn't in the approved skeleton/);
+  assert.match(err, /fence set: added or retitled 9/);
+  fs.rmSync(path.join(dir, "src", "b.ts"));
+  run("done");
+});
+
+test("snapshot: tracked files are recorded whole", () => {
+  const { dir, run } = project();
+  fs.writeFileSync(path.join(dir, "src", "types.ts"), "export type Point = { x: number };\n");
+  run("init", "T");
+  run("track", "src/types.ts");
+  run("approve");
+  run("next");
+  fs.writeFileSync(path.join(dir, "src", "types.ts"), "export type Point = { x: number; y: number };\n");
+  assert.match(failure(() => run("finalize")), /src\/types\.ts:1/);
+  fs.rmSync(path.join(dir, "src", "types.ts"));
+  assert.match(failure(() => run("finalize")), /src\/types\.ts: deleted/);
+});
+
+test("snapshot: CRLF files verify in LF; drift is reported at the right line; an EOL conversion alone isn't drift", () => {
+  const crlf = SRC.replace(/\n/g, "\r\n");
+  const { a, run } = approved(crlf);
+  fs.writeFileSync(a, crlf.replace(STUB, "return raw;"));
+  assert.match(run("status"), /phase: fill/);
+  assert.doesNotMatch(run("status"), /drift/);
+  fs.writeFileSync(a, crlf.replace(STUB, "return raw;").replace("export function interpolate(a: Point, b: Point)", "export function interpolate(a: Point, b = a)"));
+  assert.match(failure(() => run("done")), /src\/a\.ts:9\n\s+- export function interpolate\(a: Point, b: Point\): Point\[\] \{\n/);
+  fs.writeFileSync(a, SRC.replace(STUB, "return raw;")); // the same file, now LF
+  run("done");
+});
+
+test("snapshot: reshape then re-approve re-records it; a missing or stale record fails closed", () => {
+  const { dir, a, run, fill } = approved();
+  fill("1", "return raw;");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace("smooth(raw: Point[])", "smooth(raw: readonly Point[])"));
+  assert.match(failure(() => run("done")), /drift/);
+  run("reshape");
+  assert.match(run("status"), /phase: scaffold/);
+  run("approve");
+  run("start", "1", "--force");
+  run("done");
+
+  fs.rmSync(snapshotPath(dir));
+  assert.match(failure(() => run("finalize")), /no record of the approved skeleton[\s\S]*skel reshape/);
+  run("reshape");
+  run("approve");
+  const statePath = path.join(dir, ".skeleton", "state.json");
+  fs.writeFileSync(statePath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statePath, "utf-8")), reviewEpoch: 1 }));
+  assert.match(failure(() => run("finalize")), /belongs to a different approval/);
+});
+
+test("snapshot: done notes (without blocking) a fill that escapes its block, which the exterior can't see", () => {
+  const { run, fill } = approved();
+  fill("1", "return raw;\n}\nexport function evil() {\n  return [];");
+  assert.match(run("done"), /note: in src\/a\.ts:4-9, .*heuristic[\s\S]*STEP 1 done/);
+});
+
+test("Codex review (#10): a fence body grown past the scan's size cap still blocks done and finalize", () => {
+  const { dir, a, run } = project();
+  run("init", "T");
+  run("approve");
+  run("next");
+  // Keep SKEL_TODO, grow the body past 1 MB; the exterior is unchanged.
+  const big = "  // " + "x".repeat(1_100_000);
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, `${STUB}\n${big}`));
+  const stateBefore = fs.readFileSync(path.join(dir, ".skeleton", "state.json"), "utf-8");
+  assert.throws(() => run("done"), /still has SKEL_TODO/);
+  assert.throws(() => run("finalize"), /still pending: 1/);
+  assert.equal(fs.readFileSync(path.join(dir, ".skeleton", "state.json"), "utf-8"), stateBefore, "no state change on a refused finalize");
+  assert.ok(readSnapshot(dir), "the approved snapshot survives a refused finalize");
+  assert.match(fs.readFileSync(a, "utf-8"), /SKEL\[1\]/, "markers untouched");
+  assert.match(run("status"), /1 {5}drop near-duplicate points/);
+});
+
+// ---- PR #1 re-review follow-ups (issue #6) ----
+
+test("issue #6 N1: a closed string is an operand, so `\"s\" / 2` can't hide a } from the regex check", () => {
+  const m = "  // SKEL[1] x";
+  for (const q of ['"', "'", "`"]) {
+    assert.notEqual(bodyEscapesFence(`  x = ${q}s${q} / 2; } function evil() { y = 3 / 1;`, m, "a.ts"), null, q);
+  }
+  const ok = [
+    "  const r = a / b / c;",
+    '  const half = "10" / 2 + `4` / 2;',
+    '  const re = /}/g; return s.replace(re, "");',
+    '  if (/^{/.test(s)) return "a" + s.split(/,/).length;',
+    "  return x.map((v) => v / 2);",
+    '  const s = f("a", /[)}]/);',
+  ];
+  for (const body of ok) assert.equal(bodyEscapesFence(body, m, "a.ts"), null, body);
+});
+
+test("issue #6 N2: git stash -a/--all asks (it removes ignored files); -u and plain stashes don't", () => {
+  for (const c of ["git stash -a", "git stash push --all", "git stash push -ka", "git stash save --al", "git -C pkg stash push -q --all -m wip"]) {
+    assert.equal(evaluateBash({ command: c, state: fill })?.decision, "ask", c);
+  }
+  for (const c of ["git stash", "git stash -u", "git stash push --include-untracked", "git stash pop", "git stash apply", "git stash push -m all"]) {
+    assert.equal(evaluateBash({ command: c, state: fill }), null, c);
+  }
+});
+
+test("issue #6 N6: serve warns and keeps serving when the session store can't be written", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const blocked = path.join(tmp(), "not-a-dir");
+  fs.writeFileSync(blocked, "");
+  const srv = await serve(dir, { XDG_CONFIG_HOME: blocked });
+  try {
+    assert.equal((await fetch(new URL("/api/version", srv.url))).status, 200);
+    assert.match(srv.stderr(), /can't record this review session/);
+    const res = await post(srv.url, { verdict: null, general: "x", comments: [] }, { "content-type": "application/json", "x-skeleton-token": srv.token });
+    assert.equal(res.status, 503, "a send that would be quarantined is refused, not acknowledged");
+  } finally {
+    await srv.stop();
+  }
+  // init doesn't crash on it either.
+  execFileSync("node", [BIN, "init", "U", "--force"], { cwd: dir, env: { ...process.env, XDG_CONFIG_HOME: blocked }, stdio: "pipe" });
+});
+
+test("issue #6 N6: feedback queued under a pre-upgrade serve.json is flagged, never trusted", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  fs.writeFileSync(path.join(dir, ".skeleton", "serve.json"), JSON.stringify({ url: null, pid: null, session: "old", sessions: ["older", "old"] }));
+  fs.mkdirSync(path.join(dir, ".skeleton", "feedback"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".skeleton", "feedback", "1-aa.json"), JSON.stringify({ session: "old", at: 1, verdict: "approve", general: "legacy note", comments: [] }));
+  const srv = await serve(dir);
+  try {
+    assert.match(srv.stderr(), /1 unread feedback file\(s\) were queued by an older `skel serve`/);
+  } finally {
+    await srv.stop();
+  }
+  const out = run("feedback");
+  assert.match(out, /ignored 1 feedback file/);
+  assert.doesNotMatch(out, /legacy note/);
+});
+
+test("issue #6 N4: a page load kicks off a search once the last one is >5s old", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const srv = await serve(dir);
+  try {
+    const before = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
+    fs.writeFileSync(path.join(dir, "src", "late.ts"), "export function late() {\n  // SKEL[9] late\n  throw new Error(\"SKEL_TODO\");\n  // /SKEL[9]\n}\n");
+    await new Promise((r) => setTimeout(r, 5_500));
+    await fetch(srv.url);
+    let version = before;
+    for (const deadline = Date.now() + 10_000; version === before && Date.now() < deadline; ) {
+      await new Promise((r) => setTimeout(r, 200));
+      version = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
+    }
+    assert.notEqual(version, before, "the new fenced file should show up well before the 30s search");
+    assert.match(await (await fetch(srv.url)).text(), /late\.ts/);
+  } finally {
+    await srv.stop();
+  }
+});
+
+test("installed skills' example fences are documentation, not steps (walk and git-grep paths, and the gate)", () => {
+  for (const git of [false, true]) {
+    const { dir, run, hook } = project();
+    if (git) execFileSync("git", ["init", "-q", dir]);
+    run("install", dir);
+    const skill = path.join(dir, ".claude", "skills", "skeleton", "SKILL.md");
+    assert.match(fs.readFileSync(skill, "utf-8"), /SKEL\[2\]/, "the example is there");
+    run("init", "T");
+    const status = run("status");
+    assert.match(status, /0\/2 filled/);
+    assert.match(status, /2 {5}catmull-rom between a and b/, "step 2 keeps its own title");
+    assert.doesNotMatch(status, /\.claude/);
+    run("approve");
+    const askOf = (input) => { const out = hook(input); return out ? JSON.parse(out).hookSpecificOutput : null; };
+    // Between steps, the docs are not "part of the approved skeleton".
+    assert.equal(askOf({ tool_name: "Edit", tool_input: { file_path: skill, old_string: "SKEL_TODO", new_string: "x" } }), null);
+    // With step 2 active, "filling" the example in the docs is not filling step 2.
+    run("start", "2");
+    const v = askOf({ tool_name: "Edit", tool_input: { file_path: skill, old_string: 'throw new Error("SKEL_TODO");', new_string: "return 1;" } });
+    assert.equal(v?.permissionDecision, "ask", git ? "git" : "walk");
+    assert.match(v.permissionDecisionReason, /outside the skeleton/);
+    assert.doesNotMatch(v.permissionDecisionReason, /its fences? (are|is) .*\.claude/, "never points the agent back at the docs");
+  }
+});
+
+// ---- adversarial review of PR #10 ----
+
+const stateOf = (dir) => JSON.parse(fs.readFileSync(path.join(dir, ".skeleton", "state.json"), "utf-8"));
+
+test("review #10 (1): a tracked doc's example fences never become steps, and a stale record is never consulted", () => {
+  const { dir, a, run } = project();
+  const doc = path.join(dir, ".claude", "skills", "x", "SKILL.md");
+  fs.mkdirSync(path.dirname(doc), { recursive: true });
+  fs.writeFileSync(doc, '# x\n\n```ts\n// SKEL[ex] example\nthrow new Error("SKEL_TODO");\n// /SKEL[ex]\n```\n');
+  run("init", "T");
+  run("track", ".claude/skills/x/SKILL.md");
+  run("approve");
+  assert.match(run("status"), /0\/2 filled/);
+  assert.doesNotMatch(run("status"), /\bex\b/);
+  run("next");
+  fs.writeFileSync(a, SRC.replace(STUB, "return raw;"));
+  run("done");
+  run("next");
+  fs.writeFileSync(a, SRC.replaceAll(STUB, "return [];"));
+  run("done");
+  assert.match(run("finalize"), /stripped markers/);
+  assert.match(fs.readFileSync(doc, "utf-8"), /SKEL\[ex\]/, "the doc is untouched");
+});
+
+test("review #10 (1): scanSkeleton rescues only this approval's fenced files; reshape forgets the record", () => {
+  const { dir, a, run } = project();
+  run("init", "T");
+  run("approve");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, `${STUB}\n  // ${"x".repeat(1_100_000)}`));
+  const state = stateOf(dir);
+  assert.equal(scanSkeleton(dir, state).fences.length, 2, "this approval's record: the big file is still read");
+  assert.equal(scanSkeleton(dir, { ...state, reviewEpoch: 1 }).fences.length, 0, "a stale record isn't consulted");
+  assert.equal(scanSkeleton(dir, { ...state, phase: "scaffold" }).fences.length, 0, "nor in scaffold");
+  run("reshape");
+  assert.ok(!fs.existsSync(snapshotPath(dir)), "reshape clears the record");
+});
+
+test("review #10 (2): the config key is the real path, case-folded only on Windows", () => {
+  const dir = tmp();
+  assert.equal(projectKey(dir, "win32"), projectKey(dir.toUpperCase(), "win32"));
+  if (process.platform !== "win32") assert.notEqual(projectKey(dir, "linux"), projectKey(dir.toUpperCase(), "linux"));
+  if (process.platform === "win32") {
+    const flip = dir[0] === dir[0].toUpperCase() ? dir[0].toLowerCase() + dir.slice(1) : dir[0].toUpperCase() + dir.slice(1);
+    assert.equal(configPath(flip, ".snapshot"), configPath(dir, ".snapshot"));
+    assert.equal(configPath(dir.toLowerCase()), configPath(dir.toUpperCase()));
+  }
+});
+
+test("review #10 (2): on Windows, done from a differently-cased cwd finds the approval", { skip: process.platform !== "win32" }, () => {
+  const { dir, a, run } = approved();
+  fs.writeFileSync(a, SRC.replace(STUB, "return raw;"));
+  const lower = dir.toLowerCase();
+  assert.match(execFileSync("node", [BIN, "done"], { cwd: lower, encoding: "utf-8" }), /STEP 1 done/);
+  assert.ok(run("status"));
+});
+
+test("review #10 (3): the ask reason says an allowed edit still blocks done; deny and heuristic asks don't", () => {
+  const { a, run, hook } = approved();
+  const reason = (input) => JSON.parse(hook({ tool_name: "Edit", tool_input: input })).hookSpecificOutput.permissionDecisionReason;
+  assert.match(reason({ file_path: a, old_string: "// SKEL[1] drop near-duplicate points", new_string: "// SKEL[1] dedupe" }), /lands as drift/);
+  const escape = reason({ file_path: a, old_string: 'throw new Error("SKEL_TODO");\n  // /SKEL[1]', new_string: "return raw;\n}\nexport function evil() {\n  return [];\n  // /SKEL[1]" });
+  assert.match(escape, /heuristic/);
+  assert.doesNotMatch(escape, /lands as drift/, "a fill that stays in the fence isn't drift");
+  const statePath = path.join(path.dirname(path.dirname(a)), ".skeleton", "state.json");
+  fs.writeFileSync(statePath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statePath, "utf-8")), gate: "deny" }));
+  const denied = JSON.parse(hook({ tool_name: "Edit", tool_input: { file_path: a, old_string: "smooth(raw: Point[])", new_string: "smooth(raw: Point[], k = 1)" } })).hookSpecificOutput;
+  assert.equal(denied.permissionDecision, "deny");
+  assert.doesNotMatch(denied.permissionDecisionReason, /lands as drift/);
+  assert.ok(run("status"));
+});
+
+test("review #10 (4): drift straddling a fence body reports the exact lines (4 and 6), labels whitespace-only lines", () => {
+  const { a, run, fill, page } = approved();
+  fill("1", "return raw;");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace("SKEL[1] drop near-duplicate points", "SKEL[1] drop dupes").replace("// /SKEL[1]\n", "// /SKEL[1] \n"));
+  const err = failure(() => run("done"));
+  assert.match(err, /src\/a\.ts:4, 6\n/);
+  assert.doesNotMatch(err, /src\/a\.ts:4-5/);
+  assert.match(err, /\+ {3}\/\/ \/SKEL\[1\] {4}\(whitespace only\)/);
+  assert.doesNotMatch(err, /\+ {3}\/\/ SKEL\[1\] drop dupes {3}\(whitespace only\)/);
+  const [item] = page().drift.items;
+  assert.deepEqual(item.lines, [4, 6]);
+  assert.deepEqual(item.whitespace, { removed: [], added: [1] });
+  assert.deepEqual(whitespaceOnly([], [""]), { removed: [], added: [0] }, "an added blank line is whitespace only");
+});
+
+test("review #10 nits: a malformed record fails closed cleanly; a tracked file's bad markers stop approve with the marker error", () => {
+  const { dir, a, run } = approved();
+  fs.writeFileSync(a, SRC.replaceAll(STUB, "return [];"));
+  const good = fs.readFileSync(snapshotPath(dir), "utf-8");
+  const rec = JSON.parse(good);
+  const rel = Object.keys(rec.files)[0];
+  for (const bad of ["[]", "null", '"x"', JSON.stringify({ ...rec, files: [] }), JSON.stringify({ ...rec, files: { [rel]: { sha256: 1, lines: [] } } }), JSON.stringify({ ...rec, files: { [rel]: { sha256: "x", lines: "no" } } }), JSON.stringify({ ...rec, files: { [rel]: null } })]) {
+    fs.writeFileSync(snapshotPath(dir), bad);
+    assert.equal(readSnapshot(dir), null, bad);
+    const err = failure(() => run("finalize"));
+    assert.match(err, /no record of the approved skeleton/, bad);
+    assert.doesNotMatch(err, /\n\s+at /, "no stack trace");
+  }
+  fs.writeFileSync(snapshotPath(dir), good);
+  assert.ok(readSnapshot(dir));
+
+  const p = project();
+  p.run("init", "T");
+  // Over the scan's size cap, so only the snapshot reads it.
+  fs.writeFileSync(path.join(p.dir, "src", "big.ts"), `// SKEL[z] x\n// ${"x".repeat(1_100_000)}\n`);
+  p.run("track", "src/big.ts");
+  const err = failure(() => p.run("approve"));
+  assert.match(err, /fix marker errors first:\n\s+src\/big\.ts:1: SKEL\[z\] is never closed/);
+  assert.doesNotMatch(err, /\n\s+at /);
+  assert.match(p.run("status"), /phase: scaffold/, "not approved");
+  assert.ok(!fs.existsSync(snapshotPath(p.dir)));
+});
+
+test("Edit or MultiEdit with an empty old_string creates a file: asks during a step and between steps", () => {
+  const { dir, run, hook } = project();
+  run("init", "T");
+  run("approve");
+  const evil = path.join(dir, "src", "evil.ts");
+  const ask = (tool_name, tool_input) => { const out = hook({ tool_name, tool_input }); return out ? JSON.parse(out).hookSpecificOutput : null; };
+  const edit = { file_path: evil, old_string: "", new_string: "export const x = 1;" };
+  const multi = { file_path: evil, edits: [{ old_string: "", new_string: "export const x = 1;" }] };
+  for (const phase of ["between", "during"]) {
+    if (phase === "during") run("next");
+    for (const [tool, input] of [["Edit", edit], ["MultiEdit", multi], ["Write", { file_path: evil, content: "x" }]]) {
+      const v = ask(tool, input);
+      assert.equal(v?.permissionDecision, "ask", `${tool} ${phase}`);
+      assert.match(v.permissionDecisionReason, /creates a new file/, `${tool} ${phase}`);
+    }
+  }
+});
+
+// ---- PR #10 review nits (after the main merge) ----
+
+const pageData = (html) => JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<"));
+
+test("review #10 nit 1: a tracked file the scan excludes never becomes a step after approval (CLI and page)", async () => {
+  const { dir, run } = project();
+  execFileSync("git", ["init", "-q", dir]);
+  fs.writeFileSync(path.join(dir, ".gitignore"), "n.ts\n");
+  fs.writeFileSync(path.join(dir, "n.ts"), 'export function g() {\n  // SKEL[g] ignored helper\n  throw new Error("SKEL_TODO");\n  // /SKEL[g]\n}\n');
+  run("init", "T");
+  run("track", "n.ts");
+  assert.match(run("status"), /0\/2 filled/, "the scan excludes the gitignored file");
+  assert.match(run("approve"), /skeleton approved: 2 steps/);
+  const snap = readSnapshot(dir);
+  assert.deepEqual(snap.fenced, ["src/a.ts"], "the record lists the approve-time fenced files");
+  assert.ok(snap.files["n.ts"], "the tracked file is still recorded whole");
+  assert.ok(snap.fences.some((f) => f.file === "n.ts"), "its fences are in the exterior record");
+  const status = run("status");
+  assert.match(status, /0\/2 filled/, "still the approve-time step count");
+  assert.doesNotMatch(status, /\bg\b.*ignored helper/);
+  const state = stateOf(dir);
+  assert.equal(toSteps(scanSkeleton(dir, state).fences).length, 2);
+  assert.equal(buildReviewData(dir, state).steps.length, 2);
+  const srv = await serve(dir);
+  try {
+    assert.deepEqual(pageData(srv.html).steps.map((s) => s.id), ["1", "2"], "the live page agrees");
+  } finally {
+    await srv.stop();
+  }
+});
+
+test("review #10 nit 1: readSnapshot accepts only a string array for `fenced`", () => {
+  const { dir, run } = project();
+  run("init", "T");
+  run("approve");
+  const good = JSON.parse(fs.readFileSync(snapshotPath(dir), "utf-8"));
+  for (const fenced of ["src/a.ts", [1], [null], {}]) {
+    fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...good, fenced }));
+    assert.equal(readSnapshot(dir), null, JSON.stringify(fenced));
+  }
+  const { fenced, ...without } = good;
+  fs.writeFileSync(snapshotPath(dir), JSON.stringify(without));
+  assert.ok(readSnapshot(dir), "the field is optional");
+});
+
+test("review #10 nit 2: buildReviewData with and without `known` agree for a tracked .claude/ doc", async () => {
+  const { dir, a, run } = project();
+  const doc = path.join(dir, ".claude", "skills", "x", "SKILL.md");
+  fs.mkdirSync(path.dirname(doc), { recursive: true });
+  fs.writeFileSync(doc, '# x\n\n```ts\n// SKEL[ex] example\nthrow new Error("SKEL_TODO");\n// /SKEL[ex]\n```\n');
+  run("init", "T");
+  run("track", ".claude/skills/x/SKILL.md");
+  const ids = (d) => d.steps.map((s) => s.id);
+  for (const phase of ["scaffold", "fill"]) {
+    if (phase === "fill") run("approve");
+    const state = stateOf(dir);
+    const plain = buildReviewData(dir, state, new Map());
+    const polled = buildReviewData(dir, state, new Map(), [a, doc]);
+    assert.deepEqual(ids(plain), ["1", "2"], phase);
+    assert.deepEqual(ids(polled), ids(plain), `${phase}: the poll agrees with the search`);
+    assert.ok(polled.files.some((f) => f.path === ".claude/skills/x/SKILL.md" && f.fences.length === 0), `${phase}: the doc is shown as context`);
+  }
+  const srv = await serve(dir);
+  try {
+    assert.deepEqual(ids(pageData(srv.html)), ["1", "2"]);
+    assert.deepEqual(ids(pageData(await (await fetch(srv.url)).text())), ["1", "2"], "and on a poll");
+  } finally {
+    await srv.stop();
+  }
+});
+
+test("review #10 nit 3: approve tells an unwritable config dir apart from marker errors", () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const asFile = path.join(tmp(), "not-a-dir");
+  fs.writeFileSync(asFile, "");
+  const cases = [asFile];
+  // A read-only dir only blocks a non-root user on POSIX.
+  if (process.platform !== "win32" && process.getuid?.() !== 0) {
+    const ro = tmp();
+    fs.mkdirSync(path.join(ro, "skel"));
+    fs.chmodSync(path.join(ro, "skel"), 0o500);
+    cases.push(ro);
+  }
+  for (const cfg of cases) {
+    const err = failure(() => execFileSync("node", [BIN, "approve"], { cwd: dir, env: { ...process.env, XDG_CONFIG_HOME: cfg }, encoding: "utf-8", stdio: "pipe" }));
+    assert.match(err, /couldn't record the approved skeleton: .*(ENOTDIR|EEXIST|EACCES|EPERM)/, cfg);
+    assert.doesNotMatch(err, /fix marker errors/);
+    assert.doesNotMatch(err, /\n\s+at /, "no stack trace");
+    assert.match(run("status"), /phase: scaffold/, "not approved");
+  }
+  for (const cfg of cases.slice(1)) fs.chmodSync(path.join(cfg, "skel"), 0o700);
 });
