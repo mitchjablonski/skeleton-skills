@@ -14,7 +14,8 @@ import { bodyEscapesFence } from "../lib/gate.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
-  addSession, clearSessions, historyDir, pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
+  addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath, sessionStorePath,
+  storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
 import {
   clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
@@ -46,7 +47,7 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
   stop-hook [--block]                Stop hook: reports drift from the approved skeleton during a fill
-  install [projectDir]               install skills + hook into a project's .claude/
+  install [projectDir]               install skills, filler subagent + hooks into a project's .claude/
 `;
 
 function die(msg) {
@@ -68,8 +69,8 @@ function requireRoot() {
   return root;
 }
 
-function snapshot(root) {
-  const { fences, errors, files } = scanSkeleton(root);
+function snapshot(root, state = readState(root)) {
+  const { fences, errors, files } = scanSkeleton(root, state);
   return { steps: toSteps(fences), errors, files };
 }
 
@@ -113,6 +114,22 @@ async function liveServer(root) {
   }
 }
 
+/**
+ * Feedback queued by a pre-upgrade server (whose session ids lived in the
+ * project's serve.json) can't be verified, and isn't migrated: a committed
+ * serve.json looks exactly like a real one, so trusting its list would let a
+ * repo vouch for its own feedback again. Tell the human to send it again.
+ */
+function warnLegacyQueue(root) {
+  const n = legacyQueued(root);
+  if (n) {
+    console.error(
+      `skel: warning: ${n} unread feedback file(s) were queued by an older \`skel serve\` and can't be verified; ` +
+        "`skel feedback` will set them aside. If they're yours, send them again from the review page.",
+    );
+  }
+}
+
 function setActive(root, state, step, force = false) {
   if (step.status !== "todo" && !force) die(`step ${step.id} is already filled; \`skel start ${step.id} --force\` reopens it for rework`);
   writeState(root, { ...state, phase: "fill", activeStep: step.id });
@@ -144,9 +161,13 @@ const commands = {
     const old = await liveServer(root);
     if (old) { try { process.kill(old.pid); } catch {} }
     for (const f of [queueDir(root), historyDir(root), servePath(root)]) fs.rmSync(f, { force: true, recursive: true });
-    clearSessions(root);
-    clearSnapshot(root);
-    clearRendered(root);
+    try {
+      clearSessions(root);
+      clearSnapshot(root);
+      clearRendered(root);
+    } catch (err) {
+      console.error(`skel: warning: couldn't clear the previous skeleton's review sessions and approval record in ${path.dirname(sessionStorePath(root))} (${err.code ?? err.message})`);
+    }
     console.log(`skel: "${title}" started in ${root} (phase: scaffold, gate: ${gate})`);
   },
 
@@ -213,27 +234,48 @@ const commands = {
     }
     const { session, token } = newServeSession();
     const serverId = crypto.randomBytes(12).toString("hex");
-    addSession(root, session);
+    // The session store vouches for this run's feedback. If it can't be
+    // written, still serve the page (it's useful to read), but say plainly
+    // that what's sent from it won't reach the agent (and refuse sends).
+    let recorded = true;
+    try {
+      addSession(root, session);
+    } catch (err) {
+      recorded = false;
+      console.error(
+        `skel: warning: can't record this review session in ${sessionStorePath(root)} (${err.code ?? err.message}). ` +
+          "The page works, but it can't send feedback; copy it by hand, or make that directory writable (or set XDG_CONFIG_HOME) and restart `skel serve`.",
+      );
+    }
+    warnLegacyQueue(root);
     // Polls re-stat only the skeleton's own files; finding fences in NEW files
-    // takes a full search, which runs in a child process every 30s so it never
-    // blocks a request (a git grep on WSL's /mnt/c can take seconds).
+    // takes a full search, which runs in a child process so it never blocks a
+    // request (a git grep on WSL's /mnt/c can take seconds). It runs every 30s
+    // while a page is polling, and on a page load once the last one is >5s old.
     const cache = new Map();
     let known = scanRepo(root, cache).files.map((f) => path.join(root, f));
     let searching = false;
+    let lastSearch = Date.now();
+    let lastPoll = 0;
     const refresh = () => {
       if (searching) return;
       searching = true;
       execFile(process.execPath, [SELF, "__candidates"], { cwd: root, maxBuffer: 64 * 1024 * 1024, timeout: 120_000 }, (err, out) => {
         searching = false;
+        lastSearch = Date.now();
         if (!err) { try { known = JSON.parse(out); } catch {} }
       });
     };
-    setInterval(refresh, 30_000).unref();
+    setInterval(() => { if (Date.now() - lastPoll < 60_000) refresh(); }, 30_000).unref();
     const current = () => {
       const state = readState(root);
-      const tracked = (state.files ?? []).map((f) => path.join(root, String(f)));
-      const { record, ...data } = buildReviewData(root, state, cache, [...new Set([...known, ...tracked])]);
-      known = [...new Set([...known, ...data.files.map((f) => path.join(root, f.path))])];
+      // Tracked files aren't polled for fences: the CLI's search doesn't see
+      // the ones it excludes (gitignored, under .claude/), so neither does the
+      // page. buildReviewData reads their text itself. Keep watching files
+      // that have fences or malformed markers until the next search.
+      const { record, ...data } = buildReviewData(root, state, cache, known);
+      const watched = [...data.steps.flatMap((st) => st.locations.map((l) => l.file)), ...data.errored];
+      known = [...new Set([...known, ...watched.map((f) => path.join(root, f))])];
       const { generatedAt, errored, ...stable } = data;
       return { data, record, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
     };
@@ -248,6 +290,9 @@ const commands = {
         // DNS rebinding: only answer requests addressed to us by name.
         if (!hosts.has(String(req.headers.host ?? "").toLowerCase())) return void refuse(421, "misdirected request");
         if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/?"))) {
+          lastPoll = Date.now();
+          // Serve what we know now; the page's polls pick up the search's result.
+          if (Date.now() - lastSearch > 5_000) refresh();
           const { data, record, version } = current();
           // Remember what the human was shown, so `skel approve` can diff
           // against the version they reviewed.
@@ -260,6 +305,7 @@ const commands = {
           });
           res.end(renderHtml({ ...data, version }, { token }));
         } else if (req.method === "GET" && req.url === "/api/version") {
+          lastPoll = Date.now();
           res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           res.end(JSON.stringify({ version: current().version, serverId, pid: process.pid }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
@@ -272,6 +318,7 @@ const commands = {
           // A newer server (or a new skeleton) took over: don't accept notes
           // the agent would no longer trust.
           if (superseded()) return void refuse(409, `this review page is out of date; reload ${readServe(root)?.url ?? "the new review URL"}`);
+          if (!recorded) return void refuse(503, "skel serve couldn't record its session, so Claude wouldn't trust this feedback; copy it to Claude by hand");
           let body = "";
           req.on("data", (c) => { body += c; if (body.length > 2_000_000) req.destroy(); });
           req.on("end", () => {
@@ -327,6 +374,7 @@ const commands = {
     while (pendingCount(root) === 0 && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 1000));
     }
+    warnLegacyQueue(root);
     const taken = takeFeedback(root);
     if (taken.quarantined) {
       console.log(
@@ -351,7 +399,14 @@ const commands = {
     // asks before an agent runs `skel approve` (see evaluateBash). This checks
     // freshness, not authority: that what is approved is the version the human
     // last reviewed, so an edit made after their "looks good" can't ride along.
-    const record = recordSkeleton(root, state, files);
+    // A tracked file's malformed markers throw SKEL_MARKERS; anything else is I/O.
+    let record;
+    try {
+      record = recordSkeleton(root, state, files, undefined, { strict: true });
+    } catch (err) {
+      if (err.code === "SKEL_MARKERS") die(`fix marker errors first:\n  ${err.message}`);
+      die(`couldn't read the skeleton to record it: ${err.message}`);
+    }
     console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
     const { record: last, unread } = lastReview(root, state.reviewEpoch);
     if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
@@ -361,7 +416,11 @@ const commands = {
     if (reviewed && reviewed !== record.version) die(staleReview(root, state, files, reviewed, record.version));
     if (!reviewed) console.log("note: no review of this version is on record (no send from the review page this round, and no --reviewed). Approving on the human's word alone.");
     const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
-    writeSnapshot(root, next, files, record, reviewed ? { version: reviewed, source: given ? "reviewed-flag" : "review-page", at: given ? null : last.at } : null);
+    try {
+      writeSnapshot(root, next, files, record, reviewed ? { version: reviewed, source: given ? "reviewed-flag" : "review-page", at: given ? null : last.at } : null);
+    } catch (err) {
+      die(`couldn't record the approved skeleton: ${err.message}`);
+    }
     writeState(root, next);
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${reviewed ? " (the version the human reviewed)" : ""}. Run \`skel next\` to start filling.`);
   },
@@ -438,6 +497,8 @@ const commands = {
     const state = readState(root);
     if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
     writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now() });
+    // The record is of the shape being reopened; approve writes the new one.
+    clearSnapshot(root);
     console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
   },
 
@@ -446,7 +507,7 @@ const commands = {
     const state = readState(root);
     const phase = state.phase;
     if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");
-    const { fences, errors, files: fenced } = scanSkeleton(root);
+    const { fences, errors, files: fenced } = scanSkeleton(root, state);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     requireNoDrift(root, state, fenced, "finalize");
     const pending = fences.filter((f) => f.status === "todo");
@@ -483,7 +544,16 @@ const commands = {
     }
     const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
     const settingsPath = path.join(claudeDir, "settings.local.json");
-    for (const p of [claudeDir, settingsPath, path.join(target, ".gitignore")]) {
+    const skills = ["skeleton", "skeleton-fill"].map((name) => [
+      path.join(PKG_ROOT, "skills", name, "SKILL.md"), path.join(claudeDir, "skills", name, "SKILL.md"),
+    ]);
+    // The fill skill delegates each step's edits to this subagent (Read, Grep,
+    // Glob, Edit, MultiEdit only: no shell, no Write).
+    const agent = [path.join(PKG_ROOT, "agents", "skeleton-filler.md"), path.join(claudeDir, "agents", "skeleton-filler.md")];
+    // A symlinked folder would aim our writes outside the project, and a
+    // symlinked file may be someone's live checkout: refuse both.
+    const dests = [...skills, agent].flatMap(([, dest]) => [path.dirname(path.dirname(dest)), path.dirname(dest), dest]);
+    for (const p of new Set([claudeDir, ...dests, settingsPath, path.join(target, ".gitignore")])) {
       if (isLink(p)) die(`${p} is a symlink; refusing to write through it`);
     }
     let settings = {};
@@ -494,9 +564,7 @@ const commands = {
         die(`${settingsPath} isn't valid JSON; fix it first (overwriting it would drop your settings)`);
       }
     }
-    for (const name of ["skeleton", "skeleton-fill"]) {
-      const src = path.join(PKG_ROOT, "skills", name, "SKILL.md");
-      const dest = path.join(claudeDir, "skills", name, "SKILL.md");
+    for (const [src, dest] of [...skills, agent]) {
       writeFileAtomic(dest, fs.readFileSync(src, "utf-8").replaceAll("{{SKEL}}", `node "${SELF}"`));
     }
     const command = `node "${HOOK}"`;
@@ -525,6 +593,7 @@ const commands = {
     const giText = fs.existsSync(gi) ? fs.readFileSync(gi, "utf-8") : "";
     if (!/^\/?\.skeleton\/?$/m.test(giText)) fs.appendFileSync(gi, `${giText && !giText.endsWith("\n") ? "\n" : ""}.skeleton/\n`);
     console.log(`installed /skeleton and /skeleton-fill into ${claudeDir}/skills`);
+    console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
     console.log(stopOurs ? "drift check (Stop) hook already installed" : `added drift check (Stop) hook to ${settingsPath}`);
   },
