@@ -14,6 +14,8 @@
   --active: #3b5bdb;
   --comment: #fff8db;
   --changed: #fff1b8;
+  --drift: #c92a2a;
+  --drift-soft: #fdecec;
   --on-accent: #ffffff;
   --tok-kw: #8a3ffc;
   --tok-str: #1b7f5b;
@@ -40,6 +42,8 @@
     --active: #8ea6ff;
     --comment: #2f2a17;
     --changed: #3a3214;
+    --drift: #ff8787;
+    --drift-soft: #3a1c1c;
     --on-accent: #141413;
     --tok-kw: #c4a2ff;
     --tok-str: #7fd1ae;
@@ -149,6 +153,13 @@ tr.note td { padding: 6px 12px 8px 54px !important; background: var(--comment); 
 .hint { font-size: 12px; color: var(--muted); }
 .status { font-size: 12px; color: var(--filled); min-height: 18px; }
 .errors { margin: 16px 20px 0; padding: 10px 14px; border-radius: 8px; background: var(--todo-soft); color: var(--todo); font-family: var(--mono); font-size: 12px; }
+.drift-panel { margin: 16px 20px 0; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--drift); background: var(--drift-soft); }
+.drift-panel h2 { margin: 0 0 4px; font-size: 14px; color: var(--drift); }
+.drift-item { margin-top: 8px; font-size: 13px; }
+.drift-item pre { margin: 4px 0 0; padding: 6px 8px; overflow-x: auto; background: var(--surface); border-radius: 6px; font: 12px/1.45 var(--mono); }
+.drift-item .del { color: var(--drift); }
+.drift-item .add { color: var(--filled); }
+tr.drift td.src { box-shadow: inset 3px 0 var(--drift); background: var(--drift-soft); }
 .empty { padding: 40px; text-align: center; color: var(--muted); }
 
 .diagram-host { padding: 16px; overflow-x: auto; text-align: center; }
