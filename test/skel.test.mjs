@@ -424,6 +424,171 @@ test("issue #3: install writes the restricted filler subagent, idempotently, and
   assert.deepEqual(fs.readdirSync(elsewhere), []);
 });
 
+// ---- install: native permission rules (issue #4) ----
+
+const STATE_PATHS = ["state.json", "serve.json", "review.html", "feedback/**", "feedback-history/**"];
+const LEGACY_DENY = STATE_PATHS.map((p) => `Edit(/.skeleton/${p})`);
+/** The rules install should write for a project: its absolute real path, POSIX form (C:\x -> /c/x). */
+const denyFor = (target) => {
+  let real = fs.realpathSync(target);
+  if (process.platform === "win32") real = "/" + real[0].toLowerCase() + real.slice(2).split("\\").join("/");
+  return STATE_PATHS.map((p) => `Edit(/${real}/.skeleton/${p})`);
+};
+const installTarget = () => {
+  const target = tmp("skel-install-");
+  const settingsPath = path.join(target, ".claude", "settings.local.json");
+  const read = () => JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+  const write = (s) => { fs.mkdirSync(path.dirname(settingsPath), { recursive: true }); fs.writeFileSync(settingsPath, JSON.stringify(s)); };
+  const run = (...args) => execFileSync("node", [BIN, ...args, target], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  return { target, settingsPath, read, write, run, SKEL_DENY: denyFor(target) };
+};
+
+test("issue #4: install adds deny rules for .skeleton/ state to a fresh project, never for diagrams/", () => {
+  const { read, run, SKEL_DENY } = installTarget();
+  assert.match(run("install"), /added 5 permission deny rule/);
+  const s = read();
+  assert.deepEqual(s.permissions.deny, SKEL_DENY);
+  assert.ok(s.permissions.deny.every((r) => r.startsWith("Edit(") && !r.includes("diagrams")), "only Edit rules match paths; diagrams stay writable");
+  assert.ok(s.permissions.deny.every((r) => !r.replace(/\/\*\*\)$/, ")").includes("*")), "no wildcard but a trailing /** (the Linux sandbox ignores others)");
+  assert.equal(s.hooks.PreToolUse.length, 1);
+  assert.equal(s.sandbox, undefined, "install doesn't switch the sandbox on for you");
+});
+
+test("issue #4: install preserves the user's settings and rules, and a re-run changes nothing", () => {
+  const { read, write, run, settingsPath, SKEL_DENY } = installTarget();
+  const mine = {
+    model: "opus",
+    permissions: { allow: ["Bash(npm test)"], deny: ["Read(./.env)", SKEL_DENY[0]], ask: ["Bash(git push *)"] },
+    hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo mine" }] }], Stop: [{ hooks: [{ type: "command", command: "echo stop" }] }] },
+    sandbox: { enabled: true },
+  };
+  write(mine);
+  assert.match(run("install"), /added 4 permission deny rule/);
+  const once = read();
+  assert.equal(once.model, "opus");
+  assert.deepEqual(once.permissions.allow, mine.permissions.allow);
+  assert.deepEqual(once.permissions.ask, mine.permissions.ask);
+  assert.deepEqual(once.permissions.deny, ["Read(./.env)", ...SKEL_DENY], "user rules kept in place; no duplicates");
+  assert.deepEqual(once.hooks.Stop, mine.hooks.Stop);
+  assert.deepEqual(once.hooks.PreToolUse[0], mine.hooks.PreToolUse[0]);
+  assert.equal(once.hooks.PreToolUse.length, 2);
+  assert.deepEqual(once.sandbox, { enabled: true });
+
+  const text = fs.readFileSync(settingsPath, "utf-8");
+  assert.match(run("install"), /already present/);
+  assert.equal(fs.readFileSync(settingsPath, "utf-8"), text, "idempotent: byte-identical on a re-run");
+
+  // A hook from an older or moved checkout is updated in place, not duplicated.
+  const moved = read();
+  moved.hooks.PreToolUse[1].hooks[0].command = 'node "/old/clone/bin/skel.mjs" hook';
+  write(moved);
+  run("install");
+  assert.equal(read().hooks.PreToolUse.length, 2);
+  assert.match(read().hooks.PreToolUse[1].hooks[0].command, /skel-hook\.mjs"$/);
+});
+
+test("issue #4: install refuses symlinked or oddly shaped settings, leaving them untouched", () => {
+  const { target, settingsPath, write, run } = installTarget();
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  if (canSymlink) {
+    const victim = path.join(tmp("skel-victim-"), "settings.json");
+    fs.writeFileSync(victim, "{}");
+    fs.symlinkSync(victim, settingsPath);
+    assert.throws(() => run("install"), /symlink/);
+    assert.throws(() => run("uninstall"), /symlink/);
+    assert.equal(fs.readFileSync(victim, "utf-8"), "{}");
+    fs.rmSync(settingsPath);
+
+    fs.symlinkSync(path.dirname(victim), path.join(target, ".claude", "skills"), "junction");
+    assert.throws(() => run("install"), /skills is a symlink/);
+    fs.rmSync(path.join(target, ".claude", "skills"));
+  }
+
+  for (const odd of [[], { permissions: [] }, { permissions: { deny: "Edit(x)" } }, { hooks: { PreToolUse: {} } }]) {
+    write(odd);
+    assert.throws(() => run("install"), /isn't shaped the way Claude Code expects/);
+    assert.equal(fs.readFileSync(settingsPath, "utf-8"), JSON.stringify(odd));
+  }
+});
+
+test("issue #4: uninstall removes only what install added", () => {
+  const { target, read, write, run } = installTarget();
+  const mine = { permissions: { deny: ["Read(./.env)"] }, hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo mine" }] }] } };
+  write(mine);
+  run("install");
+  fs.writeFileSync(path.join(target, ".claude", "skills", "mine.md"), "x");
+  assert.ok(fs.existsSync(path.join(target, ".claude", "agents", "skeleton-filler.md")));
+  fs.writeFileSync(path.join(target, ".claude", "agents", "mine.md"), "x");
+  assert.match(run("uninstall"), /left in place/);
+  assert.deepEqual(read(), mine);
+  assert.ok(!fs.existsSync(path.join(target, ".claude", "skills", "skeleton")));
+  assert.ok(fs.existsSync(path.join(target, ".claude", "skills", "mine.md")));
+  assert.ok(!fs.existsSync(path.join(target, ".claude", "agents", "skeleton-filler.md")), "the filler subagent goes too");
+  assert.ok(fs.existsSync(path.join(target, ".claude", "agents", "mine.md")), "other agents stay");
+
+  const fresh = installTarget();
+  fresh.run("install");
+  fresh.run("uninstall");
+  assert.deepEqual(fresh.read(), {}, "a settings file install created is left empty, not deleted");
+});
+
+test("PR#11 P1: deny rules name the project's absolute real path, whatever cwd install runs from", () => {
+  const { target, read, SKEL_DENY } = installTarget();
+  fs.mkdirSync(path.join(target, "src", "deep"), { recursive: true });
+  // From a subdirectory, by a relative path: the rules still name the project root.
+  execFileSync("node", [BIN, "install", path.join("..", "..")], { cwd: path.join(target, "src", "deep"), encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  const deny = read().permissions.deny;
+  assert.deepEqual(deny, SKEL_DENY);
+  assert.ok(deny.every((r) => r.startsWith("Edit(//")), "absolute (//) rules: a /path rule in local settings anchors at the session's cwd");
+  assert.ok(deny.every((r) => !r.includes("\\") && !r.includes("/src/")), deny.join(" "));
+  if (canSymlink) {
+    // Through a symlinked path: the rules name the real directory.
+    const link = path.join(tmp("skel-link-"), "proj");
+    fs.symlinkSync(target, link, "junction");
+    execFileSync("node", [BIN, "install", link], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.deepEqual(read().permissions.deny, SKEL_DENY);
+  }
+});
+
+test("PR#11 P1: install migrates the old project-relative rules it wrote, and keeps a user's own", () => {
+  const { read, write, run, SKEL_DENY } = installTarget();
+  const hook = { matcher: "Write|Edit|MultiEdit|NotebookEdit|Bash", hooks: [{ type: "command", command: 'node "/old/clone/bin/skel-hook.mjs"' }] };
+  write({ permissions: { deny: ["Read(./.env)", ...LEGACY_DENY] }, hooks: { PreToolUse: [hook] } });
+  run("install");
+  assert.deepEqual(read().permissions.deny, ["Read(./.env)", ...SKEL_DENY], "old-form rules from a pre-ownership install replaced");
+  run("uninstall");
+  assert.deepEqual(read(), { permissions: { deny: ["Read(./.env)"] } });
+
+  // A lone old-form rule without skel's hook is the user's: never taken.
+  const other = installTarget();
+  other.write({ permissions: { deny: [LEGACY_DENY[0]] } });
+  other.run("install");
+  assert.deepEqual(other.read().permissions.deny, [LEGACY_DENY[0], ...other.SKEL_DENY]);
+  other.run("uninstall");
+  assert.deepEqual(other.read(), { permissions: { deny: [LEGACY_DENY[0]] } });
+});
+
+test("PR#11 P2: uninstall removes only the rules install added; identical pre-existing rules survive", () => {
+  const { read, write, run, SKEL_DENY } = installTarget();
+  const mine = { permissions: { deny: [SKEL_DENY[0], "Read(./.env)", SKEL_DENY[3]] } };
+  write(mine);
+  assert.match(run("install"), /added 3 permission deny rule/);
+  assert.match(run("install"), /already present/);
+  assert.match(run("install"), /already present/, "repeated installs keep ownership");
+  assert.deepEqual(read().permissions.deny, [...mine.permissions.deny, SKEL_DENY[1], SKEL_DENY[2], SKEL_DENY[4]]);
+  run("uninstall");
+  assert.deepEqual(read(), mine, "the user's identical rules survive install + uninstall");
+
+  // Ownership lives outside the project, and uninstall clears it.
+  const store = path.join(process.env.XDG_CONFIG_HOME, "skel");
+  run("install");
+  assert.ok(fs.readdirSync(store).some((f) => f.endsWith(".install.json")));
+  const before = fs.readdirSync(store).filter((f) => f.endsWith(".install.json")).length;
+  run("uninstall");
+  assert.equal(fs.readdirSync(store).filter((f) => f.endsWith(".install.json")).length, before - 1);
+  assert.deepEqual(read(), mine);
+});
+
 test("UX #10/#11: init won't replace a skeleton silently; start won't abandon one or skip quietly", () => {
   const { dir, a, run } = project();
   run("init", "First");
