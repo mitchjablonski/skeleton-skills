@@ -63,8 +63,8 @@ function requireRoot() {
   return root;
 }
 
-function snapshot(root) {
-  const { fences, errors, files } = scanSkeleton(root);
+function snapshot(root, state = readState(root)) {
+  const { fences, errors, files } = scanSkeleton(root, state);
   return { steps: toSteps(fences), errors, files };
 }
 
@@ -324,7 +324,11 @@ const commands = {
     // asks before an agent runs `skel approve` (see evaluateBash). What they
     // approved is recorded, so done/finalize can check the fill against it.
     const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
-    writeSnapshot(root, next, files);
+    try {
+      writeSnapshot(root, next, files);
+    } catch (err) {
+      die(`fix marker errors first:\n  ${err.message}`);
+    }
     writeState(root, next);
     console.log(`skeleton approved: ${steps.length} steps. Run \`skel next\` to start filling.`);
   },
@@ -401,6 +405,8 @@ const commands = {
     const state = readState(root);
     if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
     writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now() });
+    // The record is of the shape being reopened; approve writes the new one.
+    clearSnapshot(root);
     console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
   },
 
@@ -409,7 +415,7 @@ const commands = {
     const state = readState(root);
     const phase = state.phase;
     if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");
-    const { fences, errors, files: fenced } = scanSkeleton(root);
+    const { fences, errors, files: fenced } = scanSkeleton(root, state);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     requireNoDrift(root, state, fenced, "finalize");
     const pending = fences.filter((f) => f.status === "todo");
