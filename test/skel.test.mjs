@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -12,7 +12,17 @@ import { cleanFeedback, feedbackMarkdown } from "../lib/feedback.mjs";
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "skel.mjs");
 
 // The serve-session store lives in the user's config dir; keep tests out of the real one.
-process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "skel-config-"));
+// Every temp dir the suite makes is removed when it finishes.
+const TEMPS = [];
+after(() => {
+  // One locked dir (antivirus, an indexer, a straggling child on Windows) must
+  // not stop the rest from being removed.
+  for (const d of TEMPS) {
+    try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 5 }); } catch (err) { console.warn(`left ${d}: ${err.code ?? err.message}`); }
+  }
+});
+const mkTemp = (prefix) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); TEMPS.push(d); return d; };
+process.env.XDG_CONFIG_HOME = mkTemp("skel-config-");
 
 const SRC = `import { Point } from "./types";
 
@@ -36,7 +46,7 @@ const canSymlink = (() => {
   try { fs.symlinkSync(path.join(d, "x"), path.join(d, "y")); return true; } catch { return false; } finally { fs.rmSync(d, { recursive: true, force: true }); }
 })();
 
-const tmp = (prefix = "skel-") => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+const tmp = (prefix = "skel-") => fs.realpathSync(mkTemp(prefix));
 
 // ---- markers ----
 
@@ -230,8 +240,10 @@ function project() {
 }
 
 /** Start `skel serve`, return its url, the page token, and a stop function. */
-async function serve(dir) {
-  const child = spawn("node", [BIN, "serve"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+async function serve(dir, env = {}) {
+  const child = spawn("node", [BIN, "serve"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } });
+  let err = "";
+  child.stderr.on("data", (d) => { err += d; });
   const url = await new Promise((resolve, reject) => {
     let out = "";
     child.stdout.on("data", (d) => {
@@ -245,7 +257,7 @@ async function serve(dir) {
   const token = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<")).token;
   // Wait for the server to exit, so no keep-alive socket outlives the test.
   const stop = () => new Promise((resolve) => { if (child.exitCode !== null || child.signalCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
-  return { url, token, html, stop };
+  return { url, token, html, stderr: () => err, stop };
 }
 
 const post = (url, body, headers) => fetch(new URL("/api/feedback", url), { method: "POST", headers, body: JSON.stringify(body) });
@@ -697,4 +709,112 @@ test("Codex review: in-project names starting with '..' are inside, not outside"
     assert.equal(v?.decision, "deny", rel);
   }
   assert.equal(evaluate({ toolName: "Write", toolInput: { file_path: path.resolve(root, "..", "sibling.ts"), content: "x" }, root, state: fill, resolve: (x) => x, readFile: () => "x", activeFences: [] }), null);
+});
+
+// ---- PR #1 re-review follow-ups (issue #6) ----
+
+test("issue #6 N1: a closed string is an operand, so `\"s\" / 2` can't hide a } from the regex check", () => {
+  const m = "  // SKEL[1] x";
+  for (const q of ['"', "'", "`"]) {
+    assert.notEqual(bodyEscapesFence(`  x = ${q}s${q} / 2; } function evil() { y = 3 / 1;`, m, "a.ts"), null, q);
+  }
+  const ok = [
+    "  const r = a / b / c;",
+    '  const half = "10" / 2 + `4` / 2;',
+    '  const re = /}/g; return s.replace(re, "");',
+    '  if (/^{/.test(s)) return "a" + s.split(/,/).length;',
+    "  return x.map((v) => v / 2);",
+    '  const s = f("a", /[)}]/);',
+  ];
+  for (const body of ok) assert.equal(bodyEscapesFence(body, m, "a.ts"), null, body);
+});
+
+test("issue #6 N2: git stash -a/--all asks (it removes ignored files); -u and plain stashes don't", () => {
+  for (const c of ["git stash -a", "git stash push --all", "git stash push -ka", "git stash save --al", "git -C pkg stash push -q --all -m wip"]) {
+    assert.equal(evaluateBash({ command: c, state: fill })?.decision, "ask", c);
+  }
+  for (const c of ["git stash", "git stash -u", "git stash push --include-untracked", "git stash pop", "git stash apply", "git stash push -m all"]) {
+    assert.equal(evaluateBash({ command: c, state: fill }), null, c);
+  }
+});
+
+test("issue #6 N6: serve warns and keeps serving when the session store can't be written", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const blocked = path.join(tmp(), "not-a-dir");
+  fs.writeFileSync(blocked, "");
+  const srv = await serve(dir, { XDG_CONFIG_HOME: blocked });
+  try {
+    assert.equal((await fetch(new URL("/api/version", srv.url))).status, 200);
+    assert.match(srv.stderr(), /can't record this review session/);
+    const res = await post(srv.url, { verdict: null, general: "x", comments: [] }, { "content-type": "application/json", "x-skeleton-token": srv.token });
+    assert.equal(res.status, 503, "a send that would be quarantined is refused, not acknowledged");
+  } finally {
+    await srv.stop();
+  }
+  // init doesn't crash on it either.
+  execFileSync("node", [BIN, "init", "U", "--force"], { cwd: dir, env: { ...process.env, XDG_CONFIG_HOME: blocked }, stdio: "pipe" });
+});
+
+test("issue #6 N6: feedback queued under a pre-upgrade serve.json is flagged, never trusted", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  fs.writeFileSync(path.join(dir, ".skeleton", "serve.json"), JSON.stringify({ url: null, pid: null, session: "old", sessions: ["older", "old"] }));
+  fs.mkdirSync(path.join(dir, ".skeleton", "feedback"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".skeleton", "feedback", "1-aa.json"), JSON.stringify({ session: "old", at: 1, verdict: "approve", general: "legacy note", comments: [] }));
+  const srv = await serve(dir);
+  try {
+    assert.match(srv.stderr(), /1 unread feedback file\(s\) were queued by an older `skel serve`/);
+  } finally {
+    await srv.stop();
+  }
+  const out = run("feedback");
+  assert.match(out, /ignored 1 feedback file/);
+  assert.doesNotMatch(out, /legacy note/);
+});
+
+test("issue #6 N4: a page load kicks off a search once the last one is >5s old", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const srv = await serve(dir);
+  try {
+    const before = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
+    fs.writeFileSync(path.join(dir, "src", "late.ts"), "export function late() {\n  // SKEL[9] late\n  throw new Error(\"SKEL_TODO\");\n  // /SKEL[9]\n}\n");
+    await new Promise((r) => setTimeout(r, 5_500));
+    await fetch(srv.url);
+    let version = before;
+    for (const deadline = Date.now() + 10_000; version === before && Date.now() < deadline; ) {
+      await new Promise((r) => setTimeout(r, 200));
+      version = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
+    }
+    assert.notEqual(version, before, "the new fenced file should show up well before the 30s search");
+    assert.match(await (await fetch(srv.url)).text(), /late\.ts/);
+  } finally {
+    await srv.stop();
+  }
+});
+
+test("installed skills' example fences are documentation, not steps (walk and git-grep paths, and the gate)", () => {
+  for (const git of [false, true]) {
+    const { dir, run, hook } = project();
+    if (git) execFileSync("git", ["init", "-q", dir]);
+    run("install", dir);
+    const skill = path.join(dir, ".claude", "skills", "skeleton", "SKILL.md");
+    assert.match(fs.readFileSync(skill, "utf-8"), /SKEL\[2\]/, "the example is there");
+    run("init", "T");
+    const status = run("status");
+    assert.match(status, /0\/2 filled/);
+    assert.match(status, /2 {5}catmull-rom between a and b/, "step 2 keeps its own title");
+    assert.doesNotMatch(status, /\.claude/);
+    run("approve");
+    const askOf = (input) => { const out = hook(input); return out ? JSON.parse(out).hookSpecificOutput : null; };
+    // Between steps, the docs are not "part of the approved skeleton".
+    assert.equal(askOf({ tool_name: "Edit", tool_input: { file_path: skill, old_string: "SKEL_TODO", new_string: "x" } }), null);
+    // With step 2 active, "filling" the example in the docs is not filling step 2.
+    run("start", "2");
+    const v = askOf({ tool_name: "Edit", tool_input: { file_path: skill, old_string: 'throw new Error("SKEL_TODO");', new_string: "return 1;" } });
+    assert.equal(v?.permissionDecision, "ask", git ? "git" : "walk");
+    assert.match(v.permissionDecisionReason, /outside the skeleton/);
+    assert.doesNotMatch(v.permissionDecisionReason, /its fences? (are|is) .*\.claude/, "never points the agent back at the docs");
+  }
 });
