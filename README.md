@@ -48,12 +48,12 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
 /skeleton add stroke smoothing to the canvas
    → skel init, writes stubs + diagram, `skel serve` → review URL
    → you comment / request changes / approve in the page
-   → skel feedback --wait …   (Claude picks up your feedback)
-   → skel approve
+   → skel feedback --wait 110   (Claude picks up your feedback)
+   → skel approve               (Claude Code asks you to allow it)
 /skeleton-fill            (one step, then stop)
 /skeleton-fill all        (every step, still fenced)
-   → skel next → edit inside the fence → tests → skel done
-   → a structural change? Claude stops and proposes it → skel reshape → re-review
+   → skel next → edit inside the fence → tests → skel done → skel feedback
+   → a structural change? Claude stops and proposes it → you reopen it → skel reshape → re-review
    → skel finalize          (strips the markers)
 ```
 
@@ -61,18 +61,34 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
 
 | Command | |
 |---|---|
-| `skel init "<title>" [--gate ask\|deny]` | Start a skeleton (`.skeleton/state.json`) |
-| `skel track <file…>` | Include unfenced skeleton files (e.g. new types) in the review |
-| `skel status [--json]` | Phase, active step, each step's status |
-| `skel serve [--port N]` | Live review page; feedback is sent back to Claude |
+| `skel init "<title>" [--gate ask\|deny] [--force]` | Start a skeleton (`.skeleton/state.json`); won't replace one in progress without `--force` |
+| `skel track <file…>` | Include unfenced skeleton files (e.g. new types) in the review; must be inside the project |
+| `skel status [--json]` | Phase, active step, each step's status, and diagram nodes that match no step |
+| `skel serve [--port N] [--stop]` | Live review page; feedback is sent back to Claude. Reuses a running server; uses a stable port per project, so unsent drafts survive a restart |
 | `skel review` | Static `.skeleton/review.html`; copy the feedback by hand |
-| `skel feedback [--wait S]` | Print and archive the latest feedback |
-| `skel approve` / `skel reshape` | Enter the fill phase / go back to skeleton review |
-| `skel next` / `skel start <id>` / `skel done` | Run steps |
+| `skel feedback [--wait S]` | Print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise) |
+| `skel approve` | Enter the fill phase. When Claude runs it, the hook asks you to allow it: that prompt is your approval |
+| `skel reshape` | Back to skeleton review (also asks you) |
+| `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one |
 | `skel finalize` | All filled: strip the markers |
 | `skel hook` | The `PreToolUse` scope gate |
 
-**Gate modes:** `ask` (default) sends an out-of-fence edit to you for a yes or no. `deny` refuses it outright, so Claude must propose a skeleton change. The gate covers `Edit`, `MultiEdit` and `Write`. It can't see edits made through shell commands; the skill tells Claude not to do that.
+**Gate modes:** `ask` (default) sends an out-of-fence edit to you for a yes or no. `deny` refuses it outright, so Claude must propose a skeleton change.
+
+## Security model
+
+The fence is a **drift guard for a cooperative agent**: it keeps an agent that means well from quietly widening its own scope. It is not a sandbox against a hostile one, which could always write files from a shell.
+
+- **Your approval is Claude Code's permission prompt.** The hook always asks before `skel approve`, `skel reshape`, `skel init --force` or `skel finalize` runs, and before `git clean -x`/`-X` (which would delete `.skeleton/`), even in `deny` mode. That prompt is the one channel the agent can't answer for you. It fires from any working directory and for the common spellings (quoted, a path in a variable, `xargs`); it's a word match, not a shell parser. Review-page verdicts and feedback files are only signals to the agent; anything on disk or on a local port can be forged from a shell, so none of it counts as approval. How the prompt behaves follows Claude Code's permission mode: you see it in the default, `acceptEdits`, `plan` and `auto` modes; a non-interactive run with no one to answer refuses the command; and `bypassPermissions` skips it.
+- **Edits are judged by their result.** During a fill, an Edit, MultiEdit (applied in order) or Write is allowed only if the SKEL markers come out identical, every line outside the active fence is unchanged, and the filled body stays inside its block. Line endings are compared as LF (Claude Code's Edit matches CRLF files that way), and an edit whose `old_string` can't be located asks. The block check is a language-aware heuristic, not a parser, so a hit always asks rather than refuses.
+- **Between steps,** edits to fenced or tracked files, and new files, ask. NotebookEdit asks during a fill.
+- **The tool's state is off-limits.** Agent edits to any `.skeleton/` directory, at any depth (except the top-level `diagrams/`), ask, matched case-insensitively. So do Bash commands that name `.skeleton/` state, from any working directory. An enclosing skeleton that is mid-fill outranks a nested state file, so one planted or shipped deeper down can't take over the fence.
+- **The review server** binds to 127.0.0.1, answers only requests addressed to `127.0.0.1`/`localhost` (no DNS rebinding), and accepts feedback only same-origin, as JSON, with a per-run token. So other websites can't post to it. The markdown Claude reads is rebuilt server-side and framed as review notes, not instructions.
+- **Feedback is tied to this skeleton's serve runs**, whose ids live outside the project (`~/.config/skel/`), so nothing committed to a repo can vouch for a feedback file. Leftover, committed or hand-written ones are quarantined. `init` stops the old review server and forgets its sessions; a superseded server refuses sends. `skel serve` reuses a running server only after it answers with the id it recorded, and never kills a bare pid. `install` adds `.skeleton/` to `.gitignore`.
+- **Files:** tracked files must resolve inside the project; writes go through temp-file-and-rename (never through a symlink); `install` refuses symlinked or unparseable settings rather than overwrite them.
+- **Mermaid** is pinned to a patched release (past CVE-2025-54881) with Subresource Integrity, and loads without blocking the page.
+
+Not covered: arbitrary Bash, and anything once a hook fault makes it fail open. Pair it with Claude Code's permission rules if you need hard limits.
 
 ## Prior art
 
