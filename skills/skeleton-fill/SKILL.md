@@ -52,7 +52,7 @@ Don't write fence code yourself in the main conversation. The point of the hop i
 
 Between steps (after `done`, before the next `start`), edits to the skeleton's files ask the human too: there is no active fence for them to land in.
 
-At the end of each of your turns, a Stop hook checks the skeleton against the approved version and shows the human any drift. If it reports drift (or sends you back with it), treat it like a failed `skel done`: put the lines back, or stop and propose the change.
+At the end of each of your turns, a Stop hook checks the skeleton against the approved version. By default its drift report is shown to the human only; you don't see it, so `skel done` stays your check. If the human relays drift to you, or the hook is installed with `--block` and sends you back with the report, treat it like a failed `skel done`: put the lines back, or stop and propose the change.
 
 ## When the skeleton is wrong
 
