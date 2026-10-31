@@ -456,13 +456,22 @@ test("security M3: review and install never write through symlinks, and install 
 
 const STATE_PATHS = ["state.json", "serve.json", "review.html", "feedback/**", "feedback-history/**"];
 const LEGACY_DENY = STATE_PATHS.map((p) => `Edit(/.skeleton/${p})`);
-/** The rules install should write for a project: its absolute real path, POSIX form (C:\x -> /c/x). */
-const denyFor = (target) => {
-  let real = fs.realpathSync.native(target);
+/** An absolute real path as a rule spells it: POSIX form (C:\x -> /c/x), [ ] * ? escaped. */
+const ruleSpelling = (dir) => {
+  let real = fs.realpathSync.native(dir);
   if (process.platform === "win32") real = "/" + real[0].toLowerCase() + real.slice(2).split("\\").join("/");
-  real = real.replace(/[[\]*?]/g, (c) => `\\${c}`);
-  return STATE_PATHS.map((p) => `Edit(/${real}/.skeleton/${p})`);
+  return real.replace(/[[\]*?]/g, (c) => `\\${c}`);
 };
+/** The .skeleton/ rules install should write for a project: its absolute real path. */
+const stateDenyFor = (target) => STATE_PATHS.map((p) => `Edit(/${ruleSpelling(target)}/.skeleton/${p})`);
+/** The rule for skel's config dir (#26), as resolved from this test run's XDG_CONFIG_HOME. */
+const configDeny = () => {
+  const dir = path.join(process.env.XDG_CONFIG_HOME, "skel");
+  fs.mkdirSync(dir, { recursive: true });
+  return `Edit(/${ruleSpelling(dir)}/**)`;
+};
+/** Every rule install should write for a project: its .skeleton/ rules, then the config dir's. */
+const denyFor = (target) => [...stateDenyFor(target), configDeny()];
 const installTarget = () => {
   const target = tmp("skel-install-");
   const settingsPath = path.join(target, ".claude", "settings.local.json");
@@ -605,7 +614,7 @@ test("PR#11 P2: uninstall removes only the rules install added; identical pre-ex
   assert.match(run("install"), /added 3 permission deny rule/);
   assert.match(run("install"), /already present/);
   assert.match(run("install"), /already present/, "repeated installs keep ownership");
-  assert.deepEqual(read().permissions.deny, [...mine.permissions.deny, SKEL_DENY[1], SKEL_DENY[2], SKEL_DENY[4]]);
+  assert.deepEqual(read().permissions.deny, [...mine.permissions.deny, SKEL_DENY[1], SKEL_DENY[2], SKEL_DENY[4], SKEL_DENY[5]]);
   run("uninstall");
   assert.deepEqual(read(), mine, "the user's identical rules survive install + uninstall");
 
@@ -1368,7 +1377,7 @@ test("PR#11 review #2: project paths with ( ) { } [ ] keep their rules; [ ] * ? 
   assert.match(out, /added 5 permission deny rule/);
   const deny = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8")).permissions.deny;
   assert.deepEqual(deny, denyFor(target));
-  assert.ok(deny.every((r) => r.includes("/Program Files (x86)/proj{a}\\[1\\]/.skeleton/")), deny[0]);
+  assert.ok(deny.slice(0, 5).every((r) => r.includes("/Program Files (x86)/proj{a}\\[1\\]/.skeleton/")), deny[0]);
   assert.match(execFileSync("node", [BIN, "uninstall", target], { encoding: "utf-8" }), /removed 5 \.skeleton\/ permission deny rule/);
 
   if (process.platform !== "win32") {
@@ -1378,7 +1387,7 @@ test("PR#11 review #2: project paths with ( ) { } [ ] keep their rules; [ ] * ? 
     const r = execFileSync("node", [BIN, "install", odd], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
     assert.match(r, /warning: no permission deny rules/);
     const s = JSON.parse(fs.readFileSync(path.join(odd, ".claude", "settings.local.json"), "utf-8"));
-    assert.equal(s.permissions.deny.length, 0);
+    assert.deepEqual(s.permissions.deny, [configDeny()], "only the config dir's rule (#26), which doesn't depend on the project path");
     assert.equal(s.hooks.PreToolUse.length, 1);
     assert.ok(fs.existsSync(path.join(odd, ".claude", "skills", "skeleton", "SKILL.md")));
   }
@@ -1435,7 +1444,7 @@ test("PR#11 review nits: install creates a missing project dir; uninstall of a m
     const records = () => fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).length;
     const n = records();
     assert.match(run("install", missing.toUpperCase()), /already present/);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(missing, ".claude", "settings.local.json"), "utf-8")).permissions.deny.length, 5);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(missing, ".claude", "settings.local.json"), "utf-8")).permissions.deny.length, 6, "five .skeleton/ rules and the config dir's");
     assert.equal(records(), n);
   }
   if (canSymlink) {
@@ -2090,4 +2099,127 @@ test("NIT3 review: an unreadable rendered-versions store is reported as such, no
   const out = run("approve");
   assert.match(out, /the rendered-versions store couldn't be read \(not valid JSON\)/);
   assert.doesNotMatch(out, /never rendered/);
+});
+
+// ---- #26: skel's config-dir stores ----
+
+test("#26: install adds an owned, absolute, escaped deny rule for skel's config dir; a re-run is identical; uninstall removes it", () => {
+  // An XDG_CONFIG_HOME with pattern characters, reached through a symlink when we can make one.
+  // Windows filenames can't hold * or ?.
+  const realBase = path.join(tmp("skel-xdg-"), process.platform === "win32" ? "cfg [x](1)" : "cfg [x]*?(1)");
+  fs.mkdirSync(realBase, { recursive: true });
+  let xdg = realBase;
+  if (canSymlink) {
+    xdg = path.join(tmp("skel-xdglink-"), "link");
+    fs.symlinkSync(realBase, xdg, "junction");
+  }
+  const env = { ...process.env, XDG_CONFIG_HOME: xdg };
+  const target = tmp("skel-cfgrule-");
+  const settingsPath = path.join(target, ".claude", "settings.local.json");
+  const read = () => JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+  const run = (...a) => execFileSync("node", [BIN, ...a, target], { encoding: "utf-8", env, stdio: ["ignore", "pipe", "pipe"] });
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }));
+
+  const out = run("install");
+  const rule = `Edit(/${ruleSpelling(path.join(realBase, "skel"))}/**)`;
+  assert.match(rule, process.platform === "win32" ? /^Edit\(\/\/[a-z]\/.*\/cfg \\\[x\\\]\(1\)\/skel\/\*\*\)$/ : /^Edit\(\/\/.*\/cfg \\\[x\\\]\\\*\\\?\(1\)\/skel\/\*\*\)$/, rule);
+  assert.ok(!rule.includes("link"), "names the real dir, not the symlink");
+  assert.match(out, /added a permission deny rule for skel's config dir/);
+  assert.ok(out.includes(rule), out);
+  assert.deepEqual(read().permissions.deny, ["Read(./.env)", ...stateDenyFor(target), rule]);
+  const owned = fs.readdirSync(path.join(realBase, "skel")).filter((f) => f.endsWith("-install.json"));
+  assert.equal(owned.length, 1);
+  assert.ok(JSON.parse(fs.readFileSync(path.join(realBase, "skel", owned[0]), "utf-8")).ownedDeny.includes(rule), "recorded as install's");
+
+  const text = fs.readFileSync(settingsPath, "utf-8");
+  assert.match(run("install"), /permission deny rule for skel's config dir already present/);
+  assert.equal(fs.readFileSync(settingsPath, "utf-8"), text, "byte-identical on a re-run");
+
+  const un = run("uninstall");
+  assert.match(un, /removed 5 \.skeleton\/ permission deny rule/);
+  assert.match(un, /removed the config-dir permission deny rule/);
+  assert.deepEqual(read(), { permissions: { deny: ["Read(./.env)"] } });
+
+  // The user's own identical rule survives install + uninstall.
+  fs.writeFileSync(settingsPath, JSON.stringify({ permissions: { deny: [rule] } }));
+  assert.match(run("install"), /config dir already present/);
+  assert.doesNotMatch(run("uninstall"), /removed the config-dir/);
+  assert.deepEqual(read(), { permissions: { deny: [rule] } });
+  fs.rmSync(settingsPath);
+});
+
+test("#26: after XDG_CONFIG_HOME changes, install adds the new dir's rule and reports the old one as left in place", () => {
+  const target = tmp("skel-cfgmove-");
+  const xdgA = tmp("skel-xdgA-");
+  const xdgB = tmp("skel-xdgB-");
+  const run = (xdg, ...a) => execFileSync("node", [BIN, ...a, target], { encoding: "utf-8", env: { ...process.env, XDG_CONFIG_HOME: xdg }, stdio: ["ignore", "pipe", "pipe"] });
+  run(xdgA, "install");
+  const ruleA = `Edit(/${ruleSpelling(path.join(xdgA, "skel"))}/**)`;
+  const out = run(xdgB, "install");
+  const ruleB = `Edit(/${ruleSpelling(path.join(xdgB, "skel"))}/**)`;
+  assert.match(out, /added a permission deny rule for skel's config dir/);
+  assert.match(out, /left in place: 1 deny rule\(s\) for a \.\.\.\/skel\/\*\* dir/);
+  assert.ok(out.includes(ruleA), out);
+  const deny = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8")).permissions.deny;
+  assert.ok(deny.includes(ruleA) && deny.includes(ruleB));
+  // Back under the first dir, its ownership record still knows its rules.
+  run(xdgB, "uninstall");
+  run(xdgA, "uninstall");
+  assert.ok(!JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8")).permissions?.deny?.includes(ruleA));
+});
+
+test("#26: the gate asks about edits into skel's config dir from any project, denies in deny mode, and ignores other outside paths", async () => {
+  const { evaluateConfigEdit } = await import("../lib/gate.mjs");
+  const cfg = tmp("skel-cfgdir-");
+  const configDir = path.join(cfg, "skel");
+  fs.mkdirSync(configDir);
+  const base = tmp("skel-cfgproj-");
+  const at = (toolName, file, state = null) => evaluateConfigEdit({ toolName, toolInput: toolName === "NotebookEdit" ? { notebook_path: file } : { file_path: file }, base, state, configDir });
+  const record = path.join(configDir, "abc.snapshot.json");
+  for (const tool of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) {
+    const v = at(tool, record);
+    assert.equal(v?.decision, "ask", tool);
+    assert.match(v.reason, /config dir/);
+  }
+  assert.equal(at("Edit", path.join(configDir, "new", "x.json")).decision, "ask", "a new file too");
+  assert.equal(at("Edit", record.toUpperCase()).decision, "ask", "case-insensitively");
+  assert.equal(at("Write", record, { gate: "deny" }).decision, "deny");
+  assert.equal(at("Edit", path.join(cfg, "skel-other", "x.json")), null, "a sibling isn't the dir");
+  assert.equal(at("Edit", path.join(tmp("skel-elsewhere-"), "x.snapshot.json")), null, "unrelated outside paths: no opinion");
+  assert.equal(at("Edit", path.join(base, "src", "a.ts")), null);
+  assert.equal(at("Read", record), null);
+  if (canSymlink) {
+    // Outside the project, a symlink into the dir is resolved and caught.
+    const outside = path.join(tmp("skel-outlink-"), "sneaky");
+    fs.symlinkSync(configDir, outside, "junction");
+    assert.equal(at("Write", path.join(outside, "abc.snapshot.json"))?.decision, "ask", "through a symlink outside the project");
+    // Inside it, the hook stays textual: install's deny rule covers a symlink's target.
+    fs.symlinkSync(configDir, path.join(base, "sneaky"), "junction");
+    assert.equal(at("Write", path.join("sneaky", "abc.snapshot.json")), null, "left to the deny rule (checked against the link's target)");
+  }
+
+  // An in-project edit never realpaths the edited file for this check: only the config dir is resolved.
+  const resolved = [];
+  const spy = (p) => { resolved.push(p); return p; };
+  const deep = path.join(base, "a", "b", "c", "new", "file.ts");
+  assert.equal(evaluateConfigEdit({ toolName: "Write", toolInput: { file_path: deep }, base, state: null, configDir, resolve: spy }), null);
+  assert.deepEqual(resolved, [configDir], "one resolve, of the config dir");
+  resolved.length = 0;
+  evaluateConfigEdit({ toolName: "Write", toolInput: { file_path: path.join(tmp("skel-elsewhere-"), "x.ts") }, base, state: null, configDir, resolve: spy });
+  assert.equal(resolved.length, 2, "outside the project, the edited path is resolved too");
+
+  // The hook itself, with no skeleton anywhere, and Bash commands that name the dir.
+  const hook = (input) => {
+    const out = execFileSync("node", [BIN, "hook"], { cwd: base, input: JSON.stringify({ cwd: base, ...input }), encoding: "utf-8", env: { ...process.env, XDG_CONFIG_HOME: cfg } });
+    return out ? JSON.parse(out).hookSpecificOutput : null;
+  };
+  assert.equal(hook({ tool_name: "Edit", tool_input: { file_path: record, old_string: "a", new_string: "b" } })?.permissionDecision, "ask");
+  assert.equal(hook({ tool_name: "Edit", tool_input: { file_path: path.join(tmp("skel-elsewhere-"), "x.json"), old_string: "a", new_string: "b" } }), null);
+  for (const command of ["cat ~/.config/skel/abc.snapshot.json", "rm \"$XDG_CONFIG_HOME/skel/abc.json\"", "rm ${XDG_CONFIG_HOME}/skel/x", `echo {} > "${record}"`, `cd ${configDir} && ls`]) {
+    assert.equal(hook({ tool_name: "Bash", tool_input: { command } })?.permissionDecision, "ask", command);
+  }
+  for (const command of ["ls ~/.config/skeleton-tools", "ls ~/.config", "npm test", `ls ${cfg}/skel-other`]) {
+    assert.equal(hook({ tool_name: "Bash", tool_input: { command } }), null, command);
+  }
 });

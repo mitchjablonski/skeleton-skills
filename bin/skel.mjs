@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, toSteps, stripMarkers } from "../lib/markers.mjs";
-import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writeFileAtomic } from "../lib/state.mjs";
+import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, skelConfigDir, writeFileAtomic } from "../lib/state.mjs";
 import { bodyEscapesFence } from "../lib/gate.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
@@ -48,8 +48,8 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
   stop-hook [--block]                Stop hook: reports drift from the approved skeleton during a fill
-  install [projectDir]               install skills, filler subagent, hooks and .skeleton/ deny rules into a
-                                     project's .claude/
+  install [projectDir]               install skills, filler subagent, hooks and deny rules (.skeleton/ state,
+                                     skel's config dir) into a project's .claude/
   uninstall [projectDir]             remove what install added (leaves .skeleton/ and .gitignore alone)
 `;
 
@@ -179,24 +179,51 @@ const LEGACY_DENY_RULES = STATE_PATHS.map((p) => `Edit(/${STATE_DIR}/${p})`);
 const realDir = (target) => fs.realpathSync.native(target);
 
 /**
- * The deny rules for a project, or a reason they can't be written. The rule
- * path is a gitignore pattern: `[ ] * ?` are backslash-escaped so they match
- * literally (`( ) { }` aren't pattern characters and match as they are). A
- * path a rule can't spell (a newline, a literal backslash on POSIX, a Windows
- * path without a drive letter) gets no rules rather than rules that guard
- * something else; install still adds the hook and the skills.
+ * An absolute real path as a rule spells it (`/home/you/proj`, `/c/proj` on
+ * Windows), or a reason it can't be. The rule path is a gitignore pattern:
+ * `[ ] * ?` are backslash-escaped so they match literally (`( ) { }` aren't
+ * pattern characters and match as they are). A path a rule can't spell (a
+ * newline, a literal backslash on POSIX, a Windows path without a drive
+ * letter) gets no rule rather than one that guards something else.
  */
-function denyRules(target) {
-  let real = realDir(target);
+function rulePath(real) {
   if (process.platform === "win32") {
     const m = /^([A-Za-z]):[\\/](.*)$/.exec(real);
-    if (!m) return { rules: [], why: "only drive-letter paths can be written as rules on Windows" };
+    if (!m) return { path: null, why: "only drive-letter paths can be written as rules on Windows" };
     real = `/${m[1].toLowerCase()}/${m[2].split("\\").join("/")}`;
   }
   real = real.replace(/\/+$/, "");
-  if (/[\n\r\\]/.test(real)) return { rules: [], why: "the path contains a newline or a backslash, which a rule can't spell" };
-  const escaped = real.replace(/[[\]*?]/g, (c) => `\\${c}`);
-  return { rules: STATE_PATHS.map((p) => `Edit(/${escaped}/${STATE_DIR}/${p})`), why: null };
+  if (/[\n\r\\]/.test(real)) return { path: null, why: "the path contains a newline or a backslash, which a rule can't spell" };
+  return { path: real.replace(/[[\]*?]/g, (c) => `\\${c}`), why: null };
+}
+
+/** The deny rules for a project's .skeleton/ state, or why there are none (install still adds the hook and the skills). */
+function denyRules(target) {
+  const { path: p, why } = rulePath(realDir(target));
+  return why ? { rules: [], why } : { rules: STATE_PATHS.map((s) => `Edit(/${p}/${STATE_DIR}/${s})`), why: null };
+}
+
+/**
+ * The deny rule for skel's config dir ($XDG_CONFIG_HOME/skel, else
+ * ~/.config/skel), or why there is none. The approved-skeleton records, the
+ * rendered review versions, the serve sessions and the ownership records live
+ * there, outside every project, where the hook's fence doesn't reach and only
+ * Claude Code's outside-the-working-directory prompt (skipped by
+ * bypassPermissions) would otherwise stand in the way. skel writes them from
+ * its own process, which deny rules don't apply to. Resolved now: a later
+ * change of XDG_CONFIG_HOME leaves the rule guarding the old dir.
+ */
+function configDenyRule() {
+  const dir = skelConfigDir();
+  let real;
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    real = realDir(dir);
+  } catch (err) {
+    return { rule: null, why: `can't create or resolve ${dir} (${err.code ?? err.message})` };
+  }
+  const { path: p, why } = rulePath(real);
+  return why ? { rule: null, why } : { rule: `Edit(/${p}/**)`, why: null };
 }
 
 /**
@@ -206,11 +233,20 @@ function denyRules(target) {
  * was lost), never to remove them.
  */
 const SKEL_SHAPED = new RegExp(`^Edit\\((//.*)?/\\.skeleton/(${STATE_PATHS.map((p) => p.replace(/[.*]/g, (c) => `\\${c}`)).join("|")})\\)$`);
+/** The config-dir rule's shape, any dir: `Edit(//<abs>/skel/**)`. Loose (any skel/ dir matches), so only ever reported as "possibly" ours. */
+const CONFIG_SHAPED = /^Edit\(\/\/.*\/skel\/\*\*\)$/;
 function reportLeftInPlace(settings, notOurs) {
-  const left = (settings.permissions?.deny ?? []).filter((r) => typeof r === "string" && SKEL_SHAPED.test(r) && !notOurs.includes(r));
-  if (!left.length) return;
-  console.log(`left in place: ${left.length} ${STATE_DIR}/ deny rule(s) this install didn't add (a moved project's, a lost ownership record's, or your own); remove any you no longer want by hand:`);
-  for (const r of left) console.log(`  ${r}`);
+  const deny = (settings.permissions?.deny ?? []).filter((r) => typeof r === "string" && !notOurs.includes(r));
+  const left = deny.filter((r) => SKEL_SHAPED.test(r));
+  if (left.length) {
+    console.log(`left in place: ${left.length} ${STATE_DIR}/ deny rule(s) this install didn't add (a moved project's, a lost ownership record's, or your own); remove any you no longer want by hand:`);
+    for (const r of left) console.log(`  ${r}`);
+  }
+  const cfg = deny.filter((r) => CONFIG_SHAPED.test(r));
+  if (cfg.length) {
+    console.log(`left in place: ${cfg.length} deny rule(s) for a .../skel/** dir that this install didn't add; possibly skel's config-dir rule from an old XDG_CONFIG_HOME, a moved project or a lost ownership record, or your own. Remove any you no longer want by hand:`);
+    for (const r of cfg) console.log(`  ${r}`);
+  }
 }
 
 /**
@@ -751,7 +787,9 @@ const commands = {
       die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
     }
     const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
-    const { rules, why } = denyRules(target);
+    const { rules: stateRules, why } = denyRules(target);
+    const config = configDenyRule();
+    const rules = [...stateRules, ...(config.rule ? [config.rule] : [])];
     const prevOwned = readOwned(target);
     const stale = [...legacyOwned(settings, prevOwned), ...(prevOwned ?? []).filter((r) => !rules.includes(r))];
     for (const [src, dest] of installedFiles(claudeDir)) {
@@ -810,8 +848,11 @@ const commands = {
     console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
     console.log(stopOurs ? "drift check (Stop) hook updated" : `added drift check (Stop) hook to ${settingsPath}`);
+    const addedState = added.filter((r) => stateRules.includes(r));
     if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
-    else console.log(added.length ? `added ${added.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
+    else console.log(addedState.length ? `added ${addedState.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
+    if (config.why) console.log(`warning: no permission deny rule for skel's config dir: ${config.why}. The hook still asks about edits there`);
+    else console.log(`${added.includes(config.rule) ? "added a permission deny rule for skel's config dir" : "permission deny rule for skel's config dir already present"}: ${config.rule} (it is resolved now: re-run install if you change XDG_CONFIG_HOME)`);
     reportLeftInPlace(settings, rules);
     launchWarning(target);
     console.log(`optional: Claude Code's Bash sandbox can enforce those rules at the OS level; see "Security model" in the README (skel needs "excludedCommands": ["node \\"${SELF}\\" *"])`);
@@ -841,10 +882,12 @@ const commands = {
     }
     if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
     let removed = 0;
+    let removedConfig = 0;
     if (settings.permissions?.deny) {
-      const before = settings.permissions.deny.length;
+      const gone = settings.permissions.deny.filter((r) => owned.includes(r));
       settings.permissions.deny = settings.permissions.deny.filter((r) => !owned.includes(r));
-      removed = before - settings.permissions.deny.length;
+      removedConfig = gone.filter((r) => CONFIG_SHAPED.test(r)).length;
+      removed = gone.length - removedConfig;
       if (!settings.permissions.deny.length) delete settings.permissions.deny;
       if (!Object.keys(settings.permissions).length) delete settings.permissions;
     }
@@ -859,6 +902,7 @@ const commands = {
     fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
     console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook and the drift check (Stop) hook from ${claudeDir}`);
     console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
+    if (removedConfig) console.log(`removed the config-dir permission deny rule install added`);
     reportLeftInPlace(settings, []);
     console.log(`left in place: ${STATE_DIR}/ (delete it once you're done with it) and the ${STATE_DIR}/ line in .gitignore`);
   },
