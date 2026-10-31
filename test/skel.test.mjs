@@ -2503,32 +2503,48 @@ test("#32: a live skel serve poll stops serving a known file swapped for a link 
   for (const f of all) assert.doesNotMatch(fs.readFileSync(f, "utf-8"), new RegExp(OUTSIDE), f);
 });
 
-test("#32: scanFiles skips a FIFO, a dangling link and a directory, and re-checks a cached file whose identity changed", { skip: process.platform === "win32" && "no FIFOs on Windows" }, () => {
+test("#32: scanFiles skips FIFOs, dangling links and directories, follows in-project links, and re-checks a cached file whose identity changed", () => {
+  const win = process.platform === "win32";
+  const dirLink = (target, at) => fs.symlinkSync(target, at, win ? "junction" : "dir");
   const dir = tmp();
-  const a = path.join(dir, "a.ts");
+  fs.mkdirSync(path.join(dir, "sub", "deep", "er"), { recursive: true });
+  const a = path.join(dir, "sub", "a.ts");
   fs.writeFileSync(a, fencedSrc(1));
-  const fifo = path.join(dir, "pipe.ts");
-  execFileSync("mkfifo", [fifo]);
-  const dangling = path.join(dir, "gone.ts");
-  fs.symlinkSync(path.join(dir, "nowhere.ts"), dangling);
+  const deep = path.join(dir, "sub", "deep", "er", "d.ts");
+  fs.writeFileSync(deep, fencedSrc(4));
   fs.mkdirSync(path.join(dir, "folder.ts"));
-  // A link to a file inside the project is still read.
+  // Links that stay inside the project are still read: a folder link (a
+  // junction on Windows) and, where permitted, a file link.
   fs.mkdirSync(path.join(dir, "real"));
   fs.writeFileSync(path.join(dir, "real", "b.ts"), fencedSrc(2));
-  const alias = path.join(dir, "alias.ts");
-  fs.symlinkSync(path.join(dir, "real", "b.ts"), alias);
+  dirLink(path.join(dir, "real"), path.join(dir, "aliasdir"));
+  const paths = [a, deep, path.join(dir, "folder.ts"), path.join(dir, "aliasdir", "b.ts")];
+  const expect = ["sub/a.ts", "sub/deep/er/d.ts", "aliasdir/b.ts"];
+  if (!win) {
+    const fifo = path.join(dir, "pipe.ts");
+    execFileSync("mkfifo", [fifo]);
+    paths.push(fifo);
+  }
+  if (canSymlink) {
+    fs.symlinkSync(path.join(dir, "nowhere.ts"), path.join(dir, "gone.ts"));
+    fs.symlinkSync(path.join(dir, "real", "b.ts"), path.join(dir, "alias.ts"));
+    paths.push(path.join(dir, "gone.ts"), path.join(dir, "alias.ts"));
+    expect.push("alias.ts");
+  }
   const cache = new Map();
-  const scan = () => scanFiles(dir, [a, fifo, dangling, path.join(dir, "folder.ts"), alias], cache);
-  assert.deepEqual(scan().files, ["a.ts", "alias.ts"], "returns without blocking on the FIFO");
-  fs.rmSync(alias);
-  // Swap a.ts for a link to an outside file with the same size: the cache must not vouch for it.
+  const scan = () => scanFiles(dir, paths, cache);
+  assert.deepEqual(scan().files, expect, "returns without blocking on the FIFO");
+  // Swap sub/ for a link to an outside folder whose a.ts has the same size and
+  // mtime: the cache must not vouch for it.
   const ext = tmp("skel-ext-");
   const out = path.join(ext, "a.ts");
   fs.writeFileSync(out, fencedSrc(1).replace("step 1", "XXXX 1"));
   const st = fs.statSync(a);
   fs.utimesSync(out, st.atime, st.mtime);
-  fs.rmSync(a);
-  fs.symlinkSync(out, a);
-  assert.deepEqual(scan(), { fences: [], errors: [], files: [], errored: [] });
+  fs.rmSync(path.join(dir, "sub"), { recursive: true });
+  dirLink(ext, path.join(dir, "sub"));
+  const after = scan();
+  assert.deepEqual(after.files, expect.filter((f) => !f.startsWith("sub/")));
+  assert.doesNotMatch(JSON.stringify(after), /XXXX/);
   assert.equal(cache.has(a), false);
 });
