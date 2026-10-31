@@ -42,7 +42,7 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   reshape                            back to skeleton review (inside Claude Code the hook asks the human first)
   finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
-  install [projectDir]               install skills + hook into a project's .claude/
+  install [projectDir]               install skills, filler subagent + hook into a project's .claude/
 `;
 
 function die(msg) {
@@ -485,7 +485,16 @@ const commands = {
     }
     const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
     const settingsPath = path.join(claudeDir, "settings.local.json");
-    for (const p of [claudeDir, settingsPath, path.join(target, ".gitignore")]) {
+    const skills = ["skeleton", "skeleton-fill"].map((name) => [
+      path.join(PKG_ROOT, "skills", name, "SKILL.md"), path.join(claudeDir, "skills", name, "SKILL.md"),
+    ]);
+    // The fill skill delegates each step's edits to this subagent (Read, Grep,
+    // Glob, Edit, MultiEdit only: no shell, no Write).
+    const agent = [path.join(PKG_ROOT, "agents", "skeleton-filler.md"), path.join(claudeDir, "agents", "skeleton-filler.md")];
+    // A symlinked folder would aim our writes outside the project, and a
+    // symlinked file may be someone's live checkout: refuse both.
+    const dests = [...skills, agent].flatMap(([, dest]) => [path.dirname(path.dirname(dest)), path.dirname(dest), dest]);
+    for (const p of new Set([claudeDir, ...dests, settingsPath, path.join(target, ".gitignore")])) {
       if (isLink(p)) die(`${p} is a symlink; refusing to write through it`);
     }
     let settings = {};
@@ -496,9 +505,7 @@ const commands = {
         die(`${settingsPath} isn't valid JSON; fix it first (overwriting it would drop your settings)`);
       }
     }
-    for (const name of ["skeleton", "skeleton-fill"]) {
-      const src = path.join(PKG_ROOT, "skills", name, "SKILL.md");
-      const dest = path.join(claudeDir, "skills", name, "SKILL.md");
+    for (const [src, dest] of [...skills, agent]) {
       writeFileAtomic(dest, fs.readFileSync(src, "utf-8").replaceAll("{{SKEL}}", `node "${SELF}"`));
     }
     const command = `node "${HOOK}"`;
@@ -520,6 +527,7 @@ const commands = {
     const giText = fs.existsSync(gi) ? fs.readFileSync(gi, "utf-8") : "";
     if (!/^\/?\.skeleton\/?$/m.test(giText)) fs.appendFileSync(gi, `${giText && !giText.endsWith("\n") ? "\n" : ""}.skeleton/\n`);
     console.log(`installed /skeleton and /skeleton-fill into ${claudeDir}/skills`);
+    console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
   },
 };
