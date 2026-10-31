@@ -1742,6 +1742,111 @@ test("#16 on #11's install flow: uninstall removes the Stop hook (with or withou
   assert.deepEqual(fresh.read(), {});
 });
 
+// ---- issue #23 / #25 item 4: skipped-dir edges, missing-path wording ----
+
+/** Does the temp dir's filesystem fold case (macOS, Windows, WSL's /mnt/c)? */
+const foldsCase = (() => {
+  const d = mkTemp("skel-case-");
+  fs.mkdirSync(path.join(d, "lower"));
+  return fs.existsSync(path.join(d, "LOWER"));
+})();
+
+test("issue #23 F2: a case variant of a skipped dir is skipped on a case-folding filesystem (gate agrees with the scan)", { skip: !foldsCase && "the temp dir's filesystem is case-sensitive" }, () => {
+  const { dir, run, hook } = project();
+  run("install", dir);
+  run("init", "T");
+  run("approve");
+  assert.match(run("status"), /0\/2 filled/, "the scan skips .claude/");
+  const askOf = (input) => { const out = hook(input); return out ? JSON.parse(out).hookSpecificOutput : null; };
+  const edit = (spelling) => ({ tool_name: "Edit", tool_input: { file_path: path.join(dir, spelling, "skills", "skeleton", "SKILL.md"), old_string: 'throw new Error("SKEL_TODO");', new_string: "return 1;" } });
+  for (const spelling of [".Claude", ".CLAUDE"]) {
+    assert.equal(askOf(edit(spelling)), null, `${spelling}: between steps, the docs aren't part of the skeleton`);
+  }
+  run("start", "2");
+  for (const spelling of [".Claude", ".CLAUDE"]) {
+    const v = askOf(edit(spelling));
+    assert.equal(v?.permissionDecision, "ask", spelling);
+    assert.match(v.permissionDecisionReason, /outside the skeleton/, spelling);
+    assert.match(v.permissionDecisionReason, /\.claude\/skills/, `${spelling}: named by its on-disk spelling`);
+  }
+});
+
+test("issue #23 F2: a real Build/ dir is code to the scan and the gate (no blind lowercasing)", () => {
+  const { dir, run, hook } = project();
+  const b = path.join(dir, "Build", "b.ts");
+  fs.mkdirSync(path.dirname(b));
+  fs.writeFileSync(b, 'export function b() {\n  // SKEL[3] build the thing\n  throw new Error("SKEL_TODO");\n  // /SKEL[3]\n}\n');
+  run("init", "T");
+  assert.match(run("status"), /0\/3 filled/, "the scan counts Build/'s fence");
+  run("approve");
+  run("start", "3");
+  const out = hook({ tool_name: "Edit", tool_input: { file_path: b, old_string: 'throw new Error("SKEL_TODO");', new_string: "return 3;" } });
+  assert.equal(out, "", "filling step 3 in Build/ is allowed");
+  // Where the filesystem folds case, `build/b.ts` is the same file: still a fill, not "outside".
+  if (fs.existsSync(path.join(dir, "build", "b.ts"))) {
+    const lower = hook({ tool_name: "Edit", tool_input: { file_path: path.join(dir, "build", "b.ts"), old_string: 'throw new Error("SKEL_TODO");', new_string: "return 3;" } });
+    assert.equal(lower, "", "filling via build/b.ts on a case-folding filesystem is allowed");
+  }
+});
+
+test("issue #23 N-a: a tracked file under a skipped dir is context only: its fences are never steps, for the scan, the page or the gate", () => {
+  const { dir, run, hook } = project();
+  const t = path.join(dir, "build", "gen", "t.ts");
+  fs.mkdirSync(path.dirname(t), { recursive: true });
+  fs.writeFileSync(t, 'export function t() {\n  // SKEL[1] generated twin of step 1\n  throw new Error("SKEL_TODO");\n  // /SKEL[1]\n}\n');
+  run("init", "T");
+  run("track", "build/gen/t.ts");
+  run("approve");
+  const state = stateOf(dir);
+  assert.deepEqual(scanSkeleton(dir, state).files, ["src/a.ts"], "the scan ignores its fences");
+  assert.deepEqual(buildReviewData(dir, state).files.find((f) => f.path === "build/gen/t.ts")?.fences, [], "the page shows it as context");
+  const askOf = (input) => { const out = hook(input); return out ? JSON.parse(out).hookSpecificOutput : null; };
+  const fillIt = { tool_name: "Edit", tool_input: { file_path: t, old_string: 'throw new Error("SKEL_TODO");', new_string: "return 1;" } };
+  assert.match(askOf(fillIt)?.permissionDecisionReason ?? "", /no step is active/, "between steps it's recorded skeleton context: asks");
+  run("start", "1");
+  const v = askOf(fillIt);
+  assert.equal(v?.permissionDecision, "ask", "filling its fence is not filling step 1");
+  assert.match(v.permissionDecisionReason, /outside the skeleton/);
+  assert.match(v.permissionDecisionReason, /its fences aren't steps/);
+});
+
+test("issue #25 (4): a missing path is a new file only for Write or an empty old_string; an unreadable file says so", () => {
+  const { dir, run, hook } = project();
+  run("init", "T");
+  run("approve");
+  const askOf = (tool_name, tool_input) => { const out = hook({ tool_name, tool_input }); return out ? JSON.parse(out).hookSpecificOutput : null; };
+  const typo = path.join(dir, "src", "aa.ts");
+  const odd = path.join(dir, "src", "dir.ts");
+  fs.mkdirSync(odd); // exists, but can't be read as a file
+  for (const phase of ["between", "during"]) {
+    if (phase === "during") run("next");
+    assert.equal(askOf("Edit", { file_path: typo, old_string: "x", new_string: "y" }), null, `${phase}: a typo'd Edit is left to fail`);
+    assert.equal(askOf("MultiEdit", { file_path: typo, edits: [{ old_string: "x", new_string: "y" }, { old_string: "", new_string: "z" }] }), null, `${phase}: MultiEdit looks at its first edit`);
+    for (const [tool, input] of [["Write", { file_path: typo, content: "x" }], ["Edit", { file_path: typo, old_string: "", new_string: "x" }]]) {
+      assert.match(askOf(tool, input)?.permissionDecisionReason ?? "", /creates a new file/, `${phase}: ${tool}`);
+    }
+    const v = askOf("Edit", { file_path: odd, old_string: "x", new_string: "y" });
+    assert.equal(v?.permissionDecision, "ask", phase);
+    assert.match(v.permissionDecisionReason, /can't read src\/dir\.ts/, phase);
+    assert.doesNotMatch(v.permissionDecisionReason, /new file/, phase);
+    if (process.platform !== "win32" && process.getuid?.() !== 0) {
+      const locked = path.join(dir, "src", "locked.ts");
+      fs.writeFileSync(locked, "x\n");
+      fs.chmodSync(locked, 0);
+      try {
+        // A filesystem that ignores modes (WSL's /mnt/c) can still read it: then the gate checks it as usual.
+        let readable = true;
+        try { fs.readFileSync(locked); } catch { readable = false; }
+        const w = askOf("Edit", { file_path: locked, old_string: "x", new_string: "y" });
+        if (!readable) assert.match(w?.permissionDecisionReason ?? "", /can't read src\/locked\.ts/, `${phase}: EACCES`);
+      } finally {
+        fs.chmodSync(locked, 0o644);
+        fs.rmSync(locked);
+      }
+    }
+  }
+});
+
 test("read-only feedback wait returns immediately, drains pending sends, and stops", async () => {
   const { dir, run } = project();
   run("init", "T");
