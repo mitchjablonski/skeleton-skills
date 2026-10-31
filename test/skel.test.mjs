@@ -1066,3 +1066,97 @@ test("Edit or MultiEdit with an empty old_string creates a file: asks during a s
     }
   }
 });
+
+// ---- PR #10 review nits (after the main merge) ----
+
+const pageData = (html) => JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<"));
+
+test("review #10 nit 1: a tracked file the scan excludes never becomes a step after approval (CLI and page)", async () => {
+  const { dir, run } = project();
+  execFileSync("git", ["init", "-q", dir]);
+  fs.writeFileSync(path.join(dir, ".gitignore"), "n.ts\n");
+  fs.writeFileSync(path.join(dir, "n.ts"), 'export function g() {\n  // SKEL[g] ignored helper\n  throw new Error("SKEL_TODO");\n  // /SKEL[g]\n}\n');
+  run("init", "T");
+  run("track", "n.ts");
+  assert.match(run("status"), /0\/2 filled/, "the scan excludes the gitignored file");
+  assert.match(run("approve"), /skeleton approved: 2 steps/);
+  const snap = readSnapshot(dir);
+  assert.deepEqual(snap.fenced, ["src/a.ts"], "the record lists the approve-time fenced files");
+  assert.ok(snap.files["n.ts"], "the tracked file is still recorded whole");
+  assert.ok(snap.fences.some((f) => f.file === "n.ts"), "its fences are in the exterior record");
+  const status = run("status");
+  assert.match(status, /0\/2 filled/, "still the approve-time step count");
+  assert.doesNotMatch(status, /\bg\b.*ignored helper/);
+  const state = stateOf(dir);
+  assert.equal(toSteps(scanSkeleton(dir, state).fences).length, 2);
+  assert.equal(buildReviewData(dir, state).steps.length, 2);
+  const srv = await serve(dir);
+  try {
+    assert.deepEqual(pageData(srv.html).steps.map((s) => s.id), ["1", "2"], "the live page agrees");
+  } finally {
+    await srv.stop();
+  }
+});
+
+test("review #10 nit 1: readSnapshot accepts only a string array for `fenced`", () => {
+  const { dir, run } = project();
+  run("init", "T");
+  run("approve");
+  const good = JSON.parse(fs.readFileSync(snapshotPath(dir), "utf-8"));
+  for (const fenced of ["src/a.ts", [1], [null], {}]) {
+    fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...good, fenced }));
+    assert.equal(readSnapshot(dir), null, JSON.stringify(fenced));
+  }
+  const { fenced, ...without } = good;
+  fs.writeFileSync(snapshotPath(dir), JSON.stringify(without));
+  assert.ok(readSnapshot(dir), "the field is optional");
+});
+
+test("review #10 nit 2: buildReviewData with and without `known` agree for a tracked .claude/ doc", async () => {
+  const { dir, a, run } = project();
+  const doc = path.join(dir, ".claude", "skills", "x", "SKILL.md");
+  fs.mkdirSync(path.dirname(doc), { recursive: true });
+  fs.writeFileSync(doc, '# x\n\n```ts\n// SKEL[ex] example\nthrow new Error("SKEL_TODO");\n// /SKEL[ex]\n```\n');
+  run("init", "T");
+  run("track", ".claude/skills/x/SKILL.md");
+  const ids = (d) => d.steps.map((s) => s.id);
+  for (const phase of ["scaffold", "fill"]) {
+    if (phase === "fill") run("approve");
+    const state = stateOf(dir);
+    const plain = buildReviewData(dir, state, new Map());
+    const polled = buildReviewData(dir, state, new Map(), [a, doc]);
+    assert.deepEqual(ids(plain), ["1", "2"], phase);
+    assert.deepEqual(ids(polled), ids(plain), `${phase}: the poll agrees with the search`);
+    assert.ok(polled.files.some((f) => f.path === ".claude/skills/x/SKILL.md" && f.fences.length === 0), `${phase}: the doc is shown as context`);
+  }
+  const srv = await serve(dir);
+  try {
+    assert.deepEqual(ids(pageData(srv.html)), ["1", "2"]);
+    assert.deepEqual(ids(pageData(await (await fetch(srv.url)).text())), ["1", "2"], "and on a poll");
+  } finally {
+    await srv.stop();
+  }
+});
+
+test("review #10 nit 3: approve tells an unwritable config dir apart from marker errors", () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const asFile = path.join(tmp(), "not-a-dir");
+  fs.writeFileSync(asFile, "");
+  const cases = [asFile];
+  // A read-only dir only blocks a non-root user on POSIX.
+  if (process.platform !== "win32" && process.getuid?.() !== 0) {
+    const ro = tmp();
+    fs.mkdirSync(path.join(ro, "skel"));
+    fs.chmodSync(path.join(ro, "skel"), 0o500);
+    cases.push(ro);
+  }
+  for (const cfg of cases) {
+    const err = failure(() => execFileSync("node", [BIN, "approve"], { cwd: dir, env: { ...process.env, XDG_CONFIG_HOME: cfg }, encoding: "utf-8", stdio: "pipe" }));
+    assert.match(err, /couldn't record the approved skeleton: .*(ENOTDIR|EEXIST|EACCES|EPERM)/, cfg);
+    assert.doesNotMatch(err, /fix marker errors/);
+    assert.doesNotMatch(err, /\n\s+at /, "no stack trace");
+    assert.match(run("status"), /phase: scaffold/, "not approved");
+  }
+  for (const cfg of cases.slice(1)) fs.chmodSync(path.join(cfg, "skel"), 0o700);
+});

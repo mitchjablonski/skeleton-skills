@@ -253,9 +253,13 @@ const commands = {
     setInterval(() => { if (Date.now() - lastPoll < 60_000) refresh(); }, 30_000).unref();
     const current = () => {
       const state = readState(root);
-      const tracked = (state.files ?? []).map((f) => path.join(root, String(f)));
-      const data = buildReviewData(root, state, cache, [...new Set([...known, ...tracked])]);
-      known = [...new Set([...known, ...data.files.map((f) => path.join(root, f.path))])];
+      // Tracked files aren't polled for fences: the CLI's search doesn't see
+      // the ones it excludes (gitignored, under .claude/), so neither does the
+      // page. buildReviewData reads their text itself. Keep watching files
+      // that have fences or malformed markers until the next search.
+      const data = buildReviewData(root, state, cache, known);
+      const watched = [...data.steps.flatMap((st) => st.locations.map((l) => l.file)), ...data.errored];
+      known = [...new Set([...known, ...watched.map((f) => path.join(root, f))])];
       const { generatedAt, errored, ...stable } = data;
       return { data, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
     };
@@ -371,7 +375,8 @@ const commands = {
     try {
       writeSnapshot(root, next, files);
     } catch (err) {
-      die(`fix marker errors first:\n  ${err.message}`);
+      if (err.code === "SKEL_MARKERS") die(`fix marker errors first:\n  ${err.message}`);
+      die(`couldn't record the approved skeleton: ${err.message}`);
     }
     writeState(root, next);
     console.log(`skeleton approved: ${steps.length} steps. Run \`skel next\` to start filling.`);
