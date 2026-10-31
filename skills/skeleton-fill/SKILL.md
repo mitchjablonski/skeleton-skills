@@ -52,6 +52,8 @@ Don't write fence code yourself in the main conversation. The point of the hop i
 
 Between steps (after `done`, before the next `start`), edits to the skeleton's files ask the human too: there is no active fence for them to land in.
 
+At the end of each of your turns, a Stop hook checks the skeleton against the approved version and shows the human any drift. If it reports drift (or sends you back with it), treat it like a failed `skel done`: put the lines back, or stop and propose the change.
+
 ## When the skeleton is wrong
 
 Sometimes a step needs something the skeleton doesn't have (you spot it, or the filler comes back `blocked`): a new helper, a changed signature, another file, a parameter. **Don't work around the fence.** Stop and propose the change: what, where, and why, in a few lines. Reopening the skeleton is the human's call. Once they agree (in chat, or with **Reopen skeleton** in the review page):
@@ -63,6 +65,8 @@ skel reshape     # back to skeleton review; Claude Code asks them to allow it
 Make the structural edit yourself, since this is skeleton work, not a fill (new code gets its own fence and id), let the live review reload (or regenerate static review with `skel review`), and get approval again before `skel approve` and `skel next`.
 
 If the hook refuses an edit (yours or the filler's), don't retry it in another form or with a shell command. The refusal means "this is a skeleton change." The same goes for `.skeleton/`: never edit the tool's state to get past the gate.
+
+When you re-approve, `skel approve` checks that the human reviewed the reshaped version: pass `--reviewed <v>` from the `Reviewed skeleton version:` line of the feedback they paste (see `/skeleton`).
 
 ## When every step is filled
 

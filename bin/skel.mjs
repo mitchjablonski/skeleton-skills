@@ -14,16 +14,19 @@ import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writ
 import { bodyEscapesFence } from "../lib/gate.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
-  cleanFeedback, feedbackMarkdown, mergeRecords, newServeSession,
+  cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
   addSession, clearSessions, configPath, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
   sessionStorePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
-import { clearSnapshot, formatDrift, scanSkeleton, verifySnapshot, writeSnapshot } from "../lib/snapshot.mjs";
+import {
+  clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
+} from "../lib/snapshot.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Forward slashes on every platform: these land in shell commands and skill text.
 const SELF = path.join(PKG_ROOT, "bin", "skel.mjs").split(path.sep).join("/");
 const HOOK = path.join(PKG_ROOT, "bin", "skel-hook.mjs").split(path.sep).join("/");
+const STOP_HOOK = path.join(PKG_ROOT, "bin", "skel-stop.mjs").split(path.sep).join("/");
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
@@ -34,7 +37,8 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   review                             write .skeleton/review.html (static; copy feedback by hand)
   serve [--port N] [--send] [--stop] serve live read-only; --send enables feedback
   feedback [--wait SECONDS]          print (and archive) the human's latest feedback (waits up to 110s)
-  approve                            enter the fill phase (inside Claude Code the hook asks the human first)
+  approve [--reviewed VERSION]       enter the fill phase (inside Claude Code the hook asks the human first);
+                                     refuses if the version the human last reviewed isn't the current one
   next                               start the first pending step and print its fences
   start <id> [--force]               start a specific step (--force abandons an unfinished active step,
                                      or reopens a filled one for rework)
@@ -43,7 +47,8 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   reshape                            back to skeleton review (inside Claude Code the hook asks the human first)
   finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
-  install [projectDir]               install skills, filler subagent, hook and .skeleton/ deny rules into a
+  stop-hook [--block]                Stop hook: reports drift from the approved skeleton during a fill
+  install [projectDir]               install skills, filler subagent, hooks and .skeleton/ deny rules into a
                                      project's .claude/
   uninstall [projectDir]             remove what install added (leaves .skeleton/ and .gitignore alone)
 `;
@@ -76,6 +81,16 @@ function snapshot(root, state = readState(root)) {
 function requireNoDrift(root, state, fencedFiles, what) {
   const drift = verifySnapshot(root, state, fencedFiles);
   if (!drift.ok) die(`can't ${what}: ${formatDrift(drift)}`);
+}
+
+/** Why approve refuses a stale review: what changed since the version the human saw. */
+function staleReview(root, state, files, reviewed, now) {
+  const head = `can't approve: the human reviewed skeleton version ${reviewed}, but it is now ${now}.`;
+  const tail = `Ask the human to look at the review page again (a live page reloads by itself; regenerate a static one with \`skel review\`): it shows version ${now}. Approve with the version from the feedback they copy and paste (\`--reviewed\`), or after their next send in Send mode. Don't pass a version they haven't seen.`;
+  const seen = readRendered(root).find((r) => r.version === reviewed);
+  if (!seen) return `${head}\nVersion ${reviewed} isn't one this project's review page rendered recently, so there is no diff to show.\n${tail}`;
+  const diff = compareWith(seen, root, state, files);
+  return `${head}\n${formatDrift(diff, 8, { header: "Changed since that version (outside the fence bodies):", footer: tail })}`;
 }
 
 function printFences(step) {
@@ -257,6 +272,11 @@ function legacyOwned(settings, owned) {
   return hooked && LEGACY_DENY_RULES.every((r) => deny.includes(r)) ? LEGACY_DENY_RULES : [];
 }
 
+/** Our Stop hook (bin/skel-stop.mjs, or `skel.mjs stop-hook`), with any flags after it, else null. */
+const skelStopHook = (cmd) => {
+  const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?: --block)?)$/.exec(cmd);
+  return m ? { flags: m[1] } : null;
+};
 /** The scope-gate hook command from any skel checkout (current or legacy form). */
 const isSkelHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](skel-hook\.mjs"|skel\.mjs" hook)$/.test(cmd);
 
@@ -295,6 +315,7 @@ function openProjectSettings(dir, { forInstall = false } = {}) {
     : settings.permissions?.deny !== undefined && !Array.isArray(settings.permissions.deny) ? '"permissions.deny"'
     : settings.hooks !== undefined && !isObj(settings.hooks) ? '"hooks"'
     : settings.hooks?.PreToolUse !== undefined && !Array.isArray(settings.hooks.PreToolUse) ? '"hooks.PreToolUse"'
+    : settings.hooks?.Stop !== undefined && !Array.isArray(settings.hooks.Stop) ? '"hooks.Stop"'
     : null;
   if (bad) die(`${settingsPath}: ${bad} isn't shaped the way Claude Code expects; fix it first (we won't overwrite it)`);
   return { target, claudeDir, settingsPath, settings };
@@ -326,6 +347,7 @@ const commands = {
     try {
       clearSessions(root);
       clearSnapshot(root);
+      clearRendered(root);
     } catch (err) {
       console.error(`skel: warning: couldn't clear the previous skeleton's review sessions and approval record in ${path.dirname(sessionStorePath(root))} (${err.code ?? err.message})`);
     }
@@ -437,11 +459,11 @@ const commands = {
       // the ones it excludes (gitignored, under .claude/), so neither does the
       // page. buildReviewData reads their text itself. Keep watching files
       // that have fences or malformed markers until the next search.
-      const data = buildReviewData(root, state, cache, known);
+      const { record, ...data } = buildReviewData(root, state, cache, known);
       const watched = [...data.steps.flatMap((st) => st.locations.map((l) => l.file)), ...data.errored];
       known = [...new Set([...known, ...watched.map((f) => path.join(root, f))])];
       const { generatedAt, errored, ...stable } = data;
-      return { data, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
+      return { data, record, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
     };
     const superseded = () => readServe(root)?.serverId !== serverId;
     let origin = "";
@@ -457,7 +479,10 @@ const commands = {
           lastPoll = Date.now();
           // Serve what we know now; the page's polls pick up the search's result.
           if (Date.now() - lastSearch > 5_000) refresh();
-          const { data, version } = current();
+          const { data, record, version } = current();
+          // Remember what the human was shown, so `skel approve` can diff
+          // against the version they reviewed.
+          noteRendered(root, record);
           res.writeHead(200, {
             "content-type": "text/html; charset=utf-8",
             "cache-control": "no-store",
@@ -485,8 +510,14 @@ const commands = {
           req.on("data", (c) => { body += c; if (body.length > 2_000_000) req.destroy(); });
           req.on("end", () => {
             try {
-              storeFeedback(root, session, cleanFeedback(JSON.parse(body)));
-              res.writeHead(204).end();
+              const fb = cleanFeedback(JSON.parse(body));
+              const now = current().data.skeletonVersion;
+              storeFeedback(root, session, fb, now);
+              // A page that was already out of date is told so (the notes are
+              // still delivered, marked stale).
+              if (fb.version && fb.version !== now) {
+                res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ stale: true, reviewed: fb.version, current: now }));
+              } else res.writeHead(204).end();
             } catch {
               res.writeHead(400).end("bad feedback payload");
             }
@@ -547,6 +578,8 @@ const commands = {
   },
 
   approve(args) {
+    const given = flag(args, "reviewed", null);
+    if (given !== null && !isVersion(given)) die('--reviewed takes the 12-character version the human reviewed (the "Reviewed skeleton version: …" line of their feedback)');
     const root = requireRoot();
     const state = readState(root);
     if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
@@ -554,17 +587,33 @@ const commands = {
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     if (!steps.length) die("no SKEL[...] fences found — nothing to approve");
     // The human's say-so is Claude Code's permission prompt: the hook always
-    // asks before an agent runs `skel approve` (see evaluateBash). What they
-    // approved is recorded, so done/finalize can check the fill against it.
-    const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
+    // asks before an agent runs `skel approve` (see evaluateBash). This checks
+    // freshness, not authority: that what is approved is the version the human
+    // last reviewed, so an edit made after their "looks good" can't ride along.
+    // A tracked file's malformed markers throw SKEL_MARKERS; anything else is I/O.
+    let record;
     try {
-      writeSnapshot(root, next, files);
+      record = recordSkeleton(root, state, files, undefined, { strict: true });
     } catch (err) {
       if (err.code === "SKEL_MARKERS") die(`fix marker errors first:\n  ${err.message}`);
+      die(`couldn't read the skeleton to record it: ${err.message}`);
+    }
+    console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
+    const { record: last, unread } = lastReview(root, state.reviewEpoch);
+    if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
+    // What the human reviewed: the version named in the feedback the agent
+    // was given (copied markdown → --reviewed), else the page's latest send.
+    const reviewed = given ?? last?.version ?? null;
+    if (reviewed && reviewed !== record.version) die(staleReview(root, state, files, reviewed, record.version));
+    if (!reviewed) console.log("note: no reviewed version given (pass --reviewed <v> from the \"Reviewed skeleton version\" line of the feedback the human pasted) and no send on record this round. Approving on the human's word alone.");
+    const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
+    try {
+      writeSnapshot(root, next, files, record, reviewed ? { version: reviewed, source: given ? "reviewed-flag" : "review-page", at: given ? null : last.at } : null);
+    } catch (err) {
       die(`couldn't record the approved skeleton: ${err.message}`);
     }
     writeState(root, next);
-    console.log(`skeleton approved: ${steps.length} steps. Run \`skel next\` to start filling.`);
+    console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${reviewed ? " (the version the human reviewed)" : ""}. Run \`skel next\` to start filling.`);
   },
 
   next() {
@@ -669,6 +718,11 @@ const commands = {
     await runHook();
   },
 
+  async "stop-hook"(args) {
+    const { BLOCK_ON_DRIFT, runStopHook } = await import("../lib/stop.mjs");
+    await runStopHook({ block: BLOCK_ON_DRIFT || args.includes("--block") });
+  },
+
   install([dir = process.cwd()]) {
     // The hook command runs through a shell: refuse an install path that a
     // shell would interpret rather than quote it and hope. Windows paths are
@@ -695,6 +749,19 @@ const commands = {
     } else {
       settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
     }
+    // The Stop hook checks for drift at the end of every turn during a fill.
+    // Found by its script, so a moved clone is updated in place and a
+    // `--block` someone added survives a reinstall.
+    const stopCommand = `node "${STOP_HOOK}"`;
+    settings.hooks.Stop ??= [];
+    let stopOurs = false;
+    for (const m of settings.hooks.Stop) {
+      for (const hk of Array.isArray(m?.hooks) ? m.hooks : []) {
+        const found = skelStopHook(hk?.command);
+        if (found) { stopOurs = true; hk.command = stopCommand + found.flags; }
+      }
+    }
+    if (!stopOurs) settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand }] });
     settings.permissions ??= {};
     settings.permissions.deny = (settings.permissions.deny ?? []).filter((r) => !stale.includes(r));
     const added = rules.filter((r) => !settings.permissions.deny.includes(r));
@@ -712,6 +779,7 @@ const commands = {
     console.log(`installed /skeleton and /skeleton-fill into ${claudeDir}/skills`);
     console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
+    console.log(stopOurs ? "drift check (Stop) hook updated" : `added drift check (Stop) hook to ${settingsPath}`);
     if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
     else console.log(added.length ? `added ${added.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
     reportLeftInPlace(settings, rules);
@@ -728,8 +796,15 @@ const commands = {
     if (settings.hooks?.PreToolUse) {
       settings.hooks.PreToolUse = groups.filter((m) => !Array.isArray(m?.hooks) || m.hooks.length);
       if (!settings.hooks.PreToolUse.length) delete settings.hooks.PreToolUse;
-      if (!Object.keys(settings.hooks).length) delete settings.hooks;
     }
+    // The drift check (Stop) hook, with or without --block.
+    const stops = settings.hooks?.Stop ?? [];
+    for (const m of stops) if (Array.isArray(m?.hooks)) m.hooks = m.hooks.filter((hk) => !skelStopHook(hk?.command));
+    if (settings.hooks?.Stop) {
+      settings.hooks.Stop = stops.filter((m) => !Array.isArray(m?.hooks) || m.hooks.length);
+      if (!settings.hooks.Stop.length) delete settings.hooks.Stop;
+    }
+    if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
     let removed = 0;
     if (settings.permissions?.deny) {
       const before = settings.permissions.deny.length;
@@ -747,7 +822,7 @@ const commands = {
     }
     // The agents folder may hold the user's own subagents: leave it.
     fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
-    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent and the scope gate hook from ${claudeDir}`);
+    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook and the drift check (Stop) hook from ${claudeDir}`);
     console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
     reportLeftInPlace(settings, []);
     console.log(`left in place: ${STATE_DIR}/ (delete it once you're done with it) and the ${STATE_DIR}/ line in .gitignore`);
