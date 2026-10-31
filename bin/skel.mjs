@@ -24,6 +24,7 @@ const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 // Forward slashes on every platform: these land in shell commands and skill text.
 const SELF = path.join(PKG_ROOT, "bin", "skel.mjs").split(path.sep).join("/");
 const HOOK = path.join(PKG_ROOT, "bin", "skel-hook.mjs").split(path.sep).join("/");
+const STOP_HOOK = path.join(PKG_ROOT, "bin", "skel-stop.mjs").split(path.sep).join("/");
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
@@ -44,6 +45,7 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   reshape                            back to skeleton review (inside Claude Code the hook asks the human first)
   finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
+  stop-hook [--block]                Stop hook: reports drift from the approved skeleton during a fill
   install [projectDir]               install skills + hook into a project's .claude/
 `;
 
@@ -464,6 +466,11 @@ const commands = {
     await runHook();
   },
 
+  async "stop-hook"(args) {
+    const { BLOCK_ON_DRIFT, runStopHook } = await import("../lib/stop.mjs");
+    await runStopHook({ block: BLOCK_ON_DRIFT || args.includes("--block") });
+  },
+
   install([dir = process.cwd()]) {
     const target = path.resolve(dir);
     const claudeDir = path.join(target, ".claude");
@@ -504,6 +511,13 @@ const commands = {
     } else {
       settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
     }
+    // The Stop hook checks for drift at the end of every turn during a fill.
+    // Matched by its script, so a `--block` someone added survives a reinstall.
+    const stopCommand = `node "${STOP_HOOK}"`;
+    settings.hooks.Stop ??= [];
+    const isStop = (hk) => typeof hk.command === "string" && (hk.command === stopCommand || hk.command.startsWith(`${stopCommand} `));
+    const stopOurs = settings.hooks.Stop.some((m) => m.hooks?.some(isStop));
+    if (!stopOurs) settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand }] });
     writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
     // .skeleton/ is per-run state (and holds the human's feedback): keep it
     // out of commits, so a repo can't ship a verdict.
@@ -512,6 +526,7 @@ const commands = {
     if (!/^\/?\.skeleton\/?$/m.test(giText)) fs.appendFileSync(gi, `${giText && !giText.endsWith("\n") ? "\n" : ""}.skeleton/\n`);
     console.log(`installed /skeleton and /skeleton-fill into ${claudeDir}/skills`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
+    console.log(stopOurs ? "drift check (Stop) hook already installed" : `added drift check (Stop) hook to ${settingsPath}`);
   },
 };
 

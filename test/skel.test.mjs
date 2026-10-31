@@ -897,3 +897,71 @@ test("#15: Copy mode: approve --reviewed checks the version from the pasted mark
   assert.match(run("approve", "--reviewed", now), /skeleton approved/);
   assert.deepEqual([readSnapshot(dir).version, readSnapshot(dir).review.source], [now, "reviewed-flag"]);
 });
+
+// ---- issue #16: a Stop hook reports drift from the approved skeleton during a fill ----
+
+const STOP = path.join(path.dirname(BIN), "skel-stop.mjs");
+const stopHook = (cwd, input = {}, args = []) => execFileSync("node", [STOP, ...args], { cwd, input: JSON.stringify({ hook_event_name: "Stop", cwd, stop_hook_active: false, ...input }), encoding: "utf-8" });
+
+test("#16: the Stop hook is silent with no skeleton, outside a fill, and while the fill is clean", () => {
+  assert.equal(stopHook(tmp("skel-none-")), "", "no skeleton");
+  const { dir, a, run } = project();
+  run("init", "T");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(SIG, "smooth(raw: Point[], k: number): Point[]"));
+  assert.equal(stopHook(dir), "", "scaffold: edits are free");
+  run("approve");
+  run("next");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
+  assert.equal(stopHook(dir), "", "a fill inside the fence");
+  assert.equal(stopHook(path.join(dir, "src")), "", "from a subdirectory");
+  run("done");
+  run("next");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
+  run("done");
+  run("finalize");
+  fs.appendFileSync(a, "export const late = 1;\n");
+  assert.equal(stopHook(dir), "", "finalized: no fill");
+});
+
+test("#16: during a fill the Stop hook reports drift to the human without blocking; --block sends Claude back once", () => {
+  const { dir, a, run } = approved();
+  // A Bash edit outside the fence: the PreToolUse hook never saw it.
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(SIG, "smooth(raw: Point[], k = 1): Point[]"));
+  const out = JSON.parse(stopHook(dir));
+  assert.match(out.systemMessage, /drift from the approved skeleton[\s\S]*src\/a\.ts:3[\s\S]*\+ export function smooth\(raw: Point\[\], k = 1\)/);
+  assert.equal(out.decision, undefined, "notify by default");
+  const blocked = JSON.parse(stopHook(dir, {}, ["--block"]));
+  assert.equal(blocked.decision, "block");
+  assert.match(blocked.reason, /src\/a\.ts:3[\s\S]*skel reshape/);
+  assert.equal(JSON.parse(stopHook(dir, { stop_hook_active: true }, ["--block"])).decision, undefined, "blocks once, then notifies");
+  // A deleted record fails closed here too.
+  fs.rmSync(snapshotPath(dir));
+  assert.match(JSON.parse(stopHook(dir)).systemMessage, /no record of the approved skeleton/);
+  assert.match(execFileSync("node", [BIN, "stop-hook"], { cwd: dir, input: JSON.stringify({ cwd: dir }), encoding: "utf-8" }), /no record of the approved skeleton/, "also as `skel stop-hook`");
+  // Garbage input never wedges the session.
+  assert.equal(execFileSync("node", [STOP], { cwd: dir, input: "not json", encoding: "utf-8" }), "");
+});
+
+test("#16: install registers the Stop hook next to the PreToolUse hook, idempotently, keeping --block and other hooks", () => {
+  const target = tmp("skel-install-");
+  fs.mkdirSync(path.join(target, ".claude"));
+  const mine = { hooks: [{ type: "command", command: "echo mine" }] };
+  fs.writeFileSync(path.join(target, ".claude", "settings.local.json"), JSON.stringify({ hooks: { Stop: [mine] } }));
+  const install = () => execFileSync("node", [BIN, "install", target], { encoding: "utf-8" });
+  assert.match(install(), /added drift check \(Stop\) hook/);
+  assert.match(install(), /drift check \(Stop\) hook already installed/);
+  const read = () => JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"));
+  let s = read();
+  assert.equal(s.hooks.PreToolUse.length, 1);
+  assert.equal(s.hooks.Stop.length, 2);
+  assert.deepEqual(s.hooks.Stop[0], mine, "someone else's Stop hook is kept");
+  const ours = s.hooks.Stop[1].hooks[0];
+  assert.match(ours.command, /^node ".*\/bin\/skel-stop\.mjs"$/);
+  assert.equal(s.hooks.Stop[1].matcher, undefined, "Stop takes no matcher");
+  ours.command += " --block";
+  fs.writeFileSync(path.join(target, ".claude", "settings.local.json"), JSON.stringify(s));
+  install();
+  s = read();
+  assert.equal(s.hooks.Stop.length, 2);
+  assert.match(s.hooks.Stop[1].hooks[0].command, / --block$/, "a reinstall keeps the blocking switch");
+});

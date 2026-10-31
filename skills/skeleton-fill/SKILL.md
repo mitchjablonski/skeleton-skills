@@ -28,6 +28,8 @@ Arguments:
 
 Between steps (after `done`, before the next `start`), edits to the skeleton's files ask the human too: there is no active fence for them to land in.
 
+At the end of each of your turns, a Stop hook checks the skeleton against the approved version and shows the human any drift. If it reports drift (or sends you back with it), treat it like a failed `skel done`: put the lines back, or stop and propose the change.
+
 ## When the skeleton is wrong
 
 You'll sometimes find that a step needs something the skeleton doesn't have: a new helper, a changed signature, another file, a parameter. **Don't work around the fence.** Stop and propose the change: what, where, and why, in a few lines. Reopening the skeleton is the human's call. Once they agree (in chat, or with **Reopen skeleton** in the review page):

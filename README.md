@@ -40,7 +40,7 @@ git clone https://github.com/mitchjablonski/skeleton-skills
 node skeleton-skills/bin/skel.mjs install /path/to/your/project
 ```
 
-This copies the two skills into `<project>/.claude/skills/` and adds the scope-gate hook to `<project>/.claude/settings.local.json`.
+This copies the two skills into `<project>/.claude/skills/` and adds two hooks to `<project>/.claude/settings.local.json`: the `PreToolUse` scope gate and a `Stop` hook that checks for drift at the end of each turn during a fill. Re-running it updates them in place.
 
 ## The loop
 
@@ -73,6 +73,7 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
 | `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one. `done` refuses on drift from the approved skeleton |
 | `skel finalize` | All filled and no drift: strip the markers |
 | `skel hook` | The `PreToolUse` scope gate |
+| `skel stop-hook [--block]` | The `Stop` drift check (installed as `bin/skel-stop.mjs`) |
 
 **Gate modes:** `ask` (default) sends an out-of-fence edit to you for a yes or no. `deny` refuses it outright, so Claude must propose a skeleton change.
 
@@ -87,6 +88,7 @@ The fence is a **drift guard for a cooperative agent**: it keeps an agent that m
   - *Not covered:* files the skeleton never touched. Builds, tests and lockfiles change those during a fill, so recording the whole tree would flag every run; track a file to bring it in. Fence bodies aren't compared either: they are the fill.
   - Line endings are compared as LF, so converting a file's line endings isn't drift.
   - The record lives outside the project (`~/.config/skel/<hash>.snapshot.json`, next to the serve sessions), so a repo can't ship one. A missing record, or one from a different approval, fails closed: re-approve.
+  - **Checked at the end of every turn, too.** `done` and `finalize` run when the agent chooses; a `Stop` hook runs after every Claude turn while a fill is active and, on drift, shows you the same `file:line` report. By default it only notifies: Claude isn't held up. Add `--block` to its command in `settings.local.json` (or flip `BLOCK_ON_DRIFT` in `lib/stop.mjs`) to send Claude back once to revert or propose a reshape; after that it notifies, and Claude Code's limit on consecutive continuations applies. It reads only the approved skeleton's files, so a file that newly gains fences is left to `done`. Outside a fill it reads one state file and exits.
   - One escape the exterior can't see: a body that closes its own block and opens a new one before the fence ends, leaving the code after the fence intact. The hook's containment heuristic (below) is aimed at that; `skel done` repeats it as a non-blocking note for fills the hook didn't see.
 - **Edits are judged by their result.** The hook is the early warning: it stops a bad edit before it lands rather than at `skel done`. During a fill, an Edit, MultiEdit (applied in order) or Write is allowed only if the SKEL markers come out identical, every line outside the active fence is unchanged, and the filled body stays inside its block. Line endings are compared as LF (Claude Code's Edit matches CRLF files that way), and an edit whose `old_string` can't be located asks. The block check is a language-aware heuristic, not a parser, so a hit always asks rather than refuses.
 - **Between steps,** edits to fenced or tracked files, and new files, ask. NotebookEdit asks during a fill.
