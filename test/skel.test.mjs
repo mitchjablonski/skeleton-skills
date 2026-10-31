@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import { scanText, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
 import { cleanFeedback, feedbackMarkdown } from "../lib/feedback.mjs";
+import { exterior, lineDiff, snapshotPath } from "../lib/snapshot.mjs";
+import { buildReviewData } from "../lib/review.mjs";
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "skel.mjs");
 
@@ -632,4 +634,138 @@ test("PR#1 G2: an enclosing skeleton mid-fill outranks a nested state file", () 
   const src = path.join(dir, "src");
   const out = execFileSync("node", [BIN, "hook"], { cwd: src, input: JSON.stringify({ cwd: src, tool_name: "Write", tool_input: { file_path: a, content: "evil" } }), encoding: "utf-8" });
   assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+// ---- issue #2: fills are verified against a snapshot of the approved skeleton ----
+
+/** An approved project with step 1 active. */
+function approved(src = SRC) {
+  const p = project();
+  fs.writeFileSync(p.a, src);
+  p.run("init", "T");
+  p.run("approve");
+  p.run("next");
+  p.fill = (step, code) => fs.writeFileSync(p.a, fs.readFileSync(p.a, "utf-8").replace(new RegExp(`(SKEL\\[${step}\\][^\\n]*\\n\\s*)throw new Error\\("SKEL_TODO"\\);`), `$1${code}`));
+  p.page = () => buildReviewData(p.dir, JSON.parse(fs.readFileSync(path.join(p.dir, ".skeleton", "state.json"), "utf-8")));
+  return p;
+}
+const failure = (fn) => { try { fn(); } catch (err) { return String(err.stderr ?? err.message); } assert.fail("expected the command to fail"); };
+
+test("snapshot: exterior drops fence bodies and keeps markers; lineDiff finds the changed region", () => {
+  const ext = exterior(SRC.replace(/\n/g, "\r\n"), "a.ts");
+  assert.ok(!ext.lines.some((l) => l.includes("SKEL_TODO")));
+  assert.ok(ext.lines.includes("  // SKEL[1] drop near-duplicate points"), "LF-compared, markers kept");
+  assert.equal(ext.at[ext.lines.indexOf("  // /SKEL[1]")], 6, "file line numbers survive the blanking");
+  assert.deepEqual(lineDiff(["a", "b", "c", "d"], ["a", "B", "c", "d", "e"]), [
+    { aStart: 1, removed: ["b"], bStart: 1, added: ["B"] },
+    { aStart: 4, removed: [], bStart: 4, added: ["e"] },
+  ]);
+});
+
+test("snapshot: approve records it outside the project; a fill inside the fences passes done and finalize", () => {
+  const { dir, run, fill } = approved();
+  assert.ok(fs.existsSync(snapshotPath(dir)));
+  assert.ok(snapshotPath(dir).startsWith(process.env.XDG_CONFIG_HOME), "in the config dir, not the project");
+  fill("1", "return raw.filter(Boolean);\n  // a second line is fine");
+  run("done");
+  run("next");
+  fill("2", "return [a, b];");
+  run("done");
+  assert.match(run("finalize"), /stripped markers/);
+  assert.ok(!fs.existsSync(snapshotPath(dir)), "finalize forgets it");
+});
+
+test("snapshot: an Edit the hook asked about and the human allowed still blocks done", () => {
+  const { a, run, hook, fill } = approved();
+  const input = { file_path: a, old_string: "smooth(raw: Point[])", new_string: "smooth(raw: Point[], k = 1)" };
+  assert.equal(JSON.parse(hook({ tool_name: "Edit", tool_input: input })).hookSpecificOutput.permissionDecision, "ask");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(input.old_string, input.new_string)); // allowed
+  fill("1", "return raw;");
+  const err = failure(() => run("done"));
+  assert.match(err, /drift from the approved skeleton/);
+  assert.match(err, /src\/a\.ts:3\n\s+- export function smooth\(raw: Point\[\]\): Point\[\] \{\n\s+\+ export function smooth\(raw: Point\[\], k = 1\): Point\[\] \{/);
+});
+
+test("snapshot: a Bash sed -i outside the fence blocks done and finalize with file:line, and shows on the page", () => {
+  const { a, run, fill, page } = approved();
+  fill("1", "return raw;");
+  execFileSync("sed", ["-i", "s|^import { Point } from|import { Point, Evil } from|", a]);
+  const err = failure(() => run("done"));
+  assert.match(err, /can't finish step 1: drift/);
+  assert.match(err, /src\/a\.ts:1\n.*- import \{ Point \}.*\n.*\+ import \{ Point, Evil \}/);
+  const data = page();
+  assert.deepEqual(data.drift.items, [{ file: "src/a.ts", line: 1, removed: ['import { Point } from "./types";'], added: ['import { Point, Evil } from "./types";'] }]);
+  const html = fs.readFileSync(run("review").split("\n")[0], "utf-8");
+  assert.match(html, /"drift":\{"reason":null,"items":\[\{"file":"src\/a\.ts","line":1/);
+  assert.match(run("status"), /drift from the approved skeleton[\s\S]*src\/a\.ts:1/);
+  // finalize refuses too, even with every step filled (bypassing done)
+  fill("2", "return [a, b];");
+  assert.match(failure(() => run("finalize")), /can't finalize: drift[\s\S]*src\/a\.ts:1/);
+  assert.match(fs.readFileSync(a, "utf-8"), /SKEL\[1\]/, "nothing was stripped");
+});
+
+test("snapshot: a Write that fills the fence and appends code outside it blocks; new fenced files and deleted tracked files are drift", () => {
+  const { dir, a, run, hook } = approved();
+  const content = SRC.replace(STUB, "return raw;") + "export const leak = 1;\n";
+  assert.equal(JSON.parse(hook({ tool_name: "Write", tool_input: { file_path: a, content } })).hookSpecificOutput.permissionDecision, "ask");
+  fs.writeFileSync(a, content);
+  assert.match(failure(() => run("done")), /src\/a\.ts:14\n\s+\+ export const leak = 1;/);
+  fs.writeFileSync(a, SRC.replace(STUB, "return raw;"));
+  fs.writeFileSync(path.join(dir, "src", "b.ts"), "// SKEL[9] sneaky\nthrow 'SKEL_TODO';\n// /SKEL[9]\n");
+  const err = failure(() => run("done"));
+  assert.match(err, /src\/b\.ts: has fences but isn't in the approved skeleton/);
+  assert.match(err, /fence set: added or retitled 9/);
+  fs.rmSync(path.join(dir, "src", "b.ts"));
+  run("done");
+});
+
+test("snapshot: tracked files are recorded whole", () => {
+  const { dir, run } = project();
+  fs.writeFileSync(path.join(dir, "src", "types.ts"), "export type Point = { x: number };\n");
+  run("init", "T");
+  run("track", "src/types.ts");
+  run("approve");
+  run("next");
+  fs.writeFileSync(path.join(dir, "src", "types.ts"), "export type Point = { x: number; y: number };\n");
+  assert.match(failure(() => run("finalize")), /src\/types\.ts:1/);
+  fs.rmSync(path.join(dir, "src", "types.ts"));
+  assert.match(failure(() => run("finalize")), /src\/types\.ts: deleted/);
+});
+
+test("snapshot: CRLF files verify in LF; drift is reported at the right line; an EOL conversion alone isn't drift", () => {
+  const crlf = SRC.replace(/\n/g, "\r\n");
+  const { a, run } = approved(crlf);
+  fs.writeFileSync(a, crlf.replace(STUB, "return raw;"));
+  assert.match(run("status"), /phase: fill/);
+  assert.doesNotMatch(run("status"), /drift/);
+  fs.writeFileSync(a, crlf.replace(STUB, "return raw;").replace("export function interpolate(a: Point, b: Point)", "export function interpolate(a: Point, b = a)"));
+  assert.match(failure(() => run("done")), /src\/a\.ts:9\n\s+- export function interpolate\(a: Point, b: Point\): Point\[\] \{\n/);
+  fs.writeFileSync(a, SRC.replace(STUB, "return raw;")); // the same file, now LF
+  run("done");
+});
+
+test("snapshot: reshape then re-approve re-records it; a missing or stale record fails closed", () => {
+  const { dir, a, run, fill } = approved();
+  fill("1", "return raw;");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace("smooth(raw: Point[])", "smooth(raw: readonly Point[])"));
+  assert.match(failure(() => run("done")), /drift/);
+  run("reshape");
+  assert.match(run("status"), /phase: scaffold/);
+  run("approve");
+  run("start", "1", "--force");
+  run("done");
+
+  fs.rmSync(snapshotPath(dir));
+  assert.match(failure(() => run("finalize")), /no record of the approved skeleton[\s\S]*skel reshape/);
+  run("reshape");
+  run("approve");
+  const statePath = path.join(dir, ".skeleton", "state.json");
+  fs.writeFileSync(statePath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statePath, "utf-8")), reviewEpoch: 1 }));
+  assert.match(failure(() => run("finalize")), /belongs to a different approval/);
+});
+
+test("snapshot: done notes (without blocking) a fill that escapes its block, which the exterior can't see", () => {
+  const { run, fill } = approved();
+  fill("1", "return raw;\n}\nexport function evil() {\n  return [];");
+  assert.match(run("done"), /note: in src\/a\.ts:4-9, .*heuristic[\s\S]*STEP 1 done/);
 });
