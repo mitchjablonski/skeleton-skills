@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -12,7 +12,11 @@ import { cleanFeedback, feedbackMarkdown } from "../lib/feedback.mjs";
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "skel.mjs");
 
 // The serve-session store lives in the user's config dir; keep tests out of the real one.
-process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "skel-config-"));
+// Every temp dir the suite makes is removed when it finishes.
+const TEMPS = [];
+after(() => { for (const d of TEMPS) fs.rmSync(d, { recursive: true, force: true }); });
+const mkTemp = (prefix) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); TEMPS.push(d); return d; };
+process.env.XDG_CONFIG_HOME = mkTemp("skel-config-");
 
 const SRC = `import { Point } from "./types";
 
@@ -36,7 +40,7 @@ const canSymlink = (() => {
   try { fs.symlinkSync(path.join(d, "x"), path.join(d, "y")); return true; } catch { return false; } finally { fs.rmSync(d, { recursive: true, force: true }); }
 })();
 
-const tmp = (prefix = "skel-") => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+const tmp = (prefix = "skel-") => fs.realpathSync(mkTemp(prefix));
 
 // ---- markers ----
 
@@ -655,4 +659,14 @@ test("Codex review: in-project names starting with '..' are inside, not outside"
     assert.equal(v?.decision, "deny", rel);
   }
   assert.equal(evaluate({ toolName: "Write", toolInput: { file_path: path.resolve(root, "..", "sibling.ts"), content: "x" }, root, state: fill, resolve: (x) => x, readFile: () => "x", activeFences: [] }), null);
+});
+
+test("installed skills' example fences are documentation, not steps", () => {
+  const { dir, run } = project();
+  run("install", dir);
+  assert.match(fs.readFileSync(path.join(dir, ".claude", "skills", "skeleton", "SKILL.md"), "utf-8"), /SKEL\[2\]/, "the example is there");
+  run("init", "T");
+  const status = run("status");
+  assert.match(status, /0\/2 filled/);
+  assert.doesNotMatch(status, /\.claude/);
 });
