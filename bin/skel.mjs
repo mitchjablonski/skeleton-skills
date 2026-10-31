@@ -37,7 +37,8 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   reshape                            back to skeleton review (inside Claude Code the hook asks the human first)
   finalize                           all steps filled: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
-  install [projectDir]               install skills + hook into a project's .claude/
+  install [projectDir]               install skills, hook and .skeleton/ deny rules into a project's .claude/
+  uninstall [projectDir]             remove what install added (leaves .skeleton/ and .gitignore alone)
 `;
 
 function die(msg) {
@@ -94,6 +95,59 @@ function setActive(root, state, step, force = false) {
   console.log(`STEP ${step.id} active: ${step.title}`);
   console.log(`Edit only inside these fences; replace each SKEL_TODO stub. Leave the marker lines in place.`);
   printFences(step);
+}
+
+const SKILLS = ["skeleton", "skeleton-fill"];
+
+/**
+ * Claude Code permission rules `install` adds, so the agent's own file tools
+ * can't write the tool's state: Claude Code enforces deny rules before any
+ * hook (a hook's "allow" can't lift them), and the Bash sandbox, when enabled,
+ * turns them into OS-level write denials. Only `Edit(...)` path rules match
+ * (they cover Write, MultiEdit and NotebookEdit too; `Write(path)` rules
+ * never match). A `!` carve-out can't reopen diagrams/ inside a denied
+ * .skeleton/**, so the state is listed path by path, with no wildcard but a
+ * trailing /** (the only kind the Linux sandbox honours). A leading `/`
+ * anchors at the project for a rule in .claude/settings.local.json.
+ */
+const DENY_RULES = ["state.json", "serve.json", "review.html", "feedback/**", "feedback-history/**"]
+  .map((p) => `Edit(/${STATE_DIR}/${p})`);
+
+/** The scope-gate hook command from any skel checkout (current or legacy form). */
+const isSkelHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](skel-hook\.mjs"|skel\.mjs" hook)$/.test(cmd);
+
+/**
+ * A project's .claude/settings.local.json, parsed, for install/uninstall to
+ * merge into. Dies rather than risk the user's settings: a symlink on the way
+ * (we'd write through it), JSON we can't parse (we'd drop it), or a shape we
+ * don't understand (we'd clobber it).
+ */
+function openProjectSettings(dir) {
+  const target = path.resolve(dir);
+  const claudeDir = path.join(target, ".claude");
+  const settingsPath = path.join(claudeDir, "settings.local.json");
+  const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
+  const skillDirs = SKILLS.map((n) => path.join(claudeDir, "skills", n));
+  for (const p of [claudeDir, settingsPath, path.join(target, ".gitignore"), path.join(claudeDir, "skills"), ...skillDirs, ...skillDirs.map((d) => path.join(d, "SKILL.md"))]) {
+    if (isLink(p)) die(`${p} is a symlink; refusing to write through it`);
+  }
+  let settings = {};
+  if (fs.existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    } catch {
+      die(`${settingsPath} isn't valid JSON; fix it first (overwriting it would drop your settings)`);
+    }
+  }
+  const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  const bad = !isObj(settings) ? "the file"
+    : settings.permissions !== undefined && !isObj(settings.permissions) ? '"permissions"'
+    : settings.permissions?.deny !== undefined && !Array.isArray(settings.permissions.deny) ? '"permissions.deny"'
+    : settings.hooks !== undefined && !isObj(settings.hooks) ? '"hooks"'
+    : settings.hooks?.PreToolUse !== undefined && !Array.isArray(settings.hooks.PreToolUse) ? '"hooks.PreToolUse"'
+    : null;
+  if (bad) die(`${settingsPath}: ${bad} isn't shaped the way Claude Code expects; fix it first (we won't overwrite it)`);
+  return { target, claudeDir, settingsPath, settings };
 }
 
 const commands = {
@@ -398,41 +452,30 @@ const commands = {
   },
 
   install([dir = process.cwd()]) {
-    const target = path.resolve(dir);
-    const claudeDir = path.join(target, ".claude");
     // The hook command runs through a shell: refuse an install path that a
     // shell would interpret rather than quote it and hope.
     if (/["'`$\\\n\r]/.test(PKG_ROOT)) die(`can't install from a path containing quotes, $, backticks or backslashes: ${SELF}`);
-    const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
-    const settingsPath = path.join(claudeDir, "settings.local.json");
-    for (const p of [claudeDir, settingsPath, path.join(target, ".gitignore")]) {
-      if (isLink(p)) die(`${p} is a symlink; refusing to write through it`);
-    }
-    let settings = {};
-    if (fs.existsSync(settingsPath)) {
-      try {
-        settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
-      } catch {
-        die(`${settingsPath} isn't valid JSON; fix it first (overwriting it would drop your settings)`);
-      }
-    }
-    for (const name of ["skeleton", "skeleton-fill"]) {
+    const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir);
+    for (const name of SKILLS) {
       const src = path.join(PKG_ROOT, "skills", name, "SKILL.md");
       const dest = path.join(claudeDir, "skills", name, "SKILL.md");
       writeFileAtomic(dest, fs.readFileSync(src, "utf-8").replaceAll("{{SKEL}}", `node "${SELF}"`));
     }
     const command = `node "${HOOK}"`;
-    const legacy = `node "${SELF}" hook`;
     settings.hooks ??= {};
     settings.hooks.PreToolUse ??= [];
     const matcher = "Write|Edit|MultiEdit|NotebookEdit|Bash";
-    const ours = settings.hooks.PreToolUse.find((m) => m.hooks?.some((hk) => hk.command === command || hk.command === legacy));
+    const ours = settings.hooks.PreToolUse.find((m) => m?.hooks?.some?.((hk) => isSkelHook(hk?.command)));
     if (ours) {
       ours.matcher = matcher;
-      for (const hk of ours.hooks) if (hk.command === legacy) hk.command = command;
+      for (const hk of ours.hooks) if (isSkelHook(hk?.command)) hk.command = command; // legacy or moved clone
     } else {
       settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
     }
+    settings.permissions ??= {};
+    settings.permissions.deny ??= [];
+    const added = DENY_RULES.filter((r) => !settings.permissions.deny.includes(r));
+    settings.permissions.deny.push(...added);
     writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
     // .skeleton/ is per-run state (and holds the human's feedback): keep it
     // out of commits, so a repo can't ship a verdict.
@@ -441,6 +484,32 @@ const commands = {
     if (!/^\/?\.skeleton\/?$/m.test(giText)) fs.appendFileSync(gi, `${giText && !giText.endsWith("\n") ? "\n" : ""}.skeleton/\n`);
     console.log(`installed /skeleton and /skeleton-fill into ${claudeDir}/skills`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
+    console.log(added.length ? `added ${added.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
+    console.log(`optional: Claude Code's Bash sandbox can enforce those rules at the OS level; see "Security model" in the README (skel needs "excludedCommands": ["node \\"${SELF}\\" *"])`);
+  },
+
+  uninstall([dir = process.cwd()]) {
+    const { claudeDir, settingsPath, settings } = openProjectSettings(dir);
+    const groups = settings.hooks?.PreToolUse ?? [];
+    for (const m of groups) if (Array.isArray(m?.hooks)) m.hooks = m.hooks.filter((hk) => !isSkelHook(hk?.command));
+    if (settings.hooks?.PreToolUse) {
+      settings.hooks.PreToolUse = groups.filter((m) => !Array.isArray(m?.hooks) || m.hooks.length);
+      if (!settings.hooks.PreToolUse.length) delete settings.hooks.PreToolUse;
+      if (!Object.keys(settings.hooks).length) delete settings.hooks;
+    }
+    if (settings.permissions?.deny) {
+      settings.permissions.deny = settings.permissions.deny.filter((r) => !DENY_RULES.includes(r));
+      if (!settings.permissions.deny.length) delete settings.permissions.deny;
+      if (!Object.keys(settings.permissions).length) delete settings.permissions;
+    }
+    if (fs.existsSync(settingsPath)) writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+    for (const name of SKILLS) {
+      const skillDir = path.join(claudeDir, "skills", name);
+      fs.rmSync(path.join(skillDir, "SKILL.md"), { force: true });
+      try { fs.rmdirSync(skillDir); } catch {} // only if we left it empty
+    }
+    console.log(`removed /skeleton, /skeleton-fill, the scope gate hook and the ${STATE_DIR}/ deny rules from ${claudeDir}`);
+    console.log(`left in place: ${STATE_DIR}/ (delete it once you're done with it) and the ${STATE_DIR}/ line in .gitignore`);
   },
 };
 

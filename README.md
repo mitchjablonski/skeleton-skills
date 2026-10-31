@@ -40,7 +40,9 @@ git clone https://github.com/mitchjablonski/skeleton-skills
 node skeleton-skills/bin/skel.mjs install /path/to/your/project
 ```
 
-This copies the two skills into `<project>/.claude/skills/` and adds the scope-gate hook to `<project>/.claude/settings.local.json`.
+This copies the two skills into `<project>/.claude/skills/` and adds two things to `<project>/.claude/settings.local.json`: the scope-gate hook, and Claude Code permission **deny** rules for the tool's own state (see [Security model](#security-model)). It merges into what's there: your settings and rules are kept, a re-run changes nothing, and it refuses a symlinked or unparseable settings file rather than write through it or overwrite it.
+
+To remove it, run `node skeleton-skills/bin/skel.mjs uninstall /path/to/your/project`. That takes out the skills, the hook and the deny rules, and nothing else. It leaves `.skeleton/` and its `.gitignore` line for you to delete.
 
 ## The loop
 
@@ -72,6 +74,7 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
 | `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one |
 | `skel finalize` | All filled: strip the markers |
 | `skel hook` | The `PreToolUse` scope gate |
+| `skel install [dir]` / `skel uninstall [dir]` | Add or remove the skills, hook and deny rules in a project's `.claude/` |
 
 **Gate modes:** `ask` (default) sends an out-of-fence edit to you for a yes or no. `deny` refuses it outright, so Claude must propose a skeleton change.
 
@@ -79,16 +82,42 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
 
 The fence is a **drift guard for a cooperative agent**: it keeps an agent that means well from quietly widening its own scope. It is not a sandbox against a hostile one, which could always write files from a shell.
 
+### Which layer enforces what
+
+| Layer | Set up by | Enforces | Doesn't cover |
+|---|---|---|---|
+| **Claude Code permission deny rules** | `skel install` | The agent's Edit, Write, MultiEdit and NotebookEdit calls can't write `.skeleton/state.json`, `serve.json`, `review.html`, `feedback/` or `feedback-history/`. Nor can Bash commands Claude Code recognises as file writes (`> file`, `tee`, `sed -i`, …). Claude Code checks deny rules itself, whatever a hook returns (a hook's `allow` can't lift them), in every permission mode including `bypassPermissions`, and offers no prompt. The settings file is a Claude Code protected path, so the agent can't quietly delete the rules either, outside `bypassPermissions` | A script or interpreter that opens files itself (`node -e …`, `python …`). Nested `.skeleton/` directories |
+| **Bash sandbox** (optional) | You (see below) | OS-level: the same deny rules become write denials for every sandboxed shell command and its child processes, scripts included | The fence: sandboxed commands can still edit your code. The built-in file tools (the deny rules cover those). Excluded commands, and unsandboxed retries you approve |
+| **`PreToolUse` hook** (`skel hook`) | `skel install` | The fence itself: an edit during a fill must leave everything outside the active fence unchanged. Asks before `approve`, `reshape`, `init --force`, `finalize` and `git clean -x`. Asks for edits to any `.skeleton/` at any depth and for Bash commands that name it (defence in depth behind the deny rules) | Arbitrary Bash that doesn't name its target, and anything once a hook fault fails open |
+| **Snapshot check at `done`/`finalize`** | Planned ([#2](https://github.com/mitchjablonski/skeleton-skills/issues/2)) | Would catch any drift outside the fences, however it was made (Edit, Bash, a script) | Not built yet |
+
+The deny rules are listed path by path, not as `.skeleton/**`, so that `.skeleton/diagrams/` (which the agent writes during `/skeleton`) stays writable: Claude Code's `!` carve-outs can't reopen a directory inside one a rule blocks as a whole. They use only `Edit(...)`, because Claude Code checks every file-writing tool against `Edit` rules and never matches a `Write(path)` rule, and they avoid wildcards other than a trailing `/**`, the only kind the sandbox honours on Linux and WSL2. A leading `/` anchors them at the project directory.
+
+**Turning on the sandbox (recommended, manual).** `install` doesn't switch it on, because it changes how every shell command in the project runs (network goes through a proxy with an empty allowlist, writes are limited to the project and temp). To enable it, add this to `.claude/settings.local.json` (or `~/.claude/settings.json`), with the path `install` prints:
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "excludedCommands": ["node \"/path/to/skeleton-skills/bin/skel.mjs\" *"]
+  }
+}
+```
+
+`skel` itself has to run outside the sandbox. It writes the very state the deny rules protect, plus its session store in `~/.config/skel/`. And on Linux and WSL2 a sandboxed command's `localhost` is private, so your browser couldn't reach `skel serve`. Keep the skeleton-skills checkout outside the project, so the agent can't edit the excluded script. On Linux and WSL2 the sandbox needs `bubblewrap` and `socat`. Without them Claude Code runs commands unsandboxed, unless you also set `"failIfUnavailable": true`. To stop Claude from retrying a blocked command outside the sandbox, set `"allowUnsandboxedCommands": false`. See Claude Code's [sandboxing](https://code.claude.com/docs/en/sandboxing) and [permissions](https://code.claude.com/docs/en/permissions#read-and-edit) docs.
+
+### Details
+
 - **Your approval is Claude Code's permission prompt.** The hook always asks before `skel approve`, `skel reshape`, `skel init --force` or `skel finalize` runs, and before `git clean -x`/`-X` (which would delete `.skeleton/`), even in `deny` mode. That prompt is the one channel the agent can't answer for you. It fires from any working directory and for the common spellings (quoted, a path in a variable, `xargs`); it's a word match, not a shell parser. Review-page verdicts and feedback files are only signals to the agent; anything on disk or on a local port can be forged from a shell, so none of it counts as approval. How the prompt behaves follows Claude Code's permission mode: you see it in the default, `acceptEdits`, `plan` and `auto` modes; a non-interactive run with no one to answer refuses the command; and `bypassPermissions` skips it.
 - **Edits are judged by their result.** During a fill, an Edit, MultiEdit (applied in order) or Write is allowed only if the SKEL markers come out identical, every line outside the active fence is unchanged, and the filled body stays inside its block. Line endings are compared as LF (Claude Code's Edit matches CRLF files that way), and an edit whose `old_string` can't be located asks. The block check is a language-aware heuristic, not a parser, so a hit always asks rather than refuses.
 - **Between steps,** edits to fenced or tracked files, and new files, ask. NotebookEdit asks during a fill.
-- **The tool's state is off-limits.** Agent edits to any `.skeleton/` directory, at any depth (except the top-level `diagrams/`), ask, matched case-insensitively. So do Bash commands that name `.skeleton/` state, from any working directory. An enclosing skeleton that is mid-fill outranks a nested state file, so one planted or shipped deeper down can't take over the fence.
+- **The tool's state is off-limits.** The deny rules above refuse writes to the top-level state outright. Behind them, the hook asks for agent edits to any `.skeleton/` directory, at any depth (except the top-level `diagrams/`), matched case-insensitively. So do Bash commands that name `.skeleton/` state, from any working directory. An enclosing skeleton that is mid-fill outranks a nested state file, so one planted or shipped deeper down can't take over the fence.
 - **The review server** binds to 127.0.0.1, answers only requests addressed to `127.0.0.1`/`localhost` (no DNS rebinding), and accepts feedback only same-origin, as JSON, with a per-run token. So other websites can't post to it. The markdown Claude reads is rebuilt server-side and framed as review notes, not instructions.
 - **Feedback is tied to this skeleton's serve runs**, whose ids live outside the project (`~/.config/skel/`), so nothing committed to a repo can vouch for a feedback file. Leftover, committed or hand-written ones are quarantined. `init` stops the old review server and forgets its sessions; a superseded server refuses sends. `skel serve` reuses a running server only after it answers with the id it recorded, and never kills a bare pid. `install` adds `.skeleton/` to `.gitignore`.
 - **Files:** tracked files must resolve inside the project; writes go through temp-file-and-rename (never through a symlink); `install` refuses symlinked or unparseable settings rather than overwrite them.
 - **Mermaid** is pinned to a patched release (past CVE-2025-54881) with Subresource Integrity, and loads without blocking the page.
 
-Not covered: arbitrary Bash, and anything once a hook fault makes it fail open. Pair it with Claude Code's permission rules if you need hard limits.
+Not covered: arbitrary Bash editing your code outside the fence (until [#2](https://github.com/mitchjablonski/skeleton-skills/issues/2)), anything once a hook fault makes it fail open, and, without the sandbox, a script that writes `.skeleton/` state.
 
 ## Prior art
 
