@@ -35,7 +35,7 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   track <file...>                    show unfenced skeleton files (types, wiring) in the review too
   status [--json]                    phase, active step, every step's status
   review                             write .skeleton/review.html (static; copy feedback by hand)
-  serve [--port N] [--stop]          serve the review live (reuses a running server); feedback is sent back
+  serve [--port N] [--send] [--stop] serve live read-only; --send enables feedback
   feedback [--wait SECONDS]          print (and archive) the human's latest feedback (waits up to 110s)
   approve [--reviewed VERSION]       enter the fill phase (inside Claude Code the hook asks the human first);
                                      refuses if the version the human last reviewed isn't the current one
@@ -111,7 +111,7 @@ async function liveServer(root) {
   try {
     const res = await fetch(new URL("api/version", s.url), { signal: AbortSignal.timeout(1500) });
     const v = await res.json();
-    return v.serverId === s.serverId && Number.isInteger(v.pid) ? { url: s.url, pid: v.pid } : null;
+    return v.serverId === s.serverId && Number.isInteger(v.pid) ? { url: s.url, pid: v.pid, feedbackEnabled: v.feedbackEnabled !== false } : null;
   } catch {
     return null;
   }
@@ -406,23 +406,26 @@ const commands = {
     const root = requireRoot();
     const running = await liveServer(root);
     if (args.includes("--stop")) {
-      if (running) { process.kill(running.pid); console.log(`stopped the review server (${running.url})`); }
+      if (running) { try { process.kill(running.pid); } catch (err) { if (err.code !== "ESRCH") throw err; } console.log(`stopped the review server (${running.url})`); }
       else console.log("no review server running");
       fs.rmSync(servePath(root), { force: true });
       return;
     }
-    if (running) {
-      console.log(`skel review: ${running.url} (already running; \`skel serve --stop\` stops it)`);
+    const feedbackEnabled = args.includes("--send");
+    const mode = feedbackEnabled ? "feedback enabled" : "read-only";
+    if (running && running.feedbackEnabled === feedbackEnabled) {
+      console.log(`skel review: ${running.url} (${mode}; already running; \`skel serve --stop\` stops it)`);
       return;
     }
-    const { session, token } = newServeSession();
+    if (running) { try { process.kill(running.pid); } catch (err) { if (err.code !== "ESRCH") throw err; } }
+    const { session, token } = feedbackEnabled ? newServeSession() : {};
     const serverId = crypto.randomBytes(12).toString("hex");
     // The session store vouches for this run's feedback. If it can't be
     // written, still serve the page (it's useful to read), but say plainly
     // that what's sent from it won't reach the agent (and refuse sends).
     let recorded = true;
     try {
-      addSession(root, session);
+      if (feedbackEnabled) addSession(root, session);
     } catch (err) {
       recorded = false;
       console.error(
@@ -486,12 +489,13 @@ const commands = {
             "x-frame-options": "DENY",
             "referrer-policy": "no-referrer",
           });
-          res.end(renderHtml({ ...data, version }, { token }));
+          res.end(renderHtml({ ...data, version }, { token: token ?? null, feedbackEnabled, serverId }));
         } else if (req.method === "GET" && req.url === "/api/version") {
           lastPoll = Date.now();
           res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-          res.end(JSON.stringify({ version: current().version, serverId, pid: process.pid }));
+          res.end(JSON.stringify({ version: current().version, serverId, pid: process.pid, feedbackEnabled }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
+          if (!feedbackEnabled) { req.resume(); return void res.writeHead(405, { Allow: "GET", connection: "close" }).end("read-only review; reload and use Copy feedback for Claude"); }
           // Cross-site writes: same origin, a JSON content type (forces a CORS
           // preflight we never answer), and the per-run token from the page.
           const sameOrigin = !req.headers.origin || hosts.has(String(req.headers.origin).replace(/^https?:\/\//, "").toLowerCase());
@@ -532,8 +536,8 @@ const commands = {
       const p = server.address().port;
       for (const h of [`127.0.0.1:${p}`, `localhost:${p}`]) hosts.add(h);
       origin = `http://127.0.0.1:${p}`;
-      writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, port: p, pid: process.pid, serverId }), 0o600);
-      console.log(`skel review: ${origin}/`);
+      writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, port: p, pid: process.pid, serverId, feedbackEnabled }), 0o600);
+      console.log(`skel review: ${origin}/ (${mode})`);
     };
     server.once("error", (err) => {
       if (err.code !== "EADDRINUSE") throw err;
@@ -554,7 +558,10 @@ const commands = {
     // it and let the skill loop.
     const wait = Math.min(Number(flag(args, "wait", "0")) || 0, 110);
     const deadline = Date.now() + wait * 1000;
-    while (pendingCount(root) === 0 && Date.now() < deadline) {
+    let readonly = false;
+    while (pendingCount(root) === 0) {
+      if ((await liveServer(root))?.feedbackEnabled === false) { readonly = true; break; }
+      if (Date.now() >= deadline) break;
       await new Promise((r) => setTimeout(r, 1000));
     }
     warnLegacyQueue(root);
@@ -566,6 +573,7 @@ const commands = {
       );
     }
     if (taken.status === "ok") console.log(feedbackMarkdown(readState(root).title, mergeRecords(taken.records)));
+    else if (readonly) console.log("READ_ONLY: the review is read-only; the human's feedback arrives as a chat message. Wait for it; don't poll. Only if the human asks for direct Send: skel serve --send.");
     else console.log(`NO_FEEDBACK${wait ? ` (waited ${wait}s)` : ""}`);
   },
 

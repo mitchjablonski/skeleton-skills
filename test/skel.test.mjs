@@ -7,7 +7,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { scanText, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
-import { cleanFeedback, configPath, feedbackMarkdown, projectKey } from "../lib/feedback.mjs";
+import { cleanFeedback, configPath, feedbackMarkdown, projectKey, sessionStorePath } from "../lib/feedback.mjs";
 import { exterior, lineDiff, readSnapshot, recordSkeleton, scanSkeleton, snapshotPath, whitespaceOnly } from "../lib/snapshot.mjs";
 import { buildReviewData } from "../lib/review.mjs";
 import { readState } from "../lib/state.mjs";
@@ -243,8 +243,8 @@ function project() {
 }
 
 /** Start `skel serve`, return its url, the page token, and a stop function. */
-async function serve(dir, env = {}) {
-  const child = spawn("node", [BIN, "serve"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } });
+async function serve(dir, args = ["--send"], env = {}) {
+  const child = spawn("node", [BIN, "serve", ...args], { cwd: dir, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
   let err = "";
   child.stderr.on("data", (d) => { err += d; });
   const url = await new Promise((resolve, reject) => {
@@ -254,16 +254,75 @@ async function serve(dir, env = {}) {
       const m = /skel review: (http:\/\/\S+)/.exec(out);
       if (m) resolve(m[1]);
     });
+    child.stderr.on("data", (d) => { out += d; });
     child.on("exit", () => reject(new Error("serve exited: " + out)));
   });
   const html = await (await fetch(url)).text();
-  const token = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<")).token;
+  const data = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<"));
+  const token = data.token;
   // Wait for the server to exit, so no keep-alive socket outlives the test.
   const stop = () => new Promise((resolve) => { if (child.exitCode !== null || child.signalCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
-  return { url, token, html, stderr: () => err, stop };
+  return { url, token, html, data, stderr: () => err, stop };
 }
 
 const post = (url, body, headers) => fetch(new URL("/api/feedback", url), { method: "POST", headers, body: JSON.stringify(body) });
+
+test("serve defaults to read-only without a feedback session and tolerates unavailable config", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const blockedConfig = path.join(dir, "config-file");
+  fs.writeFileSync(blockedConfig, "not a directory");
+  const srv = await serve(dir, [], { ...process.env, XDG_CONFIG_HOME: blockedConfig });
+  try {
+    assert.equal(srv.token, null);
+    assert.equal(srv.data.feedbackEnabled, false);
+    const version = await (await fetch(new URL("api/version", srv.url))).json();
+    assert.equal(version.feedbackEnabled, false);
+    fs.appendFileSync(path.join(dir, "src", "a.ts"), "\n// live read-only edit\n");
+    const changed = await (await fetch(new URL("api/version", srv.url))).json();
+    assert.notEqual(changed.version, version.version);
+    assert.match(await (await fetch(srv.url)).text(), /live read-only edit/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".skeleton", "serve.json"))).feedbackEnabled, false);
+    assert.equal(fs.existsSync(sessionStorePath(dir)), false);
+    assert.equal((await post(srv.url, { verdict: "approve", general: "valid", comments: [] }, {
+      "content-type": "application/json", origin: new URL(srv.url).origin, "x-skeleton-token": "guess",
+    })).status, 405);
+    assert.equal(fs.existsSync(path.join(dir, ".skeleton", "feedback")), false);
+  } finally { await srv.stop(); }
+});
+
+test("serve reuses the same mode and restarts when feedback mode changes", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const readonly = await serve(dir, []);
+  try {
+    const first = await (await fetch(new URL("api/version", readonly.url))).json();
+    assert.match(run("serve"), /read-only; already running/);
+    assert.equal((await (await fetch(new URL("api/version", readonly.url))).json()).serverId, first.serverId);
+    const sending = await serve(dir);
+    try {
+      const second = await (await fetch(new URL("api/version", sending.url))).json();
+      assert.equal(second.feedbackEnabled, true);
+      assert.equal(sending.data.feedbackEnabled, true);
+      assert.equal(typeof sending.token, "string");
+      assert.notEqual(second.serverId, first.serverId);
+      assert.match(run("serve", "--send"), /feedback enabled; already running/);
+      assert.equal((await post(sending.url, { verdict: "approve", comments: [] }, {
+        "content-type": "application/json", "x-skeleton-token": sending.token,
+      })).status, 204);
+      const again = await serve(dir, []);
+      try {
+        const third = await (await fetch(new URL("api/version", again.url))).json();
+        assert.equal(third.feedbackEnabled, false);
+        assert.notEqual(third.serverId, second.serverId);
+        assert.match(run("serve"), /read-only; already running/);
+        assert.equal((await post(again.url, { verdict: "approve", comments: [] }, {
+          "content-type": "application/json", "x-skeleton-token": sending.token,
+        })).status, 405);
+      } finally { await again.stop(); }
+    } finally { await sending.stop(); }
+  } finally { await readonly.stop(); }
+});
 
 test("CLI: approve (the hook asks the human first) → next → gate → done → finalize", () => {
   const { dir, a, run, hook } = project();
@@ -1223,7 +1282,7 @@ test("issue #6 N6: serve warns and keeps serving when the session store can't be
   run("init", "T");
   const blocked = path.join(tmp(), "not-a-dir");
   fs.writeFileSync(blocked, "");
-  const srv = await serve(dir, { XDG_CONFIG_HOME: blocked });
+  const srv = await serve(dir, ["--send"], { XDG_CONFIG_HOME: blocked });
   try {
     assert.equal((await fetch(new URL("/api/version", srv.url))).status, 200);
     assert.match(srv.stderr(), /can't record this review session/);
@@ -1679,4 +1738,58 @@ test("#16 on #11's install flow: uninstall removes the Stop hook (with or withou
   fresh.write({ hooks: { Stop: [{ hooks: [{ type: "command", command: 'node "/x/bin/skel.mjs" stop-hook' }] }] } });
   fresh.run("uninstall");
   assert.deepEqual(fresh.read(), {});
+});
+
+test("read-only feedback wait returns immediately, drains pending sends, and stops", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const sending = await serve(dir);
+  try {
+    assert.equal((await post(sending.url, { general: "queued before downgrade", comments: [] }, {
+      "content-type": "application/json", "x-skeleton-token": sending.token,
+    })).status, 204);
+    const readonly = await serve(dir, []);
+    try {
+      const version = await (await fetch(new URL("api/version", readonly.url))).json();
+      assert.equal(readonly.data.serverId, version.serverId);
+      assert.equal(readonly.data.feedbackEnabled, false);
+      const feedback = () => execFileSync("node", [BIN, "feedback", "--wait", "110"], {
+        cwd: dir, encoding: "utf-8", timeout: 5000,
+      });
+      assert.match(feedback(), /queued before downgrade/);
+      const readonlyFeedback = feedback();
+      assert.match(readonlyFeedback, /READ_ONLY/);
+      assert.match(readonlyFeedback, /Wait for it; don't poll/);
+      assert.match(readonlyFeedback, /Only if the human asks for direct Send/);
+      assert.match(run("serve", "--stop"), /stopped the review server/);
+      assert.equal(fs.existsSync(path.join(dir, ".skeleton", "serve.json")), false);
+      assert.match(run("serve", "--stop"), /no review server running/);
+    } finally { await readonly.stop(); }
+  } finally { await sending.stop(); }
+});
+
+test("legacy version metadata without feedbackEnabled is send-mode and restarts for read-only", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const legacy = spawn(process.execPath, ["-e", `const http=require('node:http'); const server=http.createServer((req,res)=>res.end(JSON.stringify({serverId:'legacy',pid:process.pid})));server.listen(0,'127.0.0.1',()=>console.log(server.address().port));`], { stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    const port = await new Promise((resolve, reject) => {
+      legacy.stdout.once("data", (d) => resolve(Number(String(d).trim())));
+      legacy.once("error", reject);
+    });
+    fs.writeFileSync(path.join(dir, ".skeleton", "serve.json"), JSON.stringify({
+      url: `http://127.0.0.1:${port}/`, serverId: "legacy", pid: legacy.pid,
+    }));
+    assert.match(run("serve", "--send"), /feedback enabled; already running/);
+    const readonly = await serve(dir, []);
+    try {
+      const version = await (await fetch(new URL("api/version", readonly.url))).json();
+      assert.notEqual(version.serverId, "legacy");
+      assert.equal(version.feedbackEnabled, false);
+    } finally { await readonly.stop(); }
+  } finally {
+    if (legacy.exitCode === null && legacy.signalCode === null) {
+      await new Promise((resolve) => { legacy.once("exit", resolve); legacy.kill(); });
+    }
+  }
 });
