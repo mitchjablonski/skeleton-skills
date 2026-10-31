@@ -2159,7 +2159,7 @@ test("#26: after XDG_CONFIG_HOME changes, install adds the new dir's rule and re
   const out = run(xdgB, "install");
   const ruleB = `Edit(/${ruleSpelling(path.join(xdgB, "skel"))}/**)`;
   assert.match(out, /added a permission deny rule for skel's config dir/);
-  assert.match(out, /left in place: 1 config-dir deny rule/);
+  assert.match(out, /left in place: 1 deny rule\(s\) for a \.\.\.\/skel\/\*\* dir/);
   assert.ok(out.includes(ruleA), out);
   const deny = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8")).permissions.deny;
   assert.ok(deny.includes(ruleA) && deny.includes(ruleB));
@@ -2190,9 +2190,24 @@ test("#26: the gate asks about edits into skel's config dir from any project, de
   assert.equal(at("Edit", path.join(base, "src", "a.ts")), null);
   assert.equal(at("Read", record), null);
   if (canSymlink) {
+    // Outside the project, a symlink into the dir is resolved and caught.
+    const outside = path.join(tmp("skel-outlink-"), "sneaky");
+    fs.symlinkSync(configDir, outside, "junction");
+    assert.equal(at("Write", path.join(outside, "abc.snapshot.json"))?.decision, "ask", "through a symlink outside the project");
+    // Inside it, the hook stays textual: install's deny rule covers a symlink's target.
     fs.symlinkSync(configDir, path.join(base, "sneaky"), "junction");
-    assert.equal(at("Write", path.join("sneaky", "abc.snapshot.json"))?.decision, "ask", "through a symlink in the project");
+    assert.equal(at("Write", path.join("sneaky", "abc.snapshot.json")), null, "left to the deny rule (checked against the link's target)");
   }
+
+  // An in-project edit never realpaths the edited file for this check: only the config dir is resolved.
+  const resolved = [];
+  const spy = (p) => { resolved.push(p); return p; };
+  const deep = path.join(base, "a", "b", "c", "new", "file.ts");
+  assert.equal(evaluateConfigEdit({ toolName: "Write", toolInput: { file_path: deep }, base, state: null, configDir, resolve: spy }), null);
+  assert.deepEqual(resolved, [configDir], "one resolve, of the config dir");
+  resolved.length = 0;
+  evaluateConfigEdit({ toolName: "Write", toolInput: { file_path: path.join(tmp("skel-elsewhere-"), "x.ts") }, base, state: null, configDir, resolve: spy });
+  assert.equal(resolved.length, 2, "outside the project, the edited path is resolved too");
 
   // The hook itself, with no skeleton anywhere, and Bash commands that name the dir.
   const hook = (input) => {

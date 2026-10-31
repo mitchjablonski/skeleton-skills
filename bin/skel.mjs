@@ -233,7 +233,7 @@ function configDenyRule() {
  * was lost), never to remove them.
  */
 const SKEL_SHAPED = new RegExp(`^Edit\\((//.*)?/\\.skeleton/(${STATE_PATHS.map((p) => p.replace(/[.*]/g, (c) => `\\${c}`)).join("|")})\\)$`);
-/** The config-dir rule's shape, any dir: `Edit(//<abs>/skel/**)`. */
+/** The config-dir rule's shape, any dir: `Edit(//<abs>/skel/**)`. Loose (any skel/ dir matches), so only ever reported as "possibly" ours. */
 const CONFIG_SHAPED = /^Edit\(\/\/.*\/skel\/\*\*\)$/;
 function reportLeftInPlace(settings, notOurs) {
   const deny = (settings.permissions?.deny ?? []).filter((r) => typeof r === "string" && !notOurs.includes(r));
@@ -244,7 +244,7 @@ function reportLeftInPlace(settings, notOurs) {
   }
   const cfg = deny.filter((r) => CONFIG_SHAPED.test(r));
   if (cfg.length) {
-    console.log(`left in place: ${cfg.length} config-dir deny rule(s) shaped like skel's that this install didn't add (an old XDG_CONFIG_HOME's, a moved project's, a lost ownership record's, or your own); remove any you no longer want by hand:`);
+    console.log(`left in place: ${cfg.length} deny rule(s) for a .../skel/** dir that this install didn't add; possibly skel's config-dir rule from an old XDG_CONFIG_HOME, a moved project or a lost ownership record, or your own. Remove any you no longer want by hand:`);
     for (const r of cfg) console.log(`  ${r}`);
   }
 }
