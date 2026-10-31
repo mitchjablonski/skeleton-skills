@@ -62,9 +62,11 @@ Sometimes a step needs something the skeleton doesn't have (you spot it, or the 
 skel reshape     # back to skeleton review; Claude Code asks them to allow it
 ```
 
-Make the structural edit yourself, since this is skeleton work, not a fill (new code gets its own fence and id), refresh the review (the served page reloads by itself), and get approval again before `skel approve` and `skel next`. `skel approve` checks that the human reviewed the reshaped version (see `/skeleton`); pasted feedback's version goes in `--reviewed`.
+Make the structural edit yourself, since this is skeleton work, not a fill (new code gets its own fence and id), refresh the review (the served page reloads by itself), and get approval again before `skel approve` and `skel next`.
 
 If the hook refuses an edit (yours or the filler's), don't retry it in another form or with a shell command. The refusal means "this is a skeleton change." The same goes for `.skeleton/`: never edit the tool's state to get past the gate.
+
+When you re-approve, `skel approve` checks that the human reviewed the reshaped version: pass `--reviewed <v>` from the `Reviewed skeleton version:` line of the feedback they paste (see `/skeleton`).
 
 ## When every step is filled
 

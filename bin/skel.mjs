@@ -86,7 +86,7 @@ function requireNoDrift(root, state, fencedFiles, what) {
 /** Why approve refuses a stale review: what changed since the version the human saw. */
 function staleReview(root, state, files, reviewed, now) {
   const head = `can't approve: the human reviewed skeleton version ${reviewed}, but it is now ${now}.`;
-  const tail = `Ask the human to look at the review page again (it reloads by itself and shows version ${now}) and send their verdict, or paste fresh feedback; then approve. Don't pass a version they haven't seen.`;
+  const tail = `Ask the human to look at the review page again (a live page reloads by itself; regenerate a static one with \`skel review\`): it shows version ${now}. Approve with the version from the feedback they copy and paste (\`--reviewed\`), or after their next send in Send mode. Don't pass a version they haven't seen.`;
   const seen = readRendered(root).find((r) => r.version === reviewed);
   if (!seen) return `${head}\nVersion ${reviewed} isn't one this project's review page rendered recently, so there is no diff to show.\n${tail}`;
   const diff = compareWith(seen, root, state, files);
@@ -597,7 +597,7 @@ const commands = {
     // was given (copied markdown → --reviewed), else the page's latest send.
     const reviewed = given ?? last?.version ?? null;
     if (reviewed && reviewed !== record.version) die(staleReview(root, state, files, reviewed, record.version));
-    if (!reviewed) console.log("note: no review of this version is on record (no send from the review page this round, and no --reviewed). Approving on the human's word alone.");
+    if (!reviewed) console.log("note: no reviewed version given (pass --reviewed <v> from the \"Reviewed skeleton version\" line of the feedback the human pasted) and no send on record this round. Approving on the human's word alone.");
     const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
     try {
       writeSnapshot(root, next, files, record, reviewed ? { version: reviewed, source: given ? "reviewed-flag" : "review-page", at: given ? null : last.at } : null);
