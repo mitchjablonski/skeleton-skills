@@ -776,3 +776,21 @@ test("installed skills' example fences are documentation, not steps (walk and gi
     assert.doesNotMatch(v.permissionDecisionReason, /its fences? (are|is) .*\.claude/, "never points the agent back at the docs");
   }
 });
+
+test("Edit or MultiEdit with an empty old_string creates a file: asks during a step and between steps", () => {
+  const { dir, run, hook } = project();
+  run("init", "T");
+  run("approve");
+  const evil = path.join(dir, "src", "evil.ts");
+  const ask = (tool_name, tool_input) => { const out = hook({ tool_name, tool_input }); return out ? JSON.parse(out).hookSpecificOutput : null; };
+  const edit = { file_path: evil, old_string: "", new_string: "export const x = 1;" };
+  const multi = { file_path: evil, edits: [{ old_string: "", new_string: "export const x = 1;" }] };
+  for (const phase of ["between", "during"]) {
+    if (phase === "during") run("next");
+    for (const [tool, input] of [["Edit", edit], ["MultiEdit", multi], ["Write", { file_path: evil, content: "x" }]]) {
+      const v = ask(tool, input);
+      assert.equal(v?.permissionDecision, "ask", `${tool} ${phase}`);
+      assert.match(v.permissionDecisionReason, /creates a new file/, `${tool} ${phase}`);
+    }
+  }
+});
