@@ -107,6 +107,9 @@ function printFences(step) {
  * a 127.0.0.1 URL that answers with the serverId we recorded. A bare pid (or
  * a serve.json shipped in a repo) is never trusted, killed or handed out.
  */
+/** How long `skel feedback --wait` waits for a review server to answer before saying there's none. */
+const NO_SERVER_GRACE = 10_000;
+
 async function liveServer(root) {
   const s = readServe(root);
   if (!s?.url || !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(s.url) || !s.serverId) return null;
@@ -620,18 +623,17 @@ const commands = {
     const deadline = Date.now() + wait * 1000;
     let readonly = false;
     // No server (a static review, or it stopped): nothing can send, so don't
-    // sit out the wait. Missing at the start counts at once; mid-wait, only
-    // after a few checks in a row, so a restart in between isn't mistaken
-    // for it.
+    // sit out the wait. Only once none has answered for NO_SERVER_GRACE in a
+    // row: `skel serve` scans the project before it listens (and only then
+    // writes serve.json), so one just started in the background, or
+    // restarting, must not be mistaken for none.
     let noServer = false;
-    let missing = 0;
-    let first = true;
+    let missingSince = null;
     while (pendingCount(root) === 0) {
       const live = await liveServer(root);
       if (live?.feedbackEnabled === false) { readonly = true; break; }
-      missing = live ? 0 : missing + 1;
-      if (wait && (first ? missing : missing >= 3)) { noServer = true; break; }
-      first = false;
+      missingSince = live ? null : missingSince ?? Date.now();
+      if (wait && missingSince !== null && Date.now() - missingSince >= NO_SERVER_GRACE) { noServer = true; break; }
       if (Date.now() >= deadline) break;
       await new Promise((r) => setTimeout(r, 1000));
     }

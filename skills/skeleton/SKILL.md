@@ -86,7 +86,7 @@ skel serve --send # enables the authenticated feedback POST endpoint
 skel feedback --wait 110
 ```
 
-Share the new URL and ask the human to reload an existing tab after changing modes. In Send mode only, each feedback call waits up to 110 seconds (under the Bash tool's default timeout); repeat while it prints `NO_FEEDBACK`. Stop the server with `skel serve --stop` when review is finished. The default live view serves source over loopback but accepts no feedback POSTs. Send mode adds the feedback input endpoint.
+Run `skel feedback --wait 110` only after `skel serve --send` has printed its URL. Share the new URL and ask the human to reload an existing tab after changing modes. In Send mode only, each feedback call waits up to 110 seconds (under the Bash tool's default timeout); repeat while it prints `NO_FEEDBACK`. Stop the server with `skel serve --stop` when review is finished. The default live view serves source over loopback but accepts no feedback POSTs. Send mode adds the feedback input endpoint.
 
 If serving is unavailable or the human wants no HTTP listener, run `skel review` and share the generated static file path. They still comment and copy feedback into chat. Regenerate it after revisions and ask them to reopen or refresh the file.
 

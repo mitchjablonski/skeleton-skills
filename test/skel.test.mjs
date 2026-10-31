@@ -1,5 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -2287,22 +2288,70 @@ test("issue #25 (2): a gitignored tracked file's fence bodies are recorded: edit
   assert.doesNotMatch(run("status"), /drift/);
 });
 
-test("issue #25 (2): a record without `fenced` (an older approval) is still compared the way it was recorded", () => {
-  const { dir, run } = approved();
+/** A project with a gitignored tracked file whose fences aren't steps (gen/n.ts), approved and on step 1. */
+function genProject() {
+  const { dir, run, a } = project();
+  execFileSync("git", ["init", "-q", dir]);
+  fs.writeFileSync(path.join(dir, ".gitignore"), "gen/\n");
+  const n = path.join(dir, "gen", "n.ts");
+  fs.mkdirSync(path.dirname(n));
+  fs.writeFileSync(n, "// SKEL[9] example\nbody line\n// /SKEL[9]\n");
+  run("init", "T");
+  run("track", "gen/n.ts");
+  run("approve");
+  run("next");
+  return { dir, run, a, n };
+}
+
+test("issue #25 (2) review S1: a record in main's format (no `format` marker, `fenced` present) is compared the way main recorded it", () => {
+  const { dir, run, a, n } = genProject();
+  // Rewrite the record exactly as main's recordSkeleton/writeSnapshot did:
+  // every file's exterior (gen/n.ts's body dropped, its fence in the set), no `format`.
   const snap = readSnapshot(dir);
-  delete snap.fenced;
-  fs.writeFileSync(snapshotPath(dir), JSON.stringify(snap));
-  fs.writeFileSync(path.join(dir, "src", "a.ts"), SRC.replaceAll(STUB, "return [];"));
-  assert.doesNotMatch(run("status"), /drift/, "fence bodies are still dropped");
+  const hash = (lines) => crypto.createHash("sha256").update(lines.join("\n")).digest("hex");
+  const files = {};
+  const fences = [];
+  for (const rel of Object.keys(snap.files)) {
+    const ext = exterior(fs.readFileSync(path.join(dir, rel), "utf-8"), rel);
+    files[rel] = { sha256: hash(ext.lines), lines: ext.lines };
+    for (const f of ext.fences) fences.push({ file: rel, id: f.id, title: f.title });
+  }
+  const { format, ...rest } = snap;
+  assert.equal(format, 2, "this PR writes the marker");
+  fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...rest, files, fences }));
+  assert.ok(readSnapshot(dir) && readSnapshot(dir).format === undefined && Array.isArray(readSnapshot(dir).fenced));
+  assert.doesNotMatch(run("status"), /drift/, "no false drift after the upgrade");
+  assert.equal(stopHook(dir), "", "the Stop hook agrees");
+  fs.writeFileSync(a, SRC.replaceAll(STUB, "return [];"));
+  assert.doesNotMatch(run("status"), /drift/, "step bodies still dropped");
+  // An unknown format fails closed.
+  fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...rest, files, fences, format: 3 }));
+  assert.equal(readSnapshot(dir), null);
+  assert.ok(n);
 });
 
-test("#14 N4: feedback --wait with no review server returns at once with NO_SERVER", () => {
+test("issue #25 (2) review B1: the Stop hook is silent on a clean fill with a whole-recorded tracked file, and reports a body edit in it", () => {
+  const { dir, run, a, n } = genProject();
+  assert.doesNotMatch(run("status"), /drift/);
+  assert.equal(stopHook(dir), "", "clean: silent");
+  assert.equal(stopHook(dir, {}, ["--block"]), "", "clean with --block: Claude isn't sent back");
+  fs.writeFileSync(a, SRC.replaceAll(STUB, "return [];"));
+  assert.equal(stopHook(dir), "", "filling a step's fence isn't drift");
+  fs.writeFileSync(n, "// SKEL[9] example\nedited body\n// /SKEL[9]\n");
+  const out = JSON.parse(stopHook(dir));
+  assert.match(out.systemMessage, /gen\/n\.ts:2\n\s+- body line\n\s+\+ edited body/);
+  assert.doesNotMatch(out.systemMessage, /fence set/);
+  assert.match(failure(() => run("done")), /gen\/n\.ts:2/, "done agrees");
+});
+
+test("#14 N4: feedback --wait with no review server returns NO_SERVER after a short grace, not the full wait", () => {
   const { dir, run } = project();
   run("init", "T");
   run("review");
   const started = Date.now();
-  const out = execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 10_000 });
-  assert.ok(Date.now() - started < 8000, "didn't sit out the wait");
+  const out = execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 30_000 });
+  const took = Date.now() - started;
+  assert.ok(took >= 9_500 && took < 25_000, `waited the ~10s grace, not 110s (${took}ms)`);
   assert.match(out, /^NO_SERVER: /);
   assert.match(out, /chat message\. Wait for it; don't poll\./, "the READ_ONLY wording");
   assert.doesNotMatch(out, /--send/, "never suggests enabling Send");
@@ -2321,7 +2370,29 @@ test("#14 N4: feedback queued before the server stopped is still delivered by --
   } finally { await srv.stop(); }
   const out = execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 10_000 });
   assert.match(out, /sent before stop/);
-  assert.match(execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 10_000 }), /^NO_SERVER/);
+  assert.match(execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 30_000 }), /^NO_SERVER/);
+});
+
+test("#14 N4 review S2: feedback --wait started alongside `skel serve --send &` waits for it, then delivers a Send", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  // Both at once, as the skill's Send block runs them: serve hasn't written serve.json yet.
+  const fb = spawn("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  let out = "";
+  fb.stdout.on("data", (d) => { out += d; });
+  const done = new Promise((resolve) => fb.on("exit", resolve));
+  const srv = await serve(dir);
+  try {
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(fb.exitCode, null, `still waiting (${out})`);
+    assert.equal((await post(srv.url, { general: "sent while waiting", comments: [] }, { "content-type": "application/json", "x-skeleton-token": srv.token })).status, 204);
+    await done;
+    assert.match(out, /sent while waiting/);
+    assert.doesNotMatch(out, /NO_SERVER/);
+  } finally {
+    if (fb.exitCode === null) { try { process.kill(fb.pid); } catch {} }
+    await srv.stop();
+  }
 });
 
 test("#14 N2/N3: a mode change defers its reload while a note is typed, Overall notes included, and the page says why", async () => {
@@ -2342,6 +2413,7 @@ test("#14 N2/N3: a mode change defers its reload while a note is typed, Overall 
       // a changed mode never falls back to the static page's hint.
       assert.match(readonly.html, /skelModeDecision\(data, next, typing\(\) \|\| !!openEditor\)/);
       assert.match(readonly.html, /canSend \? "" : h\("div", \{ class: "hint", "data-send-hint": true \}, modeChanged\s*\? MODE_CHANGED_HINT/);
+      assert.match(readonly.html, /if \(!hint && sendButton\) \{ hint = h\("div"[^]*sendButton\.after\(hint\)/, "a deferred Send page gets the hint in place");
     } finally { await readonly.stop(); }
   } finally { await sending.stop(); }
 });
