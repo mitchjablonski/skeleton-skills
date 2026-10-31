@@ -46,16 +46,20 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
 
 ```
 /skeleton add stroke smoothing to the canvas
-   → skel init, writes stubs + diagram, `skel serve` → review URL
+   → skel init, writes stubs + diagram, `skel review` → local HTML file
    → you comment / request changes / approve in the page
-   → skel feedback --wait 110   (Claude picks up your feedback)
+   → Copy feedback for Claude → paste into chat
    → skel approve               (Claude Code asks you to allow it)
 /skeleton-fill            (one step, then stop)
 /skeleton-fill all        (every step, still fenced)
-   → skel next → edit inside the fence → tests → skel done → skel feedback
+   → skel next → edit inside the fence → tests → skel done → skel review
    → a structural change? Claude stops and proposes it → you reopen it → skel reshape → re-review
    → skel finalize          (strips the markers)
 ```
+
+Static review is the default: it creates no HTTP listener or feedback endpoint. Regenerate it with `skel review` after changes, then reopen or refresh the file. Feedback stays in the page until you copy it into chat; Claude waits for your chat reply.
+
+For live reload and one-click feedback delivery, explicitly opt in with `skel serve` and share its localhost URL. Claude then reads `skel feedback --wait 110` during review and `skel feedback` after fills. Stop it with `skel serve --stop` when finished. This mode exposes a local HTTP endpoint protected by Host/Origin checks and a per-run token. Both modes retain Claude Code's permission prompt for approval. Mermaid diagrams still load from the pinned CDN in either mode; static review is not a fully offline mode.
 
 ## CLI
 
@@ -65,7 +69,7 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
 | `skel track <file…>` | Include unfenced skeleton files (e.g. new types) in the review; must be inside the project |
 | `skel status [--json]` | Phase, active step, each step's status, and diagram nodes that match no step |
 | `skel serve [--port N] [--stop]` | Live review page; feedback is sent back to Claude. Reuses a running server; uses a stable port per project, so unsent drafts survive a restart |
-| `skel review` | Static `.skeleton/review.html`; copy the feedback by hand |
+| `skel review` | Default: static `.skeleton/review.html`; copy feedback into chat |
 | `skel feedback [--wait S]` | Print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise) |
 | `skel approve` | Enter the fill phase. When Claude runs it, the hook asks you to allow it: that prompt is your approval |
 | `skel reshape` | Back to skeleton review (also asks you) |
