@@ -16,7 +16,7 @@ import {
   cleanFeedback, feedbackMarkdown, mergeRecords, newServeSession,
   addSession, clearSessions, historyDir, pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
-import { clearSnapshot, formatDrift, verifySnapshot, writeSnapshot } from "../lib/snapshot.mjs";
+import { clearSnapshot, formatDrift, scanSkeleton, verifySnapshot, writeSnapshot } from "../lib/snapshot.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Forward slashes on every platform: these land in shell commands and skill text.
@@ -64,7 +64,7 @@ function requireRoot() {
 }
 
 function snapshot(root) {
-  const { fences, errors, files } = scanRepo(root);
+  const { fences, errors, files } = scanSkeleton(root);
   return { steps: toSteps(fences), errors, files };
 }
 
@@ -409,7 +409,7 @@ const commands = {
     const state = readState(root);
     const phase = state.phase;
     if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");
-    const { fences, errors, files: fenced } = scanRepo(root);
+    const { fences, errors, files: fenced } = scanSkeleton(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     requireNoDrift(root, state, fenced, "finalize");
     const pending = fences.filter((f) => f.status === "todo");

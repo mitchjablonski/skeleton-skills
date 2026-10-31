@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { scanText, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
 import { cleanFeedback, feedbackMarkdown } from "../lib/feedback.mjs";
-import { exterior, lineDiff, snapshotPath } from "../lib/snapshot.mjs";
+import { exterior, lineDiff, readSnapshot, snapshotPath } from "../lib/snapshot.mjs";
 import { buildReviewData } from "../lib/review.mjs";
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "skel.mjs");
@@ -712,7 +712,9 @@ test("snapshot: an Edit the hook asked about and the human allowed still blocks 
 test("snapshot: a Bash sed -i outside the fence blocks done and finalize with file:line, and shows on the page", () => {
   const { a, run, fill, page } = approved();
   fill("1", "return raw;");
-  execFileSync("sed", ["-i", "s|^import { Point } from|import { Point, Evil } from|", a]);
+  // An out-of-band edit the hook never sees (what `sed -i` would do), from a
+  // separate process so it runs on every platform.
+  execFileSync(process.execPath, ["-e", "const fs=require('fs');const f=process.argv[1];fs.writeFileSync(f,fs.readFileSync(f,'utf8').replace('import { Point } from','import { Point, Evil } from'))", a]);
   const err = failure(() => run("done"));
   assert.match(err, /can't finish step 1: drift/);
   assert.match(err, /src\/a\.ts:1\n.*- import \{ Point \}.*\n.*\+ import \{ Point, Evil \}/);
@@ -791,4 +793,21 @@ test("snapshot: done notes (without blocking) a fill that escapes its block, whi
   const { run, fill } = approved();
   fill("1", "return raw;\n}\nexport function evil() {\n  return [];");
   assert.match(run("done"), /note: in src\/a\.ts:4-9, .*heuristic[\s\S]*STEP 1 done/);
+});
+
+test("Codex review (#10): a fence body grown past the scan's size cap still blocks done and finalize", () => {
+  const { dir, a, run } = project();
+  run("init", "T");
+  run("approve");
+  run("next");
+  // Keep SKEL_TODO, grow the body past 1 MB; the exterior is unchanged.
+  const big = "  // " + "x".repeat(1_100_000);
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, `${STUB}\n${big}`));
+  const stateBefore = fs.readFileSync(path.join(dir, ".skeleton", "state.json"), "utf-8");
+  assert.throws(() => run("done"), /still has SKEL_TODO/);
+  assert.throws(() => run("finalize"), /still pending: 1/);
+  assert.equal(fs.readFileSync(path.join(dir, ".skeleton", "state.json"), "utf-8"), stateBefore, "no state change on a refused finalize");
+  assert.ok(readSnapshot(dir), "the approved snapshot survives a refused finalize");
+  assert.match(fs.readFileSync(a, "utf-8"), /SKEL\[1\]/, "markers untouched");
+  assert.match(run("status"), /1 {5}drop near-duplicate points/);
 });
