@@ -5,7 +5,7 @@
 Two Claude Code skills and a small CLI that bring back the feeling of building with an AI pair one function at a time, with strong opinions about where code lives:
 
 1. **`/skeleton`**: Claude writes the feature as a *skeleton*: real files, real types and signatures, real wiring, plus an architecture diagram. Every body is an empty, fenced stub. You review the skeleton in a local page, comment on lines or on the diagram, and approve.
-2. **`/skeleton-fill`**: Claude fills one step at a time (or `all` of them), but **only inside the fences**. A `PreToolUse` hook checks every edit, so a signature change or new file can't slip in. It has to come back to you as a skeleton change.
+2. **`/skeleton-fill`**: Claude fills one step at a time (or `all` of them), but **only inside the fences**. Each step's code is written by a restricted `skeleton-filler` subagent with no shell and no Write, and a `PreToolUse` hook checks every edit, so a signature change or new file can't slip in. It has to come back to you as a skeleton change.
 
 ![The review page: architecture diagram coloured by step status, steps sidebar, fenced code, line comments, and the feedback panel.](docs/review.png)
 
@@ -40,7 +40,7 @@ git clone https://github.com/mitchjablonski/skeleton-skills
 node skeleton-skills/bin/skel.mjs install /path/to/your/project
 ```
 
-This copies the two skills into `<project>/.claude/skills/` and adds the scope-gate hook to `<project>/.claude/settings.local.json`.
+This copies the two skills into `<project>/.claude/skills/`, the `skeleton-filler` subagent into `<project>/.claude/agents/`, and adds the scope-gate hook to `<project>/.claude/settings.local.json`. Running it again updates them in place. If `.claude/agents/` didn't exist when your Claude Code session started, restart the session so it picks up the subagent.
 
 ## The loop
 
@@ -52,7 +52,7 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
    → skel approve               (Claude Code asks you to allow it)
 /skeleton-fill            (one step, then stop)
 /skeleton-fill all        (every step, still fenced)
-   → skel next → edit inside the fence → tests → skel done → skel feedback
+   → skel next → your opinion → skeleton-filler edits inside the fence → tests → skel done → skel feedback
    → a structural change? Claude stops and proposes it → you reopen it → skel reshape → re-review
    → skel finalize          (strips the markers)
 ```
@@ -75,6 +75,18 @@ This copies the two skills into `<project>/.claude/skills/` and adds the scope-g
 
 **Gate modes:** `ask` (default) sends an out-of-fence edit to you for a yes or no. `deny` refuses it outright, so Claude must propose a skeleton change.
 
+## The filler subagent
+
+`/skeleton-fill` splits each step in two. The main conversation runs the loop: `skel serve`, `skel next`, your opinion on the approach, the tests, `skel done` and `skel feedback`. The code edit goes to `skeleton-filler`, a [Claude Code subagent](https://code.claude.com/docs/en/sub-agents) whose `tools` are only `Read, Grep, Glob, Edit, MultiEdit`, with `Bash`, `PowerShell`, `Monitor`, `Write`, `NotebookEdit` and `Agent` also denied. The main conversation hands it the fence bodies from `skel next`, the step's contract, the agreed approach and the test to satisfy. The filler edits inside the fence and returns a short report: `filled`, or `blocked` with the skeleton change it needs. It can't run the tests, so when they fail the main conversation sends the output back to it.
+
+**Why:** the hook can only pattern-match shell commands, so arbitrary Bash is the hole in the fence. The agent that writes the step's code has no shell, so for that agent every change goes through Edit, where the hook judges the result exactly. It also can't create files, can't spawn agents, and starts without your conversation, only with the step's brief.
+
+**Trade-offs:**
+- An extra subagent hop per step: a little more latency and tokens, and the filler re-reads the code around the fence.
+- The filler can't run anything. It can't check its own work, so a failing test is a round trip, not a quick local fix.
+- The main conversation still has a shell, and the skill asks it not to write fence code itself. That rule is an instruction, not something the hook enforces. The filler narrows who writes the code; it doesn't take the shell away from the session.
+- MultiEdit is a legacy tool name in current Claude Code (Edit covers it). It's listed for older versions; Claude Code only refuses a subagent when *no* entry in its `tools` resolves.
+
 ## Security model
 
 The fence is a **drift guard for a cooperative agent**: it keeps an agent that means well from quietly widening its own scope. It is not a sandbox against a hostile one, which could always write files from a shell.
@@ -85,10 +97,10 @@ The fence is a **drift guard for a cooperative agent**: it keeps an agent that m
 - **The tool's state is off-limits.** Agent edits to any `.skeleton/` directory, at any depth (except the top-level `diagrams/`), ask, matched case-insensitively. So do Bash commands that name `.skeleton/` state, from any working directory. An enclosing skeleton that is mid-fill outranks a nested state file, so one planted or shipped deeper down can't take over the fence.
 - **The review server** binds to 127.0.0.1, answers only requests addressed to `127.0.0.1`/`localhost` (no DNS rebinding), and accepts feedback only same-origin, as JSON, with a per-run token. So other websites can't post to it. The markdown Claude reads is rebuilt server-side and framed as review notes, not instructions.
 - **Feedback is tied to this skeleton's serve runs**, whose ids live outside the project (`~/.config/skel/`), so nothing committed to a repo can vouch for a feedback file. Leftover, committed or hand-written ones are quarantined. `init` stops the old review server and forgets its sessions; a superseded server refuses sends. `skel serve` reuses a running server only after it answers with the id it recorded, and never kills a bare pid. `install` adds `.skeleton/` to `.gitignore`.
-- **Files:** tracked files must resolve inside the project; writes go through temp-file-and-rename (never through a symlink); `install` refuses symlinked or unparseable settings rather than overwrite them.
+- **Files:** tracked files must resolve inside the project; writes go through temp-file-and-rename (never through a symlink); `install` refuses symlinked or unparseable settings rather than overwrite them, and refuses a symlinked `.claude/skills/` or `.claude/agents/` folder or installed skill or agent file.
 - **Mermaid** is pinned to a patched release (past CVE-2025-54881) with Subresource Integrity, and loads without blocking the page.
 
-Not covered: arbitrary Bash, and anything once a hook fault makes it fail open. Pair it with Claude Code's permission rules if you need hard limits.
+Not covered: arbitrary Bash in the main conversation (the filler subagent that writes each step's code has none), and anything once a hook fault makes it fail open. Pair it with Claude Code's permission rules if you need hard limits.
 
 ## Prior art
 
