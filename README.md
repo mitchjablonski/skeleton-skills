@@ -78,7 +78,7 @@ For no HTTP listener, use `skel review` to generate a static HTML file, then reg
 | `skel status [--json]` | Phase, active step, each step's status, and diagram nodes that match no step |
 | `skel serve [--port N] [--send] [--stop]` | Default: live read-only review; copy feedback into chat. `--send` enables direct feedback delivery. Reuses a server in the same mode; uses a stable port per project |
 | `skel review` | Static `.skeleton/review.html` with no HTTP listener; copy feedback into chat |
-| `skel feedback [--wait S]` | Send-mode only: print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise) |
+| `skel feedback [--wait S]` | Send-mode only: print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise, or at once `READ_ONLY` for a read-only server and `NO_SERVER` when none is running) |
 | `skel approve [--reviewed V]` | Enter the fill phase and record the approved skeleton. When Claude runs it, the hook asks you to allow it: that prompt is your approval. Refuses, with a diff, if the skeleton isn't the version you last reviewed: `--reviewed` names it from the feedback you pasted (else your latest send in Send mode, else the version the review page last rendered, which catches only edits made after it) |
 | `skel reshape` | Back to skeleton review (also asks you) |
 | `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one. `done` refuses on drift from the approved skeleton |
