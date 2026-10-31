@@ -84,9 +84,11 @@ function requireNoDrift(root, state, fencedFiles, what) {
 }
 
 /** Why approve refuses a stale review: what changed since the version the human saw. */
-function staleReview(root, state, files, reviewed, now) {
-  const head = `can't approve: the human reviewed skeleton version ${reviewed}, but it is now ${now}.`;
-  const tail = `Ask the human to look at the review page again (a live page reloads by itself; regenerate a static one with \`skel review\`): it shows version ${now}. Approve with the version from the feedback they copy and paste (\`--reviewed\`), or after their next send in Send mode. Don't pass a version they haven't seen.`;
+function staleReview(root, state, files, reviewed, how = "the human reviewed") {
+  // The current version is not printed: the agent must only ever pass a
+  // version it got from the human, so it isn't handed one to copy.
+  const head = `can't approve: ${how} skeleton version ${reviewed}, and the skeleton has changed since.`;
+  const tail = "Have the human reload the review page (a live page reloads by itself; regenerate a static one with `skel review`) and review it again. Approve with the version from the feedback they copy and paste (`--reviewed`), or after their next send in Send mode. Don't pass a version the human didn't give you.";
   const seen = readRendered(root).find((r) => r.version === reviewed);
   if (!seen) return `${head}\nVersion ${reviewed} isn't one this project's review page rendered recently, so there is no diff to show.\n${tail}`;
   const diff = compareWith(seen, root, state, files);
@@ -272,10 +274,13 @@ function legacyOwned(settings, owned) {
   return hooked && LEGACY_DENY_RULES.every((r) => deny.includes(r)) ? LEGACY_DENY_RULES : [];
 }
 
-/** Our Stop hook (bin/skel-stop.mjs, or `skel.mjs stop-hook`), with any flags after it, else null. */
+/**
+ * Our Stop hook (bin/skel-stop.mjs, or `skel.mjs stop-hook`) from any checkout,
+ * recognised by its script whatever flags follow; block: one of them is --block.
+ */
 const skelStopHook = (cmd) => {
-  const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?: --block)?)$/.exec(cmd);
-  return m ? { flags: m[1] } : null;
+  const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?:\s+\S+)*)\s*$/.exec(cmd);
+  return m ? { block: m[1].split(/\s+/).includes("--block") } : null;
 };
 /** The scope-gate hook command from any skel checkout (current or legacy form). */
 const isSkelHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](skel-hook\.mjs"|skel\.mjs" hook)$/.test(cmd);
@@ -493,7 +498,8 @@ const commands = {
         } else if (req.method === "GET" && req.url === "/api/version") {
           lastPoll = Date.now();
           res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-          res.end(JSON.stringify({ version: current().version, serverId, pid: process.pid, feedbackEnabled }));
+          const now = current();
+          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
           if (!feedbackEnabled) { req.resume(); return void res.writeHead(405, { Allow: "GET", connection: "close" }).end("read-only review; reload and use Copy feedback for Claude"); }
           // Cross-site writes: same origin, a JSON content type (forces a CORS
@@ -598,22 +604,31 @@ const commands = {
       if (err.code === "SKEL_MARKERS") die(`fix marker errors first:\n  ${err.message}`);
       die(`couldn't read the skeleton to record it: ${err.message}`);
     }
-    console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
     const { record: last, unread } = lastReview(root, state.reviewEpoch);
     if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
     // What the human reviewed: the version named in the feedback the agent
-    // was given (copied markdown → --reviewed), else the page's latest send.
-    const reviewed = given ?? last?.version ?? null;
-    if (reviewed && reviewed !== record.version) die(staleReview(root, state, files, reviewed, record.version));
-    if (!reviewed) console.log("note: no reviewed version given (pass --reviewed <v> from the \"Reviewed skeleton version\" line of the feedback the human pasted) and no send on record this round. Approving on the human's word alone.");
+    // was given (copied markdown → --reviewed), else the page's latest send,
+    // else the version the review page (live or `skel review`) last rendered.
+    // Under the read-only default the last is the common case: approving what
+    // the page showed is fine, approving something it never showed is not.
+    let review = null;
+    if (given) review = { version: given, source: "reviewed-flag", at: null, how: "the human reviewed" };
+    else if (last?.version) review = { version: last.version, source: "review-page", at: last.at, how: "the human reviewed" };
+    else {
+      const shown = readRendered(root)[0];
+      if (shown) review = { version: shown.version, source: "rendered", at: shown.at, how: "no --reviewed was given and nothing was sent; the review page last showed" };
+    }
+    if (review && review.version !== record.version) die(staleReview(root, state, files, review.version, review.how));
+    if (!review) console.log("note: no reviewed version given (pass --reviewed <v> from the \"Reviewed skeleton version\" line of the feedback the human pasted), no send on record, and no review page was ever rendered for this project. Approving on the human's word alone.");
+    console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
     const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
     try {
-      writeSnapshot(root, next, files, record, reviewed ? { version: reviewed, source: given ? "reviewed-flag" : "review-page", at: given ? null : last.at } : null);
+      writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at });
     } catch (err) {
       die(`couldn't record the approved skeleton: ${err.message}`);
     }
     writeState(root, next);
-    console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${reviewed ? " (the version the human reviewed)" : ""}. Run \`skel next\` to start filling.`);
+    console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
   },
 
   next() {
@@ -750,18 +765,29 @@ const commands = {
       settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
     }
     // The Stop hook checks for drift at the end of every turn during a fill.
-    // Found by its script, so a moved clone is updated in place and a
-    // `--block` someone added survives a reinstall.
+    // Found by its script, so a moved clone is updated in place, duplicates
+    // (two installs, a hand-added copy) collapse to the first, and a `--block`
+    // on any of them survives a reinstall.
     const stopCommand = `node "${STOP_HOOK}"`;
     settings.hooks.Stop ??= [];
-    let stopOurs = false;
+    let stopOurs = null;
+    let block = false;
+    const emptied = new Set();
     for (const m of settings.hooks.Stop) {
-      for (const hk of Array.isArray(m?.hooks) ? m.hooks : []) {
+      if (!Array.isArray(m?.hooks) || !m.hooks.length) continue;
+      m.hooks = m.hooks.filter((hk) => {
         const found = skelStopHook(hk?.command);
-        if (found) { stopOurs = true; hk.command = stopCommand + found.flags; }
-      }
+        if (!found) return true;
+        block ||= found.block;
+        if (stopOurs) return false;
+        stopOurs = hk;
+        return true;
+      });
+      if (!m.hooks.length) emptied.add(m);
     }
-    if (!stopOurs) settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand }] });
+    settings.hooks.Stop = settings.hooks.Stop.filter((m) => !emptied.has(m));
+    if (stopOurs) stopOurs.command = stopCommand + (block ? " --block" : "");
+    else settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand }] });
     settings.permissions ??= {};
     settings.permissions.deny = (settings.permissions.deny ?? []).filter((r) => !stale.includes(r));
     const added = rules.filter((r) => !settings.permissions.deny.includes(r));

@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { scanText, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
 import { cleanFeedback, configPath, feedbackMarkdown, projectKey, sessionStorePath } from "../lib/feedback.mjs";
-import { exterior, lineDiff, readSnapshot, recordSkeleton, scanSkeleton, snapshotPath, whitespaceOnly } from "../lib/snapshot.mjs";
+import { compareWith, exterior, lineDiff, readRendered, readSnapshot, recordSkeleton, renderedPath, safeKey, scanSkeleton, snapshotPath, whitespaceOnly } from "../lib/snapshot.mjs";
 import { buildReviewData } from "../lib/review.mjs";
 import { readState } from "../lib/state.mjs";
 
@@ -1145,8 +1145,9 @@ test("#15: approve refuses when the skeleton changed after the human's review on
     // The agent edits the skeleton after the human's "looks good".
     fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(SIG, "smooth(raw: Point[], k: number): Point[]"));
     const err = failure(() => run("approve"));
-    assert.match(err, new RegExp(`skeleton version [0-9a-f]{12}`), "prints the version it would snapshot");
-    assert.match(err, new RegExp(`the human reviewed skeleton version ${v1}, but it is now [0-9a-f]{12}`));
+    assert.match(err, new RegExp(`the human reviewed skeleton version ${v1}, and the skeleton has changed since`));
+    assert.doesNotMatch(err, new RegExp(recordSkeleton(dir, { files: [] }, ["src/a.ts"]).version), "never hands the agent the current version to pass");
+    assert.match(err, /Have the human reload the review page/);
     assert.match(err, /src\/a\.ts:3\n\s+- export function smooth\(raw: Point\[\]\): Point\[\] \{\n\s+\+ export function smooth\(raw: Point\[\], k: number\)/, "with the diff");
     assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".skeleton", "state.json"), "utf-8")).phase, "scaffold");
     // The human reloads, sees the new version, and approves it.
@@ -1173,7 +1174,8 @@ test("#15: Copy mode: approve --reviewed checks the version from the pasted mark
   assert.equal(recordSkeleton(dir, { files: [] }, ["src/a.ts"]).version, v1);
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace("// SKEL[2] catmull-rom between a and b", "// SKEL[2] linear between a and b"));
   const err = failure(() => run("approve", "--reviewed", v1));
-  assert.match(err, new RegExp(`reviewed skeleton version ${v1}, but it is now`));
+  assert.match(err, new RegExp(`reviewed skeleton version ${v1}, and the skeleton has changed since`));
+  assert.doesNotMatch(err, new RegExp(recordSkeleton(dir, { files: [] }, ["src/a.ts"]).version));
   assert.match(err, /fence set: added or retitled 2; removed or retitled 2/);
   assert.match(failure(() => run("approve", "--reviewed", "nope")), /--reviewed takes the 12-character version/);
   assert.match(failure(() => run("approve", "--reviewed", "0123456789ab")), /isn't one this project's review page rendered recently/);
@@ -1792,4 +1794,144 @@ test("legacy version metadata without feedbackEnabled is send-mode and restarts 
       await new Promise((resolve) => { legacy.once("exit", resolve); legacy.kill(); });
     }
   }
+});
+
+// ---- review of PR #20 (after #14's read-only default) ----
+
+/** The page's poll decision (lib/review-poll.js), as the browser runs it. */
+const skelPollDecision = new Function(fs.readFileSync(path.join(path.dirname(BIN), "..", "lib", "review-poll.js"), "utf-8") + "\nreturn skelPollDecision;")();
+
+test("B1/NIT3: the page's poll, fed the live server's real /api/version, leaves a fresh page alone; only a shape change says outdated", async () => {
+  const { dir, a, run } = project();
+  run("init", "T");
+  const srv = await serve(dir, []); // #14's read-only default
+  try {
+    const built = { version: srv.data.version, skeletonVersion: srv.data.skeletonVersion };
+    assert.match(built.version, /^[0-9a-f]{12}$/, "a served page embeds its content version");
+    const answer = async () => (await fetch(new URL("api/version", srv.url))).json();
+    const fresh = await answer();
+    assert.equal(typeof fresh, "object", "#14: /api/version answers an object");
+    assert.equal(fresh.skeletonVersion, built.skeletonVersion);
+    for (const busy of [false, true]) {
+      assert.deepEqual(skelPollDecision(built, fresh, busy), { reload: false, stale: false }, `fresh page, busy=${busy}: not outdated`);
+    }
+    assert.deepEqual(skelPollDecision(built, fresh.version, false), { reload: false, stale: false }, "a bare version string works too");
+    // A body edit (the fill, not the shape): live reload, never "outdated".
+    fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, 'throw new Error("SKEL_TODO: soon");'));
+    const body = await answer();
+    assert.notEqual(body.version, built.version);
+    assert.equal(body.skeletonVersion, built.skeletonVersion);
+    assert.deepEqual(skelPollDecision(built, body, false), { reload: true, stale: false });
+    assert.deepEqual(skelPollDecision(built, body, true), { reload: false, stale: false }, "typing through a body edit: no reload-before-approving");
+    // A shape edit while a note is being typed: outdated.
+    fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(SIG, "smooth(raw: Point[], k: number): Point[]"));
+    const shape = await answer();
+    assert.notEqual(shape.skeletonVersion, built.skeletonVersion);
+    assert.deepEqual(skelPollDecision(built, shape, true), { reload: false, stale: true });
+    assert.deepEqual(skelPollDecision(built, shape, false), { reload: true, stale: false });
+  } finally { await srv.stop(); }
+  // The page runs exactly this function: inlined ahead of the client, called by its poll.
+  assert.match(srv.html, /function skelPollDecision\(built, next, busy\)[\s\S]*skelPollDecision\(built, next, typing \|\| !!openEditor\)/);
+});
+
+test("S1: plain approve under the read-only default checks the version the page last rendered", () => {
+  const { dir, a, run } = project();
+  run("init", "T");
+  const v1 = pageData(fs.readFileSync(run("review").split("\n")[0], "utf-8")).skeletonVersion;
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(SIG, "smooth(raw: Point[], k: number): Point[]"));
+  const err = failure(() => run("approve"));
+  assert.match(err, new RegExp(`the review page last showed skeleton version ${v1}, and the skeleton has changed since`));
+  assert.match(err, /src\/a\.ts:3\n\s+- export function smooth\(raw: Point\[\]\): Point\[\] \{\n\s+\+ export function smooth\(raw: Point\[\], k: number\)/, "with the diff");
+  assert.doesNotMatch(err, new RegExp(recordSkeleton(dir, { files: [] }, ["src/a.ts"]).version), "no current version to copy");
+  assert.match(err, /Have the human reload the review page/);
+  assert.equal(readState(dir).phase, "scaffold");
+  // The human looks again (the page renders the new version): approve passes.
+  const v2 = pageData(fs.readFileSync(run("review").split("\n")[0], "utf-8")).skeletonVersion;
+  const out = run("approve");
+  assert.match(out, new RegExp(`version ${v2} \\(the version the review page last showed\\)`));
+  assert.doesNotMatch(out, /human's word alone/);
+  assert.deepEqual([readSnapshot(dir).review.version, readSnapshot(dir).review.source], [v2, "rendered"]);
+  // Never rendered: the old note stays.
+  const other = project();
+  other.run("init", "T");
+  assert.match(other.run("approve"), /no review page was ever rendered for this project\. Approving on the human's word alone/);
+});
+
+test("S2: snapshot and rendered-store keys can't point outside the project", () => {
+  for (const bad of ["../secret.txt", "src/../../secret.txt", "/etc/passwd", "C:/x", "C:x", "src\\a.ts", "", "a\u0000b"]) assert.equal(safeKey(bad), false, JSON.stringify(bad));
+  for (const good of ["src/a.ts", ".claude/notes.md", "a..b/c", "..x"]) assert.equal(safeKey(good), true, good);
+  const { dir, a, run } = project();
+  const secret = path.join(path.dirname(dir), `secret-${path.basename(dir)}.txt`);
+  fs.writeFileSync(secret, "TOPSECRET\n");
+  TEMPS.push(secret);
+  const leak = `../${path.basename(secret)}`;
+  run("init", "T");
+  // Rendered store: a forged entry naming a file outside is dropped, not diffed.
+  const v1 = pageData(fs.readFileSync(run("review").split("\n")[0], "utf-8")).skeletonVersion;
+  const store = JSON.parse(fs.readFileSync(renderedPath(dir), "utf-8"));
+  store.versions[0].files[leak] = { sha256: "0", lines: ["nothing"] };
+  fs.writeFileSync(renderedPath(dir), JSON.stringify(store));
+  assert.deepEqual(readRendered(dir), [], "the forged entry is rejected");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(SIG, "smooth(raw: Point[], k: number): Point[]"));
+  const err = failure(() => run("approve", "--reviewed", v1));
+  assert.doesNotMatch(err, /TOPSECRET|secret-/);
+  // compareWith itself skips such keys (a record from elsewhere, or a symlink out).
+  const rec = recordSkeleton(dir, { files: [] }, ["src/a.ts"]);
+  const forged = { ...rec, files: { ...rec.files, [leak]: { sha256: "0", lines: [] } } };
+  assert.equal(compareWith(forged, dir, { files: [] }, ["src/a.ts"]).items.some((i) => i.file.includes("secret")), false);
+  if (canSymlink) {
+    fs.symlinkSync(secret, path.join(dir, "src", "link.txt"));
+    const linked = { ...rec, files: { ...rec.files, "src/link.txt": { sha256: "0", lines: [] } } };
+    assert.equal(compareWith(linked, dir, { files: [] }, ["src/a.ts"]).items.some((i) => i.file === "src/link.txt"), false, "a symlink out of the project is skipped");
+  }
+  // Snapshot: a forged key fails closed, so the Stop hook reports no record instead of the file.
+  fs.writeFileSync(a, SRC);
+  run("approve");
+  const snap = JSON.parse(fs.readFileSync(snapshotPath(dir), "utf-8"));
+  for (const key of [leak, "/etc/passwd", "src\\a.ts"]) {
+    fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...snap, files: { ...snap.files, [key]: { sha256: "0", lines: ["TOPSECRET"] } } }));
+    assert.equal(readSnapshot(dir), null, key);
+    for (const args of [[], ["--block"]]) {
+      const out = stopHook(dir, {}, args);
+      assert.doesNotMatch(out, /TOPSECRET|secret-|passwd/, `${key} ${args}`);
+    }
+  }
+});
+
+test("NIT4: readSnapshot requires a finite review.at", () => {
+  const { dir, run } = project();
+  run("init", "T");
+  run("approve", "--reviewed", recordSkeleton(dir, { files: [] }, ["src/a.ts"]).version);
+  const text = fs.readFileSync(snapshotPath(dir), "utf-8");
+  assert.ok(readSnapshot(dir));
+  fs.writeFileSync(snapshotPath(dir), text.replace(/"at":null/, '"at":1e999'));
+  assert.match(fs.readFileSync(snapshotPath(dir), "utf-8"), /1e999/);
+  assert.equal(readSnapshot(dir), null, "Infinity is not a time");
+  fs.writeFileSync(snapshotPath(dir), text.replace(/"at":null/, '"at":1700000000000'));
+  assert.ok(readSnapshot(dir));
+});
+
+test("NIT2: install collapses duplicate skel Stop hooks to one (keeping --block), whatever their flags; uninstall removes them all", () => {
+  const { read, write, run } = installTarget();
+  const mineStop = { hooks: [{ type: "command", command: "echo stop" }] };
+  write({ hooks: { Stop: [
+    { hooks: [{ type: "command", command: 'node "/old/clone/bin/skel-stop.mjs" --verbose' }] },
+    mineStop,
+    { hooks: [{ type: "command", command: 'node "/x/bin/skel.mjs" stop-hook --block' }, { type: "command", command: "echo also mine" }] },
+    { hooks: [{ type: "command", command: 'node "/y/bin/skel-stop.mjs"' }] },
+  ] } });
+  assert.match(run("install"), /drift check \(Stop\) hook updated/);
+  const stops = read().hooks.Stop;
+  const ours = stops.flatMap((m) => m.hooks).filter((hk) => /skel(-stop)?\.mjs/.test(hk.command));
+  assert.equal(ours.length, 1, "one skel Stop hook left");
+  assert.match(ours[0].command, /^node ".*\/bin\/skel-stop\.mjs" --block$/, "current checkout, --block kept");
+  assert.deepEqual(stops, [{ hooks: [ours[0]] }, mineStop, { hooks: [{ type: "command", command: "echo also mine" }] }], "the first slot is reused, the user's hooks stay, emptied entries go");
+  run("install");
+  assert.deepEqual(read().hooks.Stop, stops, "a re-run changes nothing");
+  // Uninstall removes every one of ours, flags or not.
+  const s = read();
+  s.hooks.Stop.push({ hooks: [{ type: "command", command: 'node "/z/bin/skel-stop.mjs" --block --verbose' }] });
+  write(s);
+  run("uninstall");
+  assert.deepEqual(read().hooks.Stop, [mineStop, { hooks: [{ type: "command", command: "echo also mine" }] }]);
 });
