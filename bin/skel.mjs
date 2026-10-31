@@ -17,8 +17,9 @@ import {
 } from "../lib/feedback.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SELF = path.join(PKG_ROOT, "bin", "skel.mjs");
-const HOOK = path.join(PKG_ROOT, "bin", "skel-hook.mjs");
+// Forward slashes on every platform: these land in shell commands and skill text.
+const SELF = path.join(PKG_ROOT, "bin", "skel.mjs").split(path.sep).join("/");
+const HOOK = path.join(PKG_ROOT, "bin", "skel-hook.mjs").split(path.sep).join("/");
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
@@ -215,9 +216,12 @@ const commands = {
     let origin = "";
     const hosts = new Set();
     const server = http.createServer((req, res) => {
+      // Refusals answer before reading a body; drain it so the client gets the
+      // status instead of a connection reset (Windows resets on unread input).
+      const refuse = (code, text) => { req.resume(); res.writeHead(code, { connection: "close" }).end(text); };
       try {
         // DNS rebinding: only answer requests addressed to us by name.
-        if (!hosts.has(String(req.headers.host ?? "").toLowerCase())) return void res.writeHead(421).end("misdirected request");
+        if (!hosts.has(String(req.headers.host ?? "").toLowerCase())) return void refuse(421, "misdirected request");
         if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/?"))) {
           const { data, version } = current();
           res.writeHead(200, {
@@ -237,10 +241,10 @@ const commands = {
           const sameOrigin = !req.headers.origin || hosts.has(String(req.headers.origin).replace(/^https?:\/\//, "").toLowerCase());
           const json = String(req.headers["content-type"] ?? "").split(";")[0].trim() === "application/json";
           const tokenOk = String(req.headers["x-skeleton-token"] ?? "") === token;
-          if (!sameOrigin || !json || !tokenOk) return void res.writeHead(403).end("forbidden");
+          if (!sameOrigin || !json || !tokenOk) return void refuse(403, "forbidden");
           // A newer server (or a new skeleton) took over: don't accept notes
           // the agent would no longer trust.
-          if (superseded()) return void res.writeHead(409).end(`this review page is out of date; reload ${readServe(root)?.url ?? "the new review URL"}`);
+          if (superseded()) return void refuse(409, `this review page is out of date; reload ${readServe(root)?.url ?? "the new review URL"}`);
           let body = "";
           req.on("data", (c) => { body += c; if (body.length > 2_000_000) req.destroy(); });
           req.on("end", () => {
@@ -405,8 +409,12 @@ const commands = {
     const target = path.resolve(dir);
     const claudeDir = path.join(target, ".claude");
     // The hook command runs through a shell: refuse an install path that a
-    // shell would interpret rather than quote it and hope.
-    if (/["'`$\\\n\r]/.test(PKG_ROOT)) die(`can't install from a path containing quotes, $, backticks or backslashes: ${SELF}`);
+    // shell would interpret rather than quote it and hope. Windows paths are
+    // written with forward slashes (Node accepts them), so their backslashes
+    // never reach the shell.
+    if (/["'`$\n\r]/.test(PKG_ROOT) || (process.platform !== "win32" && PKG_ROOT.includes("\\"))) {
+      die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
+    }
     const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
     const settingsPath = path.join(claudeDir, "settings.local.json");
     for (const p of [claudeDir, settingsPath, path.join(target, ".gitignore")]) {

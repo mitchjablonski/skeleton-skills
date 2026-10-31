@@ -30,6 +30,12 @@ export function interpolate(a: Point, b: Point): Point[] {
 `;
 const STUB = 'throw new Error("SKEL_TODO");';
 
+/** Can this platform/user create symlinks? (Windows needs a privilege.) */
+const canSymlink = (() => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "skel-ln-"));
+  try { fs.symlinkSync(path.join(d, "x"), path.join(d, "y")); return true; } catch { return false; } finally { fs.rmSync(d, { recursive: true, force: true }); }
+})();
+
 const tmp = (prefix = "skel-") => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 
 // ---- markers ----
@@ -80,8 +86,10 @@ test("stripMarkers removes only marker lines", () => {
 
 // ---- gate ----
 
-const root = "/proj";
-const file = "/proj/src/a.ts";
+// Platform paths: on Windows "/proj" resolves to a drive-rooted path.
+const root = path.resolve("/proj");
+const P = (rel) => path.join(root, ...rel.split("/"));
+const file = P("src/a.ts");
 const fill = { phase: "fill", activeStep: "1", gate: "ask" };
 const gate = (toolName, toolInput, state = fill, text = SRC) =>
   evaluate({
@@ -102,7 +110,7 @@ test("UX #8: between steps, the skeleton's files ask; everything else is free", 
   const between = { phase: "fill", activeStep: null, gate: "ask", files: ["src/types.ts"] };
   assert.match(gate("Edit", { old_string: "import", new_string: "x" }, between).reason, /no step is active/);
   assert.equal(gate("Edit", { old_string: "x", new_string: "y" }, between, "const x = 1;\n"), null);
-  const tracked = evaluate({ toolName: "Edit", toolInput: { file_path: "/proj/src/types.ts", old_string: "a", new_string: "b" }, root, state: between, resolve: (p) => p, readFile: () => "a", activeFences: [] });
+  const tracked = evaluate({ toolName: "Edit", toolInput: { file_path: P("src/types.ts"), old_string: "a", new_string: "b" }, root, state: between, resolve: (p) => p, readFile: () => "a", activeFences: [] });
   assert.equal(tracked?.decision, "ask");
 });
 
@@ -174,11 +182,11 @@ test("bodyEscapesFence catches the Python dedent and a bracket left open", () =>
 
 test("security H3: the tool's own state is off-limits to agent edits in every phase; diagrams aren't", () => {
   for (const state of [fill, { phase: "scaffold", activeStep: null, gate: "ask" }]) {
-    for (const p of ["/proj/.skeleton/state.json", "/proj/.skeleton/feedback/1-ab.json", "/proj/.skeleton/serve.json"]) {
+    for (const p of [P(".skeleton/state.json"), P(".skeleton/feedback/1-ab.json"), P(".skeleton/serve.json")]) {
       const v = evaluate({ toolName: "Write", toolInput: { file_path: p, content: '{"phase":"scaffold"}' }, root, state, resolve: (x) => x, readFile: () => null, activeFences: [] });
       assert.equal(v?.decision, "ask", `${state.phase} ${p}`);
     }
-    assert.equal(evaluate({ toolName: "Write", toolInput: { file_path: "/proj/.skeleton/diagrams/a.mmd", content: "flowchart LR" }, root, state, resolve: (x) => x, readFile: () => null, activeFences: [] }), null);
+    assert.equal(evaluate({ toolName: "Write", toolInput: { file_path: P(".skeleton/diagrams/a.mmd"), content: "flowchart LR" }, root, state, resolve: (x) => x, readFile: () => null, activeFences: [] }), null);
   }
   assert.equal(evaluateBash({ command: "echo '{}' > .skeleton/state.json", state: fill })?.decision, "ask");
   assert.equal(evaluateBash({ command: "cat .skeleton//feedback/x.json", state: fill })?.decision, "ask");
@@ -186,7 +194,7 @@ test("security H3: the tool's own state is off-limits to agent edits in every ph
 });
 
 test("security L2: NotebookEdit is gated during a fill", () => {
-  assert.equal(gate("NotebookEdit", { notebook_path: "/proj/nb.ipynb", new_source: "x" }).decision, "ask");
+  assert.equal(gate("NotebookEdit", { notebook_path: P("nb.ipynb"), new_source: "x" }).decision, "ask");
 });
 
 test("gate honours gate: deny", () => {
@@ -194,7 +202,7 @@ test("gate honours gate: deny", () => {
 });
 
 test("gate ignores files outside the project", () => {
-  const v = evaluate({ toolName: "Edit", toolInput: { file_path: "/elsewhere/x.ts", old_string: "a" }, root, state: fill, resolve: (x) => x, readFile: () => "a", activeFences: [] });
+  const v = evaluate({ toolName: "Edit", toolInput: { file_path: path.resolve("/elsewhere/x.ts"), old_string: "a" }, root, state: fill, resolve: (x) => x, readFile: () => "a", activeFences: [] });
   assert.equal(v, null);
 });
 
@@ -237,7 +245,9 @@ async function serve(dir, args = ["--send"], env = process.env) {
   const html = await (await fetch(url)).text();
   const data = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<"));
   const token = data.token;
-  return { url, token, html, data, stop: () => child.kill() };
+  // Wait for the server to exit, so no keep-alive socket outlives the test.
+  const stop = () => new Promise((resolve) => { if (child.exitCode !== null || child.signalCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
+  return { url, token, html, data, stop };
 }
 
 const post = (url, body, headers) => fetch(new URL("/api/feedback", url), { method: "POST", headers, body: JSON.stringify(body) });
@@ -263,7 +273,7 @@ test("serve defaults to read-only without a feedback session and tolerates unava
       "content-type": "application/json", origin: new URL(srv.url).origin, "x-skeleton-token": "guess",
     })).status, 405);
     assert.equal(fs.existsSync(path.join(dir, ".skeleton", "feedback")), false);
-  } finally { srv.stop(); }
+  } finally { await srv.stop(); }
 });
 
 test("serve reuses the same mode and restarts when feedback mode changes", async () => {
@@ -294,9 +304,9 @@ test("serve reuses the same mode and restarts when feedback mode changes", async
         assert.equal((await post(again.url, { verdict: "approve", comments: [] }, {
           "content-type": "application/json", "x-skeleton-token": sending.token,
         })).status, 405);
-      } finally { again.stop(); }
-    } finally { sending.stop(); }
-  } finally { readonly.stop(); }
+      } finally { await again.stop(); }
+    } finally { await sending.stop(); }
+  } finally { await readonly.stop(); }
 });
 
 test("CLI: approve (the hook asks the human first) → next → gate → done → finalize", () => {
@@ -343,7 +353,7 @@ test("security H4: serve refuses cross-site posts, bad hosts, and missing tokens
     assert.doesNotMatch(srv.html, new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "page never carries the project path");
     assert.equal((await post(srv.url, body, ok)).status, 204);
   } finally {
-    srv.stop();
+    await srv.stop();
   }
 });
 
@@ -356,7 +366,7 @@ test("UX #2: two sends before the agent reads are both delivered; the latest ver
     await post(srv.url, { verdict: "changes", general: "first", comments: [{ file: "src/a.ts", line: 3, text: "rename" }] }, h);
     await post(srv.url, { verdict: null, general: "second", comments: [] }, h);
   } finally {
-    srv.stop();
+    await srv.stop();
   }
   const md = run("feedback");
   assert.match(md, /first/);
@@ -385,8 +395,10 @@ test("security M2: tracked files must resolve inside the project, and the review
   try {
     run("init", "T");
     assert.throws(() => run("track", secret), /only files inside the project/);
-    fs.symlinkSync(secret, path.join(dir, "link.txt"));
-    assert.throws(() => run("track", "link.txt"), /only files inside the project/);
+    if (canSymlink) {
+      fs.symlinkSync(secret, path.join(dir, "link.txt"));
+      assert.throws(() => run("track", "link.txt"), /only files inside the project/);
+    }
     const state = JSON.parse(fs.readFileSync(path.join(dir, ".skeleton", "state.json"), "utf-8"));
     fs.writeFileSync(path.join(dir, ".skeleton", "state.json"), JSON.stringify({ ...state, files: [`../${path.basename(secret)}`, "link.txt"] }));
     const html = fs.readFileSync(run("review").split("\n")[0], "utf-8");
@@ -401,9 +413,11 @@ test("security M3: review and install never write through symlinks, and install 
   const victim = path.join(dir, "victim.txt");
   fs.writeFileSync(victim, "original");
   run("init", "T");
-  fs.symlinkSync(victim, path.join(dir, ".skeleton", "review.html"));
-  run("review");
-  assert.equal(fs.readFileSync(victim, "utf-8"), "original");
+  if (canSymlink) {
+    fs.symlinkSync(victim, path.join(dir, ".skeleton", "review.html"));
+    run("review");
+    assert.equal(fs.readFileSync(victim, "utf-8"), "original");
+  }
 
   const target = tmp("skel-install-");
   fs.mkdirSync(path.join(target, ".claude"));
@@ -411,11 +425,12 @@ test("security M3: review and install never write through symlinks, and install 
   assert.throws(() => run("install", target), /isn't valid JSON/);
   assert.match(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"), /deny/);
   fs.rmSync(path.join(target, ".claude", "settings.local.json"));
-  fs.symlinkSync(victim, path.join(target, ".claude", "settings.local.json"));
-  assert.throws(() => run("install", target), /symlink/);
-  assert.equal(fs.readFileSync(victim, "utf-8"), "original");
-
-  fs.rmSync(path.join(target, ".claude", "settings.local.json"));
+  if (canSymlink) {
+    fs.symlinkSync(victim, path.join(target, ".claude", "settings.local.json"));
+    assert.throws(() => run("install", target), /symlink/);
+    assert.equal(fs.readFileSync(victim, "utf-8"), "original");
+    fs.rmSync(path.join(target, ".claude", "settings.local.json"));
+  }
   run("install", target);
   const settings = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"));
   assert.equal(settings.hooks.PreToolUse[0].matcher, "Write|Edit|MultiEdit|NotebookEdit|Bash");
@@ -451,7 +466,7 @@ test("N1: approve/reshape always ask, even in deny mode and however skel is spel
 
 test("N3: the .skeleton/ guard is case-insensitive, for edits and for Bash", () => {
   const scaffold = { phase: "scaffold", activeStep: null, gate: "ask" };
-  const v = evaluate({ toolName: "Write", toolInput: { file_path: "/proj/.SKELETON/state.json", content: "{}" }, root, state: scaffold, resolve: (x) => x, readFile: () => null, activeFences: [] });
+  const v = evaluate({ toolName: "Write", toolInput: { file_path: P(".SKELETON/state.json"), content: "{}" }, root, state: scaffold, resolve: (x) => x, readFile: () => null, activeFences: [] });
   assert.equal(v?.decision, "ask");
   assert.equal(evaluateBash({ command: "cd .Skeleton && cat serve.json", state: scaffold })?.decision, "ask");
 });
@@ -504,11 +519,11 @@ test("N10: notes sent to a server that has since restarted are still the human's
   try {
     await post(first.url, { verdict: null, general: "kept", comments: [] }, { "content-type": "application/json", "x-skeleton-token": first.token });
   } finally {
-    first.stop();
+    await first.stop();
   }
   await new Promise((r) => setTimeout(r, 300));
   const second = await serve(dir);
-  second.stop();
+  await second.stop();
   assert.match(run("feedback"), /kept/);
 });
 
@@ -538,7 +553,7 @@ test("R1/R2: approve/reshape ask from any cwd and in ordinary spellings", () => 
 
 test("R3: a .skeleton dir at any depth is state, and a planted nested one can't take over the fence", () => {
   const scaffold = { phase: "scaffold", activeStep: null, gate: "ask" };
-  const nested = evaluate({ toolName: "Write", toolInput: { file_path: "/proj/src/.skeleton/state.json", content: "{}" }, root, state: scaffold, resolve: (x) => x, readFile: () => null, activeFences: [] });
+  const nested = evaluate({ toolName: "Write", toolInput: { file_path: P("src/.skeleton/state.json"), content: "{}" }, root, state: scaffold, resolve: (x) => x, readFile: () => null, activeFences: [] });
   assert.equal(nested?.decision, "ask");
 
   const { dir, a, run } = project();
@@ -619,7 +634,7 @@ test("PR#1 B2: init stops the old server, and a superseded server refuses sends"
     const res = await post(old.url, { verdict: null, general: "late", comments: [] }, { "content-type": "application/json", "x-skeleton-token": old.token }).catch(() => null);
     assert.ok(!res || res.status === 409, `old server must be gone or refuse (got ${res?.status})`);
   } finally {
-    old.stop();
+    await old.stop();
   }
 });
 
@@ -656,14 +671,14 @@ test("PR#1 #6/#9: the page embeds its version, serves fresh tracked files, and k
     assert.match(html, /NEW_VERSION/);
     assert.match(html, /"version":"[0-9a-f]{12}"/);
   } finally {
-    first.stop();
+    await first.stop();
   }
   await new Promise((r) => setTimeout(r, 300));
   const second = await serve(dir);
   try {
     assert.equal(new URL(second.url).port, port);
   } finally {
-    second.stop();
+    await second.stop();
   }
 });
 
@@ -691,4 +706,12 @@ test("PR#1 G2: an enclosing skeleton mid-fill outranks a nested state file", () 
   const src = path.join(dir, "src");
   const out = execFileSync("node", [BIN, "hook"], { cwd: src, input: JSON.stringify({ cwd: src, tool_name: "Write", tool_input: { file_path: a, content: "evil" } }), encoding: "utf-8" });
   assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+test("Codex review: in-project names starting with '..' are inside, not outside", () => {
+  for (const rel of ["..settings.ts", "..internal/file.ts"]) {
+    const v = evaluate({ toolName: "Write", toolInput: { file_path: P(rel), content: "x" }, root, state: { ...fill, gate: "deny" }, resolve: (x) => x, readFile: () => "const x = 1;\n", activeFences: [] });
+    assert.equal(v?.decision, "deny", rel);
+  }
+  assert.equal(evaluate({ toolName: "Write", toolInput: { file_path: path.resolve(root, "..", "sibling.ts"), content: "x" }, root, state: fill, resolve: (x) => x, readFile: () => "x", activeFences: [] }), null);
 });
