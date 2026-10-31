@@ -93,6 +93,7 @@ In the terminal, give a short summary of the shape (files, the step list, and th
 
 - Apply every comment. Feedback quotes `file:line`, so re-read those lines first. After editing, the served page reloads by itself.
 - If you disagree with a comment, say so once with your reason, then do what they decide.
+- Before approving, run the project's formatter over the skeleton files (or save them once, if the editor formats on save). Approval records their exact text outside the fences, so a reformat afterwards shows up as drift (`(whitespace only)`) and blocks `skel done`.
 - When the verdict is **APPROVED** (or they approve in chat), run `skel approve`. Claude Code will ask them to allow it: that permission prompt is their approval, so run it only after they've said yes, and never try to approve another way.
 - Then tell them they can run `/skeleton-fill` to fill one step at a time, or `/skeleton-fill all` to fill every step without stopping (still fenced).
 - `.skeleton/` is the tool's own state (phase, the human's feedback). Don't edit or write files there except `.skeleton/diagrams/`; the hook will ask the human if you try.

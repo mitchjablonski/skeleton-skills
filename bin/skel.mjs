@@ -10,12 +10,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writeFileAtomic } from "../lib/state.mjs";
+import { bodyEscapesFence } from "../lib/gate.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, mergeRecords, newServeSession,
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath, sessionStorePath,
   storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
+import { clearSnapshot, formatDrift, scanSkeleton, verifySnapshot, writeSnapshot } from "../lib/snapshot.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Forward slashes on every platform: these land in shell commands and skill text.
@@ -35,9 +37,10 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   next                               start the first pending step and print its fences
   start <id> [--force]               start a specific step (--force abandons an unfinished active step,
                                      or reopens a filled one for rework)
-  done                               finish the active step (fails if SKEL_TODO remains)
+  done                               finish the active step (fails if SKEL_TODO remains, or on drift
+                                     outside the fences from the approved skeleton)
   reshape                            back to skeleton review (inside Claude Code the hook asks the human first)
-  finalize                           all steps filled: strip markers, phase done
+  finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
   install [projectDir]               install skills, filler subagent + hook into a project's .claude/
 `;
@@ -61,9 +64,15 @@ function requireRoot() {
   return root;
 }
 
-function snapshot(root) {
-  const { fences, errors } = scanRepo(root);
-  return { steps: toSteps(fences), errors };
+function snapshot(root, state = readState(root)) {
+  const { fences, errors, files } = scanSkeleton(root, state);
+  return { steps: toSteps(fences), errors, files };
+}
+
+/** Refuse when the working tree has drifted from the approved skeleton. */
+function requireNoDrift(root, state, fencedFiles, what) {
+  const drift = verifySnapshot(root, state, fencedFiles);
+  if (!drift.ok) die(`can't ${what}: ${formatDrift(drift)}`);
 }
 
 function printFences(step) {
@@ -139,8 +148,9 @@ const commands = {
     for (const f of [queueDir(root), historyDir(root), servePath(root)]) fs.rmSync(f, { force: true, recursive: true });
     try {
       clearSessions(root);
+      clearSnapshot(root);
     } catch (err) {
-      console.error(`skel: warning: couldn't clear old review sessions in ${sessionStorePath(root)} (${err.code ?? err.message})`);
+      console.error(`skel: warning: couldn't clear the previous skeleton's review sessions and approval record in ${path.dirname(sessionStorePath(root))} (${err.code ?? err.message})`);
     }
     console.log(`skel: "${title}" started in ${root} (phase: scaffold, gate: ${gate})`);
   },
@@ -161,9 +171,10 @@ const commands = {
   status(args) {
     const root = requireRoot();
     const state = readState(root);
-    const { steps, errors } = snapshot(root);
+    const { steps, errors, files } = snapshot(root);
+    const drift = state.phase === "fill" ? verifySnapshot(root, state, files) : null;
     if (args.includes("--json")) {
-      console.log(JSON.stringify({ ...state, errors, steps: steps.map(({ fences, ...s }) => ({
+      console.log(JSON.stringify({ ...state, errors, drift, steps: steps.map(({ fences, ...s }) => ({
         ...s, fences: fences.map(({ body, ...f }) => f),
       })) }, null, 2));
       return;
@@ -175,6 +186,7 @@ const commands = {
       console.log(`  ${mark} ${s.id.padEnd(5)} ${s.title}  (${s.fences.map((f) => `${f.file}:${f.openLine}`).join(", ")})`);
     }
     for (const e of errors) console.log(`  ! ${e}`);
+    if (drift && !drift.ok) console.log(`  ! ${formatDrift(drift).replace(/\n/g, "\n    ")}\n    (skel done and skel finalize refuse until it's resolved)`);
     // Diagram nodes named step_<id> that match no step are silently uncolored
     // on the page; say so here.
     for (const d of readDiagrams(root)) {
@@ -241,9 +253,13 @@ const commands = {
     setInterval(() => { if (Date.now() - lastPoll < 60_000) refresh(); }, 30_000).unref();
     const current = () => {
       const state = readState(root);
-      const tracked = (state.files ?? []).map((f) => path.join(root, String(f)));
-      const data = buildReviewData(root, state, cache, [...new Set([...known, ...tracked])]);
-      known = [...new Set([...known, ...data.files.map((f) => path.join(root, f.path))])];
+      // Tracked files aren't polled for fences: the CLI's search doesn't see
+      // the ones it excludes (gitignored, under .claude/), so neither does the
+      // page. buildReviewData reads their text itself. Keep watching files
+      // that have fences or malformed markers until the next search.
+      const data = buildReviewData(root, state, cache, known);
+      const watched = [...data.steps.flatMap((st) => st.locations.map((l) => l.file)), ...data.errored];
+      known = [...new Set([...known, ...watched.map((f) => path.join(root, f))])];
       const { generatedAt, errored, ...stable } = data;
       return { data, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
     };
@@ -349,12 +365,20 @@ const commands = {
     const root = requireRoot();
     const state = readState(root);
     if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
-    const { steps, errors } = snapshot(root);
+    const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     if (!steps.length) die("no SKEL[...] fences found — nothing to approve");
     // The human's say-so is Claude Code's permission prompt: the hook always
-    // asks before an agent runs `skel approve` (see evaluateBash).
-    writeState(root, { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() });
+    // asks before an agent runs `skel approve` (see evaluateBash). What they
+    // approved is recorded, so done/finalize can check the fill against it.
+    const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
+    try {
+      writeSnapshot(root, next, files);
+    } catch (err) {
+      if (err.code === "SKEL_MARKERS") die(`fix marker errors first:\n  ${err.message}`);
+      die(`couldn't record the approved skeleton: ${err.message}`);
+    }
+    writeState(root, next);
     console.log(`skeleton approved: ${steps.length} steps. Run \`skel next\` to start filling.`);
   },
 
@@ -402,13 +426,23 @@ const commands = {
     const root = requireRoot();
     const state = readState(root);
     if (!state.activeStep) die("no active step");
-    const { steps, errors } = snapshot(root);
+    const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
+    requireNoDrift(root, state, files, `finish step ${state.activeStep}`);
     const step = steps.find((s) => s.id === state.activeStep);
     if (!step) die(`step ${state.activeStep}'s fence is gone — its markers were removed or broken`);
     if (step.status === "todo") {
       const left = step.fences.filter((f) => f.status === "todo").map((f) => `${f.file}:${f.openLine}`);
       die(`step ${step.id} still has SKEL_TODO in ${left.join(", ")}`);
+    }
+    // The exterior check can't see a body that closes its own block and opens
+    // a new one before the fence ends (the code after the fence is unchanged).
+    // The hook's heuristic catches that for Edit/Write; repeat it here, as a
+    // note, for fills it didn't see. A heuristic, so it never blocks.
+    for (const f of step.fences) {
+      const marker = fs.readFileSync(path.join(root, f.file), "utf-8").split("\n")[f.openLine - 1] ?? "";
+      const escape = bodyEscapesFence(f.body.replace(/\r$/gm, ""), marker.replace(/\r$/, ""), f.file);
+      if (escape) console.log(`note: in ${f.file}:${f.openLine}-${f.closeLine}, ${escape} (a heuristic; check that the fill stays inside its block)`);
     }
     writeState(root, { ...state, activeStep: null });
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
@@ -420,15 +454,19 @@ const commands = {
     const state = readState(root);
     if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
     writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now() });
+    // The record is of the shape being reopened; approve writes the new one.
+    clearSnapshot(root);
     console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
   },
 
   finalize() {
     const root = requireRoot();
-    const phase = readState(root).phase;
+    const state = readState(root);
+    const phase = state.phase;
     if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");
-    const { fences, errors } = scanRepo(root);
+    const { fences, errors, files: fenced } = scanSkeleton(root, state);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
+    requireNoDrift(root, state, fenced, "finalize");
     const pending = fences.filter((f) => f.status === "todo");
     if (pending.length) die(`still pending: ${pending.map((f) => `${f.id} (${f.file}:${f.openLine})`).join(", ")}`);
     const files = [...new Set(fences.map((f) => f.file))];
@@ -437,6 +475,7 @@ const commands = {
       writeFileAtomic(abs, stripMarkers(fs.readFileSync(abs, "utf-8")), fs.statSync(abs).mode & 0o777);
     }
     writeState(root, { ...readState(root), phase: "done", activeStep: null });
+    clearSnapshot(root);
     console.log(`finalized: stripped markers from ${files.length} file(s)`);
   },
 

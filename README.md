@@ -5,7 +5,7 @@
 Two Claude Code skills and a small CLI that bring back the feeling of building with an AI pair one function at a time, with strong opinions about where code lives:
 
 1. **`/skeleton`**: Claude writes the feature as a *skeleton*: real files, real types and signatures, real wiring, plus an architecture diagram. Every body is an empty, fenced stub. You review the skeleton in a local page, comment on lines or on the diagram, and approve.
-2. **`/skeleton-fill`**: Claude fills one step at a time (or `all` of them), but **only inside the fences**. Each step's code is written by a restricted `skeleton-filler` subagent with no shell and no Write, and a `PreToolUse` hook checks every edit, so a signature change or a new file can't slip in unasked: it comes back to you as a skeleton change.
+2. **`/skeleton-fill`**: Claude fills one step at a time (or `all` of them), but **only inside the fences**. Each step's code is written by a restricted `skeleton-filler` subagent with no shell and no Write, a `PreToolUse` hook checks every edit, and each step is checked against a snapshot of the skeleton you approved, so a signature change or a new file can't slip in unasked: it comes back to you as a skeleton change.
 
 ![The review page: architecture diagram coloured by step status, steps sidebar, fenced code, line comments, and the feedback panel.](docs/review.png)
 
@@ -68,13 +68,13 @@ This copies the two skills into `<project>/.claude/skills/`, the `skeleton-fille
 | `skel serve [--port N] [--stop]` | Live review page; feedback is sent back to Claude. Reuses a running server; uses a stable port per project, so unsent drafts survive a restart |
 | `skel review` | Static `.skeleton/review.html`; copy the feedback by hand |
 | `skel feedback [--wait S]` | Print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise) |
-| `skel approve` | Enter the fill phase. When Claude runs it, the hook asks you to allow it: that prompt is your approval |
+| `skel approve` | Enter the fill phase and record the approved skeleton. When Claude runs it, the hook asks you to allow it: that prompt is your approval |
 | `skel reshape` | Back to skeleton review (also asks you) |
-| `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one |
-| `skel finalize` | All filled: strip the markers |
+| `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one. `done` refuses on drift from the approved skeleton |
+| `skel finalize` | All filled and no drift: strip the markers |
 | `skel hook` | The `PreToolUse` scope gate |
 
-**Gate modes:** `ask` (default) sends an out-of-fence edit to you for a yes or no. `deny` refuses it outright, so Claude must propose a skeleton change.
+**Gate modes:** `ask` (default) sends an out-of-fence edit to you for a yes or no. Saying yes lets the edit land, not the step finish: it is drift from what you approved, so `skel done` and `skel finalize` refuse until you `skel reshape` and approve the new shape. `deny` refuses it outright, so Claude must propose a skeleton change.
 
 ## The filler subagent
 
@@ -93,7 +93,13 @@ This copies the two skills into `<project>/.claude/skills/`, the `skeleton-fille
 The fence is a **drift guard for a cooperative agent**: it keeps an agent that means well from quietly widening its own scope. It is not a sandbox against a hostile one, which could always write files from a shell.
 
 - **Your approval is Claude Code's permission prompt.** The hook always asks before `skel approve`, `skel reshape`, `skel init --force` or `skel finalize` runs, and before `git clean -x`/`-X` or `git stash -a`/`--all` (which would delete `.skeleton/`), even in `deny` mode. That prompt is the one channel the agent can't answer for you. It fires from any working directory and for the common spellings (quoted, a path in a variable, `xargs`); it's a word match, not a shell parser. Review-page verdicts and feedback files are only signals to the agent; anything on disk or on a local port can be forged from a shell, so none of it counts as approval. How the prompt behaves follows Claude Code's permission mode: you see it in the default, `acceptEdits`, `plan` and `auto` modes; a non-interactive run with no one to answer refuses the command; and `bypassPermissions` skips it.
-- **Edits are judged by their result.** During a fill, an Edit, MultiEdit (applied in order) or Write is allowed only if the SKEL markers come out identical, every line outside the active fence is unchanged, and the filled body stays inside its block. Line endings are compared as LF (Claude Code's Edit matches CRLF files that way), and an edit whose `old_string` can't be located asks. The block check is a language-aware heuristic, not a parser, so a hit always asks rather than refuses.
+- **The fill is checked against what you approved.** `skel approve` records each skeleton file's *exterior*: the file with its fence bodies dropped and its marker lines kept. That is the file's shape, fence set (ids, titles, order) included. `skel done`, `skel finalize`, `skel status` and the review page compare the working tree with it exactly, however the files changed (Edit, Write, `sed -i`, a script). Any difference outside a fence blocks `done` and `finalize` with a `file:line` diff and shows on the page as drift until it is undone, or until you `reshape` and approve again, which re-records it. That includes an edit you allowed at the hook's `ask` prompt: allowing it lets it land, and the drift check still holds the step until you re-approve.
+  - *Covered:* every fenced file and every tracked file (`skel track`, recorded whole), a file deleted from either set, and any file that gains fences after approval.
+  - *Not covered:* files the skeleton never touched. Builds, tests and lockfiles change those during a fill, so recording the whole tree would flag every run; track a file to bring it in. Fence bodies aren't compared either: they are the fill. That includes the bodies of steps other than the active one, so filling a step out of turn isn't caught here (the hook asks about it).
+  - Line endings are compared as LF, so converting a file's line endings isn't drift. Other whitespace is compared exactly (a changed line that differs only in whitespace is labelled `(whitespace only)`), so run your formatter, or format-on-save, before approving.
+  - The record lives outside the project (`~/.config/skel/<hash>.snapshot.json`, next to the serve sessions; the hash is of the project's real path, lowercased on Windows so `C:\` and `c:\` agree), so a repo can't ship one. A missing record, or one from a different approval, fails closed: re-approve.
+  - One escape the exterior can't see: a body that closes its own block and opens a new one before the fence ends, leaving the code after the fence intact. The hook's containment heuristic (below) is aimed at that; `skel done` repeats it as a non-blocking note for fills the hook didn't see.
+- **Edits are judged by their result.** The hook is the early warning: it stops a bad edit before it lands rather than at `skel done`. During a fill, an Edit, MultiEdit (applied in order) or Write is allowed only if the SKEL markers come out identical, every line outside the active fence is unchanged, and the filled body stays inside its block. Line endings are compared as LF (Claude Code's Edit matches CRLF files that way), and an edit whose `old_string` can't be located asks. The block check is a language-aware heuristic, not a parser, so a hit always asks rather than refuses.
 - **Between steps,** edits to fenced or tracked files, and new files, ask. NotebookEdit asks during a fill.
 - **The tool's state is off-limits.** Agent edits to any `.skeleton/` directory, at any depth (except the top-level `diagrams/`), ask, matched case-insensitively. So do Bash commands that name `.skeleton/` state, from any working directory. **Nested skeletons:** the outermost skeleton that is mid-fill wins. While it is filling, the hook ignores any skeleton nested inside it: edits there are judged against the outer skeleton's active step (so they ask), and a state file planted or shipped deeper down can't take over the fence. When no enclosing skeleton is mid-fill, the nearest one applies. The `skel` CLI always uses the nearest one, so finalize (or reshape) the outer skeleton before working on a nested one.
 - **The review server** binds to 127.0.0.1, answers only requests addressed to `127.0.0.1`/`localhost` (no DNS rebinding), and accepts feedback only same-origin, as JSON, with a per-run token. So other websites can't post to it. The markdown Claude reads is rebuilt server-side and framed as review notes, not instructions.
@@ -101,7 +107,7 @@ The fence is a **drift guard for a cooperative agent**: it keeps an agent that m
 - **Files:** tracked files must resolve inside the project; writes go through temp-file-and-rename (never through a symlink); `install` refuses symlinked or unparseable settings rather than overwrite them, and refuses a symlinked `.claude/skills/` or `.claude/agents/` folder or installed skill or agent file.
 - **Mermaid** is pinned to a patched release (past CVE-2025-54881) with Subresource Integrity, and loads without blocking the page.
 
-Not covered: arbitrary Bash in the main conversation (the filler subagent that writes each step's code has none), and anything once a hook fault makes it fail open. Pair it with Claude Code's permission rules if you need hard limits.
+Not covered: arbitrary Bash in the main conversation (the filler subagent that writes each step's code has none) gets past the hook, but not past `done`/`finalize`, unless it changes files outside the skeleton or rewrites the record in `~/.config/skel/` (a hostile agent with a shell can). The same holds for anything that lands while a hook fault makes it fail open. Pair it with Claude Code's permission rules if you need hard limits.
 
 ## Prior art
 

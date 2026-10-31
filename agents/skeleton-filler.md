@@ -31,6 +31,7 @@ A hook checks every edit you make. An edit outside the active fence (or one that
 Stop and report instead of working around the fence when:
 - the step needs something the skeleton doesn't have: a new helper, import, parameter, type, file, or a changed signature;
 - the hook refuses an edit, or the human declines one it asked about. Don't retry it in another form; a refusal means "this is a skeleton change";
+- the human allows an edit outside the fence: it lands, but it's drift from the approved skeleton and `skel done` will refuse, so list it in BLOCKER as the skeleton change it is;
 - the contract is ambiguous enough that a wrong guess would change behavior the human cares about.
 
 Leave the stub (or your partial work) in place inside the fence. Proposing the skeleton change is the caller's job, so describe exactly what's missing.
