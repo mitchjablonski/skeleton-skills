@@ -1243,6 +1243,11 @@ test("issue #23 F2: a real Build/ dir is code to the scan and the gate (no blind
   run("start", "3");
   const out = hook({ tool_name: "Edit", tool_input: { file_path: b, old_string: 'throw new Error("SKEL_TODO");', new_string: "return 3;" } });
   assert.equal(out, "", "filling step 3 in Build/ is allowed");
+  // Where the filesystem folds case, `build/b.ts` is the same file: still a fill, not "outside".
+  if (fs.existsSync(path.join(dir, "build", "b.ts"))) {
+    const lower = hook({ tool_name: "Edit", tool_input: { file_path: path.join(dir, "build", "b.ts"), old_string: 'throw new Error("SKEL_TODO");', new_string: "return 3;" } });
+    assert.equal(lower, "", "filling via build/b.ts on a case-folding filesystem is allowed");
+  }
 });
 
 test("issue #23 N-a: a tracked file under a skipped dir is context only: its fences are never steps, for the scan, the page or the gate", () => {
