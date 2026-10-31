@@ -13,7 +13,7 @@ import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writ
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, mergeRecords, newServeSession,
-  addSession, clearSessions, historyDir, pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
+  addSession, clearSessions, configStorePath, historyDir, pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -108,11 +108,62 @@ const SKILLS = ["skeleton", "skeleton-fill"];
  * (they cover Write, MultiEdit and NotebookEdit too; `Write(path)` rules
  * never match). A `!` carve-out can't reopen diagrams/ inside a denied
  * .skeleton/**, so the state is listed path by path, with no wildcard but a
- * trailing /** (the only kind the Linux sandbox honours). A leading `/`
- * anchors at the project for a rule in .claude/settings.local.json.
+ * trailing /** (the only kind the Linux sandbox honours).
+ *
+ * The rules name the project by its ABSOLUTE real path (`//abs/path/...`): a
+ * `/path` rule in .claude/settings.local.json anchors at the session's primary
+ * working directory, not the project, so a session launched from a
+ * subdirectory would protect <subdir>/.skeleton and miss the real state. On
+ * Windows Claude Code matches POSIX-normalized paths (C:\x becomes /c/x).
  */
-const DENY_RULES = ["state.json", "serve.json", "review.html", "feedback/**", "feedback-history/**"]
-  .map((p) => `Edit(/${STATE_DIR}/${p})`);
+const STATE_PATHS = ["state.json", "serve.json", "review.html", "feedback/**", "feedback-history/**"];
+const LEGACY_DENY_RULES = STATE_PATHS.map((p) => `Edit(/${STATE_DIR}/${p})`);
+
+function denyRules(target) {
+  let real = fs.realpathSync(target);
+  if (process.platform === "win32") {
+    const m = /^([A-Za-z]):[\\/](.*)$/.exec(real);
+    if (!m) die(`can't write permission rules for ${real}: only drive-letter paths are supported on Windows`);
+    real = `/${m[1].toLowerCase()}/${m[2].split("\\").join("/")}`;
+  }
+  real = real.replace(/\/+$/, "");
+  // The rule is a gitignore pattern: a path with glob characters would match
+  // something else (or nothing), so refuse rather than guard the wrong files.
+  if (/[*?[\]{}\\()\n\r]/.test(real)) die(`can't write permission rules for a project path containing glob or rule characters: ${real}`);
+  return STATE_PATHS.map((p) => `Edit(/${real}/${STATE_DIR}/${p})`);
+}
+
+/**
+ * Which deny rules this install added, kept OUTSIDE the project (next to the
+ * serve-session store), so uninstall removes only those: a rule the user
+ * already had survives install + uninstall.
+ */
+const ownedStorePath = (target) => configStorePath(target, "install-");
+function readOwned(target) {
+  try {
+    const o = JSON.parse(fs.readFileSync(ownedStorePath(target), "utf-8")).ownedDeny;
+    return Array.isArray(o) ? o.filter((x) => typeof x === "string") : null;
+  } catch {
+    return null;
+  }
+}
+function writeOwned(target, owned) {
+  if (!owned.length) return fs.rmSync(ownedStorePath(target), { force: true });
+  writeFileAtomic(ownedStorePath(target), JSON.stringify({ root: target, ownedDeny: owned }, null, 2) + "\n", 0o600);
+}
+
+/**
+ * Rules an install from before ownership tracking wrote: the old
+ * project-relative set, claimed only when no ownership record exists, the
+ * scope gate hook is installed and all five are present (a user's own lone
+ * `Edit(/.skeleton/state.json)` is never taken).
+ */
+function legacyOwned(settings, owned) {
+  if (owned) return [];
+  const deny = settings.permissions?.deny ?? [];
+  const hooked = (settings.hooks?.PreToolUse ?? []).some((m) => m?.hooks?.some?.((hk) => isSkelHook(hk?.command)));
+  return hooked && LEGACY_DENY_RULES.every((r) => deny.includes(r)) ? LEGACY_DENY_RULES : [];
+}
 
 /** The scope-gate hook command from any skel checkout (current or legacy form). */
 const isSkelHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](skel-hook\.mjs"|skel\.mjs" hook)$/.test(cmd);
@@ -464,6 +515,9 @@ const commands = {
       die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
     }
     const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir);
+    const rules = denyRules(target);
+    const prevOwned = readOwned(target);
+    const stale = [...legacyOwned(settings, prevOwned), ...(prevOwned ?? []).filter((r) => !rules.includes(r))];
     for (const name of SKILLS) {
       const src = path.join(PKG_ROOT, "skills", name, "SKILL.md");
       const dest = path.join(claudeDir, "skills", name, "SKILL.md");
@@ -481,9 +535,12 @@ const commands = {
       settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
     }
     settings.permissions ??= {};
-    settings.permissions.deny ??= [];
-    const added = DENY_RULES.filter((r) => !settings.permissions.deny.includes(r));
+    settings.permissions.deny = (settings.permissions.deny ?? []).filter((r) => !stale.includes(r));
+    const added = rules.filter((r) => !settings.permissions.deny.includes(r));
     settings.permissions.deny.push(...added);
+    // Ours: what we add now, plus what an earlier install added and still owns.
+    // A rule that was already there and isn't recorded stays the user's.
+    writeOwned(target, rules.filter((r) => added.includes(r) || prevOwned?.includes(r)));
     writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
     // .skeleton/ is per-run state (and holds the human's feedback): keep it
     // out of commits, so a repo can't ship a verdict.
@@ -497,7 +554,9 @@ const commands = {
   },
 
   uninstall([dir = process.cwd()]) {
-    const { claudeDir, settingsPath, settings } = openProjectSettings(dir);
+    const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir);
+    const prevOwned = readOwned(target);
+    const owned = [...(prevOwned ?? []), ...legacyOwned(settings, prevOwned)];
     const groups = settings.hooks?.PreToolUse ?? [];
     for (const m of groups) if (Array.isArray(m?.hooks)) m.hooks = m.hooks.filter((hk) => !isSkelHook(hk?.command));
     if (settings.hooks?.PreToolUse) {
@@ -506,17 +565,18 @@ const commands = {
       if (!Object.keys(settings.hooks).length) delete settings.hooks;
     }
     if (settings.permissions?.deny) {
-      settings.permissions.deny = settings.permissions.deny.filter((r) => !DENY_RULES.includes(r));
+      settings.permissions.deny = settings.permissions.deny.filter((r) => !owned.includes(r));
       if (!settings.permissions.deny.length) delete settings.permissions.deny;
       if (!Object.keys(settings.permissions).length) delete settings.permissions;
     }
     if (fs.existsSync(settingsPath)) writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+    writeOwned(target, []);
     for (const name of SKILLS) {
       const skillDir = path.join(claudeDir, "skills", name);
       fs.rmSync(path.join(skillDir, "SKILL.md"), { force: true });
       try { fs.rmdirSync(skillDir); } catch {} // only if we left it empty
     }
-    console.log(`removed /skeleton, /skeleton-fill, the scope gate hook and the ${STATE_DIR}/ deny rules from ${claudeDir}`);
+    console.log(`removed /skeleton, /skeleton-fill, the scope gate hook and the ${STATE_DIR}/ deny rules it added from ${claudeDir}`);
     console.log(`left in place: ${STATE_DIR}/ (delete it once you're done with it) and the ${STATE_DIR}/ line in .gitignore`);
   },
 };
