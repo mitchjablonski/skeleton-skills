@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -12,7 +12,17 @@ import { cleanFeedback, feedbackMarkdown } from "../lib/feedback.mjs";
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "skel.mjs");
 
 // The serve-session store lives in the user's config dir; keep tests out of the real one.
-process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "skel-config-"));
+// Every temp dir the suite makes is removed when it finishes.
+const TEMPS = [];
+after(() => {
+  // One locked dir (antivirus, an indexer, a straggling child on Windows) must
+  // not stop the rest from being removed.
+  for (const d of TEMPS) {
+    try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 5 }); } catch (err) { console.warn(`left ${d}: ${err.code ?? err.message}`); }
+  }
+});
+const mkTemp = (prefix) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); TEMPS.push(d); return d; };
+process.env.XDG_CONFIG_HOME = mkTemp("skel-config-");
 
 const SRC = `import { Point } from "./types";
 
@@ -36,7 +46,7 @@ const canSymlink = (() => {
   try { fs.symlinkSync(path.join(d, "x"), path.join(d, "y")); return true; } catch { return false; } finally { fs.rmSync(d, { recursive: true, force: true }); }
 })();
 
-const tmp = (prefix = "skel-") => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+const tmp = (prefix = "skel-") => fs.realpathSync(mkTemp(prefix));
 
 // ---- markers ----
 
@@ -739,5 +749,30 @@ test("issue #6 N4: a page load kicks off a search once the last one is >5s old",
     assert.match(await (await fetch(srv.url)).text(), /late\.ts/);
   } finally {
     await srv.stop();
+  }
+});
+
+test("installed skills' example fences are documentation, not steps (walk and git-grep paths, and the gate)", () => {
+  for (const git of [false, true]) {
+    const { dir, run, hook } = project();
+    if (git) execFileSync("git", ["init", "-q", dir]);
+    run("install", dir);
+    const skill = path.join(dir, ".claude", "skills", "skeleton", "SKILL.md");
+    assert.match(fs.readFileSync(skill, "utf-8"), /SKEL\[2\]/, "the example is there");
+    run("init", "T");
+    const status = run("status");
+    assert.match(status, /0\/2 filled/);
+    assert.match(status, /2 {5}catmull-rom between a and b/, "step 2 keeps its own title");
+    assert.doesNotMatch(status, /\.claude/);
+    run("approve");
+    const askOf = (input) => { const out = hook(input); return out ? JSON.parse(out).hookSpecificOutput : null; };
+    // Between steps, the docs are not "part of the approved skeleton".
+    assert.equal(askOf({ tool_name: "Edit", tool_input: { file_path: skill, old_string: "SKEL_TODO", new_string: "x" } }), null);
+    // With step 2 active, "filling" the example in the docs is not filling step 2.
+    run("start", "2");
+    const v = askOf({ tool_name: "Edit", tool_input: { file_path: skill, old_string: 'throw new Error("SKEL_TODO");', new_string: "return 1;" } });
+    assert.equal(v?.permissionDecision, "ask", git ? "git" : "walk");
+    assert.match(v.permissionDecisionReason, /outside the skeleton/);
+    assert.doesNotMatch(v.permissionDecisionReason, /its fences? (are|is) .*\.claude/, "never points the agent back at the docs");
   }
 });
