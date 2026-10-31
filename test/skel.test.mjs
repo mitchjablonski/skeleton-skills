@@ -394,8 +394,9 @@ const STATE_PATHS = ["state.json", "serve.json", "review.html", "feedback/**", "
 const LEGACY_DENY = STATE_PATHS.map((p) => `Edit(/.skeleton/${p})`);
 /** The rules install should write for a project: its absolute real path, POSIX form (C:\x -> /c/x). */
 const denyFor = (target) => {
-  let real = fs.realpathSync(target);
+  let real = fs.realpathSync.native(target);
   if (process.platform === "win32") real = "/" + real[0].toLowerCase() + real.slice(2).split("\\").join("/");
+  real = real.replace(/[[\]*?]/g, (c) => `\\${c}`);
   return STATE_PATHS.map((p) => `Edit(/${real}/.skeleton/${p})`);
 };
 const installTarget = () => {
@@ -542,10 +543,10 @@ test("PR#11 P2: uninstall removes only the rules install added; identical pre-ex
   // Ownership lives outside the project, and uninstall clears it.
   const store = path.join(process.env.XDG_CONFIG_HOME, "skel");
   run("install");
-  assert.ok(fs.readdirSync(store).some((f) => f.startsWith("install-")));
-  const before = fs.readdirSync(store).filter((f) => f.startsWith("install-")).length;
+  assert.ok(fs.readdirSync(store).some((f) => f.endsWith("-install.json")));
+  const before = fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).length;
   run("uninstall");
-  assert.equal(fs.readdirSync(store).filter((f) => f.startsWith("install-")).length, before - 1);
+  assert.equal(fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).length, before - 1);
   assert.deepEqual(read(), mine);
 });
 
@@ -850,5 +851,93 @@ test("installed skills' example fences are documentation, not steps (walk and gi
     assert.equal(v?.permissionDecision, "ask", git ? "git" : "walk");
     assert.match(v.permissionDecisionReason, /outside the skeleton/);
     assert.doesNotMatch(v.permissionDecisionReason, /its fences? (are|is) .*\.claude/, "never points the agent back at the docs");
+  }
+});
+
+test("PR#11 review #2: project paths with ( ) { } [ ] keep their rules; [ ] * ? are escaped, an unspellable path still gets the hook", () => {
+  const parent = tmp("skel-chars-");
+  const target = path.join(parent, "Program Files (x86)", "proj{a}[1]");
+  fs.mkdirSync(target, { recursive: true });
+  const out = execFileSync("node", [BIN, "install", target], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.match(out, /added 5 permission deny rule/);
+  const deny = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8")).permissions.deny;
+  assert.deepEqual(deny, denyFor(target));
+  assert.ok(deny.every((r) => r.includes("/Program Files (x86)/proj{a}\\[1\\]/.skeleton/")), deny[0]);
+  assert.match(execFileSync("node", [BIN, "uninstall", target], { encoding: "utf-8" }), /removed 5 \.skeleton\/ permission deny rule/);
+
+  if (process.platform !== "win32") {
+    // A literal backslash can't be spelled in a rule on POSIX: no rules, but the hook and skills go in, and install says so.
+    const odd = path.join(parent, "back\\slash");
+    fs.mkdirSync(odd);
+    const r = execFileSync("node", [BIN, "install", odd], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.match(r, /warning: no permission deny rules/);
+    const s = JSON.parse(fs.readFileSync(path.join(odd, ".claude", "settings.local.json"), "utf-8"));
+    assert.equal(s.permissions.deny.length, 0);
+    assert.equal(s.hooks.PreToolUse.length, 1);
+    assert.ok(fs.existsSync(path.join(odd, ".claude", "skills", "skeleton", "SKILL.md")));
+  }
+});
+
+test("PR#11 review #3: a moved project's rules are reported as left in place, and uninstall counts what it really removed", () => {
+  const parent = tmp("skel-move-");
+  const oldDir = path.join(parent, "old");
+  const newDir = path.join(parent, "new");
+  fs.mkdirSync(oldDir);
+  const run = (...a) => execFileSync("node", [BIN, ...a], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  run("install", oldDir);
+  const oldRules = denyFor(oldDir);
+  fs.renameSync(oldDir, newDir);
+  const inst = run("install", newDir);
+  assert.match(inst, /added 5 permission deny rule/);
+  assert.match(inst, /left in place: 5 \.skeleton\/ deny rule/);
+  for (const r of oldRules) assert.ok(inst.includes(r), r);
+  const un = run("uninstall", newDir);
+  assert.match(un, /removed 5 \.skeleton\/ permission deny rule/);
+  assert.match(un, /left in place: 5 \.skeleton\/ deny rule/);
+  for (const r of oldRules) assert.ok(un.includes(r), r);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(newDir, ".claude", "settings.local.json"), "utf-8")).permissions.deny, oldRules);
+  // A second uninstall removes nothing, and says so.
+  assert.match(run("uninstall", newDir), /removed 0 \.skeleton\/ permission deny rule/);
+  // Clean up the old path's ownership record (it outlives the move by design).
+  fs.mkdirSync(oldDir);
+  run("uninstall", oldDir);
+});
+
+test("PR#11 review #1: install warns when Claude Code won't load the settings from a subdirectory launch", () => {
+  const run = (...a) => execFileSync("node", [BIN, ...a], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  const plain = tmp("skel-nogit-");
+  const warnsAt = (dir) => /warning: the hook and the deny rules live in \.claude\/settings\.local\.json/.test(run("install", dir));
+  assert.ok(warnsAt(plain), "not a git repo");
+  const repo = tmp("skel-repo-");
+  execFileSync("git", ["init", "-q", repo]);
+  fs.mkdirSync(path.join(repo, "pkg"));
+  assert.ok(warnsAt(path.join(repo, "pkg")), "a project nested in a repo");
+  assert.equal(warnsAt(repo), process.platform === "win32", "the repo root warns only on native Windows");
+});
+
+test("PR#11 review nits: install creates a missing project dir; uninstall of a missing one says so; uninstall ignores a symlinked .gitignore", () => {
+  const run = (...a) => execFileSync("node", [BIN, ...a], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  const missing = path.join(tmp("skel-missing-"), "a", "b");
+  assert.throws(() => run("uninstall", missing), (e) => /doesn't exist/.test(e.stderr) && !/at .*node:/.test(e.stderr));
+  run("install", missing);
+  assert.ok(fs.existsSync(path.join(missing, ".claude", "settings.local.json")));
+  const store = path.join(process.env.XDG_CONFIG_HOME, "skel");
+  const rec = fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).map((f) => JSON.parse(fs.readFileSync(path.join(store, f), "utf-8"))).find((r) => r.ownedDeny[0] === denyFor(missing)[0]);
+  assert.equal(rec.root, fs.realpathSync.native(missing), "ownership record names the real path");
+  if (process.platform === "win32") {
+    // Another spelling of the same path is the same project: no second rule set, one ownership record.
+    const records = () => fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).length;
+    const n = records();
+    assert.match(run("install", missing.toUpperCase()), /already present/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(missing, ".claude", "settings.local.json"), "utf-8")).permissions.deny.length, 5);
+    assert.equal(records(), n);
+  }
+  if (canSymlink) {
+    const gi = path.join(missing, ".gitignore");
+    const real = path.join(tmp("skel-gi-"), "gitignore");
+    fs.renameSync(gi, real);
+    fs.symlinkSync(real, gi);
+    assert.match(run("uninstall", missing), /removed 5/);
+    assert.throws(() => run("install", missing), /\.gitignore is a symlink/);
   }
 });

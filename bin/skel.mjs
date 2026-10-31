@@ -2,10 +2,11 @@
 // skel — plan as code skeleton, fill it one fenced step at a time.
 // Run `skel help` for commands.
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, toSteps, stripMarkers } from "../lib/markers.mjs";
@@ -13,7 +14,7 @@ import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writ
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, mergeRecords, newServeSession,
-  addSession, clearSessions, configStorePath, historyDir, pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
+  addSession, clearSessions, configPath, historyDir, pendingCount, queueDir, readServe, servePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -119,18 +120,71 @@ const SKILLS = ["skeleton", "skeleton-fill"];
 const STATE_PATHS = ["state.json", "serve.json", "review.html", "feedback/**", "feedback-history/**"];
 const LEGACY_DENY_RULES = STATE_PATHS.map((p) => `Edit(/${STATE_DIR}/${p})`);
 
+/** The project's real path, as Windows spells it on disk (true case) or as POSIX does. */
+const realDir = (target) => fs.realpathSync.native(target);
+
+/**
+ * The deny rules for a project, or a reason they can't be written. The rule
+ * path is a gitignore pattern: `[ ] * ?` are backslash-escaped so they match
+ * literally (`( ) { }` aren't pattern characters and match as they are). A
+ * path a rule can't spell (a newline, a literal backslash on POSIX, a Windows
+ * path without a drive letter) gets no rules rather than rules that guard
+ * something else; install still adds the hook and the skills.
+ */
 function denyRules(target) {
-  let real = fs.realpathSync(target);
+  let real = realDir(target);
   if (process.platform === "win32") {
     const m = /^([A-Za-z]):[\\/](.*)$/.exec(real);
-    if (!m) die(`can't write permission rules for ${real}: only drive-letter paths are supported on Windows`);
+    if (!m) return { rules: [], why: "only drive-letter paths can be written as rules on Windows" };
     real = `/${m[1].toLowerCase()}/${m[2].split("\\").join("/")}`;
   }
   real = real.replace(/\/+$/, "");
-  // The rule is a gitignore pattern: a path with glob characters would match
-  // something else (or nothing), so refuse rather than guard the wrong files.
-  if (/[*?[\]{}\\()\n\r]/.test(real)) die(`can't write permission rules for a project path containing glob or rule characters: ${real}`);
-  return STATE_PATHS.map((p) => `Edit(/${real}/${STATE_DIR}/${p})`);
+  if (/[\n\r\\]/.test(real)) return { rules: [], why: "the path contains a newline or a backslash, which a rule can't spell" };
+  const escaped = real.replace(/[[\]*?]/g, (c) => `\\${c}`);
+  return { rules: STATE_PATHS.map((p) => `Edit(/${escaped}/${STATE_DIR}/${p})`), why: null };
+}
+
+/**
+ * Any deny rule shaped like one skel writes, for any project: the absolute
+ * form or the old project-relative one. Used to report rules install and
+ * uninstall leave alone (a moved project's, or ones whose ownership record
+ * was lost), never to remove them.
+ */
+const SKEL_SHAPED = new RegExp(`^Edit\\((//.*)?/\\.skeleton/(${STATE_PATHS.map((p) => p.replace(/[.*]/g, (c) => `\\${c}`)).join("|")})\\)$`);
+function reportLeftInPlace(settings, notOurs) {
+  const left = (settings.permissions?.deny ?? []).filter((r) => typeof r === "string" && SKEL_SHAPED.test(r) && !notOurs.includes(r));
+  if (!left.length) return;
+  console.log(`left in place: ${left.length} ${STATE_DIR}/ deny rule(s) this install didn't add (a moved project's, a lost ownership record's, or your own); remove any you no longer want by hand:`);
+  for (const r of left) console.log(`  ${r}`);
+}
+
+/**
+ * Where Claude Code loads .claude/settings.local.json from: the git root on
+ * Linux/macOS/WSL, but the launch directory outside git, on native Windows, in
+ * a home-directory repo, or when the root isn't the user's. Warn when the
+ * project isn't a place both agree on, so a launch from a subdirectory would
+ * load neither the rules nor the hook.
+ */
+function launchWarning(target) {
+  const real = realDir(target);
+  const same = (a, b) => (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+  const git = (...args) => execFileSync("git", ["-C", real, ...args], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  let why = null;
+  if (process.platform === "win32") {
+    why = "on native Windows, Claude Code loads it from the directory you start in";
+  } else {
+    let top = null;
+    try { top = realDir(git("rev-parse", "--show-toplevel")); } catch {}
+    if (!top) why = "outside a git repository, Claude Code loads it from the directory you start in";
+    else if (same(top, realDir(os.homedir()))) why = "in a repository rooted at your home directory, Claude Code loads it from the directory you start in"
+    else if (!same(top, real)) why = `the project isn't its git repository's root (${top}), and Claude Code loads it from the root, or from the directory you start in`;
+    else {
+      try {
+        if (!same(path.resolve(real, git("rev-parse", "--git-dir")), path.resolve(real, git("rev-parse", "--git-common-dir")))) why = "in a git worktree, Claude Code loads it from the main checkout's root";
+      } catch {}
+    }
+  }
+  if (why) console.log(`warning: the hook and the deny rules live in .claude/settings.local.json, and ${why}. Start Claude Code in ${real} itself, not a subdirectory.`);
 }
 
 /**
@@ -138,7 +192,7 @@ function denyRules(target) {
  * serve-session store), so uninstall removes only those: a rule the user
  * already had survives install + uninstall.
  */
-const ownedStorePath = (target) => configStorePath(target, "install-");
+const ownedStorePath = (target) => configPath(target, "-install");
 function readOwned(target) {
   try {
     const o = JSON.parse(fs.readFileSync(ownedStorePath(target), "utf-8")).ownedDeny;
@@ -149,7 +203,7 @@ function readOwned(target) {
 }
 function writeOwned(target, owned) {
   if (!owned.length) return fs.rmSync(ownedStorePath(target), { force: true });
-  writeFileAtomic(ownedStorePath(target), JSON.stringify({ root: target, ownedDeny: owned }, null, 2) + "\n", 0o600);
+  writeFileAtomic(ownedStorePath(target), JSON.stringify({ root: realDir(target), ownedDeny: owned }, null, 2) + "\n", 0o600);
 }
 
 /**
@@ -174,13 +228,17 @@ const isSkelHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/
  * (we'd write through it), JSON we can't parse (we'd drop it), or a shape we
  * don't understand (we'd clobber it).
  */
-function openProjectSettings(dir) {
+function openProjectSettings(dir, { forInstall = false } = {}) {
   const target = path.resolve(dir);
+  if (!fs.existsSync(target)) {
+    if (!forInstall) die(`${target} doesn't exist`);
+    fs.mkdirSync(target, { recursive: true }); // as install always has: it creates the project dir
+  } else if (!fs.statSync(target).isDirectory()) die(`${target} isn't a directory`);
   const claudeDir = path.join(target, ".claude");
   const settingsPath = path.join(claudeDir, "settings.local.json");
   const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
   const skillDirs = SKILLS.map((n) => path.join(claudeDir, "skills", n));
-  for (const p of [claudeDir, settingsPath, path.join(target, ".gitignore"), path.join(claudeDir, "skills"), ...skillDirs, ...skillDirs.map((d) => path.join(d, "SKILL.md"))]) {
+  for (const p of [claudeDir, settingsPath, ...(forInstall ? [path.join(target, ".gitignore")] : []), path.join(claudeDir, "skills"), ...skillDirs, ...skillDirs.map((d) => path.join(d, "SKILL.md"))]) {
     if (isLink(p)) die(`${p} is a symlink; refusing to write through it`);
   }
   let settings = {};
@@ -514,8 +572,8 @@ const commands = {
     if (/["'`$\n\r]/.test(PKG_ROOT) || (process.platform !== "win32" && PKG_ROOT.includes("\\"))) {
       die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
     }
-    const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir);
-    const rules = denyRules(target);
+    const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
+    const { rules, why } = denyRules(target);
     const prevOwned = readOwned(target);
     const stale = [...legacyOwned(settings, prevOwned), ...(prevOwned ?? []).filter((r) => !rules.includes(r))];
     for (const name of SKILLS) {
@@ -540,8 +598,9 @@ const commands = {
     settings.permissions.deny.push(...added);
     // Ours: what we add now, plus what an earlier install added and still owns.
     // A rule that was already there and isn't recorded stays the user's.
-    writeOwned(target, rules.filter((r) => added.includes(r) || prevOwned?.includes(r)));
+    // Settings first: a failed write must never record rules that weren't added.
     writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+    writeOwned(target, rules.filter((r) => added.includes(r) || prevOwned?.includes(r)));
     // .skeleton/ is per-run state (and holds the human's feedback): keep it
     // out of commits, so a repo can't ship a verdict.
     const gi = path.join(target, ".gitignore");
@@ -549,7 +608,10 @@ const commands = {
     if (!/^\/?\.skeleton\/?$/m.test(giText)) fs.appendFileSync(gi, `${giText && !giText.endsWith("\n") ? "\n" : ""}.skeleton/\n`);
     console.log(`installed /skeleton and /skeleton-fill into ${claudeDir}/skills`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
-    console.log(added.length ? `added ${added.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
+    if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
+    else console.log(added.length ? `added ${added.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
+    reportLeftInPlace(settings, rules);
+    launchWarning(target);
     console.log(`optional: Claude Code's Bash sandbox can enforce those rules at the OS level; see "Security model" in the README (skel needs "excludedCommands": ["node \\"${SELF}\\" *"])`);
   },
 
@@ -564,8 +626,11 @@ const commands = {
       if (!settings.hooks.PreToolUse.length) delete settings.hooks.PreToolUse;
       if (!Object.keys(settings.hooks).length) delete settings.hooks;
     }
+    let removed = 0;
     if (settings.permissions?.deny) {
+      const before = settings.permissions.deny.length;
       settings.permissions.deny = settings.permissions.deny.filter((r) => !owned.includes(r));
+      removed = before - settings.permissions.deny.length;
       if (!settings.permissions.deny.length) delete settings.permissions.deny;
       if (!Object.keys(settings.permissions).length) delete settings.permissions;
     }
@@ -576,7 +641,9 @@ const commands = {
       fs.rmSync(path.join(skillDir, "SKILL.md"), { force: true });
       try { fs.rmdirSync(skillDir); } catch {} // only if we left it empty
     }
-    console.log(`removed /skeleton, /skeleton-fill, the scope gate hook and the ${STATE_DIR}/ deny rules it added from ${claudeDir}`);
+    console.log(`removed /skeleton, /skeleton-fill and the scope gate hook from ${claudeDir}`);
+    console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
+    reportLeftInPlace(settings, []);
     console.log(`left in place: ${STATE_DIR}/ (delete it once you're done with it) and the ${STATE_DIR}/ line in .gitignore`);
   },
 };
