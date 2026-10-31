@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { scanText, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
+import { scanFiles, scanText, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
 import { cleanFeedback, configPath, feedbackMarkdown, projectKey, sessionStorePath } from "../lib/feedback.mjs";
 import { compareWith, exterior, lineDiff, readRendered, readSnapshot, recordSkeleton, renderedPath, safeKey, scanSkeleton, snapshotPath, whitespaceOnly } from "../lib/snapshot.mjs";
@@ -2416,4 +2416,135 @@ test("#14 N2/N3: a mode change defers its reload while a note is typed, Overall 
       assert.match(readonly.html, /if \(!hint && sendButton\) \{ hint = h\("div"[^]*sendButton\.after\(hint\)/, "a deferred Send page gets the hint in place");
     } finally { await readonly.stop(); }
   } finally { await sending.stop(); }
+});
+
+// ---- #32: serve's known files stay inside the project ----
+
+const OUTSIDE = "OUTSIDE_PROJECT_SECRET";
+const fencedSrc = (id, extra = "") => `export function f${id}() {\n  // SKEL[${id}] step ${id}${extra}\n  throw new Error("SKEL_TODO");\n  // /SKEL[${id}]\n}\n`;
+
+/**
+ * A project with src/a.ts and lib/evil.ts fenced, plus a directory outside it
+ * holding x.ts (fenced SKEL[9], with a secret). `swap(kind)` replaces evil.ts
+ * with a file symlink to ../ext/x.ts ("file"), or the lib folder with a
+ * directory link to ext ("dir": a junction on Windows, which needs no privilege).
+ */
+function swapProject() {
+  const { dir, a, run } = project();
+  fs.writeFileSync(a, fencedSrc(1));
+  fs.mkdirSync(path.join(dir, "lib"));
+  const evil = path.join(dir, "lib", "evil.ts");
+  fs.writeFileSync(evil, fencedSrc(3));
+  const ext = tmp("skel-ext-");
+  fs.writeFileSync(path.join(ext, "evil.ts"), fencedSrc(9, ` ${OUTSIDE}`));
+  fs.writeFileSync(path.join(ext, "x.ts"), fencedSrc(9, ` ${OUTSIDE}`));
+  const swap = (kind) => {
+    if (kind === "file") {
+      fs.rmSync(evil);
+      fs.symlinkSync(path.join(ext, "x.ts"), evil);
+    } else {
+      fs.rmSync(path.join(dir, "lib"), { recursive: true });
+      fs.symlinkSync(ext, path.join(dir, "lib"), process.platform === "win32" ? "junction" : "dir");
+    }
+  };
+  return { dir, a, evil, run, swap };
+}
+
+for (const kind of ["file", "dir"]) {
+  const skip = kind === "file" && !canSymlink && "no symlink privilege";
+  test(`#32: a known fenced file swapped for a ${kind} link out of the project is not served (scaffold and fill)`, { skip }, () => {
+    for (const phase of ["scaffold", "fill"]) {
+      const { dir, a, evil, run, swap } = swapProject();
+      run("init", "T");
+      if (phase === "fill") { run("approve"); run("next"); }
+      const cache = new Map();
+      const known = [a, evil];
+      const before = buildReviewData(dir, readState(dir), cache, known);
+      assert.deepEqual(before.steps.map((s) => s.id), ["1", "3"], phase);
+      assert.equal(before.drift, null, phase);
+      swap(kind);
+      const data = buildReviewData(dir, readState(dir), cache, known);
+      assert.deepEqual(data.steps.map((s) => s.id), ["1"], `${phase}: the outside fence is not a step`);
+      assert.deepEqual(data.files.map((f) => f.path), ["src/a.ts"], phase);
+      assert.doesNotMatch(JSON.stringify(data), new RegExp(OUTSIDE), `${phase}: the outside text is never served`);
+      if (phase === "fill") {
+        assert.match(JSON.stringify(data.drift?.items ?? []), /lib\/evil\.ts.*now resolves outside the project/, "fill: the swap is drift");
+      }
+      // The CLI scan agrees (the snapshot's fenced extras go through the same check).
+      assert.deepEqual(scanSkeleton(dir, readState(dir), undefined, known).files, ["src/a.ts"], phase);
+    }
+  });
+}
+
+test("#32: a live skel serve poll stops serving a known file swapped for a link out of the project", async () => {
+  const { dir, run, swap } = swapProject();
+  run("init", "T");
+  const srv = await serve(dir);
+  try {
+    assert.match(srv.html, /lib\/evil\.ts/);
+    const before = (await (await fetch(new URL("api/version", srv.url))).json()).version;
+    // A file link needs a privilege on Windows; a junction over the folder doesn't.
+    swap(canSymlink ? "file" : "dir");
+    let version = before;
+    for (const deadline = Date.now() + 4_000; version === before && Date.now() < deadline; ) {
+      await new Promise((r) => setTimeout(r, 100));
+      version = (await (await fetch(new URL("api/version", srv.url))).json()).version;
+    }
+    assert.notEqual(version, before, "the poll notices the swap");
+    const html = await (await fetch(srv.url)).text();
+    assert.doesNotMatch(html, new RegExp(OUTSIDE));
+    assert.doesNotMatch(html, /lib\/evil\.ts/);
+  } finally {
+    await srv.stop();
+  }
+  // Nothing from the outside file reached the config-dir stores (noteRendered).
+  const store = path.join(process.env.XDG_CONFIG_HOME, "skel");
+  const all = fs.existsSync(store) ? fs.readdirSync(store, { recursive: true }).map((f) => path.join(store, f)).filter((f) => fs.statSync(f).isFile()) : [];
+  for (const f of all) assert.doesNotMatch(fs.readFileSync(f, "utf-8"), new RegExp(OUTSIDE), f);
+});
+
+test("#32: scanFiles skips FIFOs, dangling links and directories, follows in-project links, and re-checks a cached file whose identity changed", () => {
+  const win = process.platform === "win32";
+  const dirLink = (target, at) => fs.symlinkSync(target, at, win ? "junction" : "dir");
+  const dir = tmp();
+  fs.mkdirSync(path.join(dir, "sub", "deep", "er"), { recursive: true });
+  const a = path.join(dir, "sub", "a.ts");
+  fs.writeFileSync(a, fencedSrc(1));
+  const deep = path.join(dir, "sub", "deep", "er", "d.ts");
+  fs.writeFileSync(deep, fencedSrc(4));
+  fs.mkdirSync(path.join(dir, "folder.ts"));
+  // Links that stay inside the project are still read: a folder link (a
+  // junction on Windows) and, where permitted, a file link.
+  fs.mkdirSync(path.join(dir, "real"));
+  fs.writeFileSync(path.join(dir, "real", "b.ts"), fencedSrc(2));
+  dirLink(path.join(dir, "real"), path.join(dir, "aliasdir"));
+  const paths = [a, deep, path.join(dir, "folder.ts"), path.join(dir, "aliasdir", "b.ts")];
+  const expect = ["sub/a.ts", "sub/deep/er/d.ts", "aliasdir/b.ts"];
+  if (!win) {
+    const fifo = path.join(dir, "pipe.ts");
+    execFileSync("mkfifo", [fifo]);
+    paths.push(fifo);
+  }
+  if (canSymlink) {
+    fs.symlinkSync(path.join(dir, "nowhere.ts"), path.join(dir, "gone.ts"));
+    fs.symlinkSync(path.join(dir, "real", "b.ts"), path.join(dir, "alias.ts"));
+    paths.push(path.join(dir, "gone.ts"), path.join(dir, "alias.ts"));
+    expect.push("alias.ts");
+  }
+  const cache = new Map();
+  const scan = () => scanFiles(dir, paths, cache);
+  assert.deepEqual(scan().files, expect, "returns without blocking on the FIFO");
+  // Swap sub/ for a link to an outside folder whose a.ts has the same size and
+  // mtime: the cache must not vouch for it.
+  const ext = tmp("skel-ext-");
+  const out = path.join(ext, "a.ts");
+  fs.writeFileSync(out, fencedSrc(1).replace("step 1", "XXXX 1"));
+  const st = fs.statSync(a);
+  fs.utimesSync(out, st.atime, st.mtime);
+  fs.rmSync(path.join(dir, "sub"), { recursive: true });
+  dirLink(ext, path.join(dir, "sub"));
+  const after = scan();
+  assert.deepEqual(after.files, expect.filter((f) => !f.startsWith("sub/")));
+  assert.doesNotMatch(JSON.stringify(after), /XXXX/);
+  assert.equal(cache.has(a), false);
 });
