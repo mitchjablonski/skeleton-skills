@@ -542,7 +542,7 @@ const commands = {
       );
     }
     if (taken.status === "ok") console.log(feedbackMarkdown(readState(root).title, mergeRecords(taken.records)));
-    else if (readonly) console.log("READ_ONLY (review server has feedback disabled; use `skel serve --send` to enable it)");
+    else if (readonly) console.log("READ_ONLY: the review is read-only; the human's feedback arrives as a chat message. Wait for it; don't poll. Only if the human asks for direct Send: skel serve --send.");
     else console.log(`NO_FEEDBACK${wait ? ` (waited ${wait}s)` : ""}`);
   },
 

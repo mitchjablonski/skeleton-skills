@@ -77,7 +77,7 @@ If the human changes the structure during review, update the diagram to match.
 skel serve        # live read-only review; run in the background
 ```
 
-Give the human the printed localhost URL. They can comment in the page, use **Copy feedback for Claude**, and paste the feedback into chat. The page reloads as code changes. Wait for their reply in chat; do not poll `skel feedback` in this default mode. On WSL, Windows browsers reach `127.0.0.1` directly.
+Give the human the printed localhost URL. They can comment in the page, use **Copy feedback for Claude**, and paste the feedback into chat. The page reloads as code changes. Wait for their reply in chat; do not poll `skel feedback` in this default mode. If it prints `READ_ONLY`, wait for the human's chat message; never enable Send yourself. On WSL, Windows browsers reach `127.0.0.1` directly.
 
 If the human explicitly asks for direct feedback delivery, opt in to Send:
 

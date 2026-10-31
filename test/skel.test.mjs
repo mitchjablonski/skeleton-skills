@@ -1533,7 +1533,10 @@ test("read-only feedback wait returns immediately, drains pending sends, and sto
         cwd: dir, encoding: "utf-8", timeout: 5000,
       });
       assert.match(feedback(), /queued before downgrade/);
-      assert.match(feedback(), /READ_ONLY/);
+      const readonlyFeedback = feedback();
+      assert.match(readonlyFeedback, /READ_ONLY/);
+      assert.match(readonlyFeedback, /Wait for it; don't poll/);
+      assert.match(readonlyFeedback, /Only if the human asks for direct Send/);
       assert.match(run("serve", "--stop"), /stopped the review server/);
       assert.equal(fs.existsSync(path.join(dir, ".skeleton", "serve.json")), false);
       assert.match(run("serve", "--stop"), /no review server running/);
