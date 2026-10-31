@@ -49,16 +49,22 @@ To remove it, run `node skeleton-skills/bin/skel.mjs uninstall /path/to/your/pro
 
 ```
 /skeleton add stroke smoothing to the canvas
-   → skel init, writes stubs + diagram, `skel serve` → review URL
+   → skel init, writes stubs + diagram, `skel serve` → live read-only page
    → you comment / request changes / approve in the page
-   → skel feedback --wait 110   (Claude picks up your feedback)
+   → Copy feedback for Claude → paste into chat
    → skel approve               (Claude Code asks you to allow it)
 /skeleton-fill            (one step, then stop)
 /skeleton-fill all        (every step, still fenced)
-   → skel next → your opinion → skeleton-filler edits inside the fence → tests → skel done → skel feedback
+   → skel next → your opinion → skeleton-filler edits inside the fence → tests → skel done (page reloads)
    → a structural change? Claude stops and proposes it → you reopen it → skel reshape → re-review
    → skel finalize          (strips the markers)
 ```
+
+The default is a **live read-only page**: code and step status update automatically, and you can add line comments, diagram comments and overall notes. Use **Copy feedback for Claude** and paste it into chat. Claude waits for your chat reply. The server accepts no feedback POSTs in this mode.
+
+For one-click Send, explicitly opt in with `skel serve --send`. Claude then reads `skel feedback --wait 110` during review and `skel feedback` after fills. This enables the feedback POST endpoint, protected by Host/Origin checks and a per-run token. Switching between `skel serve` and `skel serve --send` restarts the verified server in the requested mode; open tabs reload automatically after a switch. Stop it with `skel serve --stop` when finished.
+
+For no HTTP listener, use `skel review` to generate a static HTML file, then regenerate and refresh after changes. All modes retain Claude Code's permission prompt for approval. Live modes expose source to processes that can connect to the loopback port; read-only removes the feedback input endpoint, not this read surface. Mermaid still loads from the pinned CDN in every mode.
 
 ## CLI
 
@@ -67,9 +73,9 @@ To remove it, run `node skeleton-skills/bin/skel.mjs uninstall /path/to/your/pro
 | `skel init "<title>" [--gate ask\|deny] [--force]` | Start a skeleton (`.skeleton/state.json`); won't replace one in progress without `--force` |
 | `skel track <file…>` | Include unfenced skeleton files (e.g. new types) in the review; must be inside the project |
 | `skel status [--json]` | Phase, active step, each step's status, and diagram nodes that match no step |
-| `skel serve [--port N] [--stop]` | Live review page; feedback is sent back to Claude. Reuses a running server; uses a stable port per project, so unsent drafts survive a restart |
-| `skel review` | Static `.skeleton/review.html`; copy the feedback by hand |
-| `skel feedback [--wait S]` | Print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise) |
+| `skel serve [--port N] [--send] [--stop]` | Default: live read-only review; copy feedback into chat. `--send` enables direct feedback delivery. Reuses a server in the same mode; uses a stable port per project |
+| `skel review` | Static `.skeleton/review.html` with no HTTP listener; copy feedback into chat |
+| `skel feedback [--wait S]` | Send-mode only: print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise) |
 | `skel approve` | Enter the fill phase and record the approved skeleton. When Claude runs it, the hook asks you to allow it: that prompt is your approval |
 | `skel reshape` | Back to skeleton review (also asks you) |
 | `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one. `done` refuses on drift from the approved skeleton |
@@ -136,7 +142,7 @@ The rules and the hook both live in `.claude/settings.local.json`, and Claude Co
 - **Edits are judged by their result.** The hook is the early warning: it stops a bad edit before it lands rather than at `skel done`. During a fill, an Edit, MultiEdit (applied in order) or Write is allowed only if the SKEL markers come out identical, every line outside the active fence is unchanged, and the filled body stays inside its block. Line endings are compared as LF (Claude Code's Edit matches CRLF files that way), and an edit whose `old_string` can't be located asks. The block check is a language-aware heuristic, not a parser, so a hit always asks rather than refuses.
 - **Between steps,** edits to fenced or tracked files, and new files, ask. NotebookEdit asks during a fill.
 - **The tool's state is off-limits.** The deny rules above refuse writes to the top-level state outright. Behind them, the hook asks for agent edits to any `.skeleton/` directory, at any depth (except the top-level `diagrams/`), matched case-insensitively. So do Bash commands that name `.skeleton/` state, from any working directory. **Nested skeletons:** the outermost skeleton that is mid-fill wins. While it is filling, the hook ignores any skeleton nested inside it: edits there are judged against the outer skeleton's active step (so they ask), and a state file planted or shipped deeper down can't take over the fence. When no enclosing skeleton is mid-fill, the nearest one applies. The `skel` CLI always uses the nearest one, so finalize (or reshape) the outer skeleton before working on a nested one.
-- **The review server** binds to 127.0.0.1, answers only requests addressed to `127.0.0.1`/`localhost` (no DNS rebinding), and accepts feedback only same-origin, as JSON, with a per-run token. So other websites can't post to it. The markdown Claude reads is rebuilt server-side and framed as review notes, not instructions.
+- **The review server** binds to 127.0.0.1 and answers only requests addressed to `127.0.0.1`/`localhost` (no DNS rebinding). By default it rejects feedback POSTs; comments reach Claude when you copy them into chat. With `--send`, it accepts feedback only same-origin, as JSON, with a per-run token. The markdown Claude reads is rebuilt server-side and framed as review notes, not instructions.
 - **Feedback is tied to this skeleton's serve runs**, whose ids live outside the project (`~/.config/skel/`), so nothing committed to a repo can vouch for a feedback file. Leftover, committed or hand-written ones are quarantined. `init` stops the old review server and forgets its sessions; a superseded server refuses sends. `skel serve` reuses a running server only after it answers with the id it recorded, and never kills a bare pid. `install` adds `.skeleton/` to `.gitignore`. If the session store can't be written, `serve` warns and keeps serving the page, but refuses sends from it (they couldn't be trusted). Feedback left unread by a pre-upgrade `skel serve` (which kept its session ids in `.skeleton/serve.json`) is quarantined, not migrated: a committed `serve.json` looks the same as a real one, so trusting it would let a repo vouch for its own feedback again. `serve` and `feedback` warn about it; re-send it from the page.
 - **Files:** tracked files must resolve inside the project; writes go through temp-file-and-rename (never through a symlink); `install` refuses symlinked or unparseable settings rather than overwrite them, and refuses a symlinked `.claude/skills/` or `.claude/agents/` folder or installed skill or agent file.
 - **Mermaid** is pinned to a patched release (past CVE-2025-54881) with Subresource Integrity, and loads without blocking the page.
