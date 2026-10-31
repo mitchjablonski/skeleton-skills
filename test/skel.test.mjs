@@ -1963,8 +1963,12 @@ test("S1: plain approve under the read-only default checks the version the page 
 });
 
 test("S2: snapshot and rendered-store keys can't point outside the project", () => {
-  for (const bad of ["../secret.txt", "src/../../secret.txt", "/etc/passwd", "C:/x", "C:x", "src\\a.ts", "", "a\u0000b"]) assert.equal(safeKey(bad), false, JSON.stringify(bad));
-  for (const good of ["src/a.ts", ".claude/notes.md", "a..b/c", "..x"]) assert.equal(safeKey(good), true, good);
+  for (const platform of ["linux", "win32"]) {
+    for (const bad of ["../secret.txt", "src/../../secret.txt", "/etc/passwd", "", "a\u0000b"]) assert.equal(safeKey(bad, platform), false, `${platform} ${JSON.stringify(bad)}`);
+    for (const good of ["src/a.ts", ".claude/notes.md", "a..b/c", "..x"]) assert.equal(safeKey(good, platform), true, `${platform} ${good}`);
+    // A drive prefix or backslash leaves the project only on Windows; on Linux they're filename characters.
+    for (const k of ["C:/x", "C:x", "src\\a.ts", "a:b.ts", "src/a:b.ts"]) assert.equal(safeKey(k, platform), platform !== "win32" || k === "src/a:b.ts", `${platform} ${k}`);
+  }
   const { dir, a, run } = project();
   const secret = path.join(path.dirname(dir), `secret-${path.basename(dir)}.txt`);
   fs.writeFileSync(secret, "TOPSECRET\n");
@@ -1987,13 +1991,15 @@ test("S2: snapshot and rendered-store keys can't point outside the project", () 
   if (canSymlink) {
     fs.symlinkSync(secret, path.join(dir, "src", "link.txt"));
     const linked = { ...rec, files: { ...rec.files, "src/link.txt": { sha256: "0", lines: [] } } };
-    assert.equal(compareWith(linked, dir, { files: [] }, ["src/a.ts"]).items.some((i) => i.file === "src/link.txt"), false, "a symlink out of the project is skipped");
+    const items = compareWith(linked, dir, { files: [] }, ["src/a.ts"]).items.filter((i) => i.file === "src/link.txt");
+    assert.deepEqual(items, [{ file: "src/link.txt", note: "now resolves outside the project (it is part of the approved skeleton)" }], "a recorded file now linking out is drift, reported without its content");
+    fs.rmSync(path.join(dir, "src", "link.txt"));
   }
   // Snapshot: a forged key fails closed, so the Stop hook reports no record instead of the file.
   fs.writeFileSync(a, SRC);
   run("approve");
   const snap = JSON.parse(fs.readFileSync(snapshotPath(dir), "utf-8"));
-  for (const key of [leak, "/etc/passwd", "src\\a.ts"]) {
+  for (const key of [leak, "/etc/passwd", ...(process.platform === "win32" ? ["src\\a.ts"] : [])]) {
     fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...snap, files: { ...snap.files, [key]: { sha256: "0", lines: ["TOPSECRET"] } } }));
     assert.equal(readSnapshot(dir), null, key);
     for (const args of [[], ["--block"]]) {
@@ -2039,4 +2045,49 @@ test("NIT2: install collapses duplicate skel Stop hooks to one (keeping --block)
   write(s);
   run("uninstall");
   assert.deepEqual(read().hooks.Stop, [mineStop, { hooks: [{ type: "command", command: "echo also mine" }] }]);
+});
+
+test("B-new: a recorded file swapped for a symlink out of the project (or a dangling one) is drift: done/finalize refuse, the Stop hook reports it", { skip: !canSymlink && "no symlink privilege" }, () => {
+  const { dir, run } = project();
+  fs.writeFileSync(path.join(dir, "src", "a.ts"), "// SKEL[1] one\nthrow new Error(\"SKEL_TODO\");\n// /SKEL[1]\n\nexport const keep = 1;\n");
+  fs.writeFileSync(path.join(dir, "src", "b.ts"), "// SKEL[2] two\nthrow new Error(\"SKEL_TODO\");\n// /SKEL[2]\n");
+  run("init", "T");
+  run("approve");
+  run("next");
+  const out = tmp("skel-out-");
+  const a = path.join(dir, "src", "a.ts");
+  fs.writeFileSync(path.join(out, "a.ts"), fs.readFileSync(a, "utf-8").replace("keep = 1", "keep = 2").replace("SKEL_TODO", "done"));
+  fs.rmSync(a);
+  fs.symlinkSync(path.join(out, "a.ts"), a);
+  for (const [why, note] of [["outside", /src\/a\.ts: now resolves outside the project/], ["dangling", /src\/a\.ts: is now a dangling link/]]) {
+    if (why === "dangling") fs.rmSync(path.join(out, "a.ts"));
+    assert.match(failure(() => run("done")), note, `${why}: done refuses`);
+    assert.match(failure(() => run("finalize")), note, `${why}: finalize refuses`);
+    const hook = JSON.parse(stopHook(dir) || "{}");
+    assert.match(hook.systemMessage ?? "", note, `${why}: the Stop hook reports it`);
+    assert.doesNotMatch(JSON.stringify(hook), /keep = 2/, "without reading the linked file");
+  }
+});
+
+test("NIT1/NIT4 review: a chained Stop command stays the user's; uninstall keeps an empty group it didn't empty", () => {
+  const { read, write, run } = installTarget();
+  const chained = { hooks: [{ type: "command", command: 'node "/x/bin/skel-stop.mjs" && notify-send done' }] };
+  const empty = { hooks: [] };
+  write({ hooks: { Stop: [chained, empty] } });
+  run("install");
+  const stops = read().hooks.Stop;
+  assert.deepEqual(stops.slice(0, 2), [chained, empty], "neither rewritten nor dropped");
+  assert.equal(stops.length, 3, "ours is added alongside");
+  run("uninstall");
+  assert.deepEqual(read().hooks.Stop, [chained, empty]);
+});
+
+test("NIT3 review: an unreadable rendered-versions store is reported as such, not as never rendered", () => {
+  const { dir, run } = project();
+  run("init", "T");
+  run("review");
+  fs.writeFileSync(renderedPath(dir), "{not json");
+  const out = run("approve");
+  assert.match(out, /the rendered-versions store couldn't be read \(not valid JSON\)/);
+  assert.doesNotMatch(out, /never rendered/);
 });

@@ -19,7 +19,7 @@ import {
   sessionStorePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
 import {
-  clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
+  clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
 } from "../lib/snapshot.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -276,10 +276,11 @@ function legacyOwned(settings, owned) {
 
 /**
  * Our Stop hook (bin/skel-stop.mjs, or `skel.mjs stop-hook`) from any checkout,
- * recognised by its script whatever flags follow; block: one of them is --block.
+ * recognised by its script whatever flags (`--x`) follow; block: one of them is
+ * --block. Anything else after it (`&& notify-send done`) makes it the user's.
  */
 const skelStopHook = (cmd) => {
-  const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?:\s+\S+)*)\s*$/.exec(cmd);
+  const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?:\s+--\w[\w-]*)*)\s*$/.exec(cmd);
   return m ? { block: m[1].split(/\s+/).includes("--block") } : null;
 };
 /** The scope-gate hook command from any skel checkout (current or legacy form). */
@@ -614,12 +615,15 @@ const commands = {
     let review = null;
     if (given) review = { version: given, source: "reviewed-flag", at: null, how: "the human reviewed" };
     else if (last?.version) review = { version: last.version, source: "review-page", at: last.at, how: "the human reviewed" };
-    else {
-      const shown = readRendered(root)[0];
+    let storeError = null;
+    if (!review) {
+      const store = readRenderedStore(root);
+      storeError = store.unreadable;
+      const shown = store.versions[0];
       if (shown) review = { version: shown.version, source: "rendered", at: shown.at, how: "no --reviewed was given and nothing was sent; the review page last showed" };
     }
     if (review && review.version !== record.version) die(staleReview(root, state, files, review.version, review.how));
-    if (!review) console.log("note: no reviewed version given (pass --reviewed <v> from the \"Reviewed skeleton version\" line of the feedback the human pasted), no send on record, and no review page was ever rendered for this project. Approving on the human's word alone.");
+    if (!review) console.log(`note: no reviewed version given (pass --reviewed <v> from the "Reviewed skeleton version" line of the feedback the human pasted), no send on record, and ${storeError ? `the rendered-versions store couldn't be read (${storeError}), so there's no rendered version to check against` : "no review page was ever rendered for this project"}. Approving on the human's word alone.`);
     console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
     const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
     try {
@@ -825,9 +829,14 @@ const commands = {
     }
     // The drift check (Stop) hook, with or without --block.
     const stops = settings.hooks?.Stop ?? [];
-    for (const m of stops) if (Array.isArray(m?.hooks)) m.hooks = m.hooks.filter((hk) => !skelStopHook(hk?.command));
+    const emptiedStops = new Set();
+    for (const m of stops) {
+      if (!Array.isArray(m?.hooks) || !m.hooks.length) continue;
+      m.hooks = m.hooks.filter((hk) => !skelStopHook(hk?.command));
+      if (!m.hooks.length) emptiedStops.add(m);
+    }
     if (settings.hooks?.Stop) {
-      settings.hooks.Stop = stops.filter((m) => !Array.isArray(m?.hooks) || m.hooks.length);
+      settings.hooks.Stop = stops.filter((m) => !emptiedStops.has(m));
       if (!settings.hooks.Stop.length) delete settings.hooks.Stop;
     }
     if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
