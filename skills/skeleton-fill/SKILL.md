@@ -7,7 +7,7 @@ description: Fill an approved code skeleton one fenced step at a time (the next 
 
 The structure was approved. Behavior gets written **inside the fences only**. A PreToolUse hook checks every Edit and Write. An edit outside the active step's fence goes back to the human (or is refused, depending on the gate setting).
 
-You run the loop; a restricted subagent writes the code. The **`skeleton-filler`** subagent has Read, Grep, Glob and Edit, but no shell and no Write, so the code for a step is written by an agent that can't run commands or create files. You keep the shell: you run `skel` and the tests, and you hand each step's edits to the filler.
+You run the loop; a restricted subagent writes the code. The **`skeleton-filler`** subagent has Read, Grep, Glob and Edit, but no shell and no Write, so the code for a step is written by an agent that can't run commands, and can't create a file without the human allowing it (an Edit that would create one asks them). You keep the shell: you run `skel` and the tests, and you hand each step's edits to the filler.
 
 CLI: `{{SKEL}}` (written below as `skel`).
 

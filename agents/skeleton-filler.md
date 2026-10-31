@@ -1,6 +1,6 @@
 ---
 name: skeleton-filler
-description: Fills one active step of an approved code skeleton, editing only inside that step's SKEL fences. Has no shell and can't create files. Used by /skeleton-fill, which runs the CLI and the tests itself; don't use it for anything else.
+description: Fills one active step of an approved code skeleton, editing only inside that step's SKEL fences. Has no shell, and can't create a file without the human allowing it. Used by /skeleton-fill, which runs the CLI and the tests itself; don't use it for anything else.
 tools: Read, Grep, Glob, Edit, MultiEdit
 disallowedTools: Bash, PowerShell, Monitor, Write, NotebookEdit, Agent
 model: inherit
