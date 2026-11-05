@@ -134,7 +134,7 @@ test("approval-record faults notify without forcing a corrective turn", t => {
   cli(["init", "broken approval"]);
   fs.writeFileSync(path.join(root, "code.js"), "// SKEL[1] value\nconst value=1;\n// /SKEL[1]\n");
   cli(["approve"]);
-  const store = path.join(root, "config", "skel");
+  const store = path.join(root, "state", "skel");
   const name = fs.readdirSync(store).find(name => name.endsWith(".snapshot.json"));
   assert.ok(name);
   const record = path.join(store, name);
@@ -163,11 +163,11 @@ function approvedFixture(t) {
   f.source = '// outside\n// SKEL[1] value\nconst value=1;\n// /SKEL[1]\n// after\n';
   fs.writeFileSync(f.file, f.source);
   f.cli(["approve"]);
-  const settings = { XDG_CONFIG_HOME: path.join(f.root, "config") };
+  const settings = { XDG_STATE_HOME: path.join(f.root, "state") };
   // Identify metadata from the actual approved record, without using ambient HOME.
-  const suffix = fs.readdirSync(path.join(settings.XDG_CONFIG_HOME, "skel")).find(n => n.endsWith(".snapshot.json")).replace(".snapshot.json", "");
-  f.cache = path.join(settings.XDG_CONFIG_HOME, "skel", suffix + ".stop-notice.json");
-  f.record = path.join(settings.XDG_CONFIG_HOME, "skel", suffix + ".snapshot.json");
+  const suffix = fs.readdirSync(path.join(settings.XDG_STATE_HOME, "skel")).find(n => n.endsWith(".snapshot.json")).replace(".snapshot.json", "");
+  f.cache = path.join(settings.XDG_STATE_HOME, "skel", suffix + ".stop-notice.json");
+  f.record = path.join(settings.XDG_STATE_HOME, "skel", suffix + ".snapshot.json");
   f.stop = (input = {}, args = []) => {
     const result = f.run("skel-stop.mjs", args, { stop_hook_active: false, ...input });
     assert.equal(result.status, 0, result.stderr);
@@ -271,7 +271,7 @@ test("concurrent Stop processes claim one unchanged drift at most once", async t
   fs.writeFileSync(f.file, f.source.replace("// outside", "// concurrent drift"));
   const outputs = await Promise.all(Array.from({ length: 6 }, () => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.resolve("bin/skel-stop.mjs")], {
-      cwd: f.root, env: { ...process.env, CLAUDE_PROJECT_DIR: f.root, XDG_CONFIG_HOME: path.join(f.root, "config") },
+      cwd: f.root, env: f.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";
@@ -422,4 +422,36 @@ test("an already-notified unchanged drift reads its cache without metadata write
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), { claimed: false, writes: 0 });
   assert.equal(fs.readFileSync(f.cache, "utf8"), before);
+});
+
+
+test("Stop advisory migration moves valid metadata and never refuses corrupt or conflicting caches", async t => {
+  const { migrateProject, planMigration } = await import("../lib/migrate.mjs");
+  const { projectKey, migratedMarker } = await import("../lib/state.mjs");
+  const valid = JSON.stringify({ format: 1, approval: "a".repeat(64), drift: "b".repeat(64) });
+  for (const [label, old, dest] of [["valid", valid, null], ["corrupt", "{", null], ["conflict", valid, "{}"], ["oversized", " ".repeat(300), null]]) {
+    const f = fixture(t), from = path.join(f.root, "legacy"), to = path.join(f.root, "new");
+    fs.mkdirSync(from); fs.mkdirSync(to);
+    const key = projectKey(f.root), name = key + ".stop-notice.json";
+    fs.writeFileSync(path.join(from, name), old);
+    fs.writeFileSync(path.join(from, name + ".lock"), "ephemeral");
+    if (dest) fs.writeFileSync(path.join(to, name), dest);
+    const args = { key, from, to, keyOf: projectKey };
+    assert.deepEqual(planMigration(args).problems, [], label);
+    migrateProject(args);
+    assert.equal(fs.existsSync(path.join(from, name)), false, label);
+    if (old === valid) {
+      assert.equal(fs.readFileSync(path.join(to, name), "utf8"), valid);
+      if (process.platform !== "win32") assert.equal(fs.statSync(path.join(to, name)).mode & 0o777, 0o600);
+    } else assert.equal(fs.existsSync(path.join(to, name)), false);
+    assert.equal(fs.existsSync(path.join(to, name + ".lock")), false);
+    assert.equal(fs.readFileSync(path.join(from, name + ".lock"), "utf8"), "ephemeral");
+  }
+  const f = fixture(t), from = path.join(f.root, "legacy"), to = path.join(f.root, "new");
+  fs.mkdirSync(from); fs.mkdirSync(to);
+  const key = projectKey(f.root);
+  fs.writeFileSync(path.join(from, migratedMarker(key)), "");
+  fs.writeFileSync(path.join(from, key + ".snapshot.json"), "retained");
+  fs.writeFileSync(path.join(to, key + ".stop-notice.json"), valid);
+  assert.ok(planMigration({ key, from, to, keyOf: projectKey }).problems.some(p => p.kind === "marker"), "advisory metadata cannot establish migrated authority");
 });
