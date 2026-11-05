@@ -19,7 +19,7 @@ import { SHELL_CSP, buildReviewData, clientScript, pagePayload, readDiagrams, re
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
-  storeFeedback, takeFeedback, withFeedbackLock, ensureReviewRound,
+  storeFeedback, takeFeedback, withFeedbackLock, ensureReviewRound, feedbackLockNotice,
 } from "../lib/feedback.mjs";
 import { discardUnusedStateDirFiles, migrateProject, migrationPlan } from "../lib/migrate.mjs";
 import { storeNotice } from "../lib/store-notice.mjs";
@@ -525,15 +525,17 @@ const commands = {
       if (configNotice) console.error(configNotice);
       die(`no ${STATE_DIR}/state.json here or above — run \`skel init "<title>"\` first`);
     }
+    const feedbackLock = feedbackLockNotice(root);
     const state = readState(root);
     if (!validState(state)) {
       const error = `can't read ${path.join(root, STATE_DIR, "state.json")}; repair that file or run \`skel init --force "<title>"\` from ${root} (requires approval in Claude Code)`;
       if (args.includes("--json")) {
-        console.log(JSON.stringify({ error, configNotice }, null, 2));
+        console.log(JSON.stringify({ error, configNotice, ...(feedbackLock ? { feedbackLockNotice: feedbackLock } : {}) }, null, 2));
         process.exitCode = 1;
         return;
       }
       if (configNotice) console.error(configNotice);
+      if (feedbackLock) console.error(feedbackLock);
       die(error);
     }
     const { steps, errors, files } = snapshot(root);
@@ -545,7 +547,7 @@ const commands = {
     const sourceCheck = { ...(gap ? { coverageGap: gap } : {}), ...(coverage ? { coverage: { id: coverage.id, policy: coverage.policy, mode: coverage.discovery.mode, fullCheck: "done and finalize" } } : {}) };
     const stores = await storeNotice(root);
     if (args.includes("--json")) {
-      console.log(JSON.stringify({ ...state, errors, drift, ...sourceCheck, configNotice, ...(stores ? { storeNotice: stores } : {}), steps: steps.map(({ fences, ...s }) => ({
+      console.log(JSON.stringify({ ...state, errors, drift, ...sourceCheck, configNotice, ...(feedbackLock ? { feedbackLockNotice: feedbackLock } : {}), ...(stores ? { storeNotice: stores } : {}), steps: steps.map(({ fences, ...s }) => ({
         ...s, fences: fences.map(({ body, ...f }) => f),
       })) }, null, 2));
       return;
@@ -553,6 +555,7 @@ const commands = {
     const done = steps.filter((s) => s.status === "filled").length;
     console.log(`${state.title} — phase: ${state.phase}${state.activeStep ? `, active: ${state.activeStep}` : ""} — ${done}/${steps.length} filled`);
     if (configNotice) console.log(configNotice);
+    if (feedbackLock) console.log(`  ! ${feedbackLock}`);
     for (const s of steps) {
       const mark = s.id === state.activeStep ? "▶" : s.status === "filled" ? "✓" : "·";
       console.log(`  ${mark} ${s.id.padEnd(5)} ${s.title}  (${s.fences.map((f) => `${f.file}:${f.openLine}`).join(", ")})`);

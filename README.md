@@ -68,6 +68,8 @@ If a project's old records can't be moved, `skel migrate` moves none of them and
 
 Changing `XDG_CONFIG_HOME` or `XDG_STATE_HOME` later doesn't migrate anything: skel looks only where they point now, so re-run `skel install` after a change.
 
+**Feedback ordering lock recovery.** Send, feedback draining and approval share `.skeleton/feedback/.order-lock` so accepted notes cannot race approval. `skel status` reports a present lock (also as `feedbackLockNotice` in `--json`); presence does not mean it is stale. Retry after the active operation finishes. If a crash left the lock behind, stop all skel servers and commands, then remove only that empty lock directory from an external terminal and retry. Skel never expires or automatically deletes this authority lock. Do not remove the feedback queue or approval records to recover it.
+
 ## The loop
 
 ```

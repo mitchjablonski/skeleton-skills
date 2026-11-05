@@ -231,3 +231,30 @@ test("restored state without round never promotes queued modern approval", t => 
   assert.match(result.stdout, /Reviewed skeleton version: unknown/);
   assert.equal(fs.readFileSync(file, "utf8"), before);
 });
+
+
+test("status reports a present ordering lock read-only and approval recovers after external removal", t => {
+  const { root, cli } = fixture(t);
+  const lock = path.join(queueDir(root), ".order-lock");
+  fs.mkdirSync(lock, { recursive: true });
+  const before = fs.readFileSync(path.join(root, ".skeleton/state.json"), "utf8");
+  const status = cli("status");
+  assert.equal(status.status, 0, status.stderr);
+  assert.ok(status.stdout.includes(lock));
+  assert.match(status.stdout, /may be active/);
+  assert.match(status.stdout, /stop all skel servers\/commands.*external terminal/);
+  const json = cli("status", "--json");
+  assert.equal(json.status, 0, json.stderr);
+  assert.ok(JSON.parse(json.stdout).feedbackLockNotice.includes(lock));
+  assert.equal(fs.lstatSync(lock).isDirectory(), true, "status never repairs the lock");
+  assert.equal(fs.readFileSync(path.join(root, ".skeleton/state.json"), "utf8"), before);
+  const blocked = cli("approve");
+  assert.notEqual(blocked.status, 0);
+  assert.ok(blocked.stderr.includes(lock));
+  assert.match(blocked.stderr, /external terminal/);
+  fs.rmdirSync(lock); // external repair, after the fixture's commands have exited
+  assert.equal(JSON.parse(cli("status", "--json").stdout).feedbackLockNotice, undefined);
+  const approved = cli("approve");
+  assert.equal(approved.status, 0, approved.stderr);
+  assert.equal(readState(root).phase, "fill");
+});
