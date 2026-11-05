@@ -359,7 +359,7 @@ As §4.3 explains, there are two failure paths, and each needs its own fix.
 - **Internal (code change).** Today's `catch` is silent (main: `lib/hook.mjs:73-75`), so Claude Code sees success. Change it to emit a decision when a fill may be active: if the hook got far enough to find a skeleton root, or any state file it can't parse, it emits `ask` (or `deny` under `gate: deny`) with a reason saying the gate failed. With no skeleton anywhere it stays silent, so unrelated projects are unaffected. An unparseable `state.json` should count as "fill may be active", not as "no skeleton".
 - **Launcher and startup (configuration).** `onFailure: "block"` makes can't-start, non-zero exit, timeout and invalid output block the call ([hooks](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails)). The hook can't tell at that point whether a fill is active, so this blocks every gated call (every Edit and Bash) in that project until the hook is fixed. With today's per-project install, or a plugin at local or project scope, that wedges one project. With a plugin at user scope it wedges every project.
 - **Verdict:** this section recommends the internal change, emitting `ask` and `deny` only under `gate: deny`; `onFailure: "block"` only in the strict tier, where wedging is the right failure, and with a documented recovery (`skel uninstall`, or `/hooks`). Note that `onFailure` "has no effect" on `Stop` hooks, and the shipped Stop hook itself fails open (main: `lib/stop.mjs:10`), so `done`/`finalize` remain the fail-closed check.
-- **Not settled.** Draft #35 implements the internal change with `deny` rather than `ask`. §9 Q7 records both positions; neither is decided.
+- **Not settled.** Draft #35 implements the internal change with `deny` rather than `ask`. §9 Q7 records the maintainer's decision: `deny` until repaired.
 
 ### 5.15 The trusted executable boundary (prerequisite for the strict tier; new)
 
@@ -389,7 +389,7 @@ Two tiers. Same code, different guarantees, stated plainly.
    - Drift diff shown on the review page.
 3. **Trusted state outside the project** (5.7) and an `Edit` deny rule on it (5.3; shipped for today's config-dir stores in PR #30).
 4. **Approval bound to content** (5.9; shipped in PR #20), still through the permission prompt by default. Keep the word-match ask as a convenience, but document that it is not a boundary.
-5. **A `ConfigChange` guard, and fail closed while a fill may be active** by fixing the hook's internal `catch` (5.14; draft #35, with the decision open in §9 Q7). `onFailure: "block"` is a strict-tier setting. **Plugin packaging** (5.13) is a later release, per the joint recommendation in §9 Q8.
+5. **A `ConfigChange` guard, and fail closed while a fill may be active** by fixing the hook's internal `catch` (5.14; draft #35, per the decision in §9 Q7). `onFailure: "block"` is a strict-tier setting. **Plugin packaging** (5.13) is a later release, per the joint recommendation in §9 Q8.
 6. **Review server: live read-only by default** (5.5, the maintainer's decision; shipped in PR #14). `skel serve` has no input endpoint and feedback is copied into chat; `skel serve --send` opts in to one-click Send; `skel review` writes a static file. Hardening for the remaining read surface and for opted-in Send: the token in the URL fragment, data behind the token, and a CSP (with the residual stated in 5.5).
 7. **Containment heuristic kept**, ask-only.
 
@@ -475,7 +475,7 @@ Spikes needed before committing to Phase 4 (the strict tier's claims are conditi
 
 ## 9. Decisions for the maintainer
 
-**These are recommendations awaiting the maintainer. Only Q11 and Q9's default mode are decided.** Nothing here should be merged as decided on the strength of this section.
+**These are recommendations awaiting the maintainer. Only Q7, Q11 and Q9's default mode are decided.** Nothing here should be merged as decided on the strength of this section.
 
 - **Joint recommendation:** Claude and Codex agree, after working through each question on PR #12 and in their direct discussion.
 - **Under discussion:** they don't agree yet, and both positions are stated.
@@ -495,15 +495,12 @@ Spikes needed before committing to Phase 4 (the strict tier's claims are conditi
    - Keep pre-existing user rules, don't infer ownership when a record is missing, and document what reinstalling or changing the environment does.
    - This covers the stores already outside the project. Moving the phase out of `.skeleton/state.json`, as 5.7 proposes, is a further step neither position addresses.
 6. **Approval channel.** *Joint recommendation:* the permission prompt stays the default, as workflow authorization rather than a human-authenticated receipt. Typed `/skeleton-approve` is for the strict tier only, gated on the `UserPromptExpansion` spike (Codex is taking it, with the network-reach spike) and on a privileged writer the agent can't reach (5.15).
-7. **Hook failure. One decision for the maintainer.**
-   - *Joint:* fail closed while a fill or unreadable enrolled state may exist, which needs the internal `catch` change, since configuration can't see a swallowed exception. No project, scaffold and done stay usable. `onFailure: "block"` in the strict tier only.
-   - *Open: which decision a fault emits.*
-     - **A, draft #35 today (Codex's first choice):** `deny` on a fault and on unreadable state. An unevaluated call shouldn't go to something that can answer automatically.
-     - **B (Codex's alternative; Claude's recommendation):** on a fault during a readable fill, use the configured gate; on unreadable state, `deny`, because the configured gate is unknown.
-     - **C (from the Claude review of #35):** configured gate on a fault; `ask` on unreadable state, so a person can approve a repair from the session.
-   - *Relevant to the choice (§4.2):* bypass mode skips a hook `ask`, and hooks, mods and `--permission-prompt-tool` can answer it, while a hook `deny` still blocks. A `deny` also leaves the human no prompt to proceed until the fault is fixed.
-   - *Needed under any option (the review's blocking finding on #35):* name the bad file and the repair command; let repair commands through as `ask`; count only a real skel state, and don't let a bad file above the project deny everything.
-   - Draft #35 is held for this decision.
+7. **Hook failure.** *Decided by the maintainer: option A, deny until repaired.* A hook fault during a fill, or unreadable enrolled state, refuses the call the broken gate can't evaluate. Normal evaluated out-of-fence edits still follow the configured gate.
+   - *Also:* no project, scaffold and done stay usable. `onFailure: "block"` in the strict tier only.
+   - *Option kept in reserve:* B, the configured gate on a fault during a readable fill, acceptable to the maintainer if `deny` turns out to break real use. C (`ask` on unreadable state) wasn't taken.
+   - *Accepted cost:* a harmless call is refused until the hook or state is repaired. A human must always have a documented way out.
+   - *Required (the review's blocking finding on #35):* name the bad file and the repair command; let repair commands through as `ask`; count only a real skel state, and don't let a bad file above the project deny everything.
+   - Draft #35 implements this.
 8. **Packaging.** *Joint recommendation:* make a plugin the main way to get skel, as its own release after #35 and #18, at project or local scope, not user scope, for usability and with no trust claim (5.13, 5.15). Keep a small install step, because plugins can't ship permission rules (only `agent` and `subagentStatusLine` settings take effect).
    - *Required first:* a live probe of disabling the plugin and reloading while its hook is active, before claiming #35's `ConfigChange` guard survives that. `enabledPlugins` is a settings key, so the event should fire, but that is unproven.
 9. **Review server.** *Decided:* live read-only by default, `skel serve --send` opt-in, `skel review` static fallback (shipped, PR #14). *Joint recommendation:* add the fragment-held token, `/api/data` behind the token and the CSP as separate hardening, while saying plainly that they don't stop a same-origin script or a same-user process (5.5).
@@ -559,7 +556,7 @@ What the project has accepted as its scope (§1–§3), independent of what is b
 Everything in §5–§7 that §10.1 doesn't list as merged is a **planned control**: a design intention whose effect hasn't been shown. That includes, in particular:
 
 - one corrective Stop continuation by default (§9 Q3; today's default only notifies);
-- the fail-closed hook (§5.14) and the `ConfigChange` guard (draft #35, held for §9 Q7), and plugin packaging (§9 Q8);
+- the fail-closed hook (§5.14) and the `ConfigChange` guard (draft #35, per §9 Q7), and plugin packaging (§9 Q8);
 - trusted state outside the project (#18);
 - the whole strict tier (#19), whose promises are conditional on §5.15 and the spikes in §7.
 
