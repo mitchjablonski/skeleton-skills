@@ -5,7 +5,7 @@
   "type": "module",
   "bin": { "skel": "bin/skel.mjs" },
   "files": ["bin", "lib", "skills", "agents"],
-  "scripts": { "test": "node --test test/skel.test.mjs test/diagrams.test.mjs test/config-hook.test.mjs test/status-notice.test.mjs test/cli-recovery.test.mjs test/installer-preserve.test.mjs test/stop-default.test.mjs" },
+  "scripts": { "test": "node --test test/skel.test.mjs test/diagrams.test.mjs test/config-hook.test.mjs test/status-notice.test.mjs test/cli-recovery.test.mjs test/installer-preserve.test.mjs test/stop-default.test.mjs test/source-set.test.mjs" },
   "engines": { "node": ">=20" },
   "license": "MIT"
 }
