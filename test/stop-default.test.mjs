@@ -483,3 +483,60 @@ test("a legacy Stop cache follows authority without routing snapshot or rendered
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd:f.root, env:f.env, encoding:"utf8" });
   assert.equal(result.status, 0, result.stderr);
 });
+
+test("stale advisory locks recover dead owners and aged locks, and re-arm changed/clean/new approval drift", async t => {
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
+  const dead = child.pid;
+  const f = approvedFixture(t), lock = f.cache + ".lock";
+  const write = record => fs.writeFileSync(lock, JSON.stringify(record));
+  fs.writeFileSync(f.file, f.source.replace("// outside", "// first drift"));
+  write({pid:process.pid,at:Date.now()});
+  assert.equal(f.stop().decision, undefined, "recent live owner remains busy");
+  fs.writeFileSync(lock, "{");
+  assert.equal(f.stop().decision, undefined, "recent malformed lock remains busy");
+  fs.writeFileSync(lock, "");
+  assert.equal(f.stop().decision, undefined, "recent empty lock remains busy");
+  write({pid:dead,at:Date.now()+86400000});
+  assert.equal(f.stop().decision, "block", "dead owner recovers even when its timestamp is in the future");
+  assert.equal(fs.existsSync(lock), false);
+  fs.writeFileSync(f.file, f.source.replace("// outside", "// changed drift"));
+  write({pid:process.pid,at:Date.now()-61000});
+  assert.equal(f.stop().decision, "block", "aged live owner recovers changed drift");
+  fs.writeFileSync(f.file, f.source);
+  fs.writeFileSync(lock, "{");
+  const old = new Date(Date.now()-61000); fs.utimesSync(lock,old,old);
+  assert.equal(f.stop(), null, "aged malformed lock allows clean reset");
+  assert.equal(fs.existsSync(f.cache), false);
+  fs.writeFileSync(f.file, f.source.replace("// outside", "// changed drift"));
+  assert.equal(f.stop().decision, "block", "clean then redrift re-arms");
+  f.cli(["reshape"]);fs.writeFileSync(f.file,f.source);
+  write({pid:dead,at:Date.now()+86400000});
+  f.cli(["approve"]);
+  assert.equal(fs.existsSync(f.cache), false, "successful new approval resets through a stale lock");
+  fs.writeFileSync(f.file,f.source.replace("// outside", "// changed drift"));
+  assert.equal(f.stop().decision,"block");
+});
+
+test("Stop advisory lock cleanup preserves a replacement owner and unknown live owners", t => {
+  const f = fixture(t);
+  const module = pathToFileURL(path.resolve("lib/stop-notice.mjs")).href;
+  const code = [
+    'import fs from "node:fs"; import path from "node:path"; import assert from "node:assert/strict";',
+    'import {claimStopNotice, stopNoticePath} from '+JSON.stringify(module)+';',
+    'const root='+JSON.stringify(f.root)+';',
+    'const file=stopNoticePath(root), lock=file+".lock";',
+    'fs.mkdirSync(path.dirname(file),{recursive:true});',
+    'const snap={approvedAt:1,files:{},fences:[]};',
+    'fs.writeFileSync(lock,JSON.stringify({pid:process.pid,at:Date.now()}));',
+    'const kill=process.kill; process.kill=()=>{throw Object.assign(new Error("unknown"),{code:"EPERM"})};',
+    'assert.equal(claimStopNotice(root,snap,"a".repeat(64)),false); process.kill=kill; fs.unlinkSync(lock);',
+    'const rename=fs.renameSync;',
+    'fs.renameSync=(from,to)=>{if(to===file){fs.unlinkSync(lock);fs.writeFileSync(lock,JSON.stringify({pid:process.pid,at:Date.now(),nonce:"replacement"}));}return rename(from,to)};',
+    'assert.equal(claimStopNotice(root,snap,"a".repeat(64)),true);',
+    'assert.equal(JSON.parse(fs.readFileSync(lock,"utf8")).nonce,"replacement");',
+    'fs.renameSync=rename;',
+  ].join("\n");
+  const result = spawnSync(process.execPath,["--input-type=module","-e",code],{cwd:f.root,env:f.env,encoding:"utf8"});
+  assert.equal(result.status,0,result.stderr);
+});
