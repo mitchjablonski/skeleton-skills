@@ -12,11 +12,12 @@ import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, realish, skelStateDir, writeFileAtomic } from "../lib/state.mjs";
 import { bodyEscapesFence } from "../lib/gate.mjs";
+import { isSkelHook, rulePath } from "../lib/install-status.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
-  addSession, clearSessions, historyDir, legacyQueued, migrationBlock, pendingCount, queueDir, readServe, servePath,
-  sessionStorePath, storeFeedback, storePath, takeFeedback,
+  addSession, clearSessions, forgetStoreHomes, historyDir, legacyQueued, migrationBlock, pendingCount, queueDir, readServe, reinstallNotice, servePath,
+  storeFeedback, storePath, takeFeedback,
 } from "../lib/feedback.mjs";
 import {
   clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
@@ -181,25 +182,6 @@ const LEGACY_DENY_RULES = STATE_PATHS.map((p) => `Edit(/${STATE_DIR}/${p})`);
 /** The project's real path, as Windows spells it on disk (true case) or as POSIX does. */
 const realDir = (target) => fs.realpathSync.native(target);
 
-/**
- * An absolute real path as a rule spells it (`/home/you/proj`, `/c/proj` on
- * Windows), or a reason it can't be. The rule path is a gitignore pattern:
- * `[ ] * ?` are backslash-escaped so they match literally (`( ) { }` aren't
- * pattern characters and match as they are). A path a rule can't spell (a
- * newline, a literal backslash on POSIX, a Windows path without a drive
- * letter) gets no rule rather than one that guards something else.
- */
-function rulePath(real) {
-  if (process.platform === "win32") {
-    const m = /^([A-Za-z]):[\\/](.*)$/.exec(real);
-    if (!m) return { path: null, why: "only drive-letter paths can be written as rules on Windows" };
-    real = `/${m[1].toLowerCase()}/${m[2].split("\\").join("/")}`;
-  }
-  real = real.replace(/\/+$/, "");
-  if (/[\n\r\\]/.test(real)) return { path: null, why: "the path contains a newline or a backslash, which a rule can't spell" };
-  return { path: real.replace(/[[\]*?]/g, (c) => `\\${c}`), why: null };
-}
-
 /** The deny rules for a project's .skeleton/ state, or why there are none (install still adds the hook and the skills). */
 function denyRules(target) {
   const { path: p, why } = rulePath(realDir(target));
@@ -230,8 +212,8 @@ function storeDenyRules() {
   } catch (err) {
     current = { name: "state dir", dir, rule: null, why: `can't create or resolve ${dir} (${err.code ?? err.message})` };
   }
-  const old = legacyConfigDir();
-  return old === dir ? [current] : [current, toRule(realish(old), old, "old config dir")];
+  const old = toRule(realish(legacyConfigDir()), legacyConfigDir(), "old config dir");
+  return old.rule && old.rule === current.rule ? [current] : [current, old];
 }
 
 /**
@@ -297,8 +279,8 @@ const ownedStorePath = (target) => storePath(target, "-install");
  * as "not ours": so install and uninstall stop, before changing anything, when
  * the project's old records can't be moved.
  */
-function refuseBlockedMigration(target) {
-  const blocked = migrationBlock(target);
+function refuseBlockedMigration(target, opts) {
+  const blocked = migrationBlock(target, opts);
   if (blocked) die(blocked);
 }
 function readOwned(target) {
@@ -336,8 +318,6 @@ const skelStopHook = (cmd) => {
   const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?:\s+--\w[\w-]*)*)\s*$/.exec(cmd);
   return m ? { block: m[1].split(/\s+/).includes("--block") } : null;
 };
-/** The scope-gate hook command from any skel checkout (current or legacy form). */
-const isSkelHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](skel-hook\.mjs"|skel\.mjs" hook)$/.test(cmd);
 
 /**
  * A project's .claude/settings.local.json, parsed, for install/uninstall to
@@ -392,6 +372,7 @@ const commands = {
     const title = args.filter((a) => a !== "--force").join(" ").trim();
     if (!title) die('usage: skel init "<title>"');
     const root = findRoot(process.cwd()) ?? process.cwd();
+    refuseBlockedMigration(root); // before state.json: the check at dispatch needs one to exist
     const existing = readState(root);
     if (existing && existing.phase !== "done" && !force) {
       die(`a skeleton is already in progress here: "${existing.title}" (phase: ${existing.phase}). Use --force to replace it.`);
@@ -408,7 +389,7 @@ const commands = {
       clearSnapshot(root);
       clearRendered(root);
     } catch (err) {
-      console.error(`skel: warning: couldn't clear the previous skeleton's review sessions and approval record in ${path.dirname(sessionStorePath(root))} (${err.code ?? err.message})`);
+      console.error(`skel: warning: couldn't clear the previous skeleton's review sessions and approval record (${err.path ?? err.code ?? err.message}${err.path ? `: ${err.code}` : ""})`);
     }
     console.log(`skel: "${title}" started in ${root} (phase: scaffold, gate: ${gate})`);
   },
@@ -431,8 +412,9 @@ const commands = {
     const state = readState(root);
     const { steps, errors, files } = snapshot(root);
     const drift = state.phase === "fill" ? verifySnapshot(root, state, files) : null;
+    const reinstall = reinstallNotice(root);
     if (args.includes("--json")) {
-      console.log(JSON.stringify({ ...state, errors, drift, steps: steps.map(({ fences, ...s }) => ({
+      console.log(JSON.stringify({ ...state, errors, drift, ...(reinstall ? { reinstall } : {}), steps: steps.map(({ fences, ...s }) => ({
         ...s, fences: fences.map(({ body, ...f }) => f),
       })) }, null, 2));
       return;
@@ -444,6 +426,7 @@ const commands = {
       console.log(`  ${mark} ${s.id.padEnd(5)} ${s.title}  (${s.fences.map((f) => `${f.file}:${f.openLine}`).join(", ")})`);
     }
     for (const e of errors) console.log(`  ! ${e}`);
+    if (reinstall) console.log(`  ! ${reinstall}`);
     if (drift && !drift.ok) console.log(`  ! ${formatDrift(drift).replace(/\n/g, "\n    ")}\n    (skel done and skel finalize refuse until it's resolved)`);
     // Diagram nodes named step_<id> that match no step are silently uncolored
     // on the page; say so here.
@@ -488,7 +471,7 @@ const commands = {
     } catch (err) {
       recorded = false;
       console.error(
-        `skel: warning: can't record this review session in ${sessionStorePath(root)} (${err.code ?? err.message}). ` +
+        `skel: warning: can't record this review session in ${err.path ?? "skel's state dir"} (${err.code ?? err.message}). ` +
           "The page works, but it can't send feedback; copy it by hand, or make that directory writable (or set XDG_STATE_HOME) and restart `skel serve`.",
       );
     }
@@ -832,7 +815,8 @@ const commands = {
       die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
     }
     const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
-    refuseBlockedMigration(target);
+    // Checked now, moved once the settings name the state dir (below).
+    refuseBlockedMigration(target, { preview: true });
     const { rules: stateRules, why } = denyRules(target);
     const stores = storeDenyRules();
     const rules = [...new Set([...stateRules, ...stores.map((s) => s.rule).filter(Boolean)])];
@@ -884,6 +868,9 @@ const commands = {
     // A rule that was already there and isn't recorded stays the user's.
     // Settings first: a failed write must never record rules that weren't added.
     writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+    // The rule is in place, so the project's records move now, this one first.
+    forgetStoreHomes();
+    refuseBlockedMigration(target);
     writeOwned(target, rules.filter((r) => added.includes(r) || prevOwned?.includes(r)));
     // .skeleton/ is per-run state (and holds the human's feedback): keep it
     // out of commits, so a repo can't ship a verdict.
@@ -908,7 +895,7 @@ const commands = {
 
   uninstall([dir = process.cwd()]) {
     const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir);
-    refuseBlockedMigration(target);
+    refuseBlockedMigration(target, { preview: true });
     const prevOwned = readOwned(target);
     const owned = [...(prevOwned ?? []), ...legacyOwned(settings, prevOwned)];
     const groups = settings.hooks?.PreToolUse ?? [];
