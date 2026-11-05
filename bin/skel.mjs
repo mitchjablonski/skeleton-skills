@@ -27,6 +27,7 @@ const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const SELF = path.join(PKG_ROOT, "bin", "skel.mjs").split(path.sep).join("/");
 const HOOK = path.join(PKG_ROOT, "bin", "skel-hook.mjs").split(path.sep).join("/");
 const STOP_HOOK = path.join(PKG_ROOT, "bin", "skel-stop.mjs").split(path.sep).join("/");
+const CONFIG_HOOK = path.join(PKG_ROOT, "bin", "skel-config-hook.mjs").split(path.sep).join("/");
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
@@ -37,14 +38,15 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   review                             write .skeleton/review.html (static; copy feedback by hand)
   serve [--port N] [--send] [--stop] serve live read-only; --send enables feedback
   feedback [--wait SECONDS]          print (and archive) the human's latest feedback (waits up to 110s)
-  approve [--reviewed VERSION]       enter the fill phase (inside Claude Code the hook asks the human first);
+  approve [--reviewed VERSION]       enter the fill phase (the loaded hook requests permission;
+                                     permission modes and integrations control who answers);
                                      refuses if the version the human last reviewed isn't the current one
   next                               start the first pending step and print its fences
   start <id> [--force]               start a specific step (--force abandons an unfinished active step,
                                      or reopens a filled one for rework)
   done                               finish the active step (fails if SKEL_TODO remains, or on drift
                                      outside the fences from the approved skeleton)
-  reshape                            back to skeleton review (inside Claude Code the hook asks the human first)
+  reshape                            back to skeleton review (the loaded hook requests permission)
   finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
   stop-hook [--block]                Stop hook: reports drift from the approved skeleton during a fill
@@ -324,6 +326,8 @@ const skelStopHook = (cmd) => {
 };
 /** The scope-gate hook command from any skel checkout (current or legacy form). */
 const isSkelHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](skel-hook\.mjs"|skel\.mjs" hook)$/.test(cmd);
+/** Exact standalone commands only: a chained command remains the user's. */
+const isSkelConfigHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/]skel-config-hook\.mjs"$/.test(cmd);
 
 /**
  * A project's .claude/settings.local.json, parsed, for install/uninstall to
@@ -361,6 +365,7 @@ function openProjectSettings(dir, { forInstall = false } = {}) {
     : settings.hooks !== undefined && !isObj(settings.hooks) ? '"hooks"'
     : settings.hooks?.PreToolUse !== undefined && !Array.isArray(settings.hooks.PreToolUse) ? '"hooks.PreToolUse"'
     : settings.hooks?.Stop !== undefined && !Array.isArray(settings.hooks.Stop) ? '"hooks.Stop"'
+    : settings.hooks?.ConfigChange !== undefined && !Array.isArray(settings.hooks.ConfigChange) ? '"hooks.ConfigChange"'
     : null;
   if (bad) die(`${settingsPath}: ${bad} isn't shaped the way Claude Code expects; fix it first (we won't overwrite it)`);
   return { target, claudeDir, settingsPath, settings };
@@ -660,9 +665,9 @@ const commands = {
     const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     if (!steps.length) die("no SKEL[...] fences found — nothing to approve");
-    // The human's say-so is Claude Code's permission prompt: the hook always
-    // asks before an agent runs `skel approve` (see evaluateBash). This checks
-    // freshness, not authority: that what is approved is the version the human
+    // The loaded hook requests permission (see evaluateBash); permission modes
+    // and integrations determine who answers. This checks freshness, not
+    // human authority: that what is approved is the version the human
     // last reviewed, so an edit made after their "looks good" can't ride along.
     // A tracked file's malformed markers throw SKEL_MARKERS; anything else is I/O.
     let record;
@@ -861,6 +866,21 @@ const commands = {
     settings.hooks.Stop = settings.hooks.Stop.filter((m) => !emptied.has(m));
     if (stopOurs) stopOurs.command = stopCommand + (block ? " --block" : "");
     else settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand }] });
+    // Freeze ordinary settings reloads during a fill. Keep other hooks and
+    // groups; remove only our exact standalone command, including moved clones.
+    settings.hooks.ConfigChange ??= [];
+    const configGroups = settings.hooks.ConfigChange;
+    const emptiedConfigs = new Set();
+    for (const group of configGroups) {
+      if (!Array.isArray(group?.hooks) || !group.hooks.length) continue;
+      group.hooks = group.hooks.filter((hk) => !isSkelConfigHook(hk?.command));
+      if (!group.hooks.length) emptiedConfigs.add(group);
+    }
+    settings.hooks.ConfigChange = configGroups.filter((g) => !emptiedConfigs.has(g));
+    settings.hooks.ConfigChange.push({
+      matcher: "user_settings|project_settings|local_settings",
+      hooks: [{ type: "command", command: `node "${CONFIG_HOOK}"` }],
+    });
     settings.permissions ??= {};
     settings.permissions.deny = (settings.permissions.deny ?? []).filter((r) => !stale.includes(r));
     const added = rules.filter((r) => !settings.permissions.deny.includes(r));
@@ -879,6 +899,7 @@ const commands = {
     console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
     console.log(stopOurs ? "drift check (Stop) hook updated" : `added drift check (Stop) hook to ${settingsPath}`);
+    console.log(`installed settings-reload guard (ConfigChange); settings changes are held during a fill`);
     const addedState = added.filter((r) => stateRules.includes(r));
     if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
     else console.log(addedState.length ? `added ${addedState.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
@@ -910,6 +931,17 @@ const commands = {
     if (settings.hooks?.Stop) {
       settings.hooks.Stop = stops.filter((m) => !emptiedStops.has(m));
       if (!settings.hooks.Stop.length) delete settings.hooks.Stop;
+    }
+    const configs = settings.hooks?.ConfigChange ?? [];
+    const emptiedConfigs = new Set();
+    for (const group of configs) {
+      if (!Array.isArray(group?.hooks) || !group.hooks.length) continue;
+      group.hooks = group.hooks.filter((hk) => !isSkelConfigHook(hk?.command));
+      if (!group.hooks.length) emptiedConfigs.add(group);
+    }
+    if (settings.hooks?.ConfigChange) {
+      settings.hooks.ConfigChange = configs.filter((g) => !emptiedConfigs.has(g));
+      if (!settings.hooks.ConfigChange.length) delete settings.hooks.ConfigChange;
     }
     if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
     let removed = 0;
