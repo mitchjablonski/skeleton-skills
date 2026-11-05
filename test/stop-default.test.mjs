@@ -344,7 +344,7 @@ test("successful reapproval re-arms when a frozen clock repeats the same approva
   assert.equal(f.stop().decision, "block", "the identical drift gets its new-approval nudge");
 });
 
-test("a broken delivery helper cannot prevent successful CLI approval", t => {
+test("delivery helper faults preserve drift notification and successful CLI approval", t => {
   const f = fixture(t);
   const clone = path.join(f.root, "node_modules", "test-checkout");
   fs.mkdirSync(clone, { recursive: true });
@@ -361,7 +361,41 @@ test("a broken delivery helper cannot prevent successful CLI approval", t => {
   cli(["init", "cache failure is advisory"]);
   fs.writeFileSync(path.join(f.root, "code.js"), "// SKEL[1] value\nconst x = 1;\n// /SKEL[1]\n");
   assert.match(cli(["approve"]).stdout, /skeleton approved/);
+
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.root, ".skeleton/state.json"), "utf8")).phase, "fill");
+  const file = path.join(f.root, "code.js");
+  const baseline = fs.readFileSync(file, "utf8");
+  fs.appendFileSync(file, "// auxiliary drift\n");
+  const helper = path.join(clone, "lib/stop-notice.mjs");
+  const stop = () => spawnSync(process.execPath, [path.join(clone, "bin/skel-stop.mjs")], {
+    cwd: f.root, env: f.env, input: JSON.stringify({ cwd: f.root, stop_hook_active: false }), encoding: "utf8",
+  });
+  for (const [label, code] of [
+    ["syntax error", "not JavaScript {{{"],
+    ["missing module", null],
+    ["top-level failure", 'throw new Error("delivery import failed");'],
+    ["missing exports", "export const unused = true;"],
+    ["claim throws", 'export const claimStopNotice = () => { throw new Error("claim"); };'],
+    ["truthy contract", 'export const claimStopNotice = () => "true";'],
+    ["fulfilled Promise contract", "export const claimStopNotice = () => Promise.resolve(true);"],
+    ["rejected Promise contract", 'export const claimStopNotice = () => Promise.reject(new Error("claim"));'],
+  ]) {
+    if (code === null) fs.rmSync(helper); else fs.writeFileSync(helper, code);
+    const result = stop();
+    assert.equal(result.status, 0, label + ": " + result.stderr);
+    assert.equal(result.stderr, "", label);
+    const report = JSON.parse(result.stdout);
+    assert.match(report.systemMessage, /auxiliary drift/, label);
+    assert.equal(report.decision, undefined, label);
+    assert.equal(report.reason, undefined, label);
+  }
+  fs.writeFileSync(helper, 'export const clearStopNotice = () => Promise.reject(new Error("clear"));');
+  fs.writeFileSync(file, baseline);
+  const clean = stop();
+  assert.equal(clean.status, 0, clean.stderr);
+  assert.equal(clean.stdout, "");
+  cli(["reshape"]);
+  assert.match(cli(["approve"]).stdout, /skeleton approved/, "rejected advisory clear cannot break approval");
 });
 
 

@@ -761,7 +761,7 @@ const commands = {
     // repeats the old approval identity. Advisory cache faults never undo it.
     try {
       const { clearStopNotice } = await import("../lib/stop-notice.mjs");
-      clearStopNotice(root);
+      await clearStopNotice(root);
     } catch {}
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
