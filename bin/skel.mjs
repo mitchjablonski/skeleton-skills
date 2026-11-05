@@ -4,6 +4,7 @@
 
 import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
+import { performance } from "node:perf_hooks";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -787,7 +788,7 @@ const commands = {
     // The agent's Bash tool times out at 120s by default: keep each wait under
     // it and let the skill loop.
     const wait = Math.min(Number(flag(args, "wait", "0")) || 0, 110);
-    const deadline = Date.now() + wait * 1000;
+    const deadline = performance.now() + wait * 1000;
     let readonly = false;
     // No server (a static review, or it stopped): nothing can send, so don't
     // sit out the wait. Only once none has answered for NO_SERVER_GRACE in a
@@ -799,9 +800,9 @@ const commands = {
     while (pendingCount(root) === 0) {
       const live = await liveServer(root);
       if (live?.feedbackEnabled === false) { readonly = true; break; }
-      missingSince = live ? null : missingSince ?? Date.now();
-      if (wait && missingSince !== null && Date.now() - missingSince >= NO_SERVER_GRACE) { noServer = true; break; }
-      if (Date.now() >= deadline) break;
+      missingSince = live ? null : missingSince ?? performance.now();
+      if (wait && missingSince !== null && performance.now() - missingSince >= NO_SERVER_GRACE) { noServer = true; break; }
+      if (performance.now() >= deadline) break;
       await new Promise((r) => setTimeout(r, 1000));
     }
     warnLegacyQueue(root);
@@ -812,7 +813,7 @@ const commands = {
           "They are not the human's feedback; don't act on them.\n",
       );
     }
-    if (taken.status === "ok") console.log(feedbackMarkdown(requireState(root).title, mergeRecords(taken.records)));
+    if (taken.status === "ok") console.log(feedbackMarkdown(requireState(root).title, mergeRecords(taken.records, requireState(root).reviewRound)));
     else if (readonly) console.log("READ_ONLY: the review is read-only; the human's feedback arrives as a chat message. Wait for it; don't poll. Only if the human asks for direct Send: skel serve --send.");
     else if (noServer) console.log("NO_SERVER: no review server is running (a static review, or it stopped), so nothing can be sent; the human's feedback arrives as a chat message. Wait for it; don't poll.");
     else console.log(`NO_FEEDBACK${wait ? ` (waited ${wait}s)` : ""}`);

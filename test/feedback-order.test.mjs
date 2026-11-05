@@ -12,8 +12,10 @@ const MODULE = new URL("../lib/feedback.mjs", import.meta.url).href;
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "feedback-order-"));
   const old = process.env.XDG_CONFIG_HOME;
+  const oldState = process.env.XDG_STATE_HOME;
   process.env.XDG_CONFIG_HOME = path.join(root, "config");
-  t.after(() => { fs.rmSync(root, { recursive: true, force: true }); if (old === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = old; });
+  process.env.XDG_STATE_HOME = path.join(root, "state");
+  t.after(() => { fs.rmSync(root, { recursive: true, force: true }); if (old === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = old; if (oldState === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = oldState; });
   const cli = (...args) => spawnSync(process.execPath, ["--import", "data:text/javascript,Date.now=()=>1", BIN, ...args], { cwd: root, env: process.env, encoding: "utf8" });
   assert.equal(cli("init", "logical ordering").status, 0);
   fs.writeFileSync(path.join(root, "a.js"), '// SKEL[1] value\nconst value=1;\n// /SKEL[1]\n');
@@ -60,7 +62,7 @@ test("reshape changes round while older unread remains visible; legacy never win
   assert.equal(merged.verdict, null);
   assert.equal(merged.version, null);
   assert.match(merged.general, /legacy note/);
-  assert.match(merged.general, /send the review again/);
+  assert.match(merged.general, /send any old notes that still apply again/);
 });
 test("concurrent accepted sends get unique order; busy lock refuses without stealing", async t => {
   const { root } = fixture(t);
@@ -173,4 +175,36 @@ test("failed approve on legacy fill does not initialize a review round or rewrit
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /already approved/);
   assert.equal(fs.readFileSync(file, "utf8"), before);
+});
+test("feedback wait terminates with a frozen wall clock", { timeout: 10000 }, t => {
+  const { root } = fixture(t);
+  const result = spawnSync(process.execPath, ["--import", "data:text/javascript,Date.now=()=>1", BIN, "feedback", "--wait", "0.1"], {
+    cwd: root, env: process.env, encoding: "utf8", timeout: 5000,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /NO_FEEDBACK/);
+});
+test("CLI retains earlier round notes without canonical approval, current review wins without legacy nag", t => {
+  const { root, cli } = fixture(t);
+  assert.equal(cli("approve").status, 0);
+  send(root, 10, "111111111111");
+  assert.equal(cli("reshape").status, 0);
+  const earlier = cli("feedback");
+  assert.equal(earlier.status, 0, earlier.stderr);
+  assert.match(earlier.stdout, /Earlier review round/);
+  assert.doesNotMatch(earlier.stdout, /APPROVED/);
+  assert.match(earlier.stdout, /Reviewed skeleton version: unknown/);
+  assert.equal(cli("review").status, 0);
+  const html = fs.readFileSync(path.join(root, ".skeleton/review.html"), "utf8");
+  const data = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1]);
+  send(root, 5, data.skeletonVersion);
+  fs.writeFileSync(path.join(queueDir(root), "legacy.json"), JSON.stringify({ session: "known-session", at: 1000, version: "ffffffffffff", verdict: "changes", general: "old note" }));
+  const current = cli("feedback");
+  assert.match(current.stdout, /APPROVED/);
+  assert.match(current.stdout, new RegExp(`Reviewed skeleton version: ${data.skeletonVersion}`));
+  assert.match(current.stdout, /old note/);
+  const approved = cli("approve");
+  assert.equal(approved.status, 0, approved.stderr);
+  assert.doesNotMatch(approved.stdout, /legacy feedback ordering is unknown/);
 });
