@@ -741,8 +741,8 @@ const commands = {
           req.on("end", () => {
             try {
               const fb = cleanFeedback(JSON.parse(body));
-              const now = current().data.skeletonVersion;
-              storeFeedback(root, session, fb, now);
+              let now;
+              storeFeedback(root, session, fb, () => (now = current().data.skeletonVersion));
               // A page that was already out of date is told so (the notes are
               // still delivered, marked stale).
               if (fb.version && fb.version !== now) {

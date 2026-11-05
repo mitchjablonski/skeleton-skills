@@ -131,9 +131,46 @@ test("serve replaces verified clock-only server instead of silently reusing it",
     const drained = takeFeedback(root).records;
     assert.ok(drained[1].at < drained[0].at);
     assert.equal(mergeRecords(drained).verdict, "changes");
+    fs.writeFileSync(path.join(root, ".skeleton/state.json"), "{");
+    const broken = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": data.token }, body: JSON.stringify({ verdict: "approve", comments: [] }) });
+    assert.equal(broken.status, 503);
+    const diagnostic = await broken.text();
+    assert.ok(diagnostic.includes(path.join(root, ".skeleton/state.json")));
+    assert.match(diagnostic, /external terminal/);
+    const invalid = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": data.token }, body: "{" });
+    assert.equal(invalid.status, 400);
   } finally {
     if (current && current.exitCode === null) current.kill();
     if (old.exitCode === null) old.kill();
     await Promise.all([old, current].filter(Boolean).map(child => (child.exitCode !== null || child.signalCode !== null) ? Promise.resolve() : new Promise(resolve => child.once("exit", resolve))));
   }
+});
+test("async lock remains held through fulfillment or rejection; synchronous calls stay synchronous", async t => {
+  const { root } = fixture(t);
+  const listeners = process.listenerCount("exit");
+  let release;
+  const held = withFeedbackLock(root, async () => {
+    await new Promise(resolve => { release = resolve; });
+    return 42;
+  });
+  assert.throws(() => withFeedbackLock(root, () => "unexpected"), /locked/);
+  release();
+  assert.equal(await held, 42);
+  assert.equal(withFeedbackLock(root, () => 7), 7);
+  await assert.rejects(withFeedbackLock(root, async () => { throw new Error("rejected operation"); }), /rejected operation/);
+  assert.equal(fs.existsSync(path.join(queueDir(root), ".order-lock")), false);
+  assert.equal(process.listenerCount("exit"), listeners);
+});
+test("failed approve on legacy fill does not initialize a review round or rewrite state", t => {
+  const { root, cli } = fixture(t);
+  assert.equal(cli("approve").status, 0);
+  const file = path.join(root, ".skeleton/state.json");
+  const state = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete state.reviewRound;
+  fs.writeFileSync(file, JSON.stringify(state));
+  const before = fs.readFileSync(file, "utf8");
+  const result = cli("approve");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /already approved/);
+  assert.equal(fs.readFileSync(file, "utf8"), before);
 });
