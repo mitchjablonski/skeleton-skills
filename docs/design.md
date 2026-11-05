@@ -1,6 +1,6 @@
 # skeleton-skills: threat model and design review
 
-Status: **decided** (issue #7). First reviewed at `1929b8a` (PR #1 head); revised after Codex's review on PR #12; evidence refreshed against merged `main` at `970850c`, including PR #35 (final implementation head `b3872ed`). PR #45 (`ebec`) and PR #46 (`e1af8ae`) are published for review, not merged. **The maintainer has decided every question in §9. A decision isn't an implementation: §10 says what has shipped, and the strict tier stays a conditional design target.**
+Status: **decided** (issue #7). First reviewed at `1929b8a` (PR #1 head); revised after Codex's review on PR #12; evidence refreshed against merged `main` at `970850c`, including PR #35 (final implementation head `b3872ed`). PR #45 (`ebec3cb`) and PR #46 (`e1af8ae`) are published for review, not merged. **The maintainer has decided every question in §9. A decision isn't an implementation: §10 says what has shipped, and the strict tier stays a conditional design target.**
 Claude Code behaviour cited below was checked against the docs on 2026-10-30 and re-checked on 2026-10-31 for the claims added in the revision, and in November 2026 for the Stop, `ConfigChange`, `onFailure` and plugin claims; links are inline.
 
 **Line numbers.** §4 describes the **PR #1 baseline**, and its citations refer to `1929b8a` unless they say "main". Citations marked "main", and those in §10, refer to `main` at `9a4541d`. Unmarked citations outside §10 can still be baseline lines. Much of §4 has changed since the baseline; **§10 (implementation status) says which recommendations shipped, which are in review and which are only planned.** Don't read a recommendation in §5–§7 as shipped unless §10 lists it as merged.
@@ -541,11 +541,12 @@ Added after Codex's review, so that no decision or recommendation above reads as
 | **Merged** | #34 | First item of #17: the README no longer calls the permission prompt the one channel the agent can't answer. | §4.2 |
 | **Merged** | #35 | Closes #17 standard-tier work: settings reload guard during an enrolled fill, internal fault denial with a repair ask path, scoped receipt/state diagnosis, and persisted historical blocked-change notices surfaced by status/Stop. Notices are consumed once per session; status remains non-consuming. Blocks reloads, not disk writes or restart-loaded settings; managed policy and startup faults remain outside this control. | §4.3, §5.14, §9 Q7 |
 | **Closed** | #17 | Standard-tier approval-channel claims and fault/reload work shipped through #34 and #35. This does not establish a human-authenticated strict-tier receipt. | §4.3, §5.14 |
-| **Planned** | #18 | Move trusted state to `$XDG_STATE_HOME/skel/`, with the migration of §5.7. | §5.7, §9 Q5 |
+| **In review, blocked** | #18 / PR #41 | Move trusted state to `$XDG_STATE_HOME/skel/`, with the migration of §5.7. Upgrade findings require preserving effective permission coverage and replacing an old review server before relying on migrated storage. | §5.7, §9 Q5 |
 | **Planned** | #19 | Strict tier: sandbox, typed approval via `UserPromptExpansion` behind an agent-inaccessible entrypoint or origin boundary, the executable boundary, and the remaining spikes. The CLI expansion spike is done: the event doesn't authenticate human origin (§5.8). | §5.4, §5.8, §5.15, §7 |
 | **Decided, not built** | #37 | Reviewable-source-set verification. | §5.1 item 2, §9 Q2 |
-| **In review** | #38 / PR #45 (`ebec`) | One corrective Stop continuation by default, with explicit notify-only opt-out. CLI protocol probe completed; implementation remains unmerged. | §5.1 item 1, §9 Q3 |
-| **Decided, not built** | #39 | Fragment token, `/api/data` behind it, and a CSP. | §5.5, §9 Q9 |
+| **In review** | #38 / PR #45 (`ebec3cb`) | One corrective Stop continuation by default, with explicit notify-only opt-out. CLI protocol probe completed; implementation remains unmerged. | §5.1 item 1, §9 Q3 |
+| **In review, blocked** | #39 / PR #43 | Fragment token, `/api/data` behind it, and a CSP. The upgrade must replace a legacy server that still serves unauthenticated source. | §5.5, §9 Q9 |
+| **In review** | #42 / PR #46 (`e1af8ae`) | Deduplicate installed scope hooks without changing user matchers or removing pre-existing empty groups. | §4.3 |
 | **Decided, not built** | #40 | A plugin as the main way to get skel, after #35 and #18; needs a live disable-and-reload probe first. | §5.13, §9 Q8 |
 | **Not started** | n/a | Gate compares against the snapshot (§5.1 item 3). AST checks (§5.6) are deferred by §9 Q10. | |
 
