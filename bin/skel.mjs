@@ -878,15 +878,20 @@ const commands = {
     const matcher = "Write|Edit|MultiEdit|NotebookEdit|Bash";
     // Shared matchers and metadata belong to the user's remaining hooks.
     let ours = false;
+    let firstHook = null;
     settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter((group) => {
       if (!Array.isArray(group?.hooks)) return true;
       const before = group.hooks.length;
-      group.hooks = group.hooks.filter((hook) => !isSkelHook(hook?.command));
+      group.hooks = group.hooks.filter((hook) => {
+        if (!isSkelHook(hook?.command)) return true;
+        firstHook ??= hook;
+        return false;
+      });
       const removed = group.hooks.length !== before;
       ours ||= removed;
       return !removed || group.hooks.length > 0;
     });
-    settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
+    settings.hooks.PreToolUse.push({ matcher, hooks: [{ ...(firstHook ?? { type: "command" }), command }] });
     // The Stop hook checks for drift at the end of every turn during a fill.
     // Found by its script, so a moved clone is updated in place, duplicates
     // (two installs, a hand-added copy) collapse to the first, and a `--block`
