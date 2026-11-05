@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { BLOCK_ON_DRIFT, stopMode } from "../lib/stop.mjs";
 
 function fixture(t) {
@@ -18,7 +19,7 @@ function fixture(t) {
     assert.equal(result.status, 0, result.stderr);
     return result;
   };
-  return { root, run, cli };
+  return { root, run, cli, env };
 }
 
 test("Stop mode defaults and both entrypoints reject conflicting flags", t => {
@@ -284,4 +285,107 @@ test("concurrent Stop processes claim one unchanged drift at most once", async t
   })));
   assert.equal(outputs.filter(x => x.decision === "block").length, 1);
   assert.ok(outputs.every(x => x.systemMessage.includes("concurrent drift")));
+});
+
+
+test("a clean absent delivery cache needs no metadata writes", t => {
+  const f = fixture(t);
+  const module = new URL("../lib/stop-notice.mjs", import.meta.url).href;
+  const code = [
+    'import fs from "node:fs";',
+    'import { clearStopNotice } from ' + JSON.stringify(module) + ';',
+    'let writes = 0;',
+    'for (const method of ["mkdirSync", "openSync", "writeFileSync", "renameSync", "rmSync"]) {',
+    '  fs[method] = () => { writes++; throw new Error("unexpected metadata write"); };',
+    '}',
+    'console.log(JSON.stringify({ cleared: clearStopNotice(' + JSON.stringify(f.root) + '), writes }));',
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    cwd: f.root, env: f.env, encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { cleared: true, writes: 0 });
+  assert.equal(fs.existsSync(path.join(f.root, "config")), false);
+});
+
+test("successful reapproval re-arms when a frozen clock repeats the same approval identity; failed approval does not", t => {
+  const f = approvedFixture(t);
+  const clock = path.join(f.root, "frozen-clock.mjs");
+  fs.writeFileSync(clock, "Date.now = () => 1730000000000;\n");
+  const frozen = args => spawnSync(process.execPath, ["--import", pathToFileURL(clock).href, path.resolve("bin/skel.mjs"), ...args], {
+    cwd: f.root, env: f.env, encoding: "utf8",
+  });
+  const success = args => {
+    const result = frozen(args);
+    assert.equal(result.status, 0, result.stderr);
+    return result;
+  };
+  success(["reshape"]);
+  success(["approve"]);
+  const first = JSON.parse(fs.readFileSync(f.record, "utf8"));
+  const drifted = f.source.replace("// outside", "// frozen drift");
+  fs.writeFileSync(f.file, drifted);
+  assert.equal(f.stop().decision, "block");
+  const claim = fs.readFileSync(f.cache, "utf8");
+  assert.equal(frozen(["approve"]).status, 1, "already filling is a failed approval");
+  assert.equal(fs.readFileSync(f.cache, "utf8"), claim);
+  success(["reshape"]);
+  fs.writeFileSync(f.file, "// SKEL[1] unfinished\n");
+  assert.equal(frozen(["approve"]).status, 1, "marker failure cannot reset delivery");
+  assert.equal(fs.readFileSync(f.cache, "utf8"), claim);
+  fs.writeFileSync(f.file, f.source);
+  success(["approve"]);
+  const second = JSON.parse(fs.readFileSync(f.record, "utf8"));
+  assert.equal(second.approvedAt, first.approvedAt, "actual subprocess clock was frozen");
+  assert.equal(second.version, first.version, "the same baseline repeats its version");
+  assert.deepEqual(second.files, first.files);
+  assert.equal(fs.existsSync(f.cache), false, "successful approval explicitly resets delivery");
+  fs.writeFileSync(f.file, drifted);
+  assert.equal(f.stop().decision, "block", "the identical drift gets its new-approval nudge");
+});
+
+test("a broken delivery helper cannot prevent successful CLI approval", t => {
+  const f = fixture(t);
+  const clone = path.join(f.root, "node_modules", "test-checkout");
+  fs.mkdirSync(clone, { recursive: true });
+  for (const dir of ["bin", "lib"]) fs.cpSync(path.resolve(dir), path.join(clone, dir), { recursive: true });
+  fs.copyFileSync(path.resolve("package.json"), path.join(clone, "package.json"));
+  fs.writeFileSync(path.join(clone, "lib/stop-notice.mjs"), "this is not valid JavaScript {{{");
+  const cli = args => {
+    const result = spawnSync(process.execPath, [path.join(clone, "bin/skel.mjs"), ...args], {
+      cwd: f.root, env: f.env, encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return result;
+  };
+  cli(["init", "cache failure is advisory"]);
+  fs.writeFileSync(path.join(f.root, "code.js"), "// SKEL[1] value\nconst x = 1;\n// /SKEL[1]\n");
+  assert.match(cli(["approve"]).stdout, /skeleton approved/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.root, ".skeleton/state.json"), "utf8")).phase, "fill");
+});
+
+
+test("an already-notified unchanged drift reads its cache without metadata writes", t => {
+  const f = approvedFixture(t);
+  fs.writeFileSync(f.file, f.source.replace("// outside", "// read-only repeat"));
+  assert.equal(f.stop().decision, "block");
+  const before = fs.readFileSync(f.cache, "utf8");
+  const module = new URL("../lib/stop-notice.mjs", import.meta.url).href;
+  const code = [
+    'import fs from "node:fs";',
+    'import { claimStopNotice } from ' + JSON.stringify(module) + ';',
+    'const snap = JSON.parse(fs.readFileSync(' + JSON.stringify(f.record) + ', "utf8"));',
+    'const drift = JSON.parse(fs.readFileSync(' + JSON.stringify(f.cache) + ', "utf8")).drift;',
+    'let writes = 0;',
+    'for (const method of ["mkdirSync", "openSync", "writeFileSync", "renameSync", "rmSync"]) {',
+    '  fs[method] = () => { writes++; throw new Error("unexpected metadata write"); };',
+    '}',
+    'console.log(JSON.stringify({ claimed: claimStopNotice(' + JSON.stringify(f.root) + ', snap, drift), writes }));',
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    cwd: f.root, env: f.env, encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { claimed: false, writes: 0 });
+  assert.equal(fs.readFileSync(f.cache, "utf8"), before);
 });

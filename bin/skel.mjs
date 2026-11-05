@@ -757,6 +757,12 @@ const commands = {
       die(`couldn't record the approved skeleton: ${err.message}`);
     }
     writeState(root, next);
+    // Successful approval re-arms delivery even if a frozen or reversed clock
+    // repeats the old approval identity. Advisory cache faults never undo it.
+    try {
+      const { clearStopNotice } = await import("../lib/stop-notice.mjs");
+      clearStopNotice(root);
+    } catch {}
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
     if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`);
