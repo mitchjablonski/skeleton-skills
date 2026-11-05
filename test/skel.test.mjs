@@ -8,14 +8,15 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { scanFiles, scanText, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
-import { cleanFeedback, configPath, feedbackMarkdown, projectKey, sessionStorePath } from "../lib/feedback.mjs";
+import { cleanFeedback, feedbackMarkdown, projectKey, sessionStorePath, storePath } from "../lib/feedback.mjs";
+import { migrateProject } from "../lib/migrate.mjs";
 import { compareWith, exterior, lineDiff, readRendered, readSnapshot, recordSkeleton, renderedPath, safeKey, scanSkeleton, snapshotPath, whitespaceOnly } from "../lib/snapshot.mjs";
 import { buildReviewData } from "../lib/review.mjs";
-import { readState } from "../lib/state.mjs";
+import { inSkelConfig, legacyConfigDir, readState, skelStateDir } from "../lib/state.mjs";
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "skel.mjs");
 
-// The serve-session store lives in the user's config dir; keep tests out of the real one.
+// skel's stores live in the user's state dir, and migrate from the old config dir; keep tests out of the real ones.
 // Every temp dir the suite makes is removed when it finishes.
 const TEMPS = [];
 after(() => {
@@ -27,6 +28,8 @@ after(() => {
 });
 const mkTemp = (prefix) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); TEMPS.push(d); return d; };
 process.env.XDG_CONFIG_HOME = mkTemp("skel-config-");
+process.env.XDG_STATE_HOME = mkTemp("skel-state-");
+process.env.LOCALAPPDATA = mkTemp("skel-localappdata-");
 
 const SRC = `import { Point } from "./types";
 
@@ -268,12 +271,12 @@ async function serve(dir, args = ["--send"], env = {}) {
 
 const post = (url, body, headers) => fetch(new URL("/api/feedback", url), { method: "POST", headers, body: JSON.stringify(body) });
 
-test("serve defaults to read-only without a feedback session and tolerates unavailable config", async () => {
+test("serve defaults to read-only without a feedback session and tolerates an unavailable state dir", async () => {
   const { dir, run } = project();
   run("init", "T");
   const blockedConfig = path.join(dir, "config-file");
   fs.writeFileSync(blockedConfig, "not a directory");
-  const srv = await serve(dir, [], { ...process.env, XDG_CONFIG_HOME: blockedConfig });
+  const srv = await serve(dir, [], { ...process.env, XDG_STATE_HOME: blockedConfig });
   try {
     assert.equal(srv.token, null);
     assert.equal(srv.data.feedbackEnabled, false);
@@ -465,14 +468,14 @@ const ruleSpelling = (dir) => {
 };
 /** The .skeleton/ rules install should write for a project: its absolute real path. */
 const stateDenyFor = (target) => STATE_PATHS.map((p) => `Edit(/${ruleSpelling(target)}/.skeleton/${p})`);
-/** The rule for skel's config dir (#26), as resolved from this test run's XDG_CONFIG_HOME. */
-const configDeny = () => {
-  const dir = path.join(process.env.XDG_CONFIG_HOME, "skel");
+/** The rules for skel's store dirs (#26, #18), as resolved from this test run's env: the state dir, then the old config dir (install doesn't create that one). */
+const storeDeny = (stateHome = process.env.XDG_STATE_HOME, configHome = process.env.XDG_CONFIG_HOME) => {
+  const dir = path.join(stateHome, "skel");
   fs.mkdirSync(dir, { recursive: true });
-  return `Edit(/${ruleSpelling(dir)}/**)`;
+  return [`Edit(/${ruleSpelling(dir)}/**)`, `Edit(/${ruleSpelling(configHome)}/skel/**)`];
 };
-/** Every rule install should write for a project: its .skeleton/ rules, then the config dir's. */
-const denyFor = (target) => [...stateDenyFor(target), configDeny()];
+/** Every rule install should write for a project: its .skeleton/ rules, then the store dirs'. */
+const denyFor = (target) => [...stateDenyFor(target), ...storeDeny()];
 const installTarget = () => {
   const target = tmp("skel-install-");
   const settingsPath = path.join(target, ".claude", "settings.local.json");
@@ -615,12 +618,12 @@ test("PR#11 P2: uninstall removes only the rules install added; identical pre-ex
   assert.match(run("install"), /added 3 permission deny rule/);
   assert.match(run("install"), /already present/);
   assert.match(run("install"), /already present/, "repeated installs keep ownership");
-  assert.deepEqual(read().permissions.deny, [...mine.permissions.deny, SKEL_DENY[1], SKEL_DENY[2], SKEL_DENY[4], SKEL_DENY[5]]);
+  assert.deepEqual(read().permissions.deny, [...mine.permissions.deny, SKEL_DENY[1], SKEL_DENY[2], SKEL_DENY[4], SKEL_DENY[5], SKEL_DENY[6]]);
   run("uninstall");
   assert.deepEqual(read(), mine, "the user's identical rules survive install + uninstall");
 
   // Ownership lives outside the project, and uninstall clears it.
-  const store = path.join(process.env.XDG_CONFIG_HOME, "skel");
+  const store = path.join(process.env.XDG_STATE_HOME, "skel");
   run("install");
   assert.ok(fs.readdirSync(store).some((f) => f.endsWith("-install.json")));
   const before = fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).length;
@@ -979,7 +982,7 @@ test("snapshot: exterior drops fence bodies and keeps markers; lineDiff finds th
 test("snapshot: approve records it outside the project; a fill inside the fences passes done and finalize", () => {
   const { dir, run, fill } = approved();
   assert.ok(fs.existsSync(snapshotPath(dir)));
-  assert.ok(snapshotPath(dir).startsWith(process.env.XDG_CONFIG_HOME), "in the config dir, not the project");
+  assert.ok(snapshotPath(dir).startsWith(process.env.XDG_STATE_HOME), "in the state dir, not the project");
   fill("1", "return raw.filter(Boolean);\n  // a second line is fine");
   run("done");
   run("next");
@@ -1294,7 +1297,7 @@ test("issue #6 N6: serve warns and keeps serving when the session store can't be
   run("init", "T");
   const blocked = path.join(tmp(), "not-a-dir");
   fs.writeFileSync(blocked, "");
-  const srv = await serve(dir, ["--send"], { XDG_CONFIG_HOME: blocked });
+  const srv = await serve(dir, ["--send"], { XDG_STATE_HOME: blocked });
   try {
     assert.equal((await fetch(new URL("/api/version", srv.url))).status, 200);
     assert.match(srv.stderr(), /can't record this review session/);
@@ -1304,7 +1307,7 @@ test("issue #6 N6: serve warns and keeps serving when the session store can't be
     await srv.stop();
   }
   // init doesn't crash on it either.
-  execFileSync("node", [BIN, "init", "U", "--force"], { cwd: dir, env: { ...process.env, XDG_CONFIG_HOME: blocked }, stdio: "pipe" });
+  execFileSync("node", [BIN, "init", "U", "--force"], { cwd: dir, env: { ...process.env, XDG_STATE_HOME: blocked }, stdio: "pipe" });
 });
 
 test("issue #6 N6: feedback queued under a pre-upgrade serve.json is flagged, never trusted", async () => {
@@ -1388,7 +1391,7 @@ test("PR#11 review #2: project paths with ( ) { } [ ] keep their rules; [ ] * ? 
     const r = execFileSync("node", [BIN, "install", odd], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
     assert.match(r, /warning: no permission deny rules/);
     const s = JSON.parse(fs.readFileSync(path.join(odd, ".claude", "settings.local.json"), "utf-8"));
-    assert.deepEqual(s.permissions.deny, [configDeny()], "only the config dir's rule (#26), which doesn't depend on the project path");
+    assert.deepEqual(s.permissions.deny, storeDeny(), "only the store dirs' rules (#26, #18), which don't depend on the project path");
     assert.equal(s.hooks.PreToolUse.length, 1);
     assert.ok(fs.existsSync(path.join(odd, ".claude", "skills", "skeleton", "SKILL.md")));
   }
@@ -1437,7 +1440,7 @@ test("PR#11 review nits: install creates a missing project dir; uninstall of a m
   assert.throws(() => run("uninstall", missing), (e) => /doesn't exist/.test(e.stderr) && !/at .*node:/.test(e.stderr));
   run("install", missing);
   assert.ok(fs.existsSync(path.join(missing, ".claude", "settings.local.json")));
-  const store = path.join(process.env.XDG_CONFIG_HOME, "skel");
+  const store = path.join(process.env.XDG_STATE_HOME, "skel");
   const rec = fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).map((f) => JSON.parse(fs.readFileSync(path.join(store, f), "utf-8"))).find((r) => r.ownedDeny[0] === denyFor(missing)[0]);
   assert.equal(rec.root, fs.realpathSync.native(missing), "ownership record names the real path");
   if (process.platform === "win32") {
@@ -1445,7 +1448,7 @@ test("PR#11 review nits: install creates a missing project dir; uninstall of a m
     const records = () => fs.readdirSync(store).filter((f) => f.endsWith("-install.json")).length;
     const n = records();
     assert.match(run("install", missing.toUpperCase()), /already present/);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(missing, ".claude", "settings.local.json"), "utf-8")).permissions.deny.length, 6, "five .skeleton/ rules and the config dir's");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(missing, ".claude", "settings.local.json"), "utf-8")).permissions.deny.length, 7, "five .skeleton/ rules and the two store dirs'");
     assert.equal(records(), n);
   }
   if (canSymlink) {
@@ -1501,8 +1504,8 @@ test("review #10 (2): the config key is the real path, case-folded only on Windo
   if (process.platform !== "win32") assert.notEqual(projectKey(dir, "linux"), projectKey(dir.toUpperCase(), "linux"));
   if (process.platform === "win32") {
     const flip = dir[0] === dir[0].toUpperCase() ? dir[0].toLowerCase() + dir.slice(1) : dir[0].toUpperCase() + dir.slice(1);
-    assert.equal(configPath(flip, ".snapshot"), configPath(dir, ".snapshot"));
-    assert.equal(configPath(dir.toLowerCase()), configPath(dir.toUpperCase()));
+    assert.equal(storePath(flip, ".snapshot"), storePath(dir, ".snapshot"));
+    assert.equal(storePath(dir.toLowerCase()), storePath(dir.toUpperCase()));
   }
 });
 
@@ -1661,7 +1664,7 @@ test("review #10 nit 2: buildReviewData with and without `known` agree for a tra
   }
 });
 
-test("review #10 nit 3: approve tells an unwritable config dir apart from marker errors", () => {
+test("review #10 nit 3: approve tells an unwritable state dir apart from marker errors", () => {
   const { dir, run } = project();
   run("init", "T");
   const asFile = path.join(tmp(), "not-a-dir");
@@ -1675,7 +1678,7 @@ test("review #10 nit 3: approve tells an unwritable config dir apart from marker
     cases.push(ro);
   }
   for (const cfg of cases) {
-    const err = failure(() => execFileSync("node", [BIN, "approve"], { cwd: dir, env: { ...process.env, XDG_CONFIG_HOME: cfg }, encoding: "utf-8", stdio: "pipe" }));
+    const err = failure(() => execFileSync("node", [BIN, "approve"], { cwd: dir, env: { ...process.env, XDG_STATE_HOME: cfg }, encoding: "utf-8", stdio: "pipe" }));
     assert.match(err, /couldn't record the approved skeleton: .*(ENOTDIR|EEXIST|EACCES|EPERM)/, cfg);
     assert.doesNotMatch(err, /fix marker errors/);
     assert.doesNotMatch(err, /\n\s+at /, "no stack trace");
@@ -2103,10 +2106,10 @@ test("NIT3 review: an unreadable rendered-versions store is reported as such, no
   assert.doesNotMatch(out, /never rendered/);
 });
 
-// ---- #26: skel's config-dir stores ----
+// ---- #26, #18: skel's store dirs ----
 
-test("#26: install adds an owned, absolute, escaped deny rule for skel's config dir; a re-run is identical; uninstall removes it", () => {
-  // An XDG_CONFIG_HOME with pattern characters, reached through a symlink when we can make one.
+test("#26: install adds an owned, absolute, escaped deny rule for skel's state dir; a re-run is identical; uninstall removes it", () => {
+  // An XDG_STATE_HOME with pattern characters, reached through a symlink when we can make one.
   // Windows filenames can't hold * or ?.
   const realBase = path.join(tmp("skel-xdg-"), process.platform === "win32" ? "cfg [x](1)" : "cfg [x]*?(1)");
   fs.mkdirSync(realBase, { recursive: true });
@@ -2115,7 +2118,7 @@ test("#26: install adds an owned, absolute, escaped deny rule for skel's config 
     xdg = path.join(tmp("skel-xdglink-"), "link");
     fs.symlinkSync(realBase, xdg, "junction");
   }
-  const env = { ...process.env, XDG_CONFIG_HOME: xdg };
+  const env = { ...process.env, XDG_STATE_HOME: xdg };
   const target = tmp("skel-cfgrule-");
   const settingsPath = path.join(target, ".claude", "settings.local.json");
   const read = () => JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
@@ -2127,40 +2130,42 @@ test("#26: install adds an owned, absolute, escaped deny rule for skel's config 
   const rule = `Edit(/${ruleSpelling(path.join(realBase, "skel"))}/**)`;
   assert.match(rule, process.platform === "win32" ? /^Edit\(\/\/[a-z]\/.*\/cfg \\\[x\\\]\(1\)\/skel\/\*\*\)$/ : /^Edit\(\/\/.*\/cfg \\\[x\\\]\\\*\\\?\(1\)\/skel\/\*\*\)$/, rule);
   assert.ok(!rule.includes("link"), "names the real dir, not the symlink");
-  assert.match(out, /added a permission deny rule for skel's config dir/);
+  const oldRule = storeDeny()[1];
+  assert.match(out, /added a permission deny rule for skel's state dir/);
+  assert.match(out, /added a permission deny rule for skel's old config dir/);
   assert.ok(out.includes(rule), out);
-  assert.deepEqual(read().permissions.deny, ["Read(./.env)", ...stateDenyFor(target), rule]);
+  assert.deepEqual(read().permissions.deny, ["Read(./.env)", ...stateDenyFor(target), rule, oldRule]);
   const owned = fs.readdirSync(path.join(realBase, "skel")).filter((f) => f.endsWith("-install.json"));
   assert.equal(owned.length, 1);
   assert.ok(JSON.parse(fs.readFileSync(path.join(realBase, "skel", owned[0]), "utf-8")).ownedDeny.includes(rule), "recorded as install's");
 
   const text = fs.readFileSync(settingsPath, "utf-8");
-  assert.match(run("install"), /permission deny rule for skel's config dir already present/);
+  assert.match(run("install"), /permission deny rule for skel's state dir already present/);
   assert.equal(fs.readFileSync(settingsPath, "utf-8"), text, "byte-identical on a re-run");
 
   const un = run("uninstall");
   assert.match(un, /removed 5 \.skeleton\/ permission deny rule/);
-  assert.match(un, /removed the config-dir permission deny rule/);
+  assert.match(un, /removed 2 store-dir permission deny rule/);
   assert.deepEqual(read(), { permissions: { deny: ["Read(./.env)"] } });
 
   // The user's own identical rule survives install + uninstall.
   fs.writeFileSync(settingsPath, JSON.stringify({ permissions: { deny: [rule] } }));
-  assert.match(run("install"), /config dir already present/);
-  assert.doesNotMatch(run("uninstall"), /removed the config-dir/);
+  assert.match(run("install"), /state dir already present/);
+  assert.match(run("uninstall"), /removed 1 store-dir/, "only the old config dir's, which install added");
   assert.deepEqual(read(), { permissions: { deny: [rule] } });
   fs.rmSync(settingsPath);
 });
 
-test("#26: after XDG_CONFIG_HOME changes, install adds the new dir's rule and reports the old one as left in place", () => {
+test("#26: after XDG_STATE_HOME changes, install adds the new dir's rule and reports the old one as left in place", () => {
   const target = tmp("skel-cfgmove-");
   const xdgA = tmp("skel-xdgA-");
   const xdgB = tmp("skel-xdgB-");
-  const run = (xdg, ...a) => execFileSync("node", [BIN, ...a, target], { encoding: "utf-8", env: { ...process.env, XDG_CONFIG_HOME: xdg }, stdio: ["ignore", "pipe", "pipe"] });
+  const run = (xdg, ...a) => execFileSync("node", [BIN, ...a, target], { encoding: "utf-8", env: { ...process.env, XDG_STATE_HOME: xdg }, stdio: ["ignore", "pipe", "pipe"] });
   run(xdgA, "install");
   const ruleA = `Edit(/${ruleSpelling(path.join(xdgA, "skel"))}/**)`;
   const out = run(xdgB, "install");
   const ruleB = `Edit(/${ruleSpelling(path.join(xdgB, "skel"))}/**)`;
-  assert.match(out, /added a permission deny rule for skel's config dir/);
+  assert.match(out, /added a permission deny rule for skel's state dir/);
   assert.match(out, /left in place: 1 deny rule\(s\) for a \.\.\.\/skel\/\*\* dir/);
   assert.ok(out.includes(ruleA), out);
   const deny = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8")).permissions.deny;
@@ -2171,7 +2176,7 @@ test("#26: after XDG_CONFIG_HOME changes, install adds the new dir's rule and re
   assert.ok(!JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8")).permissions?.deny?.includes(ruleA));
 });
 
-test("#26: the gate asks about edits into skel's config dir from any project, denies in deny mode, and ignores other outside paths", async () => {
+test("#26: the gate asks about edits into a skel store dir from any project, denies in deny mode, and ignores other outside paths", async () => {
   const { evaluateConfigEdit } = await import("../lib/gate.mjs");
   const cfg = tmp("skel-cfgdir-");
   const configDir = path.join(cfg, "skel");
@@ -2182,7 +2187,7 @@ test("#26: the gate asks about edits into skel's config dir from any project, de
   for (const tool of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) {
     const v = at(tool, record);
     assert.equal(v?.decision, "ask", tool);
-    assert.match(v.reason, /config dir/);
+    assert.match(v.reason, /state dir/);
   }
   assert.equal(at("Edit", path.join(configDir, "new", "x.json")).decision, "ask", "a new file too");
   assert.equal(at("Edit", record.toUpperCase()).decision, "ask", "case-insensitively");
@@ -2201,12 +2206,12 @@ test("#26: the gate asks about edits into skel's config dir from any project, de
     assert.equal(at("Write", path.join("sneaky", "abc.snapshot.json")), null, "left to the deny rule (checked against the link's target)");
   }
 
-  // An in-project edit never realpaths the edited file for this check: only the config dir is resolved.
+  // An in-project edit never realpaths the edited file for this check: only the store dir is resolved.
   const resolved = [];
   const spy = (p) => { resolved.push(p); return p; };
   const deep = path.join(base, "a", "b", "c", "new", "file.ts");
   assert.equal(evaluateConfigEdit({ toolName: "Write", toolInput: { file_path: deep }, base, state: null, configDir, resolve: spy }), null);
-  assert.deepEqual(resolved, [configDir], "one resolve, of the config dir");
+  assert.deepEqual(resolved, [configDir], "one resolve, of the store dir");
   resolved.length = 0;
   evaluateConfigEdit({ toolName: "Write", toolInput: { file_path: path.join(tmp("skel-elsewhere-"), "x.ts") }, base, state: null, configDir, resolve: spy });
   assert.equal(resolved.length, 2, "outside the project, the edited path is resolved too");
@@ -2497,8 +2502,8 @@ test("#32: a live skel serve poll stops serving a known file swapped for a link 
   } finally {
     await srv.stop();
   }
-  // Nothing from the outside file reached the config-dir stores (noteRendered).
-  const store = path.join(process.env.XDG_CONFIG_HOME, "skel");
+  // Nothing from the outside file reached the state dir's stores (noteRendered).
+  const store = path.join(process.env.XDG_STATE_HOME, "skel");
   const all = fs.existsSync(store) ? fs.readdirSync(store, { recursive: true }).map((f) => path.join(store, f)).filter((f) => fs.statSync(f).isFile()) : [];
   for (const f of all) assert.doesNotMatch(fs.readFileSync(f, "utf-8"), new RegExp(OUTSIDE), f);
 });
@@ -2547,4 +2552,399 @@ test("#32: scanFiles skips FIFOs, dangling links and directories, follows in-pro
   assert.deepEqual(after.files, expect.filter((f) => !f.startsWith("sub/")));
   assert.doesNotMatch(JSON.stringify(after), /XXXX/);
   assert.equal(cache.has(a), false);
+});
+
+// ---- #18: trusted state moves to the state dir ----
+
+const SUFFIXES = ["", ".snapshot", ".rendered", "-install"];
+
+/**
+ * A project under its own XDG homes, with a real filled-in store set moved back
+ * to the old config dir, as an older skel would have left it.
+ */
+const legacyProject = () => {
+  const { dir } = project();
+  const cfgHome = tmp("skel-m-cfg-");
+  const stateHome = tmp("skel-m-state-");
+  const oldDir = path.join(cfgHome, "skel");
+  const newDir = path.join(stateHome, "skel");
+  const env = { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome };
+  const spawnIt = (args, input) => execFileSync("node", [BIN, ...args], { cwd: dir, env, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], input });
+  const key = projectKey(dir);
+  const oldFile = (s) => path.join(oldDir, `${key}${s}.json`);
+  const newFile = (s) => path.join(newDir, `${key}${s}.json`);
+  const records = () => {
+    spawnIt(["init", "T"]);
+    spawnIt(["review"]);
+    spawnIt(["approve"]);
+    fs.writeFileSync(newFile(""), JSON.stringify({ root: dir, sessions: ["abc"] }));
+    fs.writeFileSync(newFile("-install"), JSON.stringify({ root: dir, ownedDeny: [] }));
+    fs.mkdirSync(oldDir, { recursive: true });
+    for (const s of SUFFIXES) fs.renameSync(newFile(s), oldFile(s));
+    return Object.fromEntries(SUFFIXES.map((s) => [s, fs.readFileSync(oldFile(s))]));
+  };
+  const skel = (...args) => {
+    const r = { stdout: "", stderr: "", ok: true };
+    try { r.stdout = spawnIt(args); } catch (e) { r.ok = false; r.stdout = e.stdout; r.stderr = e.stderr; }
+    return r;
+  };
+  return { dir, cfgHome, stateHome, oldDir, newDir, env, oldFile, newFile, records, skel, spawnIt, key };
+};
+const onlyFiles = (d) => (fs.existsSync(d) ? fs.readdirSync(d).sort() : []);
+
+test("#18: fresh install: stores go to the state dir, rules cover both dirs, the old dir isn't created", () => {
+  const cfgHome = tmp("skel-f-cfg-");
+  const stateHome = tmp("skel-f-state-");
+  const target = tmp("skel-f-proj-");
+  const env = { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome };
+  execFileSync("node", [BIN, "install", target], { encoding: "utf-8", env, stdio: "pipe" });
+  const deny = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8")).permissions.deny;
+  assert.deepEqual(deny, [...stateDenyFor(target), ...storeDeny(stateHome, cfgHome)]);
+  assert.equal(fs.existsSync(path.join(cfgHome, "skel")), false);
+  assert.deepEqual(onlyFiles(path.join(stateHome, "skel")), [`${projectKey(target)}-install.json`]);
+});
+
+test("#18: migration moves every store together, byte for byte, and a later run has nothing to do", () => {
+  const m = legacyProject();
+  const before = m.records();
+  const first = execFileSync("node", [BIN, "status"], { cwd: m.dir, env: m.env, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  for (const s of SUFFIXES) {
+    assert.deepEqual(fs.readFileSync(m.newFile(s)), before[s], `${s} arrived whole`);
+    assert.equal(fs.existsSync(m.oldFile(s)), false, `${s} left the old dir`);
+    if (process.platform !== "win32") assert.equal(fs.statSync(m.newFile(s)).mode & 0o777, 0o600);
+  }
+  assert.equal(fs.existsSync(m.oldDir), false, "the emptied old dir is gone");
+  assert.deepEqual(onlyFiles(m.newDir).filter((f) => f.includes(".migrate.")), [], "no temp files left");
+  assert.match(first, /phase: fill/);
+  assert.doesNotMatch(first, /no record of the approved skeleton/, "the approval came with it");
+  assert.equal(m.skel("status").stderr, "", "a later run has nothing to say");
+  // Other projects' files stay in the old dir until those projects run.
+  const other = path.join(m.oldDir, `${"0".repeat(24)}.snapshot.json`);
+  const again = legacyProject();
+  again.records();
+  fs.writeFileSync(path.join(again.oldDir, path.basename(other)), "someone else's");
+  again.skel("status");
+  assert.deepEqual(onlyFiles(again.oldDir), [path.basename(other)]);
+});
+
+test("#18: the first run announces the move and asks for a reinstall", () => {
+  const m = legacyProject();
+  m.records();
+  const store = { ...m.env };
+  const child = spawn("node", [BIN, "status"], { cwd: m.dir, env: store, stdio: ["ignore", "ignore", "pipe"] });
+  let err = "";
+  child.stderr.on("data", (d) => { err += d; });
+  return new Promise((resolve) => child.on("exit", () => {
+    assert.match(err, /moved this project's state from .* to .*Re-run `skel install`/s);
+    resolve();
+  }));
+});
+
+test("#18: a conflicting destination is refused: nothing moves, nothing is overwritten, and the human can clear it", () => {
+  const m = legacyProject();
+  const before = m.records();
+  fs.mkdirSync(m.newDir, { recursive: true });
+  const theirs = JSON.stringify({ root: m.dir, sessions: ["different"] });
+  fs.writeFileSync(m.newFile(""), theirs);
+  const r = m.skel("status");
+  assert.equal(r.ok, false);
+  assert.match(r.stderr, /already exists and differs from/);
+  assert.ok(r.stderr.includes(m.newFile("")) && r.stderr.includes(m.oldFile("")), r.stderr);
+  assert.match(r.stderr, /nothing was moved/);
+  assert.doesNotMatch(r.stderr, /\n\s+at /, "no stack trace");
+  assert.equal(fs.readFileSync(m.newFile(""), "utf-8"), theirs, "destination untouched");
+  for (const s of SUFFIXES) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], `${s} still in the old dir`);
+  for (const s of SUFFIXES.slice(1)) assert.equal(fs.existsSync(m.newFile(s)), false, `${s} wasn't moved on its own`);
+  // The refusal isn't remembered: once the human chooses, the rest moves.
+  fs.rmSync(m.oldFile(""));
+  assert.equal(m.skel("status").ok, true);
+  for (const s of SUFFIXES.slice(1)) assert.deepEqual(fs.readFileSync(m.newFile(s)), before[s]);
+  assert.equal(fs.readFileSync(m.newFile(""), "utf-8"), theirs);
+});
+
+test("#18: a corrupt destination is refused too, and a symlink there isn't written through", () => {
+  const m = legacyProject();
+  const before = m.records();
+  fs.mkdirSync(m.newDir, { recursive: true });
+  fs.writeFileSync(m.newFile(".snapshot"), "{broken");
+  const r = m.skel("done");
+  assert.equal(r.ok, false);
+  assert.match(r.stderr, /already exists and differs .*\(and is corrupt\)/);
+  assert.equal(fs.readFileSync(m.newFile(".snapshot"), "utf-8"), "{broken");
+  assert.deepEqual(fs.readFileSync(m.oldFile(".snapshot")), before[".snapshot"]);
+  if (canSymlink) {
+    fs.rmSync(m.newFile(".snapshot"));
+    const aim = path.join(m.stateHome, "aim.json");
+    fs.writeFileSync(aim, "untouched");
+    fs.symlinkSync(aim, m.newFile(".snapshot"));
+    assert.equal(m.skel("status").ok, false);
+    assert.equal(fs.readFileSync(aim, "utf-8"), "untouched");
+  }
+});
+
+test("#18: a corrupt source fails closed: done, the Stop hook and the library all refuse, and it stays put", () => {
+  const corruptions = [
+    ["{broken", /not valid JSON/],
+    [JSON.stringify({ root: "x", files: "nope" }), /not the shape skel writes/],
+    [JSON.stringify({ files: {} }), /doesn't name its project/],
+    [JSON.stringify({ root: tmp("skel-other-"), files: {} }), /names another project/],
+  ];
+  for (const [text, why] of corruptions) {
+    const m = legacyProject();
+    const before = m.records();
+    // A step filled and ready to finish, so the snapshot check is all that's left for `done`.
+    const step = m.skel("next");
+    assert.equal(step.ok, true, step.stderr);
+    const a = path.join(m.dir, "src", "a.ts");
+    fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
+    // `next` has moved the records; put them back for the first run this test is about.
+    for (const s of SUFFIXES) if (fs.existsSync(m.newFile(s))) { fs.mkdirSync(m.oldDir, { recursive: true }); fs.renameSync(m.newFile(s), m.oldFile(s)); }
+    fs.writeFileSync(m.oldFile(".snapshot"), text);
+    const done = m.skel("done");
+    assert.equal(done.ok, false, text);
+    assert.match(done.stderr, why);
+    assert.match(done.stderr, /corrupt source/);
+    assert.equal(fs.readFileSync(m.oldFile(".snapshot"), "utf-8"), text, "left for the human");
+    for (const s of ["", ".rendered", "-install"]) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], "the rest waits with it");
+    assert.deepEqual(onlyFiles(m.newDir), [], "nothing half-moved");
+    // The Stop hook has no CLI preflight: it must not read the gap as all clear.
+    const stop = JSON.parse(m.spawnIt(["stop-hook"], JSON.stringify({ cwd: m.dir })));
+    assert.match(stop.systemMessage, /corrupt source/);
+    // Deleting the corrupt file is the human's way out, and it fails closed as a missing record.
+    fs.rmSync(m.oldFile(".snapshot"));
+    const after = m.skel("done");
+    assert.equal(after.ok, false);
+    assert.doesNotMatch(after.stderr, /corrupt source/);
+    assert.match(after.stderr, /no record of the approved skeleton/);
+  }
+  // In-process, the readers answer "no record", which their callers fail closed on.
+  const { dir } = project();
+  const key = projectKey(dir);
+  const old = path.join(process.env.XDG_CONFIG_HOME, "skel");
+  fs.mkdirSync(old, { recursive: true });
+  fs.writeFileSync(path.join(old, `${key}.snapshot.json`), "{broken");
+  assert.equal(readSnapshot(dir), null);
+  assert.throws(() => snapshotPath(dir), { code: "SKEL_STATE_MIGRATION" });
+  fs.rmSync(path.join(old, `${key}.snapshot.json`));
+});
+
+test("#18: a symlinked source is refused, not followed", { skip: !canSymlink }, () => {
+  const m = legacyProject();
+  m.records();
+  const elsewhere = path.join(m.cfgHome, "elsewhere.json");
+  fs.renameSync(m.oldFile(".snapshot"), elsewhere);
+  fs.symlinkSync(elsewhere, m.oldFile(".snapshot"));
+  const r = m.skel("status");
+  assert.equal(r.ok, false);
+  assert.match(r.stderr, /not a regular file/);
+});
+
+test("#18: a part-done migration resumes; a file already at the destination is cleared from the old dir", () => {
+  const m = legacyProject();
+  const before = m.records();
+  fs.mkdirSync(m.newDir, { recursive: true });
+  // A crash after one move, and after one copy whose source wasn't removed yet.
+  fs.renameSync(m.oldFile(".snapshot"), m.newFile(".snapshot"));
+  fs.copyFileSync(m.oldFile(".rendered"), m.newFile(".rendered"));
+  assert.equal(m.skel("status").ok, true);
+  for (const s of SUFFIXES) {
+    assert.deepEqual(fs.readFileSync(m.newFile(s)), before[s]);
+    assert.equal(fs.existsSync(m.oldFile(s)), false);
+  }
+});
+
+test("#18: skel processes racing the migration all succeed and lose nothing", async () => {
+  for (let round = 0; round < 3; round++) {
+    const m = legacyProject();
+    const before = m.records();
+    const codes = await Promise.all(Array.from({ length: 6 }, () => new Promise((resolve) => {
+      spawn("node", [BIN, "status"], { cwd: m.dir, env: m.env, stdio: "ignore" }).on("exit", resolve);
+    })));
+    assert.deepEqual(codes, [0, 0, 0, 0, 0, 0]);
+    for (const s of SUFFIXES) {
+      assert.deepEqual(fs.readFileSync(m.newFile(s)), before[s]);
+      assert.equal(fs.existsSync(m.oldFile(s)), false);
+    }
+    assert.deepEqual(onlyFiles(m.newDir).filter((f) => f.includes(".migrate.")), []);
+  }
+});
+
+test("#18: migrateProject: a lost race, a filesystem without hard links, and one dir reached two ways", () => {
+  const setup = () => {
+    const base = tmp("skel-mp-");
+    const from = path.join(base, "old", "skel");
+    const to = path.join(base, "new", "skel");
+    fs.mkdirSync(from, { recursive: true });
+    fs.mkdirSync(to, { recursive: true });
+    const root = tmp("skel-mp-root-");
+    const key = crypto.randomBytes(12).toString("hex");
+    const text = JSON.stringify({ root, sessions: ["a"] });
+    fs.writeFileSync(path.join(from, `${key}.json`), text);
+    return { from, to, key, text, keyOf: () => key, source: path.join(from, `${key}.json`), dest: path.join(to, `${key}.json`), log: () => {} };
+  };
+  // The other process gets there first with the same bytes.
+  let t = setup();
+  migrateProject({ ...t, link: (_, dest) => { fs.writeFileSync(dest, t.text); throw Object.assign(new Error("x"), { code: "EEXIST" }); } });
+  assert.equal(fs.readFileSync(t.dest, "utf-8"), t.text);
+  assert.equal(fs.existsSync(t.source), false);
+  // ... with different bytes, and the source is still there: refused, both kept.
+  t = setup();
+  assert.throws(() => migrateProject({ ...t, link: (_, dest) => { fs.writeFileSync(dest, "other"); throw Object.assign(new Error("x"), { code: "EEXIST" }); } }), { code: "SKEL_STATE_MIGRATION" });
+  assert.equal(fs.readFileSync(t.dest, "utf-8"), "other");
+  assert.equal(fs.readFileSync(t.source, "utf-8"), t.text);
+  // No hard links here: an exclusive copy instead.
+  t = setup();
+  assert.equal(migrateProject({ ...t, link: () => { throw Object.assign(new Error("x"), { code: "EPERM" }); } }), 1);
+  assert.equal(fs.readFileSync(t.dest, "utf-8"), t.text);
+  assert.equal(fs.existsSync(t.source), false);
+  assert.deepEqual(fs.readdirSync(t.to), [path.basename(t.dest)], "no temp left");
+  // The destination can't be created: refused, source kept.
+  t = setup();
+  fs.rmSync(path.dirname(t.to), { recursive: true });
+  fs.writeFileSync(path.dirname(t.to), "a file");
+  assert.throws(() => migrateProject(t), { code: "SKEL_STATE_MIGRATION" });
+  assert.equal(fs.readFileSync(t.source, "utf-8"), t.text);
+  // The same dir spelled the same: no-op. Reached through a link: the only copy is never "cleared".
+  t = setup();
+  assert.equal(migrateProject({ ...t, to: t.from }), 0);
+  assert.equal(fs.readFileSync(t.source, "utf-8"), t.text);
+  if (canSymlink) {
+    fs.rmSync(t.to, { recursive: true });
+    fs.symlinkSync(t.from, t.to, "junction");
+    assert.equal(migrateProject(t), 0);
+    assert.equal(fs.readFileSync(t.source, "utf-8"), t.text, "not deleted as a duplicate of itself");
+  }
+});
+
+test("#18: skelStateDir: env override, POSIX default, native Windows, relative values ignored", () => {
+  const posix = { platform: "linux", home: "/home/me" };
+  assert.equal(skelStateDir({ ...posix, env: {} }), "/home/me/.local/state/skel");
+  assert.equal(skelStateDir({ ...posix, env: { XDG_STATE_HOME: "/x/state" } }), "/x/state/skel");
+  assert.equal(skelStateDir({ ...posix, env: { XDG_STATE_HOME: "rel/state" } }), "/home/me/.local/state/skel", "the XDG spec ignores relative values");
+  assert.equal(skelStateDir({ ...posix, env: { LOCALAPPDATA: "/mnt/c/AppData" } }), "/home/me/.local/state/skel", "WSL doesn't use %LOCALAPPDATA%");
+  const win = { platform: "win32", home: "C:\\Users\\me" };
+  assert.equal(skelStateDir({ ...win, env: { LOCALAPPDATA: "C:\\Users\\me\\AppData\\Local" } }), "C:\\Users\\me\\AppData\\Local\\skel");
+  assert.equal(skelStateDir({ ...win, env: { LOCALAPPDATA: "D:\\Elsewhere" } }), "D:\\Elsewhere\\skel");
+  assert.equal(skelStateDir({ ...win, env: {} }), "C:\\Users\\me\\AppData\\Local\\skel");
+  assert.equal(skelStateDir({ ...win, env: { LOCALAPPDATA: "relative" } }), "C:\\Users\\me\\AppData\\Local\\skel");
+  assert.equal(skelStateDir({ ...win, env: { LOCALAPPDATA: "C:\\L", XDG_STATE_HOME: "D:\\xdg" } }), "D:\\xdg\\skel", "an explicit override wins, as XDG_CONFIG_HOME did");
+  assert.equal(legacyConfigDir({ env: {}, home: os.homedir() }), path.join(os.homedir(), ".config", "skel"));
+  assert.equal(legacyConfigDir({ env: { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } }), path.join(process.env.XDG_CONFIG_HOME, "skel"));
+});
+
+test("#18: on native Windows the CLI stores under %LOCALAPPDATA%", { skip: process.platform !== "win32" }, () => {
+  const { dir } = project();
+  const local = tmp("skel-local-");
+  const env = { ...process.env, LOCALAPPDATA: local };
+  delete env.XDG_STATE_HOME;
+  execFileSync("node", [BIN, "init", "T"], { cwd: dir, env, stdio: "pipe" });
+  execFileSync("node", [BIN, "approve"], { cwd: dir, env, stdio: "pipe" });
+  assert.ok(fs.existsSync(path.join(local, "skel", `${projectKey(dir)}.snapshot.json`)));
+});
+
+test("#18: reinstall after a migration: both rules, old ownership carries over, re-run identical, uninstall removes only owned rules", () => {
+  const cfgHome = tmp("skel-r-cfg-");
+  const stateHome = tmp("skel-r-state-");
+  const target = tmp("skel-r-proj-");
+  const env = { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome };
+  const run = (...a) => execFileSync("node", [BIN, ...a, target], { encoding: "utf-8", env, stdio: ["ignore", "pipe", "pipe"] });
+  const settingsPath = path.join(target, ".claude", "settings.local.json");
+  const read = () => JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+  const [newRule, oldRule] = storeDeny(stateHome, cfgHome);
+  const mine = ["Read(./.env)", "Edit(//somewhere/skel/**)"];
+  // What an older install left: its rules in settings, its record in the old dir.
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  const olderOwned = [...stateDenyFor(target), oldRule];
+  fs.writeFileSync(settingsPath, JSON.stringify({ permissions: { deny: [...mine, ...olderOwned] } }));
+  const key = projectKey(target);
+  fs.mkdirSync(path.join(cfgHome, "skel"), { recursive: true });
+  fs.writeFileSync(path.join(cfgHome, "skel", `${key}-install.json`), JSON.stringify({ root: fs.realpathSync.native(target), ownedDeny: olderOwned }));
+
+  const out = run("install");
+  assert.match(out, /added a permission deny rule for skel's state dir/);
+  assert.match(out, /permission deny rule for skel's old config dir already present/);
+  assert.equal(fs.existsSync(path.join(cfgHome, "skel", `${key}-install.json`)), false, "the record moved");
+  const deny = read().permissions.deny;
+  assert.deepEqual(deny, [...mine, ...olderOwned, newRule]);
+  const text = fs.readFileSync(settingsPath, "utf-8");
+  run("install");
+  assert.equal(fs.readFileSync(settingsPath, "utf-8"), text, "byte-identical on a re-run");
+
+  const un = run("uninstall");
+  assert.match(un, /removed 5 \.skeleton\/ permission deny rule/);
+  assert.match(un, /removed 2 store-dir permission deny rule/);
+  assert.match(un, /left in place: 1 deny rule\(s\) for a \.\.\.\/skel\/\*\* dir/);
+  assert.deepEqual(read().permissions.deny, mine);
+});
+
+test("#18: ownership is never inferred: without a record, identical rules stay the user's; a corrupt old record stops install and uninstall", () => {
+  const cfgHome = tmp("skel-o-cfg-");
+  const stateHome = tmp("skel-o-state-");
+  const target = tmp("skel-o-proj-");
+  const env = { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome };
+  const run = (...a) => execFileSync("node", [BIN, ...a, target], { encoding: "utf-8", env, stdio: ["ignore", "pipe", "pipe"] });
+  const settingsPath = path.join(target, ".claude", "settings.local.json");
+  const [newRule, oldRule] = storeDeny(stateHome, cfgHome);
+  const pre = { permissions: { deny: [newRule, oldRule] } };
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify(pre));
+  run("install");
+  run("uninstall");
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf-8")), pre, "both pre-existing rules survive");
+
+  const before = JSON.stringify({ permissions: { deny: ["Read(./.env)"] } });
+  fs.writeFileSync(settingsPath, before);
+  fs.mkdirSync(path.join(cfgHome, "skel"), { recursive: true });
+  const record = path.join(cfgHome, "skel", `${projectKey(target)}-install.json`);
+  fs.writeFileSync(record, "{broken");
+  for (const cmd of ["install", "uninstall"]) {
+    assert.throws(() => run(cmd), (e) => /corrupt source/.test(e.stderr) && !/\n\s+at /.test(e.stderr), cmd);
+    assert.equal(fs.readFileSync(settingsPath, "utf-8"), before, `${cmd} changed nothing`);
+  }
+  assert.equal(fs.readFileSync(record, "utf-8"), "{broken");
+  fs.rmSync(record);
+});
+
+test("#18: the hook guards both locations, for edits and for the Bash word match, and stays textual in the project", async () => {
+  const { evaluateConfigEdit } = await import("../lib/gate.mjs");
+  const cfgHome = tmp("skel-h-cfg-");
+  const stateHome = tmp("skel-h-state-");
+  const base = tmp("skel-h-proj-");
+  const hook = (input) => {
+    const out = execFileSync("node", [BIN, "hook"], { cwd: base, input: JSON.stringify({ cwd: base, ...input }), encoding: "utf-8", env: { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome } });
+    return out ? JSON.parse(out).hookSpecificOutput : null;
+  };
+  const edit = (file_path) => hook({ tool_name: "Edit", tool_input: { file_path, old_string: "a", new_string: "b" } });
+  // Neither dir exists yet: an agent mustn't be able to create a record in either.
+  for (const f of [path.join(stateHome, "skel", "abc.snapshot.json"), path.join(cfgHome, "skel", "abc.snapshot.json")]) {
+    const v = edit(f);
+    assert.equal(v?.permissionDecision, "ask", f);
+    assert.ok(v.permissionDecisionReason.includes(path.join(stateHome, "skel")), "names the state dir");
+    assert.ok(v.permissionDecisionReason.includes(path.join(cfgHome, "skel")), "and the old location");
+  }
+  assert.equal(edit(path.join(stateHome, "skel-other", "x")), null);
+  assert.equal(edit(path.join(base, "src", "a.ts")), null);
+  const spellings = [
+    "cat ~/.local/state/skel/abc.snapshot.json", "rm $HOME/.local/state/skel/abc.json", "rm \"$XDG_STATE_HOME/skel/abc.json\"", "ls ${XDG_STATE_HOME}/skel",
+    "type %LOCALAPPDATA%\\skel\\abc.json", "rm $LOCALAPPDATA/skel/abc.json", "rm \"$env:LOCALAPPDATA\\skel\\abc.json\"", "ls ${LOCALAPPDATA}/skel", "dir C:\\Users\\me\\AppData\\Local\\skel", "ls /c/Users/me/AppData/Local/skel/",
+    "cat ~/.config/skel/abc.json", "rm \"$XDG_CONFIG_HOME/skel/abc.json\"",
+    `echo {} > "${path.join(stateHome, "skel", "abc.json")}"`, `cd ${path.join(cfgHome, "skel")} && ls`,
+  ];
+  for (const command of spellings) assert.equal(hook({ tool_name: "Bash", tool_input: { command } })?.permissionDecision, "ask", command);
+  for (const command of ["ls ~/.local/state/skeleton", "ls ~/.local/state", "ls $LOCALAPPDATA/skel-tools", `ls ${stateHome}/skel-other`, "npm test"]) {
+    assert.equal(hook({ tool_name: "Bash", tool_input: { command } }), null, command);
+  }
+  // Drive-path forms of the resolved dir, for Git Bash.
+  const dirs = ["C:\\State\\skel", "/home/me/.config/skel"];
+  assert.equal(evaluateBash({ command: "rm /c/State/skel/x", state: null, configDir: dirs })?.decision, "ask");
+  assert.equal(evaluateBash({ command: "rm C:/state/SKEL/x", state: null, configDir: dirs })?.decision, "ask");
+  assert.equal(evaluateBash({ command: "rm /c/State/skelly", state: null, configDir: dirs }), null);
+
+  // In the project: only the store dirs are resolved, once each, never the edited path (#30).
+  const resolved = [];
+  const spy = (p) => { resolved.push(p); return p; };
+  const both = [path.join(stateHome, "skel"), path.join(cfgHome, "skel")];
+  assert.equal(evaluateConfigEdit({ toolName: "Write", toolInput: { file_path: path.join(base, "deep", "new", "f.ts") }, base, state: null, configDir: both, resolve: spy }), null);
+  assert.deepEqual(resolved, both);
+  assert.equal(inSkelConfig(path.join(both[1], "x"), { dir: both, project: base, resolve: spy }), true);
 });

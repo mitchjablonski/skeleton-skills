@@ -10,13 +10,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
-import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, skelConfigDir, writeFileAtomic } from "../lib/state.mjs";
+import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, realish, skelStateDir, writeFileAtomic } from "../lib/state.mjs";
 import { bodyEscapesFence } from "../lib/gate.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
-  addSession, clearSessions, configPath, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
-  sessionStorePath, storeFeedback, takeFeedback,
+  addSession, clearSessions, historyDir, legacyQueued, migrationBlock, pendingCount, queueDir, readServe, servePath,
+  sessionStorePath, storeFeedback, storePath, takeFeedback,
 } from "../lib/feedback.mjs";
 import {
   clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
@@ -49,7 +49,7 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
   stop-hook [--block]                Stop hook: reports drift from the approved skeleton during a fill
   install [projectDir]               install skills, filler subagent, hooks and deny rules (.skeleton/ state,
-                                     skel's config dir) into a project's .claude/
+                                     skel's state dir) into a project's .claude/
   uninstall [projectDir]             remove what install added (leaves .skeleton/ and .gitignore alone)
 `;
 
@@ -207,26 +207,31 @@ function denyRules(target) {
 }
 
 /**
- * The deny rule for skel's config dir ($XDG_CONFIG_HOME/skel, else
- * ~/.config/skel), or why there is none. The approved-skeleton records, the
- * rendered review versions, the serve sessions and the ownership records live
- * there, outside every project, where the hook's fence doesn't reach and only
- * Claude Code's outside-the-working-directory prompt (skipped by
- * bypassPermissions) would otherwise stand in the way. skel writes them from
- * its own process, which deny rules don't apply to. Resolved now: a later
- * change of XDG_CONFIG_HOME leaves the rule guarding the old dir.
+ * The deny rule for each dir skel's stores can be in, or why there is none. The
+ * approved-skeleton records, the rendered review versions, the serve sessions
+ * and the ownership records live in the state dir, outside every project, where
+ * the hook's fence doesn't reach and only Claude Code's
+ * outside-the-working-directory prompt (skipped by bypassPermissions) would
+ * otherwise stand in the way. The old config dir gets one too, created or not:
+ * a migration trusts what it finds there. skel writes the stores from its own
+ * process, which deny rules don't apply to. Resolved now: a later change of
+ * XDG_STATE_HOME or XDG_CONFIG_HOME leaves a rule guarding the dir it named.
  */
-function configDenyRule() {
-  const dir = skelConfigDir();
-  let real;
+function storeDenyRules() {
+  const toRule = (real, dir, name) => {
+    const { path: p, why } = rulePath(real);
+    return why ? { name, dir, rule: null, why } : { name, dir, rule: `Edit(/${p}/**)`, why: null };
+  };
+  const dir = skelStateDir();
+  let current;
   try {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    real = realDir(dir);
+    current = toRule(realDir(dir), dir, "state dir");
   } catch (err) {
-    return { rule: null, why: `can't create or resolve ${dir} (${err.code ?? err.message})` };
+    current = { name: "state dir", dir, rule: null, why: `can't create or resolve ${dir} (${err.code ?? err.message})` };
   }
-  const { path: p, why } = rulePath(real);
-  return why ? { rule: null, why } : { rule: `Edit(/${p}/**)`, why: null };
+  const old = legacyConfigDir();
+  return old === dir ? [current] : [current, toRule(realish(old), old, "old config dir")];
 }
 
 /**
@@ -236,8 +241,8 @@ function configDenyRule() {
  * was lost), never to remove them.
  */
 const SKEL_SHAPED = new RegExp(`^Edit\\((//.*)?/\\.skeleton/(${STATE_PATHS.map((p) => p.replace(/[.*]/g, (c) => `\\${c}`)).join("|")})\\)$`);
-/** The config-dir rule's shape, any dir: `Edit(//<abs>/skel/**)`. Loose (any skel/ dir matches), so only ever reported as "possibly" ours. */
-const CONFIG_SHAPED = /^Edit\(\/\/.*\/skel\/\*\*\)$/;
+/** A store-dir rule's shape, any dir: `Edit(//<abs>/skel/**)`. Loose (any skel/ dir matches), so only ever reported as "possibly" ours. */
+const STORE_SHAPED = /^Edit\(\/\/.*\/skel\/\*\*\)$/;
 function reportLeftInPlace(settings, notOurs) {
   const deny = (settings.permissions?.deny ?? []).filter((r) => typeof r === "string" && !notOurs.includes(r));
   const left = deny.filter((r) => SKEL_SHAPED.test(r));
@@ -245,9 +250,9 @@ function reportLeftInPlace(settings, notOurs) {
     console.log(`left in place: ${left.length} ${STATE_DIR}/ deny rule(s) this install didn't add (a moved project's, a lost ownership record's, or your own); remove any you no longer want by hand:`);
     for (const r of left) console.log(`  ${r}`);
   }
-  const cfg = deny.filter((r) => CONFIG_SHAPED.test(r));
+  const cfg = deny.filter((r) => STORE_SHAPED.test(r));
   if (cfg.length) {
-    console.log(`left in place: ${cfg.length} deny rule(s) for a .../skel/** dir that this install didn't add; possibly skel's config-dir rule from an old XDG_CONFIG_HOME, a moved project or a lost ownership record, or your own. Remove any you no longer want by hand:`);
+    console.log(`left in place: ${cfg.length} deny rule(s) for a .../skel/** dir that this install didn't add; possibly skel's store-dir rule from an old XDG_STATE_HOME or XDG_CONFIG_HOME, a moved project or a lost ownership record, or your own. Remove any you no longer want by hand:`);
     for (const r of cfg) console.log(`  ${r}`);
   }
 }
@@ -286,7 +291,16 @@ function launchWarning(target) {
  * serve-session store), so uninstall removes only those: a rule the user
  * already had survives install + uninstall.
  */
-const ownedStorePath = (target) => configPath(target, "-install");
+const ownedStorePath = (target) => storePath(target, "-install");
+/**
+ * Ownership decides which rules are the user's, and an unreadable record reads
+ * as "not ours": so install and uninstall stop, before changing anything, when
+ * the project's old records can't be moved.
+ */
+function refuseBlockedMigration(target) {
+  const blocked = migrationBlock(target);
+  if (blocked) die(blocked);
+}
 function readOwned(target) {
   try {
     const o = JSON.parse(fs.readFileSync(ownedStorePath(target), "utf-8")).ownedDeny;
@@ -475,7 +489,7 @@ const commands = {
       recorded = false;
       console.error(
         `skel: warning: can't record this review session in ${sessionStorePath(root)} (${err.code ?? err.message}). ` +
-          "The page works, but it can't send feedback; copy it by hand, or make that directory writable (or set XDG_CONFIG_HOME) and restart `skel serve`.",
+          "The page works, but it can't send feedback; copy it by hand, or make that directory writable (or set XDG_STATE_HOME) and restart `skel serve`.",
       );
     }
     warnLegacyQueue(root);
@@ -818,9 +832,10 @@ const commands = {
       die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
     }
     const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
+    refuseBlockedMigration(target);
     const { rules: stateRules, why } = denyRules(target);
-    const config = configDenyRule();
-    const rules = [...stateRules, ...(config.rule ? [config.rule] : [])];
+    const stores = storeDenyRules();
+    const rules = [...new Set([...stateRules, ...stores.map((s) => s.rule).filter(Boolean)])];
     const prevOwned = readOwned(target);
     const stale = [...legacyOwned(settings, prevOwned), ...(prevOwned ?? []).filter((r) => !rules.includes(r))];
     for (const [src, dest] of installedFiles(claudeDir)) {
@@ -882,8 +897,10 @@ const commands = {
     const addedState = added.filter((r) => stateRules.includes(r));
     if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
     else console.log(addedState.length ? `added ${addedState.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
-    if (config.why) console.log(`warning: no permission deny rule for skel's config dir: ${config.why}. The hook still asks about edits there`);
-    else console.log(`${added.includes(config.rule) ? "added a permission deny rule for skel's config dir" : "permission deny rule for skel's config dir already present"}: ${config.rule} (it is resolved now: re-run install if you change XDG_CONFIG_HOME)`);
+    for (const { name, rule, why: noRule } of stores) {
+      if (noRule) console.log(`warning: no permission deny rule for skel's ${name}: ${noRule}. The hook still asks about edits there`);
+      else console.log(`${added.includes(rule) ? `added a permission deny rule for skel's ${name}` : `permission deny rule for skel's ${name} already present`}: ${rule} (it is resolved now: re-run install if you change XDG_STATE_HOME or XDG_CONFIG_HOME)`);
+    }
     reportLeftInPlace(settings, rules);
     launchWarning(target);
     console.log(`optional: Claude Code's Bash sandbox can enforce those rules at the OS level; see "Security model" in the README (skel needs "excludedCommands": ["node \\"${SELF}\\" *"])`);
@@ -891,6 +908,7 @@ const commands = {
 
   uninstall([dir = process.cwd()]) {
     const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir);
+    refuseBlockedMigration(target);
     const prevOwned = readOwned(target);
     const owned = [...(prevOwned ?? []), ...legacyOwned(settings, prevOwned)];
     const groups = settings.hooks?.PreToolUse ?? [];
@@ -913,12 +931,12 @@ const commands = {
     }
     if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
     let removed = 0;
-    let removedConfig = 0;
+    let removedStores = 0;
     if (settings.permissions?.deny) {
       const gone = settings.permissions.deny.filter((r) => owned.includes(r));
       settings.permissions.deny = settings.permissions.deny.filter((r) => !owned.includes(r));
-      removedConfig = gone.filter((r) => CONFIG_SHAPED.test(r)).length;
-      removed = gone.length - removedConfig;
+      removedStores = gone.filter((r) => STORE_SHAPED.test(r)).length;
+      removed = gone.length - removedStores;
       if (!settings.permissions.deny.length) delete settings.permissions.deny;
       if (!Object.keys(settings.permissions).length) delete settings.permissions;
     }
@@ -933,7 +951,7 @@ const commands = {
     fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
     console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook and the drift check (Stop) hook from ${claudeDir}`);
     console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
-    if (removedConfig) console.log(`removed the config-dir permission deny rule install added`);
+    if (removedStores) console.log(`removed ${removedStores} store-dir permission deny rule(s) install added`);
     reportLeftInPlace(settings, []);
     console.log(`left in place: ${STATE_DIR}/ (delete it once you're done with it) and the ${STATE_DIR}/ line in .gitignore`);
   },
@@ -942,4 +960,11 @@ const commands = {
 const [cmd = "help", ...rest] = process.argv.slice(2);
 const run = Object.hasOwn(commands, cmd) ? commands[cmd] : null;
 if (!run) die(`unknown command "${cmd}"\n\n${HELP}`);
+// A project whose old records can't be moved stops here with the reason, before
+// a command can read the gap as "no record". Hooks fail closed on their own
+// paths; install and uninstall take their target as an argument, and check it.
+if (!["help", "hook", "stop-hook", "install", "uninstall", "__candidates"].includes(cmd)) {
+  const here = findRoot(process.cwd());
+  if (here) refuseBlockedMigration(here);
+}
 await run(rest);
