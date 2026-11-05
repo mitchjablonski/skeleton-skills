@@ -74,6 +74,34 @@ test("notice consumed once per session, status remains, next block resets delive
   recordConfigNotice(root, { source: "project_settings" });
   assert.ok(takeConfigNotice(root, "session-a"));
 });
+
+test("done preserves a blocked-settings notice until the active fill ends", t => {
+  const root = fixture(t);
+  const bin = fileURLToPath(new URL("../bin/skel.mjs", import.meta.url));
+  const stop = fileURLToPath(new URL("../bin/skel-stop.mjs", import.meta.url));
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: root };
+  const run = args => {
+    const result = spawnSync(process.execPath, [bin, ...args], { cwd: root, env, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  };
+  run(["init", "notice retention"]);
+  const file = path.join(root, "code.js");
+  fs.writeFileSync(file, 'export function value() {\n// SKEL[1] value\nthrow new Error("SKEL_TODO");\n// /SKEL[1]\n}\n');
+  run(["approve"]);
+  run(["next"]);
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace('throw new Error("SKEL_TODO");', "return 1;"));
+  recordConfigNotice(root, { source: "local_settings", file_path: "settings.local.json" });
+  run(["done"]);
+  const status = JSON.parse(run(["status", "--json"]));
+  assert.equal(status.phase, "fill");
+  assert.match(status.configNotice, /historical notice/);
+  const stopped = spawnSync(process.execPath, [stop], { cwd: root, env, encoding: "utf8", input: JSON.stringify({ cwd: root, session_id: "same-turn" }) });
+  assert.equal(stopped.status, 0, stopped.stderr);
+  assert.match(JSON.parse(stopped.stdout).systemMessage, /settings change was blocked/);
+  run(["reshape"]);
+  assert.equal(readConfigNotice(root), null);
+});
 test("phase repair asks when gate import fails; storage error still blocks reload", t => {
   const root = fixture(t);
   fs.mkdirSync(path.join(root, ".skeleton"));

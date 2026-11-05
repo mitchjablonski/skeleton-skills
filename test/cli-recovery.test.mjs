@@ -42,6 +42,8 @@ test("a broken gate leaves a human CLI recovery route and asks for phase repair"
   assert.equal(JSON.parse(ordinary.stdout).hookSpecificOutput.permissionDecision, "deny");
   const repair = hook({ tool_name: "Bash", tool_input: { command: "skel reshape" } });
   assert.equal(JSON.parse(repair.stdout).hookSpecificOutput.permissionDecision, "ask");
+  const unrelated = hook({ tool_name: "Bash", tool_input: { command: "echo .skeleton/state.json; rm -r src" } });
+  assert.equal(JSON.parse(unrelated.stdout).hookSpecificOutput.permissionDecision, "deny", "a state-path mention alone is not a repair fallback");
   const reshaped = run(["reshape"]);
   assert.equal(reshaped.status, 0, reshaped.stderr);
   assert.equal(run(["help"]).status, 0);

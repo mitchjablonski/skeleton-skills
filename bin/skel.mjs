@@ -809,7 +809,6 @@ const commands = {
       if (escape) console.log(`note: in ${f.file}:${f.openLine}-${f.closeLine}, ${escape} (a heuristic; check that the fill stays inside its block)`);
     }
     writeState(root, { ...state, activeStep: null });
-    clearConfigNotices(root);
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
     console.log(`STEP ${state.activeStep} done. ${pending.length} pending${pending[0] ? `; next: ${pending[0].id} ${pending[0].title}` : ""}.`);
   },
