@@ -120,3 +120,16 @@ test("malformed ConfigChange settings are refused before installer writes", t =>
     assert.equal(fs.existsSync(path.join(root, ".claude/skills")), false);
   }
 });
+test("cwd fill owns nested corrupt decoy but outside corrupt owner denies", t => {
+  const root = fixture(t), outside = fixture(t), child = path.join(root, "child");
+  state(root, JSON.stringify({ phase: "fill", activeStep: "1", files: [] }));
+  state(child, '{'); state(outside, '{');
+  const source = '// SKEL[1] value\nconst value = 1;\n// /SKEL[1]\n';
+  fs.writeFileSync(path.join(child, "code.js"), source);
+  fs.writeFileSync(path.join(outside, "code.js"), source);
+  const run = file => spawnSync(process.execPath, [path.resolve("bin/skel-hook.mjs")], { input: JSON.stringify({ cwd: root, tool_name: "Edit", tool_input: { file_path: file, old_string: "const value = 1;", new_string: "const value = 2;" } }), encoding: "utf8", env: { ...process.env, CLAUDE_PROJECT_DIR: root } });
+  const owned = run(path.join(child, "code.js"));
+  assert.equal(owned.stderr, "");
+  assert.equal(owned.stdout, "");
+  assert.equal(JSON.parse(run(path.join(outside, "code.js")).stdout).hookSpecificOutput.permissionDecision, "deny");
+});
