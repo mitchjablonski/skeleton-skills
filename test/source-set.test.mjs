@@ -117,9 +117,10 @@ test("a fill inside the fence passes done and finalize, and only the fenced file
 });
 
 test("approve shows counts, policy, exclusions, and says a baseline isn't proof every file was shown", () => {
-  const p = project({ files: { "build/out.js": "x", "package-lock.json": "{}", LICENSE: "MIT", "dist/out.js": "ignored", "a.min.js": "x" } });
+  const p = project({ files: { "package-lock.json": "{}", LICENSE: "MIT", "dist/out.js": "ignored", "a.min.js": "x" } });
+  p.write("build/out.js", "untracked output"); // a committed one would be source
   const out = p.ok(["approve"]);
-  assert.match(out, /source baseline [0-9a-f]{12} \(policy 1, discovered with git\)/);
+  assert.match(out, new RegExp(`source baseline [0-9a-f]{12} \\(policy ${SOURCE_POLICY}, discovered with git\\)`));
   assert.match(out, /1 fenced \(only these leave out their fence bodies\)/);
   assert.match(out, /ignored by git \d+ \(.*dist\//);
   assert.match(out, /build 1 \(build\/out\.js\)/);
@@ -127,7 +128,7 @@ test("approve shows counts, policy, exclusions, and says a baseline isn't proof 
   assert.match(out, /generated 1 \(a\.min\.js\)/);
   assert.match(out, /unknown-extension \d+ \(.*LICENSE/);
   assert.match(out, /`skel track` adds any of them/);
-  assert.match(out, /isn't proof that every file was shown: the review page showed 1 file\(s\)/);
+  assert.match(out, /isn't proof that every file was shown: the skeleton, which is what the review page shows, holds 1 file\(s\)/);
 });
 
 // ---- unfenced edit, add, delete, rename ----
@@ -223,7 +224,7 @@ test("a git-tracked file that .gitignore now matches is a member, and so is what
   p.ok(["track", "secrets/plan.ts"]);
   p.ok(["approve"]);
   const members = readSnapshot(p.dir).coverage.members;
-  assert.ok(members["dist/kept.js"] === undefined, "dist/ is a build dir: the policy's exclusion holds without a track");
+  assert.ok(members["dist/kept.js"], "committed to git: a folder name doesn't take it out");
   assert.equal(members["secrets/plan.ts"].tracked, true);
   assert.equal(members["dist/untracked.js"], undefined);
   p.ok(["start", "1"]);
@@ -276,7 +277,11 @@ test("an unknown extension isn't discovered, is counted, and skel track brings i
 // ---- exclusions ----
 
 test("ignored output and policy exclusions aren't flagged, new or changed", () => {
-  const p = filling({ files: { "build/old.js": "1\n", "package-lock.json": "{}\n", "node_modules/x/i.js": "1\n" } });
+  const p = project({ files: { "package-lock.json": "{}\n" } });
+  p.write("build/old.js", "1\n");
+  p.write("node_modules/x/i.js", "1\n");
+  p.ok(["approve"]);
+  p.ok(["start", "1"]);
   p.write("dist/out.js", "new output\n");
   p.write("debug.log", "log\n");
   p.write("secrets/ignored-source.ts", "a source name under an ignore rule\n");
@@ -329,6 +334,123 @@ test("an ignore rule outside the tree (.git/info/exclude) doesn't take a member 
   gitIn(p.dir, "rm", "-q", "--cached", "src/plain.ts");
   fs.rmSync(p.abs("src/plain.ts"));
   assertCompletionRefused(p, /src\/plain\.ts: deleted/);
+});
+
+test("an ignore file that ignores itself can't hide new source; one there at approval is a member", () => {
+  const p = filling({ files: { "logs/.gitignore": "*\n" } });
+  assert.ok(readSnapshot(p.dir).coverage.members["logs/.gitignore"], "a self-ignoring ignore file at approval is baselined");
+  p.write("logs/today.log", "noise\n");
+  p.write("src/a.ts", FILLED);
+  assert.match(p.ok(["done"]), /STEP 1 done/, "what it ignores stays out");
+  p.ok(["start", "1", "--force"]);
+  p.write("src/.gitignore", "new.ts\n.gitignore\n");
+  p.write("src/new.ts", "hidden\n");
+  assertCompletionRefused(p, /src\/\.gitignore: new since approval/);
+  fs.rmSync(p.abs("src/.gitignore"));
+  p.write("logs/.gitignore", "*\n!keep.ts\n");
+  assertCompletionRefused(p, /logs\/\.gitignore: changed since approval/);
+});
+
+test("ignore rules outside the tree are baselined: .git/info/exclude and core.excludesFile", () => {
+  const global = path.join(tmp("skel-gi-"), "ignore");
+  fs.writeFileSync(global, "*.bak\n");
+  const p = project();
+  gitIn(p.dir, "config", "core.excludesFile", global);
+  p.ok(["approve"]);
+  p.ok(["start", "1"]);
+  assert.ok(readSnapshot(p.dir).coverage.discovery.ignoreFiles.some((f) => f.file.includes(global) && f.sha256));
+  p.write("src/a.ts", FILLED);
+  assert.match(p.ok(["done"]), /STEP 1 done/);
+  p.ok(["start", "1", "--force"]);
+  fs.appendFileSync(p.abs(".git/info/exclude"), "src/sneaky.ts\n");
+  p.write("src/sneaky.ts", "hidden\n");
+  assertCompletionRefused(p, /\.git\/info\/exclude: changed since approval: it decides which files discovery sees/);
+  fs.writeFileSync(p.abs(".git/info/exclude"), fs.readFileSync(p.abs(".git/info/exclude"), "utf-8").replace("src/sneaky.ts\n", ""));
+  fs.rmSync(p.abs("src/sneaky.ts"));
+  fs.appendFileSync(global, "src/other.ts\n");
+  assertCompletionRefused(p, /global ignore file .*ignore: changed since approval/);
+});
+
+test("without git, skel applies .gitignore files itself: build output stays out, and new source is still seen", () => {
+  const p = project({ git: false, files: { ".gitignore": "out-js/\n*.tmp.ts\n/rooted.ts\n!keep.tmp.ts\n", "sub/.gitignore": "local.ts\n" } });
+  p.write("rooted.ts", "ignored at the root only\n");
+  p.write("lib/rooted.ts", "not ignored here\n");
+  p.write("sub/local.ts", "ignored by the nested file\n");
+  p.write("keep.tmp.ts", "re-included\n");
+  const out = p.ok(["approve"]);
+  assert.match(out, /ignored by git|ignored/);
+  const m = readSnapshot(p.dir).coverage.members;
+  assert.equal(m["rooted.ts"], undefined);
+  assert.ok(m["lib/rooted.ts"]);
+  assert.equal(m["sub/local.ts"], undefined);
+  assert.ok(m["keep.tmp.ts"], "a negation re-includes");
+  assert.ok(m["sub/.gitignore"]);
+  p.ok(["start", "1"]);
+  p.write("out-js/a.js", "built\n");
+  p.write("src/x.tmp.ts", "scratch\n");
+  p.write("src/a.ts", FILLED);
+  assert.match(p.ok(["done"]), /STEP 1 done/);
+  p.ok(["start", "1", "--force"]);
+  p.write("src/real.ts", "new source\n");
+  assert.match(p.refused(["done"]), /src\/real\.ts: new since approval/);
+  // A self-ignoring ignore file is still a member here too.
+  fs.rmSync(p.abs("src/real.ts"));
+  p.write("src/.gitignore", "new.ts\n.gitignore\n");
+  p.write("src/new.ts", "hidden\n");
+  assert.match(p.refused(["done"]), /src\/\.gitignore: new since approval/);
+});
+
+test("folder-name exclusions don't take out what git tracks; untracked output under those names stays out", () => {
+  const p = project({ files: { "src/generated/types.ts": "t\n", "lib/vendor/v.go": "package v\n", "tools/build/run.ts": "r\n", "src/out/o.ts": "o\n", "db/schema.prisma": "model A {}\n", "views/page.ejs": "<p>\n" } });
+  p.ok(["approve"]);
+  const m = readSnapshot(p.dir).coverage.members;
+  for (const f of ["src/generated/types.ts", "lib/vendor/v.go", "tools/build/run.ts", "src/out/o.ts", "db/schema.prisma", "views/page.ejs"]) assert.ok(m[f], f);
+  p.ok(["start", "1"]);
+  p.write("src/generated/new.ts", "codegen output\n");
+  p.write("tools/build/new.js", "build output\n");
+  p.write("src/a.ts", FILLED);
+  assert.match(p.ok(["done"]), /STEP 1 done/);
+  p.ok(["start", "1", "--force"]);
+  p.write("lib/vendor/v.go", "package changed\n");
+  assertCompletionRefused(p, /lib\/vendor\/v\.go: changed since approval/);
+});
+
+test("a path named like an Object.prototype key is a member like any other", () => {
+  const p = project({ git: false });
+  // Written one by one: an object literal's `__proto__` key would set its prototype instead.
+  p.write("__proto__", "first\n");
+  p.write("toString", "x\n");
+  p.ok(["track", "__proto__", "toString"]);
+  p.ok(["approve"]);
+  const text = fs.readFileSync(snapshotPath(p.dir), "utf-8");
+  const members = JSON.parse(text).coverage.members;
+  assert.ok(Object.hasOwn(members, "__proto__") && members.__proto__.tracked, "an own member, in the record");
+  assert.ok(Object.hasOwn(JSON.parse(text).files, "__proto__"), "and in the skeleton record");
+  p.ok(["start", "1"]);
+  p.write("__proto__", "second\n");
+  assertCompletionRefused(p, /__proto__/);
+});
+
+test("links named __proto__, toString and constructor: enrolled, and new ones flagged", { skip: noLinks }, () => {
+  const outside = tmp("skel-out-");
+  fs.writeFileSync(path.join(outside, "a.ts"), "a\n");
+  fs.writeFileSync(path.join(outside, "b.ts"), "b\n");
+  const p = project();
+  fs.symlinkSync(path.join(outside, "a.ts"), p.abs("__proto__"));
+  p.ok(["approve"]);
+  assert.ok(Object.hasOwn(readSnapshot(p.dir).coverage.members, "__proto__"));
+  p.ok(["start", "1"]);
+  fs.rmSync(p.abs("__proto__"));
+  fs.symlinkSync(path.join(outside, "b.ts"), p.abs("__proto__"));
+  assertCompletionRefused(p, /__proto__: now points to/);
+  fs.rmSync(p.abs("__proto__"));
+  fs.symlinkSync(path.join(outside, "a.ts"), p.abs("__proto__"));
+  fs.symlinkSync(path.join(outside, "a.ts"), p.abs("toString"));
+  fs.symlinkSync(path.join(outside, "a.ts"), p.abs("constructor"));
+  p.write("src/a.ts", FILLED);
+  const out = p.refused(["done"]);
+  assert.match(out, /toString: new since approval/);
+  assert.match(out, /constructor: new since approval/);
 });
 
 // ---- links, read failures, non-regular files ----
@@ -687,7 +809,7 @@ test("git absent at approval falls back to the walk, says so, and applies the sa
   const empty = tmp("skel-nogit-");
   const noGit = { env: { PATH: empty, Path: empty } };
   const out = p.ok(["approve"], noGit);
-  assert.match(out, /discovered with walk: git isn't available, so \.gitignore isn't applied/);
+  assert.match(out, /discovered with walk: git isn't available, so skel applies the \.gitignore files itself/);
   const m = readSnapshot(p.dir).coverage.members;
   assert.ok(m["src/plain.ts"]);
   assert.equal(m["dist/o.js"], undefined);
@@ -891,13 +1013,14 @@ test("describeCoverage names the fallback and the kinds of member", async () => 
   p.ok(["track", "src/types.ts"]);
   const { coverage } = await captureSourceSet(p.dir, readState(p.dir), ["src/a.ts"]);
   const text = describeCoverage(coverage, 2).join("\n");
-  assert.match(text, /discovered with walk: not a git repository/);
+  assert.match(text, /discovered with walk: not a git repository, so skel applies the \.gitignore files itself/);
   assert.match(text, /1 fenced .*1 tracked, 1 other source/);
-  assert.match(text, /showed 2 file/);
+  assert.match(text, /holds 2 file/);
 });
 
 test("discovery never reads a file, and lists nothing the policy excludes as a member", () => {
-  const p = project({ files: { "dist/o.js": "1\n", "build/b.js": "1\n" } });
+  const p = project({ files: { "dist/o.js": "1\n" } });
+  p.write("build/b.js", "untracked output\n");
   const found = discoverSource(p.dir, { withIgnored: true });
   assert.equal(found.mode, "git");
   assert.ok(found.eligible.has("src/plain.ts"));
@@ -988,7 +1111,7 @@ test("the shape of format 3 is checked: no baseline, a baseline on an old format
   // A record made under other rules can't be compared under these.
   fs.writeFileSync(snapshotPath(p.dir), JSON.stringify({ ...snap, coverage: { ...coverage, policy: SOURCE_POLICY + 1 } }));
   p.write("src/a.ts", FILLED);
-  assert.match(p.refused(["done"]), /discovery policy 2, and this skel uses 1.*skel reshape/s);
+  assert.match(p.refused(["done"]), new RegExp(`discovery policy ${SOURCE_POLICY + 1}, and this skel uses ${SOURCE_POLICY}.*skel reshape`, "s"));
 });
 
 // ---- migration ----

@@ -111,6 +111,23 @@ async function requireNoDrift(root, state, fencedFiles, what) {
   if (gap || failure) die(`can't ${what}: ${gap ?? failure}`);
 }
 
+/**
+ * What approve records: one discovery and one read, so the skeleton record and
+ * the source baseline hold the same bytes. Needs no lock: nothing it reads is
+ * skel's own state, and the checks after it decide whether it's used.
+ */
+async function captureApproval(root, state, files) {
+  try {
+    const source = await captureSourceSet(root, state, files);
+    return { source, record: recordSkeleton(root, state, files, source.read, { strict: true }) };
+  } catch (err) {
+    // A tracked file's malformed markers throw SKEL_MARKERS; anything else is I/O.
+    if (err.code === "SKEL_SOURCE") die(`can't approve: ${err.message}`);
+    if (err.code === "SKEL_MARKERS") die(`fix marker errors first:\n  ${err.message}`);
+    die(`couldn't read the skeleton to record it: ${err.message}`);
+  }
+}
+
 /** Why approve refuses a stale review: what changed since the version the human saw. */
 function staleReview(root, state, files, reviewed, how = "the human reviewed") {
   // The current version is not printed: the agent must only ever pass a
@@ -813,18 +830,10 @@ const commands = {
     // and integrations determine who answers. This checks freshness, not
     // human authority: that what is approved is the version the human
     // last reviewed, so an edit made after their "looks good" can't ride along.
-    // A tracked file's malformed markers throw SKEL_MARKERS; anything else is I/O.
-    // One discovery and one read: the record and the baseline hold the same bytes.
-    let record, source;
+    // The slow part (seconds on a large /mnt/c project) runs first and alone, so
+    // a lock taken for the checks below (#50's feedback lock) isn't held through it.
     const sourceStart = Date.now();
-    try {
-      source = await captureSourceSet(root, state, files);
-      record = recordSkeleton(root, state, files, source.read, { strict: true });
-    } catch (err) {
-      if (err.code === "SKEL_SOURCE") die(`can't approve: ${err.message}`);
-      if (err.code === "SKEL_MARKERS") die(`fix marker errors first:\n  ${err.message}`);
-      die(`couldn't read the skeleton to record it: ${err.message}`);
-    }
+    const { record, source } = await captureApproval(root, state, files);
     const { record: last, unread } = lastReview(root, state.reviewEpoch);
     if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
     // What the human reviewed: the version named in the feedback the agent
