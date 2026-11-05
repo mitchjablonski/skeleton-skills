@@ -980,7 +980,7 @@ const commands = {
     }
     // The agents folder may hold the user's own subagents: leave it.
     fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
-    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate, drift check (Stop) and settings-reload (ConfigChange) hooks from ${claudeDir}`);
+    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook, the drift check (Stop) hook and the settings-reload (ConfigChange) hook from ${claudeDir}`);
     console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
     if (removedConfig) console.log(`removed the config-dir permission deny rule install added`);
     reportLeftInPlace(settings, []);
