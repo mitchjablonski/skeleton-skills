@@ -337,7 +337,7 @@ An HMAC over the approval needs a key the agent can't read. That requires a sand
 
 ### 5.13 Ship as a Claude Code plugin (new)
 
-A plugin bundles `skills/`, agents and `hooks/hooks.json`, references its scripts with `${CLAUDE_PLUGIN_ROOT}`, and puts the files in its `bin/` on the Bash tool's `PATH` ([plugin reference](https://code.claude.com/docs/en/plugins-reference)). Marketplace plugins are copied to `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/` at install ([plugin loading](https://code.claude.com/docs/en/plugins/loading)). Whether to do this is §9 Q8, which is still under discussion.
+A plugin bundles `skills/`, agents and `hooks/hooks.json`, references its scripts with `${CLAUDE_PLUGIN_ROOT}`, and puts the files in its `bin/` on the Bash tool's `PATH` ([plugin reference](https://code.claude.com/docs/en/plugins-reference)). Marketplace plugins are copied to `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/` at install ([plugin loading](https://code.claude.com/docs/en/plugins/loading)). Whether to do this is §9 Q8 (joint recommendation, awaiting the maintainer).
 
 - **Benefits:**
   - The hook config and skill copies stop being written into the project's `.claude`.
@@ -389,7 +389,7 @@ Two tiers. Same code, different guarantees, stated plainly.
    - Drift diff shown on the review page.
 3. **Trusted state outside the project** (5.7) and an `Edit` deny rule on it (5.3; shipped for today's config-dir stores in PR #30).
 4. **Approval bound to content** (5.9; shipped in PR #20), still through the permission prompt by default. Keep the word-match ask as a convenience, but document that it is not a boundary.
-5. **A `ConfigChange` guard, and fail closed while a fill may be active** by fixing the hook's internal `catch` (5.14; draft #35, with the decision open in §9 Q7). `onFailure: "block"` is a strict-tier setting. **Plugin packaging** (5.13) is under discussion in §9 Q8.
+5. **A `ConfigChange` guard, and fail closed while a fill may be active** by fixing the hook's internal `catch` (5.14; draft #35, with the decision open in §9 Q7). `onFailure: "block"` is a strict-tier setting. **Plugin packaging** (5.13) is a later release, per the joint recommendation in §9 Q8.
 6. **Review server: live read-only by default** (5.5, the maintainer's decision; shipped in PR #14). `skel serve` has no input endpoint and feedback is copied into chat; `skel serve --send` opts in to one-click Send; `skel review` writes a static file. Hardening for the remaining read surface and for opted-in Send: the token in the URL fragment, data behind the token, and a CSP (with the residual stated in 5.5).
 7. **Containment heuristic kept**, ask-only.
 
@@ -495,17 +495,17 @@ Spikes needed before committing to Phase 4 (the strict tier's claims are conditi
    - Keep pre-existing user rules, don't infer ownership when a record is missing, and document what reinstalling or changing the environment does.
    - This covers the stores already outside the project. Moving the phase out of `.skeleton/state.json`, as 5.7 proposes, is a further step neither position addresses.
 6. **Approval channel.** *Joint recommendation:* the permission prompt stays the default, as workflow authorization rather than a human-authenticated receipt. Typed `/skeleton-approve` is for the strict tier only, gated on the `UserPromptExpansion` spike (Codex is taking it, with the network-reach spike) and on a privileged writer the agent can't reach (5.15).
-7. **Hook failure. Under discussion.**
-   - *Agreed:* fail closed while a fill or unreadable enrolled state may exist, which needs the internal `catch` change, since configuration can't see a swallowed exception. No project, scaffold and done stay usable. `onFailure: "block"` in the strict tier only.
+7. **Hook failure. One decision for the maintainer.**
+   - *Joint:* fail closed while a fill or unreadable enrolled state may exist, which needs the internal `catch` change, since configuration can't see a swallowed exception. No project, scaffold and done stay usable. `onFailure: "block"` in the strict tier only.
    - *Open: which decision a fault emits.*
-     - **Codex (draft #35):** `deny`.
-     - **Claude (5.14):** `ask`, with `deny` only under `gate: deny`.
+     - **A, draft #35 today (Codex's first choice):** `deny` on a fault and on unreadable state. An unevaluated call shouldn't go to something that can answer automatically.
+     - **B (Codex's alternative; Claude's recommendation):** on a fault during a readable fill, use the configured gate; on unreadable state, `deny`, because the configured gate is unknown.
+     - **C (from the Claude review of #35):** configured gate on a fault; `ask` on unreadable state, so a person can approve a repair from the session.
    - *Relevant to the choice (§4.2):* bypass mode skips a hook `ask`, and hooks, mods and `--permission-prompt-tool` can answer it, while a hook `deny` still blocks. A `deny` also leaves the human no prompt to proceed until the fault is fixed.
+   - *Needed under any option (the review's blocking finding on #35):* name the bad file and the repair command; let repair commands through as `ask`; count only a real skel state, and don't let a bad file above the project deny everything.
    - Draft #35 is held for this decision.
-8. **Packaging. Under discussion.** Both accept that a plugin isn't a trust boundary (5.13, 5.15).
-   - **Codex:** keep `skel install` now. Plugin packaging alone isn't a trust boundary and shouldn't delay the standard fixes.
-   - **Claude:** make a plugin the main way to get skel, as its own release after #35 and #18, at local or project scope for usability, not user scope. Keep a small install step, because plugins can't ship permission rules (only `agent` and `subagentStatusLine` settings take effect).
-   - *Open question for either path:* what #35's `ConfigChange` guard needs under a plugin (5.13). No answer is recorded yet.
+8. **Packaging.** *Joint recommendation:* make a plugin the main way to get skel, as its own release after #35 and #18, at project or local scope, not user scope, for usability and with no trust claim (5.13, 5.15). Keep a small install step, because plugins can't ship permission rules (only `agent` and `subagentStatusLine` settings take effect).
+   - *Required first:* a live probe of disabling the plugin and reloading while its hook is active, before claiming #35's `ConfigChange` guard survives that. `enabledPlugins` is a settings key, so the event should fire, but that is unproven.
 9. **Review server.** *Decided:* live read-only by default, `skel serve --send` opt-in, `skel review` static fallback (shipped, PR #14). *Joint recommendation:* add the fragment-held token, `/api/data` behind the token and the CSP as separate hardening, while saying plainly that they don't stop a same-origin script or a same-user process (5.5).
 10. **Containment heuristic.** *Joint recommendation:* keep it ask-only; no AST project for now.
 11. **Filler subagent.** *Decided:* shipped as the fill default (PR #8).
