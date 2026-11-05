@@ -882,13 +882,22 @@ const commands = {
     settings.hooks ??= {};
     settings.hooks.PreToolUse ??= [];
     const matcher = "Write|Edit|MultiEdit|NotebookEdit|Bash";
-    const ours = settings.hooks.PreToolUse.find((m) => m?.hooks?.some?.((hk) => isSkelHook(hk?.command)));
-    if (ours) {
-      ours.matcher = matcher;
-      for (const hk of ours.hooks) if (isSkelHook(hk?.command)) hk.command = command; // legacy or moved clone
-    } else {
-      settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
-    }
+    // Shared matchers and metadata belong to the user's remaining hooks.
+    let ours = false;
+    let firstHook = null;
+    settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter((group) => {
+      if (!Array.isArray(group?.hooks)) return true;
+      const before = group.hooks.length;
+      group.hooks = group.hooks.filter((hook) => {
+        if (!isSkelHook(hook?.command)) return true;
+        firstHook ??= hook;
+        return false;
+      });
+      const removed = group.hooks.length !== before;
+      ours ||= removed;
+      return !removed || group.hooks.length > 0;
+    });
+    settings.hooks.PreToolUse.push({ matcher, hooks: [{ ...(firstHook ?? { type: "command" }), command }] });
     // The Stop hook checks for drift at the end of every turn during a fill.
     // Found by its script, so a moved clone is updated in place, duplicates
     // (two installs, a hand-added copy) collapse to the first, and a `--block`
@@ -1008,9 +1017,15 @@ const commands = {
     const prevOwned = readOwned(target);
     const owned = [...(prevOwned ?? []), ...legacyOwned(settings, prevOwned)];
     const groups = settings.hooks?.PreToolUse ?? [];
-    for (const m of groups) if (Array.isArray(m?.hooks)) m.hooks = m.hooks.filter((hk) => !isSkelHook(hk?.command));
+    const emptied = new Set();
+    for (const group of groups) {
+      if (!Array.isArray(group?.hooks)) continue;
+      const before = group.hooks.length;
+      group.hooks = group.hooks.filter((hook) => !isSkelHook(hook?.command));
+      if (before && !group.hooks.length) emptied.add(group);
+    }
     if (settings.hooks?.PreToolUse) {
-      settings.hooks.PreToolUse = groups.filter((m) => !Array.isArray(m?.hooks) || m.hooks.length);
+      settings.hooks.PreToolUse = groups.filter((group) => !emptied.has(group));
       if (!settings.hooks.PreToolUse.length) delete settings.hooks.PreToolUse;
     }
     // The drift check (Stop) hook, with or without --block.
