@@ -20,7 +20,7 @@ import {
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
   storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
-import { migrateProject, migrationPlan } from "../lib/migrate.mjs";
+import { discardUnusedStateDirFiles, migrateProject, migrationPlan } from "../lib/migrate.mjs";
 import { storeNotice } from "../lib/store-notice.mjs";
 import {
   clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
@@ -422,6 +422,7 @@ const commands = {
     if (old) { try { process.kill(old.pid); } catch {} }
     for (const f of [queueDir(root), historyDir(root), servePath(root)]) fs.rmSync(f, { force: true, recursive: true });
     try {
+      discardUnusedStateDirFiles(root);
       clearSessions(root);
       clearSnapshot(root);
       clearRendered(root);
@@ -702,7 +703,7 @@ const commands = {
     else console.log(`NO_FEEDBACK${wait ? ` (waited ${wait}s)` : ""}`);
   },
 
-  approve(args) {
+  async approve(args) {
     const given = flag(args, "reviewed", null);
     if (given !== null && !isVersion(given)) die('--reviewed takes the 12-character version the human reviewed (the "Reviewed skeleton version: …" line of their feedback)');
     const root = requireRoot();
@@ -751,6 +752,8 @@ const commands = {
     }
     writeState(root, next);
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
+    // This is where a record in an unguarded state dir gets used: say so, don't refuse.
+    if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`);
   },
 
   next() {
