@@ -3,13 +3,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { BLOCK_ON_DRIFT, stopMode } from "../lib/stop.mjs";
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "stop-default-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const env = { ...process.env, CLAUDE_PROJECT_DIR: root, XDG_CONFIG_HOME: path.join(root, "config") };
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: root, XDG_CONFIG_HOME: path.join(root, "config"), XDG_STATE_HOME: path.join(root, "state"), HOME: path.join(root, "home"), USERPROFILE: path.join(root, "home"), LOCALAPPDATA: path.join(root, "local") };
   const run = (entry, args = [], input = {}) => spawnSync(process.execPath, [path.resolve("bin", entry), ...args], {
     cwd: root, env, input: JSON.stringify({ cwd: root, ...input }), encoding: "utf8",
   });
@@ -27,6 +27,7 @@ test("Stop mode defaults and both entrypoints reject conflicting flags", t => {
   assert.equal(stopMode(["--block"]), true);
   assert.equal(stopMode(["--notify-only"]), false);
   assert.throws(() => stopMode(["--block", "--notify-only"]), /mutually exclusive/);
+  assert.throws(() => stopMode(["--notify-onyl"]), /unknown Stop hook flag/);
   const { run } = fixture(t);
   for (const [entry, prefix] of [["skel-stop.mjs", []], ["skel.mjs", ["stop-hook"]]]) {
     const result = run(entry, [...prefix, "--block", "--notify-only"]);
@@ -57,16 +58,6 @@ test("real approval: clean silent, notices preserved, drift corrects once, both 
   run("skel-config-hook.mjs", [], { source: "policy_settings" });
   assert.equal(stop(), null);
   fs.writeFileSync(file, source.replace('// outside', '// drift'));
-  const first = stop();
-  assert.equal(first.decision, "block");
-  assert.match(first.reason, /Resolve this/);
-  assert.match(first.reason, /Edit[\s\S]*ask the human or deny[\s\S]*whole-file[\s\S]*uncommitted fence fills/);
-  for (const output of [stop([], true), stop(["--notify-only"]), stop(["--notify-only"], true), stop(["--notify-only"], false, "skel.mjs")]) {
-    assert.ok(output.systemMessage);
-    assert.equal(output.decision, undefined);
-    assert.equal(output.hookSpecificOutput, undefined);
-  }
-  assert.equal(stop(["--block"]).decision, "block");
   for (const [entry, args] of [["skel-stop.mjs", []], ["skel.mjs", ["stop-hook"]]]) {
     const output = JSON.parse(run(entry, args).stdout);
     assert.ok(output.systemMessage);
@@ -80,6 +71,17 @@ test("real approval: clean silent, notices preserved, drift corrects once, both 
       assert.equal(output.reason, undefined);
     }
   }
+  const first = stop();
+  assert.equal(first.decision, "block");
+  assert.match(first.reason, /Resolve this/);
+  assert.match(first.reason, /Edit[\s\S]*ask the human or deny[\s\S]*whole-file[\s\S]*uncommitted fence fills/);
+  for (const output of [stop([], true), stop(["--notify-only"]), stop(["--notify-only"], true), stop(["--notify-only"], false, "skel.mjs")]) {
+    assert.ok(output.systemMessage);
+    assert.equal(output.decision, undefined);
+    assert.equal(output.hookSpecificOutput, undefined);
+  }
+  assert.equal(stop(["--block"]).decision, undefined, "explicit block does not repeat unchanged drift");
+
 });
 
 test("install keeps notify-only across reinstalls and moved clones; conflicting modes preserve user hooks", t => {
@@ -150,4 +152,136 @@ test("approval-record faults notify without forcing a corrective turn", t => {
     }
     fs.writeFileSync(record, original);
   }
+});
+
+
+function approvedFixture(t) {
+  const f = fixture(t);
+  f.cli(["init", "one nudge"]);
+  f.file = path.join(f.root, "code.js");
+  f.source = '// outside\n// SKEL[1] value\nconst value=1;\n// /SKEL[1]\n// after\n';
+  fs.writeFileSync(f.file, f.source);
+  f.cli(["approve"]);
+  const settings = { XDG_CONFIG_HOME: path.join(f.root, "config") };
+  // Identify metadata from the actual approved record, without using ambient HOME.
+  const suffix = fs.readdirSync(path.join(settings.XDG_CONFIG_HOME, "skel")).find(n => n.endsWith(".snapshot.json")).replace(".snapshot.json", "");
+  f.cache = path.join(settings.XDG_CONFIG_HOME, "skel", suffix + ".stop-notice.json");
+  f.record = path.join(settings.XDG_CONFIG_HOME, "skel", suffix + ".snapshot.json");
+  f.stop = (input = {}, args = []) => {
+    const result = f.run("skel-stop.mjs", args, { stop_hook_active: false, ...input });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout ? JSON.parse(result.stdout) : null;
+  };
+  return f;
+}
+
+test("unchanged drift nudges once across prompts and sessions; changed drift, clean and new approval re-arm", t => {
+  const f = approvedFixture(t);
+  const stateBefore = fs.readFileSync(path.join(f.root, ".skeleton/state.json"), "utf8");
+  const baselineBefore = fs.readFileSync(f.record, "utf8");
+  const a = f.source.replace("// outside", "// drift A");
+  const b = f.source.replace("// outside", "// drift B");
+  fs.writeFileSync(f.file, a);
+  assert.equal(f.stop({ session_id: "prompt-one" }).decision, "block");
+  assert.equal(f.stop({ session_id: "prompt-two" }).decision, undefined);
+  assert.equal(f.stop({ session_id: "different-session" }, ["--block"]).decision, undefined);
+  const metadata = JSON.parse(fs.readFileSync(f.cache, "utf8"));
+  assert.deepEqual(Object.keys(metadata).sort(), ["approval", "drift", "format"]);
+  assert.equal(metadata.format, 1);
+  assert.match(metadata.approval, /^[0-9a-f]{64}$/);
+  assert.match(metadata.drift, /^[0-9a-f]{64}$/);
+  assert.ok(fs.statSync(f.cache).size < 256);
+  if (process.platform !== "win32") assert.equal(fs.statSync(f.cache).mode & 0o777, 0o600);
+  assert.equal(fs.readFileSync(f.record, "utf8"), baselineBefore);
+  assert.equal(fs.readFileSync(path.join(f.root, ".skeleton/state.json"), "utf8"), stateBefore);
+  fs.writeFileSync(f.file, b);
+  assert.equal(f.stop().decision, "block", "changed exterior gets a fresh nudge");
+  assert.equal(f.stop().decision, undefined);
+  fs.writeFileSync(f.file, f.source);
+  assert.equal(f.stop(), null);
+  assert.equal(fs.existsSync(f.cache), false);
+  fs.writeFileSync(f.file, b);
+  assert.equal(f.stop().decision, "block", "clean then same drift re-arms");
+  f.cli(["reshape"]);
+  fs.writeFileSync(f.file, f.source);
+  f.cli(["approve"]);
+  fs.writeFileSync(f.file, b);
+  assert.equal(f.stop().decision, "block", "new approval re-arms even the same exterior hash");
+  assert.equal(fs.existsSync(f.cache + ".lock"), false);
+});
+
+test("fence-body edits and shifted exterior line offsets do not repeat an unchanged nudge", t => {
+  const f = approvedFixture(t);
+  const drifted = f.source.replace("// after", "// after drift");
+  fs.writeFileSync(f.file, drifted);
+  const first = f.stop();
+  assert.equal(first.decision, "block");
+  const metadata = fs.readFileSync(f.cache, "utf8");
+  fs.writeFileSync(f.file, drifted.replace("const value=1;", "const value=2;\nconst more=3;\nconst filled=4;"));
+  const shifted = f.stop();
+  assert.equal(shifted.decision, undefined);
+  assert.notEqual(shifted.systemMessage, first.systemMessage, "the report's current line number moved");
+  assert.equal(fs.readFileSync(f.cache, "utf8"), metadata, "identity ignores legitimate fence contents and offsets");
+  fs.writeFileSync(f.file, fs.readFileSync(f.file, "utf8").replace("// after drift", "// changed exterior again"));
+  assert.equal(f.stop().decision, "block");
+});
+
+test("notify-only and nonfalse continuation flags do not consume the first eligible nudge", t => {
+  const f = approvedFixture(t);
+  fs.writeFileSync(f.file, f.source.replace("// outside", "// drift"));
+  for (const flag of [true, null, 0, "false", {}, []]) {
+    assert.equal(f.stop({ stop_hook_active: flag }).decision, undefined);
+    assert.equal(fs.existsSync(f.cache), false);
+  }
+  const omitted = f.run("skel-stop.mjs", [], {});
+  assert.equal(JSON.parse(omitted.stdout).decision, undefined);
+  assert.equal(f.stop({}, ["--notify-only"]).decision, undefined);
+  for (const [entry, args] of [["skel-stop.mjs", ["--notify-onyl"]], ["skel.mjs", ["stop-hook", "--notify-onyl"]]]) {
+    const rejected = f.run(entry, args, { stop_hook_active: false });
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /unknown Stop hook flag/);
+    assert.equal(rejected.stdout, "");
+  }
+  assert.equal(fs.existsSync(f.cache), false);
+  assert.equal(f.stop().decision, "block");
+});
+
+test("malformed, unwritable and busy delivery caches only notify and never consume a claim", t => {
+  const f = approvedFixture(t);
+  fs.writeFileSync(f.file, f.source.replace("// outside", "// drift"));
+  fs.writeFileSync(f.cache, "{");
+  assert.equal(f.stop().decision, undefined);
+  assert.equal(fs.readFileSync(f.cache, "utf8"), "{", "do not silently rewrite corrupt metadata");
+  fs.writeFileSync(f.cache, " ".repeat(257));
+  assert.equal(f.stop().decision, undefined, "oversized delivery metadata is never parsed");
+  fs.rmSync(f.cache);
+  fs.mkdirSync(f.cache);
+  assert.equal(f.stop().decision, undefined, "cache file is not writable as a regular record");
+  fs.rmdirSync(f.cache);
+  fs.writeFileSync(f.cache + ".lock", '{"pid":1}');
+  assert.equal(f.stop().decision, undefined, "busy or stranded lock never forces a continuation");
+  assert.equal(fs.existsSync(f.cache), false);
+  fs.rmSync(f.cache + ".lock");
+  assert.equal(f.stop().decision, "block", "none of those failures consumed the claim");
+});
+
+test("concurrent Stop processes claim one unchanged drift at most once", async t => {
+  const f = approvedFixture(t);
+  fs.writeFileSync(f.file, f.source.replace("// outside", "// concurrent drift"));
+  const outputs = await Promise.all(Array.from({ length: 6 }, () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.resolve("bin/skel-stop.mjs")], {
+      cwd: f.root, env: { ...process.env, CLAUDE_PROJECT_DIR: f.root, XDG_CONFIG_HOME: path.join(f.root, "config") },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", c => stdout += c);
+    child.stderr.on("data", c => stderr += c);
+    child.on("error", reject);
+    child.on("exit", code => {
+      try { assert.equal(code, 0, stderr); resolve(JSON.parse(stdout)); } catch (e) { reject(e); }
+    });
+    child.stdin.end(JSON.stringify({ cwd: f.root, stop_hook_active: false }));
+  })));
+  assert.equal(outputs.filter(x => x.decision === "block").length, 1);
+  assert.ok(outputs.every(x => x.systemMessage.includes("concurrent drift")));
 });

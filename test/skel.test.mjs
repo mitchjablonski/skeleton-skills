@@ -1234,8 +1234,8 @@ test("#38: drift requests one correction by default; --notify-only opts out", ()
   assert.equal(JSON.parse(stopHook(dir, { stop_hook_active: true })).decision, undefined, "the continuation only notifies");
   assert.equal(JSON.parse(stopHook(dir, {}, ["--notify-only"])).decision, undefined, "explicit notify-only opts out");
   const blocked = JSON.parse(stopHook(dir, {}, ["--block"]));
-  assert.equal(blocked.decision, "block");
-  assert.match(blocked.reason, /src\/a\.ts:3[\s\S]*skel reshape/);
+  assert.equal(blocked.decision, undefined, "unchanged drift already requested its correction");
+  assert.match(out.reason, /src\/a\.ts:3[\s\S]*skel reshape/);
   assert.equal(JSON.parse(stopHook(dir, { stop_hook_active: true }, ["--block"])).decision, undefined, "blocks once, then notifies");
   // A deleted record fails closed here too.
   fs.rmSync(snapshotPath(dir));
