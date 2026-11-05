@@ -351,6 +351,39 @@ test("an ignore file that ignores itself can't hide new source; one there at app
   assertCompletionRefused(p, /logs\/\.gitignore: changed since approval/);
 });
 
+test("the walk's .gitignore reader agrees with git, file by file", () => {
+  const all = ["src/a/mytest.ts", "src/mytest.ts", "src/b/c/deep.ts", "t/m/ax/k.ts", "t/ax/k.ts", "x/y.ts", "xay.ts", "tab.ts", "sp.ts", "sp2.ts ", "lead/x.ts",
+    "a/b.ts", "a/x/b.ts", "a/x/y/b.ts", "doc/a.ts", "doc/x/a.ts", "keep/one.ts", "keep/two.ts", "q1.ts", "q12.ts", "logs/x.ts", "logs/sub/y.ts", "hash#.ts", "#lit.ts", "!bang.ts", "br[1].ts", "n/outx/z.ts", "outx/z.ts"];
+  // Windows can't keep a trailing space in a file name.
+  const files = all.filter((f) => POSIX || !f.endsWith(" "));
+  const ignore = ["src/**test.ts", "t/**x/*.ts", "x[/]y.ts", "tab.ts\t", "sp.ts   ", "sp2.ts\\ ", "a/**/b.ts", "/doc/*.ts", "keep/*", "!keep/one.ts", "q?.ts", "logs/**", "\\#lit.ts", "\\!bang.ts", "br\\[1].ts", "/outx/", "**/deep.ts"].join("\n");
+  const dir = tmp();
+  for (const f of files) {
+    fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), "x\n");
+  }
+  fs.writeFileSync(path.join(dir, ".gitignore"), `${ignore}\n`);
+  const walk = discoverSource(dir, { mode: "walk" });
+  const ours = new Set([...walk.eligible, ...walk.unknown]);
+  gitIn(dir, "init", "-q");
+  const theirs = new Set(gitIn(dir, "ls-files", "-z", "-o", "--exclude-standard").split("\0").filter(Boolean));
+  const diff = files.filter((f) => ours.has(f) !== theirs.has(f)).map((f) => `${f}: git ${theirs.has(f) ? "keeps" : "ignores"} it, the walk ${ours.has(f) ? "keeps" : "ignores"} it`);
+  assert.deepEqual(diff, []);
+  // The cases from review, named.
+  for (const f of ["src/a/mytest.ts", "t/m/ax/k.ts", "x/y.ts", "tab.ts"]) assert.ok(ours.has(f), f);
+});
+
+test("setting core.excludesFile is reported as the setting moving", () => {
+  const p = filling();
+  const global = path.join(tmp("skel-gi-"), "ignore");
+  fs.writeFileSync(global, "*.bak\n");
+  gitIn(p.dir, "config", "core.excludesFile", global);
+  p.write("src/a.ts", FILLED);
+  const out = p.refused(["done"]);
+  assert.match(out, new RegExp(`global ignore file: is now ${global.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}, not .*git.ignore`));
+  assert.doesNotMatch(out, /global ignore file .*: changed since approval/);
+});
+
 test("ignore rules outside the tree are baselined: .git/info/exclude and core.excludesFile", () => {
   const global = path.join(tmp("skel-gi-"), "ignore");
   fs.writeFileSync(global, "*.bak\n");
