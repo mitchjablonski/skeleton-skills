@@ -2747,12 +2747,19 @@ test("#18: the commit marker decides: a late write to the old dir can't flip a m
   fs.writeFileSync(m.oldFile(".rendered"), JSON.stringify({ root: m.dir, versions: [] }));
   const status = m.skel("status");
   assert.doesNotMatch(status.stdout, /no record of the approved skeleton/);
-  assert.match(status.stdout, /1 file\(s\) for this project remain in .*ignores them.*`skel migrate`/s);
+  assert.match(status.stdout, /1 file\(s\) for this project remain in .*skel ignores them.*differs from the state dir, so it stays until you delete it/s);
+  assert.doesNotMatch(status.stdout, /Run `skel migrate` to remove/);
   assert.deepEqual(fs.readFileSync(m.newFile(".rendered")), before[".rendered"], "and it's not merged in");
-  // Removing it finishes a committed move, so a fill doesn't hold it up.
+  // A rerun keeps and names what the state dir has no copy of; a fill doesn't hold it up.
   const r = m.skel("migrate");
   assert.equal(r.ok, true, r.stderr);
-  assert.match(r.stdout, /removed 1 leftover/);
+  assert.match(r.stdout, /removed 0 leftover/);
+  assert.ok(r.stdout.includes(`kept ${m.oldFile(".rendered")}`), r.stdout);
+  assert.ok(fs.existsSync(m.oldFile(".rendered")));
+  // An exact copy goes, and status says which.
+  fs.copyFileSync(m.newFile(".rendered"), m.oldFile(".rendered"));
+  assert.match(m.skel("status").stdout, /Run `skel migrate` to remove the 1 that match/);
+  assert.match(m.skel("migrate").stdout, /removed 1 leftover/);
   assert.equal(fs.existsSync(m.oldFile(".rendered")), false);
   assert.doesNotMatch(m.skel("status").stdout, /remain in/);
 });
@@ -3020,7 +3027,9 @@ test("#18: a crash at any point reads as one whole location, never as no record,
   assert.equal(rerun.ok, true, rerun.stderr);
   assert.equal(fs.existsSync(m.newFile(".snapshot")), false, "the cleared record stays cleared");
   assert.deepEqual(JSON.parse(fs.readFileSync(m.newFile(""), "utf-8")).sessions, ["newer"]);
-  assert.deepEqual(onlyFiles(m.oldDir), [`${m.key}.migrated`]);
+  assert.deepEqual(onlyFiles(m.oldDir), [`${m.key}.json`, `${m.key}.migrated`, `${m.key}.snapshot.json`].sort(), "what the state dir has no copy of stays, for a human to delete");
+  assert.match(rerun.stdout, /removed 2 leftover/);
+  assert.match(rerun.stdout, /kept .*\.snapshot\.json/);
 
   // Only the marker left: nothing to do.
   m = legacyProject();
@@ -3410,6 +3419,69 @@ test("#18: an unreadable old dir doesn't hand a planted state-dir record trust, 
     fs.chmodSync(m.oldDir, 0o700);
   }
   for (const s of SUFFIXES) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], s);
+});
+
+test("#18: under a marker, old files without an exact state-dir copy stay and are named: a stray marker can't delete real records", () => {
+  const makers = { "regular file": (f) => fs.writeFileSync(f, ""), directory: (f) => fs.mkdirSync(f) };
+  for (const [kind, make] of Object.entries(makers)) {
+    const m = legacyProject();
+    const before = m.records();
+    make(path.join(m.oldDir, `${m.key}.migrated`));
+    fs.mkdirSync(m.newDir, { recursive: true });
+    fs.writeFileSync(m.newFile("-install"), JSON.stringify({ root: m.dir, ownedDeny: ["Edit(//elsewhere/skel/**)"] }));
+    const status = m.skel("status").stdout;
+    assert.match(status, /until you delete them/, kind);
+    assert.doesNotMatch(status, /Run `skel migrate` to remove/, kind);
+    assert.match(m.skel("migrate", "--dry-run").stdout, new RegExp(`${m.key}\\.snapshot\\.json: keep`), kind);
+    const r = m.skel("migrate");
+    assert.equal(r.ok, true, r.stderr);
+    assert.match(r.stdout, /removed 0 leftover/, kind);
+    for (const s of SUFFIXES) {
+      assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], `${kind}: ${s}`);
+      assert.ok(r.stdout.includes(`kept ${m.oldFile(s)}`), r.stdout);
+    }
+    m.setPhase("fill");
+    assert.match(m.stop().systemMessage, /until you delete them/, `${kind}: Stop says so too`);
+  }
+});
+
+test("#18: init after a move, with an unreadable old dir, keeps the state dir's records", { skip: !canDenyDirs }, () => {
+  const m = legacyProject();
+  m.records();
+  assert.equal(m.skel("migrate").ok, true);
+  const owned = fs.readFileSync(m.newFile("-install"));
+  fs.chmodSync(m.oldDir, 0o000);
+  try {
+    m.skel("init", "Z", "--force");
+    assert.deepEqual(fs.readFileSync(m.newFile("-install")), owned);
+    assert.ok(fs.existsSync(m.newFile(".snapshot")), "nothing was discarded on an unknown marker");
+  } finally {
+    fs.chmodSync(m.oldDir, 0o700);
+  }
+});
+
+test("#18: a planted ownership record can't take the user's rules: install and uninstall keep what install never writes, and say so", () => {
+  const theirs = ["Bash(curl:*)", "Read(./.env)", "Edit(/secrets/**)"];
+  for (const cmd of ["install", "uninstall"]) {
+    const cfgHome = tmp("skel-p-cfg-");
+    const stateHome = tmp("skel-p-state-");
+    const target = tmp("skel-p-proj-");
+    const env = { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome };
+    const run = (c) => execFileSync("node", [BIN, c, target], { encoding: "utf-8", env, stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 });
+    const settingsPath = path.join(target, ".claude", "settings.local.json");
+    run("install");
+    const installed = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    installed.permissions.deny.push(...theirs);
+    fs.writeFileSync(settingsPath, JSON.stringify(installed));
+    const record = path.join(stateHome, "skel", `${projectKey(target)}-install.json`);
+    const rec = JSON.parse(fs.readFileSync(record, "utf-8"));
+    fs.writeFileSync(record, JSON.stringify({ ...rec, ownedDeny: [...rec.ownedDeny, ...theirs] }));
+    const out = run(cmd);
+    assert.match(out, /lists 3 rule\(s\) install never writes, so they're left alone: Bash\(curl:\*\)/, cmd);
+    const deny = JSON.parse(fs.readFileSync(settingsPath, "utf-8")).permissions.deny;
+    for (const r of theirs) assert.ok(deny.includes(r), `${cmd}: ${r}`);
+    if (cmd === "uninstall") assert.deepEqual(deny, theirs, "and skel's own rules still go");
+  }
 });
 
 test("#18: a marker with only a settings notice in the state dir is refused: real old records aren't leftovers", () => {

@@ -323,7 +323,13 @@ function readOwned(target) {
   let o;
   try { o = JSON.parse(text).ownedDeny; } catch {}
   if (!Array.isArray(o)) die(`install's ownership record ${file} is corrupt. Delete it to treat every current rule as yours, or restore a good copy, then run this again.`);
-  return o.filter((x) => typeof x === "string");
+  // A record outside the project can still be planted. Install only ever adds
+  // rules of these shapes, so anything else stays the user's, whatever it says.
+  const strings = o.filter((x) => typeof x === "string");
+  const ours = (r) => SKEL_SHAPED.test(r) || STORE_SHAPED.test(r) || LEGACY_DENY_RULES.includes(r);
+  const foreign = strings.filter((r) => !ours(r));
+  if (foreign.length) console.log(`warning: install's ownership record ${file} lists ${foreign.length} rule(s) install never writes, so they're left alone: ${foreign.join(", ")}`);
+  return strings.filter(ours);
 }
 function writeOwned(target, owned) {
   if (!owned.length) return fs.rmSync(ownedStorePath(target), { force: true });
@@ -1026,7 +1032,11 @@ const commands = {
       if (err.code === "SKEL_STATE_MIGRATION") die(err.message);
       throw err;
     }
-    if (plan.marked) return console.log(`removed ${plan.stale.length} leftover file(s) from ${plan.from}`);
+    if (plan.marked) {
+      console.log(`removed ${plan.stale.length} leftover file(s) from ${plan.from}`);
+      for (const o of plan.outcomes.filter((x) => x.outcome === "keep")) console.log(`kept ${o.source}: ${o.why}`);
+      return;
+    }
     console.log(`moved ${moved} of this project's records from ${plan.from} to ${plan.to}`);
     launchWarning(root);
     console.log("note: a Claude Code session started before `skel install` still enforces only the old rule: restart it.");
