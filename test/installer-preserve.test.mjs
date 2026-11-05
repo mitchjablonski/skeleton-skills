@@ -4,6 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const BIN = fileURLToPath(new URL("../bin/skel.mjs", import.meta.url));
 
 test("PreToolUse deduplicates moved and legacy commands while preserving user groups", t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "skel-preserve-"));
@@ -22,7 +25,7 @@ test("PreToolUse deduplicates moved and legacy commands while preserving user gr
     { matcher: "Bash", hooks: [{ type: "command", command: legacy }, { type: "command", command: old }] },
   ] } }));
   const run = action => {
-    const result = spawnSync(process.execPath, [path.resolve("bin/skel.mjs"), action, root], {
+    const result = spawnSync(process.execPath, [BIN, action, root], {
       env: { ...process.env, XDG_CONFIG_HOME: path.join(root, "config") }, encoding: "utf8",
     });
     assert.equal(result.status, 0, result.stderr);
