@@ -22,7 +22,7 @@ test("configuration guard allows absent/scaffold/done, blocks fill and corrupt s
     state(root, JSON.stringify({ phase }));
     assert.equal(configDecision({ cwd: root }), null);
   }
-  for (const text of ['{"phase":"fill"}', '{', '{}']) {
+  for (const text of ['{"phase":"fill"}', '{']) {
     state(root, text);
     assert.equal(configDecision({ cwd: root }).decision, "block");
   }
@@ -93,7 +93,7 @@ test("valid input gate exception denies using session enrollment even with outsi
 test("corrupt session state denies valid outside calls and corrupt outer overrides nested fill", t => {
   const root = fixture(t), outside = fixture(t), child = path.join(root, "child");
   state(root, '{'); state(child, '{"phase":"fill"}');
-  assert.match(configDecision({ cwd: child }, outside).reason, /cannot be read/);
+  assert.match(configDecision({ cwd: child }, root).reason, /cannot be read/);
   for (const cwd of [outside, child]) {
     const result = spawnSync(process.execPath, [path.resolve("bin/skel-hook.mjs")], { input: JSON.stringify({ cwd, tool_name: "Bash", tool_input: { command: "echo hi" } }), encoding: "utf8", env: { ...process.env, CLAUDE_PROJECT_DIR: root } });
     assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, "deny");
@@ -132,4 +132,64 @@ test("cwd fill owns nested corrupt decoy but outside corrupt owner denies", t =>
   assert.equal(owned.stderr, "");
   assert.equal(owned.stdout, "");
   assert.equal(JSON.parse(run(path.join(outside, "code.js")).stdout).hookSpecificOutput.permissionDecision, "deny");
+});
+test("scope ignores malformed ancestors, repair asks, odd target paths stay harmless", t => {
+  const parent = fixture(t), root = path.join(parent, "project"); fs.mkdirSync(root);
+  state(parent, '{');
+  const run = tool_input => spawnSync(process.execPath, [path.resolve("bin/skel-hook.mjs")], { input: JSON.stringify({ cwd: root, tool_name: tool_input.command ? "Bash" : "Edit", tool_input }), encoding: "utf8", env: { ...process.env, CLAUDE_PROJECT_DIR: root } });
+  assert.equal(run({ command: "echo ok" }).stdout, "");
+  fs.writeFileSync(path.join(root, "plain"), "x");
+  assert.equal(run({ file_path: path.join(root, "plain", "child.js") }).stdout, "");
+  state(root, '{');
+  const denied = JSON.parse(run({ command: "echo ok" }).stdout).hookSpecificOutput;
+  assert.equal(denied.permissionDecision, "deny"); assert.ok(denied.permissionDecisionReason.includes(path.join(root, ".skeleton", "state.json")));
+  assert.equal(JSON.parse(run({ command: "skel init --force" }).stdout).hookSpecificOutput.permissionDecision, "ask");
+});
+test("blocked configuration notice persists, appears at Stop outside fill, and clears", t => {
+  const root = fixture(t), config = path.join(root, "config");
+  state(root, '{"phase":"fill"}');
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: root, XDG_CONFIG_HOME: config };
+  const run = (entry, input) => spawnSync(process.execPath, [path.resolve("bin", entry)], { input: JSON.stringify(input), encoding: "utf8", env });
+  const event = { cwd: root, source: "local_settings", file_path: "settings.local.json", content: "SECRET-MUST-NOT-STORE" };
+  const blocked = run("skel-config-hook.mjs", event);
+  assert.equal(blocked.stderr, "");
+  assert.equal(JSON.parse(blocked.stdout).decision, "block");
+  state(root, '{"phase":"scaffold"}');
+  const notice = JSON.parse(run("skel-stop.mjs", { cwd: root }).stdout).systemMessage;
+  assert.match(notice, /historical notice/); assert.match(notice, /settings.local.json/); assert.doesNotMatch(notice, /SECRET-MUST/);
+  assert.equal(run("skel-config-hook.mjs", event).stdout, "");
+  assert.equal(run("skel-stop.mjs", { cwd: root }).stdout, "");
+});
+test("ignored malformed ancestors never own a sibling target with real fill", t => {
+  const parent = fixture(t), cwd = path.join(parent, "session"), target = path.join(parent, "actual");
+  fs.mkdirSync(cwd); state(target, '{"phase":"fill","activeStep":null}');
+  fs.writeFileSync(path.join(target, "code.js"), "// SKEL[1] value\nconst x = 1;\n// /SKEL[1]\n");
+  for (const invalid of ['{', 'null', '{"phase":"foreign"}']) {
+    state(parent, invalid);
+    const result = spawnSync(process.execPath, [path.resolve("bin/skel-hook.mjs")], { input: JSON.stringify({ cwd, tool_name: "Edit", tool_input: { file_path: path.join(target, "code.js"), old_string: "1", new_string: "2" } }), encoding: "utf8", env: { ...process.env, CLAUDE_PROJECT_DIR: cwd } });
+    assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, "ask");
+  }
+});
+test("approved external owner with broken state denies descendant target and permits repair", t => {
+  const root = fixture(t), session = fixture(t), config = path.join(session, "config");
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: session, XDG_CONFIG_HOME: config };
+  const cli = args => {
+    const r = spawnSync(process.execPath, [path.resolve("bin/skel.mjs"), ...args], { cwd: root, env, encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr); return r;
+  };
+  cli(["init", "external"]);
+  fs.mkdirSync(path.join(root, "src"));
+  const file = path.join(root, "src/x.js");
+  fs.writeFileSync(file, '// SKEL[1] x\nconst x = 1;\n// /SKEL[1]\n');
+  cli(["approve"]);
+  const run = input => spawnSync(process.execPath, [path.resolve("bin/skel-hook.mjs")], { input: JSON.stringify(input), encoding: "utf8", env });
+  for (const broken of ['{', '{}', 'directory-replaced']) {
+    if (broken === "directory-replaced") {
+      fs.rmSync(path.join(root, ".skeleton"), { recursive: true });
+      fs.writeFileSync(path.join(root, ".skeleton"), "foreign file");
+    } else state(root, broken);
+    const denied = run({ cwd: session, tool_name: "Edit", tool_input: { file_path: file, old_string: "1", new_string: "2" } });
+    assert.equal(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision, "deny");
+    assert.equal(JSON.parse(run({ cwd: root, tool_name: "Bash", tool_input: { command: "skel init --force" } }).stdout).hookSpecificOutput.permissionDecision, "ask");
+  }
 });

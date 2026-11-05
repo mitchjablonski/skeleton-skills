@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, skelConfigDir, writeFileAtomic } from "../lib/state.mjs";
 import { bodyEscapesFence } from "../lib/gate.mjs";
+import { readConfigNotice } from "../lib/config-notice.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
@@ -418,18 +419,34 @@ const commands = {
   },
 
   status(args) {
-    const root = requireRoot();
+    const root = findRoot(process.cwd());
+    const configNotice = readConfigNotice(process.env.CLAUDE_PROJECT_DIR || process.cwd()) || (root && readConfigNotice(root));
+    if (!root) {
+      if (configNotice) console.error(configNotice);
+      die(`no ${STATE_DIR}/state.json here or above — run \`skel init "<title>"\` first`);
+    }
     const state = readState(root);
+    if (!state) {
+      const error = `can't read ${path.join(root, STATE_DIR, "state.json")}; repair that file or run \`skel init --force "<title>"\` from ${root} (requires approval in Claude Code)`;
+      if (args.includes("--json")) {
+        console.log(JSON.stringify({ error, configNotice }, null, 2));
+        process.exitCode = 1;
+        return;
+      }
+      if (configNotice) console.error(configNotice);
+      die(error);
+    }
     const { steps, errors, files } = snapshot(root);
     const drift = state.phase === "fill" ? verifySnapshot(root, state, files) : null;
     if (args.includes("--json")) {
-      console.log(JSON.stringify({ ...state, errors, drift, steps: steps.map(({ fences, ...s }) => ({
+      console.log(JSON.stringify({ ...state, errors, drift, configNotice, steps: steps.map(({ fences, ...s }) => ({
         ...s, fences: fences.map(({ body, ...f }) => f),
       })) }, null, 2));
       return;
     }
     const done = steps.filter((s) => s.status === "filled").length;
     console.log(`${state.title} — phase: ${state.phase}${state.activeStep ? `, active: ${state.activeStep}` : ""} — ${done}/${steps.length} filled`);
+    if (configNotice) console.log(configNotice);
     for (const s of steps) {
       const mark = s.id === state.activeStep ? "▶" : s.status === "filled" ? "✓" : "·";
       console.log(`  ${mark} ${s.id.padEnd(5)} ${s.title}  (${s.fences.map((f) => `${f.file}:${f.openLine}`).join(", ")})`);
@@ -899,7 +916,7 @@ const commands = {
     console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
     console.log(stopOurs ? "drift check (Stop) hook updated" : `added drift check (Stop) hook to ${settingsPath}`);
-    console.log(`installed settings-reload guard (ConfigChange); settings changes are held during a fill`);
+    console.log(`settings-reload guard (ConfigChange) configured; settings changes are held during a fill`);
     const addedState = added.filter((r) => stateRules.includes(r));
     if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
     else console.log(addedState.length ? `added ${addedState.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
@@ -963,7 +980,7 @@ const commands = {
     }
     // The agents folder may hold the user's own subagents: leave it.
     fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
-    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook and the drift check (Stop) hook from ${claudeDir}`);
+    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate, drift check (Stop) and settings-reload (ConfigChange) hooks from ${claudeDir}`);
     console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
     if (removedConfig) console.log(`removed the config-dir permission deny rule install added`);
     reportLeftInPlace(settings, []);
