@@ -10,7 +10,7 @@ const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "skel-cli-recovery-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  return { root, env: { ...process.env, CLAUDE_PROJECT_DIR: root, XDG_CONFIG_HOME: path.join(root, "config") } };
+  return { root, env: { ...process.env, CLAUDE_PROJECT_DIR: root, XDG_STATE_HOME: path.join(root, "state"), XDG_CONFIG_HOME: path.join(root, "config"), LOCALAPPDATA: path.join(root, "localappdata") } };
 }
 
 test("ordinary CLI commands diagnose corrupt state without a TypeError stack", t => {

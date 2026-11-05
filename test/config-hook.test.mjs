@@ -6,13 +6,18 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { configDecision } from "../lib/config-hook.mjs";
 
-const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
-const isolatedXdgConfigHome = fs.mkdtempSync(path.join(os.tmpdir(), "skel-config-suite-"));
-process.env.XDG_CONFIG_HOME = isolatedXdgConfigHome;
+// Stores live in the state dir and migrate from the old config dir: keep every path out of the real ones.
+const isolatedHomes = fs.mkdtempSync(path.join(os.tmpdir(), "skel-suite-homes-"));
+process.env.XDG_CONFIG_HOME = path.join(isolatedHomes, "config");
+process.env.LOCALAPPDATA = path.join(isolatedHomes, "localappdata");
+process.on("exit", () => { try { fs.rmSync(isolatedHomes, { recursive: true, force: true }); } catch {} });
+const originalXdgStateHome = process.env.XDG_STATE_HOME;
+const isolatedXdgStateHome = fs.mkdtempSync(path.join(os.tmpdir(), "skel-config-suite-"));
+process.env.XDG_STATE_HOME = isolatedXdgStateHome;
 after(() => {
-  if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
-  else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
-  fs.rmSync(isolatedXdgConfigHome, { recursive: true, force: true, maxRetries: 5 });
+  if (originalXdgStateHome === undefined) delete process.env.XDG_STATE_HOME;
+  else process.env.XDG_STATE_HOME = originalXdgStateHome;
+  fs.rmSync(isolatedXdgStateHome, { recursive: true, force: true, maxRetries: 5 });
 });
 
 function fixture(t) {
@@ -70,7 +75,7 @@ test("install/reinstall/uninstall owns only standalone ConfigChange commands", t
   const old = { matcher: "local_settings", hooks: [{ type: "command", command: 'node "/old/bin/skel-config-hook.mjs"' }, { type: "command", command: "echo shared" }] };
   fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { ConfigChange: [chained, empty, user, old] } }));
   const run = cmd => {
-    const out = spawnSync(process.execPath, [path.resolve("bin/skel.mjs"), cmd, project], { encoding: "utf8", env: { ...process.env, XDG_CONFIG_HOME: cfg } });
+    const out = spawnSync(process.execPath, [path.resolve("bin/skel.mjs"), cmd, project], { encoding: "utf8", env: { ...process.env, XDG_STATE_HOME: cfg } });
     assert.equal(out.status, 0, out.stderr);
     return JSON.parse(fs.readFileSync(settingsPath, "utf8"));
   };
@@ -122,7 +127,7 @@ test("malformed ConfigChange settings are refused before installer writes", t =>
   const original = JSON.stringify({ hooks: { ConfigChange: {} } });
   fs.writeFileSync(settingsPath, original);
   for (const cmd of ["install", "uninstall"]) {
-    const result = spawnSync(process.execPath, [path.resolve("bin/skel.mjs"), cmd, root], { encoding: "utf8", env: { ...process.env, XDG_CONFIG_HOME: path.join(root, "config") } });
+    const result = spawnSync(process.execPath, [path.resolve("bin/skel.mjs"), cmd, root], { encoding: "utf8", env: { ...process.env, XDG_STATE_HOME: path.join(root, "config") } });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /hooks.ConfigChange/);
     assert.equal(fs.readFileSync(settingsPath, "utf8"), original);
@@ -157,7 +162,7 @@ test("scope ignores malformed ancestors, repair asks, odd target paths stay harm
 test("blocked configuration notice persists, appears at Stop outside fill, and clears", t => {
   const root = fixture(t), config = path.join(root, "config");
   state(root, '{"phase":"fill"}');
-  const env = { ...process.env, CLAUDE_PROJECT_DIR: root, XDG_CONFIG_HOME: config };
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: root, XDG_STATE_HOME: config };
   const run = (entry, input) => spawnSync(process.execPath, [path.resolve("bin", entry)], { input: JSON.stringify(input), encoding: "utf8", env });
   const event = { cwd: root, source: "local_settings", file_path: "settings.local.json", content: "SECRET-MUST-NOT-STORE" };
   const blocked = run("skel-config-hook.mjs", event);
@@ -181,7 +186,7 @@ test("ignored malformed ancestors never own a sibling target with real fill", t 
 });
 test("approved external owner with broken state denies descendant target and permits repair", t => {
   const root = fixture(t), session = fixture(t), config = path.join(session, "config");
-  const env = { ...process.env, CLAUDE_PROJECT_DIR: session, XDG_CONFIG_HOME: config };
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: session, XDG_STATE_HOME: config };
   const cli = args => {
     const r = spawnSync(process.execPath, [path.resolve("bin/skel.mjs"), ...args], { cwd: root, env, encoding: "utf8" });
     assert.equal(r.status, 0, r.stderr); return r;

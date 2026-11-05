@@ -4,23 +4,30 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { approvalReceiptStatus, configPath } from "../lib/state.mjs";
+import { approvalReceiptStatus, storePath } from "../lib/state.mjs";
 import { configDecision } from "../lib/config-hook.mjs";
 import { spawnSync } from "node:child_process";
 import { enrollment } from "../lib/config-hook.mjs";
 import { configNoticePath, recordConfigNotice, takeConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 
+// Stores live in the state dir and migrate from the old config dir: keep every path out of the real ones.
+const isolatedHomes = fs.mkdtempSync(path.join(os.tmpdir(), "skel-suite-homes-"));
+process.env.XDG_CONFIG_HOME = path.join(isolatedHomes, "config");
+process.env.LOCALAPPDATA = path.join(isolatedHomes, "localappdata");
+process.env.XDG_STATE_HOME = path.join(isolatedHomes, "state");
+process.on("exit", () => { try { fs.rmSync(isolatedHomes, { recursive: true, force: true }); } catch {} });
+
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "status-notice-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const old = process.env.XDG_CONFIG_HOME;
-  process.env.XDG_CONFIG_HOME = path.join(root, "config");
-  t.after(() => { if (old === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = old; });
+  const old = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = path.join(root, "config");
+  t.after(() => { if (old === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = old; });
   return root;
 }
 test("broken config store cannot enroll absent skeleton, real bad state stays protected", t => {
   const root = fixture(t);
-  fs.writeFileSync(process.env.XDG_CONFIG_HOME, "not a directory");
+  fs.writeFileSync(process.env.XDG_STATE_HOME, "not a directory");
   assert.equal(enrollment(root).protected, false);
   fs.mkdirSync(path.join(root, ".skeleton"));
   fs.writeFileSync(path.join(root, ".skeleton/state.json"), '{');
@@ -29,7 +36,7 @@ test("broken config store cannot enroll absent skeleton, real bad state stays pr
 
 test("mode-000 config storage cannot enroll a project with no skeleton", { skip: process.platform === "win32" }, t => {
   const root = fixture(t);
-  const config = process.env.XDG_CONFIG_HOME;
+  const config = process.env.XDG_STATE_HOME;
   fs.mkdirSync(config);
   fs.chmodSync(config, 0);
   try {
@@ -47,7 +54,7 @@ test("mode-000 config storage cannot enroll a project with no skeleton", { skip:
 
 test("empty approval storage skips project realpaths and is indexed once per hook", t => {
   const root = fixture(t);
-  fs.mkdirSync(path.join(process.env.XDG_CONFIG_HOME, "skel"), { recursive: true });
+  fs.mkdirSync(path.join(process.env.XDG_STATE_HOME, "skel"), { recursive: true });
   const realpath = fs.realpathSync.native;
   const readdir = fs.readdirSync;
   let resolves = 0, listings = 0;
@@ -58,7 +65,7 @@ test("empty approval storage skips project realpaths and is indexed once per hoo
     assert.equal(approvalReceiptStatus(root, cache), "absent");
     assert.equal(approvalReceiptStatus(path.join(root, "uninitialized-child"), cache), "absent");
     assert.equal(resolves, 0);
-    assert.equal(listings, 1);
+    assert.equal(listings, 2, "once per store dir, the state dir and the old one");
   } finally {
     fs.realpathSync.native = realpath;
     fs.readdirSync = readdir;
@@ -111,7 +118,7 @@ test("phase repair asks when gate import fails; storage error still blocks reloa
   const code = `import {runHook} from ${JSON.stringify(module)}; await runHook({loadGate:async()=>{throw new Error("fault")}});`;
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { env, input: JSON.stringify({ cwd: root, tool_name: "Bash", tool_input: { command: "skel reshape" } }), encoding: "utf8" });
   assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, "ask");
-  fs.writeFileSync(process.env.XDG_CONFIG_HOME, "not a directory");
+  fs.writeFileSync(process.env.XDG_STATE_HOME, "not a directory");
   const blocked = spawnSync(process.execPath, [path.resolve("bin/skel-config-hook.mjs")], { env, input: JSON.stringify({ cwd: root, source: "local_settings" }), encoding: "utf8" });
   assert.equal(JSON.parse(blocked.stdout).decision, "block");
   assert.match(blocked.stderr, /notice/);
@@ -119,11 +126,11 @@ test("phase repair asks when gate import fails; storage error still blocks reloa
 
 test("status reports blocked reloads even with corrupt state, without a stack trace", t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "skel-status-notice-"));
-  const previous = process.env.XDG_CONFIG_HOME;
-  process.env.XDG_CONFIG_HOME = path.join(root, "config");
+  const previous = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = path.join(root, "config");
   t.after(() => {
-    if (previous === undefined) delete process.env.XDG_CONFIG_HOME;
-    else process.env.XDG_CONFIG_HOME = previous;
+    if (previous === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previous;
     fs.rmSync(root, { recursive: true, force: true });
   });
   fs.mkdirSync(path.join(root, ".skeleton"));
@@ -149,11 +156,11 @@ test("status reports blocked reloads even with corrupt state, without a stack tr
 
 test("malformed notices are ignored and notice storage failure cannot permit a reload", t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "skel-notice-failure-"));
-  const previous = process.env.XDG_CONFIG_HOME;
-  process.env.XDG_CONFIG_HOME = path.join(root, "config");
+  const previous = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = path.join(root, "config");
   t.after(() => {
-    if (previous === undefined) delete process.env.XDG_CONFIG_HOME;
-    else process.env.XDG_CONFIG_HOME = previous;
+    if (previous === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previous;
     fs.rmSync(root, { recursive: true, force: true });
   });
   fs.mkdirSync(path.join(root, ".skeleton"));
@@ -167,7 +174,7 @@ test("malformed notices are ignored and notice storage failure cannot permit a r
   const entry = fileURLToPath(new URL("../bin/skel-config-hook.mjs", import.meta.url));
   const result = spawnSync(process.execPath, [entry], {
     cwd: root, encoding: "utf8", input: JSON.stringify({ cwd: root, source: "local_settings" }),
-    env: { ...process.env, XDG_CONFIG_HOME: blockedConfig, CLAUDE_PROJECT_DIR: root },
+    env: { ...process.env, XDG_STATE_HOME: blockedConfig, CLAUDE_PROJECT_DIR: root },
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).decision, "block");
@@ -176,11 +183,11 @@ test("malformed notices are ignored and notice storage failure cannot permit a r
 
 test("an approval record protects a skeleton link redirected to a regular file", t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "skel-notice-link-"));
-  const previous = process.env.XDG_CONFIG_HOME;
-  process.env.XDG_CONFIG_HOME = path.join(root, "config");
+  const previous = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = path.join(root, "config");
   t.after(() => {
-    if (previous === undefined) delete process.env.XDG_CONFIG_HOME;
-    else process.env.XDG_CONFIG_HOME = previous;
+    if (previous === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previous;
     fs.rmSync(root, { recursive: true, force: true });
   });
   const target = path.join(root, "regular-file");
@@ -190,7 +197,7 @@ test("an approval record protects a skeleton link redirected to a regular file",
     if (["EPERM", "EACCES"].includes(err.code)) return t.skip("file symlinks require platform privilege");
     throw err;
   }
-  const receipt = configPath(root, ".snapshot");
+  const receipt = storePath(root, ".snapshot");
   fs.mkdirSync(path.dirname(receipt), { recursive: true });
   fs.writeFileSync(receipt, "{}");
   assert.equal(configDecision({ cwd: root }, root).decision, "block");
