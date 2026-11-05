@@ -2355,8 +2355,9 @@ test("issue #25 (2) review S1: a record in main's format (no `format` marker, `f
     files[rel] = { sha256: hash(ext.lines), lines: ext.lines };
     for (const f of ext.fences) fences.push({ file: rel, id: f.id, title: f.title });
   }
-  const { format, ...rest } = snap;
-  assert.equal(format, 2, "this PR writes the marker");
+  const { format, coverage, ...rest } = snap;
+  assert.equal(format, 3, "this PR writes the marker");
+  assert.ok(coverage, "and the baseline that goes with it");
   fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...rest, files, fences }));
   assert.ok(readSnapshot(dir) && readSnapshot(dir).format === undefined && Array.isArray(readSnapshot(dir).fenced));
   assert.doesNotMatch(run("status"), /drift/, "no false drift after the upgrade");
@@ -2364,7 +2365,7 @@ test("issue #25 (2) review S1: a record in main's format (no `format` marker, `f
   fs.writeFileSync(a, SRC.replaceAll(STUB, "return [];"));
   assert.doesNotMatch(run("status"), /drift/, "step bodies still dropped");
   // An unknown format fails closed.
-  fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...rest, files, fences, format: 3 }));
+  fs.writeFileSync(snapshotPath(dir), JSON.stringify({ ...rest, files, fences, format: 4 }));
   assert.equal(readSnapshot(dir), null);
   assert.ok(n);
 });

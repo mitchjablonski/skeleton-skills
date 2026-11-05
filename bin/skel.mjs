@@ -23,8 +23,9 @@ import {
 import { discardUnusedStateDirFiles, migrateProject, migrationPlan } from "../lib/migrate.mjs";
 import { storeNotice } from "../lib/store-notice.mjs";
 import {
-  clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
+  clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, readSnapshot, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
 } from "../lib/snapshot.mjs";
+import { captureSourceSet, completionAdvice, coverageGap, describeCoverage, verifyCompletion } from "../lib/source-set.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Forward slashes on every platform: these land in shell commands and skill text.
@@ -104,9 +105,10 @@ function snapshot(root, state = requireState(root)) {
 }
 
 /** Refuse when the working tree has drifted from the approved skeleton. */
-function requireNoDrift(root, state, fencedFiles, what) {
-  const drift = verifySnapshot(root, state, fencedFiles);
-  if (!drift.ok) die(`can't ${what}: ${formatDrift(drift)}`);
+async function requireNoDrift(root, state, fencedFiles, what) {
+  const { drift, gap, failure } = await verifyCompletion(root, state, fencedFiles);
+  if (!drift.ok) die(`can't ${what}: ${formatDrift(drift)}${completionAdvice(drift.items)}${gap ? `\n${gap}` : ""}`);
+  if (gap || failure) die(`can't ${what}: ${gap ?? failure}`);
 }
 
 /** Why approve refuses a stale review: what changed since the version the human saw. */
@@ -470,10 +472,15 @@ const commands = {
       die(error);
     }
     const { steps, errors, files } = snapshot(root);
+    // The skeleton's own files only: agents run this constantly, and discovery and hashing every member can take many seconds.
     const drift = state.phase === "fill" ? verifySnapshot(root, state, files) : null;
+    const record = state.phase === "fill" && !drift.reason ? readSnapshot(root) : null;
+    const gap = record && coverageGap(record);
+    const coverage = record && !gap ? record.coverage : null;
+    const sourceCheck = { ...(gap ? { coverageGap: gap } : {}), ...(coverage ? { coverage: { id: coverage.id, policy: coverage.policy, mode: coverage.discovery.mode, fullCheck: "done and finalize" } } : {}) };
     const stores = await storeNotice(root);
     if (args.includes("--json")) {
-      console.log(JSON.stringify({ ...state, errors, drift, configNotice, ...(stores ? { storeNotice: stores } : {}), steps: steps.map(({ fences, ...s }) => ({
+      console.log(JSON.stringify({ ...state, errors, drift, ...sourceCheck, configNotice, ...(stores ? { storeNotice: stores } : {}), steps: steps.map(({ fences, ...s }) => ({
         ...s, fences: fences.map(({ body, ...f }) => f),
       })) }, null, 2));
       return;
@@ -488,6 +495,8 @@ const commands = {
     for (const e of errors) console.log(`  ! ${e}`);
     if (stores) console.log(`  ! ${stores}`);
     if (drift && !drift.ok) console.log(`  ! ${formatDrift(drift).replace(/\n/g, "\n    ")}\n    (skel done and skel finalize refuse until it's resolved)`);
+    if (gap) console.log(`  ! ${gap}`);
+    if (coverage) console.log(`  (this checked the skeleton's own files; the full check of source baseline ${coverage.id} runs at done/finalize)`);
     // Diagram nodes named step_<id> that match no step are silently uncolored
     // on the page; say so here.
     for (const d of readDiagrams(root)) {
@@ -723,10 +732,14 @@ const commands = {
     // human authority: that what is approved is the version the human
     // last reviewed, so an edit made after their "looks good" can't ride along.
     // A tracked file's malformed markers throw SKEL_MARKERS; anything else is I/O.
-    let record;
+    // One discovery and one read: the record and the baseline hold the same bytes.
+    let record, source;
+    const sourceStart = Date.now();
     try {
-      record = recordSkeleton(root, state, files, undefined, { strict: true });
+      source = await captureSourceSet(root, state, files);
+      record = recordSkeleton(root, state, files, source.read, { strict: true });
     } catch (err) {
+      if (err.code === "SKEL_SOURCE") die(`can't approve: ${err.message}`);
       if (err.code === "SKEL_MARKERS") die(`fix marker errors first:\n  ${err.message}`);
       die(`couldn't read the skeleton to record it: ${err.message}`);
     }
@@ -750,9 +763,12 @@ const commands = {
     if (review && review.version !== record.version) die(staleReview(root, state, files, review.version, review.how));
     if (!review) console.log(`note: no reviewed version given (pass --reviewed <v> from the "Reviewed skeleton version" line of the feedback the human pasted), no send on record, and ${storeError ? `the rendered-versions store couldn't be read (${storeError}), so there's no rendered version to check against` : "no review page was ever rendered for this project"}. Approving on the human's word alone.`);
     console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
+    for (const line of describeCoverage(source.coverage, Object.keys(record.files).length)) console.log(line);
+    const sourceTook = Date.now() - sourceStart;
+    if (sourceTook > 3000) console.log(`  note: reading the source set took ${(sourceTook / 1000).toFixed(1)}s. \`done\` and \`finalize\` re-read it.`);
     const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
     try {
-      writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at });
+      writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at }, source.coverage);
     } catch (err) {
       die(`couldn't record the approved skeleton: ${err.message}`);
     }
@@ -808,7 +824,7 @@ const commands = {
     if (!state.activeStep) die("no active step");
     const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
-    requireNoDrift(root, state, files, `finish step ${state.activeStep}`);
+    await requireNoDrift(root, state, files, `finish step ${state.activeStep}`);
     const step = steps.find((s) => s.id === state.activeStep);
     if (!step) die(`step ${state.activeStep}'s fence is gone — its markers were removed or broken`);
     if (step.status === "todo") {
@@ -843,14 +859,14 @@ const commands = {
     console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
   },
 
-  finalize() {
+  async finalize() {
     const root = requireRoot();
     const state = requireState(root);
     const phase = state.phase;
     if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");
     const { fences, errors, files: fenced } = scanSkeleton(root, state);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
-    requireNoDrift(root, state, fenced, "finalize");
+    await requireNoDrift(root, state, fenced, "finalize");
     const pending = fences.filter((f) => f.status === "todo");
     if (pending.length) die(`still pending: ${pending.map((f) => `${f.id} (${f.file}:${f.openLine})`).join(", ")}`);
     const files = [...new Set(fences.map((f) => f.file))];
