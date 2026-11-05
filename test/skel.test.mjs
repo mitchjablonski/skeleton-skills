@@ -1153,7 +1153,8 @@ test("#15: approve refuses when the skeleton changed after the human's review on
   let v2;
   try {
     const v1 = pageData(srv.html).skeletonVersion;
-    await post(srv.url, { verdict: "approve", general: "", comments: [], version: v1 }, h);
+    const sent = await post(srv.url, { verdict: "approve", general: "", comments: [], version: v1 }, h);
+    assert.equal(sent.status, 204, `feedback POST failed: ${sent.status} ${await sent.text()}`);
     assert.match(failure(() => run("approve")), /feedback you haven't read yet[\s\S]*skel feedback/, "unread sends come first");
     run("feedback");
     // The agent edits the skeleton after the human's "looks good".
