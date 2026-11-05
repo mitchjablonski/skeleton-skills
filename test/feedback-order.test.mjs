@@ -208,3 +208,18 @@ test("CLI retains earlier round notes without canonical approval, current review
   assert.equal(approved.status, 0, approved.stderr);
   assert.doesNotMatch(approved.stdout, /legacy feedback ordering is unknown/);
 });
+test("restored state without round never promotes queued modern approval", t => {
+  const { root, cli } = fixture(t);
+  send(root, 1, "111111111111");
+  const file = path.join(root, ".skeleton/state.json");
+  const state = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete state.reviewRound;
+  fs.writeFileSync(file, JSON.stringify(state));
+  const before = fs.readFileSync(file, "utf8");
+  const result = cli("feedback");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /note/);
+  assert.doesNotMatch(result.stdout, /Verdict: APPROVED/);
+  assert.match(result.stdout, /Reviewed skeleton version: unknown/);
+  assert.equal(fs.readFileSync(file, "utf8"), before);
+});
