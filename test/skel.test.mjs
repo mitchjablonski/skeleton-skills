@@ -8,7 +8,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { scanFiles, scanText, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
-import { cleanFeedback, feedbackMarkdown, projectKey, sessionStorePath, storePath } from "../lib/feedback.mjs";
+import { cleanFeedback, feedbackMarkdown, newServeSession, projectKey, sessionStorePath, storePath } from "../lib/feedback.mjs";
 import { migrateProject, planMigration } from "../lib/migrate.mjs";
 import { compareWith, exterior, lineDiff, readRendered, readSnapshot, recordSkeleton, renderedPath, safeKey, scanSkeleton, snapshotPath, whitespaceOnly } from "../lib/snapshot.mjs";
 import { buildReviewData } from "../lib/review.mjs";
@@ -247,12 +247,17 @@ function project(parent) {
   return { dir, a, run, hook };
 }
 
-/** Start `skel serve`, return its url, the page token, and a stop function. */
-async function serve(dir, args = ["--send"], env = {}) {
+/**
+ * Start `skel serve`, return its url, the token from the fragment it printed,
+ * the page shell and the client script, the data the page reads with the token
+ * (`data`; `read()` for a fresh read, which counts as a page view; `version()`
+ * for a poll), and a stop function. `view: false` skips the first read.
+ */
+async function serve(dir, args = ["--send"], env = {}, { view = true } = {}) {
   const child = spawn("node", [BIN, "serve", ...args], { cwd: dir, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
   let err = "";
   child.stderr.on("data", (d) => { err += d; });
-  const url = await new Promise((resolve, reject) => {
+  const printed = await new Promise((resolve, reject) => {
     let out = "";
     child.stdout.on("data", (d) => {
       out += d;
@@ -262,12 +267,17 @@ async function serve(dir, args = ["--send"], env = {}) {
     child.stderr.on("data", (d) => { out += d; });
     child.on("exit", () => reject(new Error("serve exited: " + out)));
   });
+  const url = new URL("/", printed).href;
+  const token = /^#t=([0-9a-f]+)$/.exec(new URL(printed).hash)?.[1];
+  const headers = { "x-skeleton-token": token };
+  const read = async () => (await fetch(new URL("/api/data", url), { headers })).json();
+  const version = async () => (await fetch(new URL("/api/version", url), { headers })).json();
   const html = await (await fetch(url)).text();
-  const data = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1].replace(/\\u003c/g, "<"));
-  const token = data.token;
+  const client = await (await fetch(new URL("/assets/review.js", url))).text();
+  const data = view ? await read() : null;
   // Wait for the server to exit, so no keep-alive socket outlives the test.
   const stop = () => new Promise((resolve) => { if (child.exitCode !== null || child.signalCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
-  return { url, token, html, data, stderr: () => err, stop };
+  return { url, printed, token, html, client, data, read, version, stderr: () => err, stop };
 }
 
 const post = (url, body, headers) => fetch(new URL("/api/feedback", url), { method: "POST", headers, body: JSON.stringify(body) });
@@ -279,14 +289,14 @@ test("serve defaults to read-only without a feedback session and tolerates an un
   fs.writeFileSync(blockedConfig, "not a directory");
   const srv = await serve(dir, [], { ...process.env, XDG_STATE_HOME: blockedConfig });
   try {
-    assert.equal(srv.token, null);
+    assert.match(srv.token, /^[0-9a-f]{48}$/, "read-only needs a token too: it guards the reads");
     assert.equal(srv.data.feedbackEnabled, false);
-    const version = await (await fetch(new URL("api/version", srv.url))).json();
+    const version = await srv.version();
     assert.equal(version.feedbackEnabled, false);
     fs.appendFileSync(path.join(dir, "src", "a.ts"), "\n// live read-only edit\n");
-    const changed = await (await fetch(new URL("api/version", srv.url))).json();
+    const changed = await srv.version();
     assert.notEqual(changed.version, version.version);
-    assert.match(await (await fetch(srv.url)).text(), /live read-only edit/);
+    assert.match(JSON.stringify(await srv.read()), /live read-only edit/);
     assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".skeleton", "serve.json"))).feedbackEnabled, false);
     assert.equal(fs.existsSync(sessionStorePath(dir)), false);
     assert.equal((await post(srv.url, { verdict: "approve", general: "valid", comments: [] }, {
@@ -301,12 +311,12 @@ test("serve reuses the same mode and restarts when feedback mode changes", async
   run("init", "T");
   const readonly = await serve(dir, []);
   try {
-    const first = await (await fetch(new URL("api/version", readonly.url))).json();
+    const first = await readonly.version();
     assert.match(run("serve"), /read-only; already running/);
-    assert.equal((await (await fetch(new URL("api/version", readonly.url))).json()).serverId, first.serverId);
+    assert.equal((await readonly.version()).serverId, first.serverId);
     const sending = await serve(dir);
     try {
-      const second = await (await fetch(new URL("api/version", sending.url))).json();
+      const second = await sending.version();
       assert.equal(second.feedbackEnabled, true);
       assert.equal(sending.data.feedbackEnabled, true);
       assert.equal(typeof sending.token, "string");
@@ -317,7 +327,7 @@ test("serve reuses the same mode and restarts when feedback mode changes", async
       })).status, 204);
       const again = await serve(dir, []);
       try {
-        const third = await (await fetch(new URL("api/version", again.url))).json();
+        const third = await again.version();
         assert.equal(third.feedbackEnabled, false);
         assert.notEqual(third.serverId, second.serverId);
         assert.match(run("serve"), /read-only; already running/);
@@ -370,7 +380,9 @@ test("security H4: serve refuses cross-site posts, bad hosts, and missing tokens
       });
     });
     assert.equal(rebound, 421, "DNS rebinding");
-    assert.doesNotMatch(srv.html, new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "page never carries the project path");
+    const inPage = new RegExp(JSON.stringify(dir).slice(1, -1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    assert.doesNotMatch(srv.html, inPage, "the shell never carries the project path");
+    assert.doesNotMatch(JSON.stringify(srv.data), inPage, "nor does the data");
     assert.equal((await post(srv.url, body, ok)).status, 204);
   } finally {
     await srv.stop();
@@ -903,11 +915,11 @@ test("PR#1 #6/#9: the page embeds its version, serves fresh tracked files, and k
   let port;
   try {
     port = new URL(first.url).port;
-    await fetch(new URL("/api/version", first.url));
+    await first.version();
     fs.writeFileSync(path.join(dir, "src", "types.ts"), "NEW_VERSION\n");
-    const html = await (await fetch(first.url)).text();
-    assert.match(html, /NEW_VERSION/);
-    assert.match(html, /"version":"[0-9a-f]{12}"/);
+    const page = JSON.stringify(await first.read());
+    assert.match(page, /NEW_VERSION/);
+    assert.match(page, /"version":"[0-9a-f]{12}"/);
   } finally {
     await first.stop();
   }
@@ -1120,7 +1132,7 @@ test("#15: the page shows the skeleton version, and sent or copied feedback carr
   run("init", "T");
   const srv = await serve(dir);
   try {
-    const data = pageData(srv.html);
+    const data = srv.data;
     assert.match(data.skeletonVersion, /^[0-9a-f]{12}$/);
     assert.equal(data.skeletonVersion, recordSkeleton(dir, { files: [] }, ["src/a.ts"]).version, "the same exteriors + fence set approve records");
     assert.equal(data.record, undefined, "the page doesn't carry the raw record");
@@ -1152,7 +1164,7 @@ test("#15: approve refuses when the skeleton changed after the human's review on
   const h = { "content-type": "application/json", "x-skeleton-token": srv.token };
   let v2;
   try {
-    const v1 = pageData(srv.html).skeletonVersion;
+    const v1 = srv.data.skeletonVersion;
     const sent = await post(srv.url, { verdict: "approve", general: "", comments: [], version: v1 }, h);
     assert.equal(sent.status, 204, `feedback POST failed: ${sent.status} ${await sent.text()}`);
     assert.match(failure(() => run("approve")), /feedback you haven't read yet[\s\S]*skel feedback/, "unread sends come first");
@@ -1166,7 +1178,7 @@ test("#15: approve refuses when the skeleton changed after the human's review on
     assert.match(err, /src\/a\.ts:3\n\s+- export function smooth\(raw: Point\[\]\): Point\[\] \{\n\s+\+ export function smooth\(raw: Point\[\], k: number\)/, "with the diff");
     assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".skeleton", "state.json"), "utf-8")).phase, "scaffold");
     // The human reloads, sees the new version, and approves it.
-    const page = pageData(await (await fetch(srv.url)).text());
+    const page = await srv.read();
     v2 = page.skeletonVersion;
     assert.notEqual(v2, v1);
     await post(srv.url, { verdict: "approve", general: "", comments: [], version: v2 }, h);
@@ -1303,7 +1315,7 @@ test("issue #6 N6: serve warns and keeps serving when the session store can't be
   fs.writeFileSync(blocked, "");
   const srv = await serve(dir, ["--send"], { XDG_STATE_HOME: blocked });
   try {
-    assert.equal((await fetch(new URL("/api/version", srv.url))).status, 200);
+    assert.equal(typeof (await srv.version()).serverId, "string");
     assert.match(srv.stderr(), /can't record this review session/);
     const res = await post(srv.url, { verdict: null, general: "x", comments: [] }, { "content-type": "application/json", "x-skeleton-token": srv.token });
     assert.equal(res.status, 503, "a send that would be quarantined is refused, not acknowledged");
@@ -1349,7 +1361,7 @@ if (process.argv.includes("__candidates")) {
     SKEL_TEST_SEARCH_LOG: searchLog,
   });
   try {
-    const before = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
+    const before = (await srv.version()).version;
     fs.writeFileSync(path.join(dir, "src", "late.ts"), "export function late() {\n  // SKEL[9] late\n  throw new Error(\"SKEL_TODO\");\n  // /SKEL[9]\n}\n");
     const searchCounts = () => {
       if (!fs.existsSync(searchLog)) return { started: 0, finished: 0 };
@@ -1363,7 +1375,7 @@ if (process.argv.includes("__candidates")) {
     const launchDeadline = Date.now() + 20_000;
     let launched = false;
     while (Date.now() < launchDeadline && !launched) {
-      await (await fetch(srv.url)).text();
+      await srv.read();
       launched = searchCounts().started > beforeSearch.started;
       if (!launched) await new Promise((r) => setTimeout(r, 250));
     }
@@ -1376,10 +1388,10 @@ if (process.argv.includes("__candidates")) {
     let version = before;
     for (const deadline = Date.now() + 60_000; version === before && Date.now() < deadline; ) {
       await new Promise((r) => setTimeout(r, 200));
-      version = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
+      version = (await srv.version()).version;
     }
     assert.notEqual(version, before, "the page-triggered rescan should publish the new fenced file");
-    assert.match(await (await fetch(srv.url)).text(), /late\.ts/);
+    assert.match(JSON.stringify(await srv.read()), /late\.ts/);
   } finally {
     await srv.stop();
   }
@@ -1655,7 +1667,7 @@ test("review #10 nit 1: a tracked file the scan excludes never becomes a step af
   assert.equal(buildReviewData(dir, state).steps.length, 2);
   const srv = await serve(dir);
   try {
-    assert.deepEqual(pageData(srv.html).steps.map((s) => s.id), ["1", "2"], "the live page agrees");
+    assert.deepEqual(srv.data.steps.map((s) => s.id), ["1", "2"], "the live page agrees");
   } finally {
     await srv.stop();
   }
@@ -1694,8 +1706,8 @@ test("review #10 nit 2: buildReviewData with and without `known` agree for a tra
   }
   const srv = await serve(dir);
   try {
-    assert.deepEqual(ids(pageData(srv.html)), ["1", "2"]);
-    assert.deepEqual(ids(pageData(await (await fetch(srv.url)).text())), ["1", "2"], "and on a poll");
+    assert.deepEqual(ids(srv.data), ["1", "2"]);
+    assert.deepEqual(ids(await srv.read()), ["1", "2"], "and on a poll");
   } finally {
     await srv.stop();
   }
@@ -1908,7 +1920,7 @@ test("read-only feedback wait returns immediately, drains pending sends, and sto
     })).status, 204);
     const readonly = await serve(dir, []);
     try {
-      const version = await (await fetch(new URL("api/version", readonly.url))).json();
+      const version = await readonly.version();
       assert.equal(readonly.data.serverId, version.serverId);
       assert.equal(readonly.data.feedbackEnabled, false);
       const feedback = () => execFileSync("node", [BIN, "feedback", "--wait", "110"], {
@@ -1938,10 +1950,10 @@ test("legacy version metadata without feedbackEnabled is send-mode and restarts 
     fs.writeFileSync(path.join(dir, ".skeleton", "serve.json"), JSON.stringify({
       url: `http://127.0.0.1:${port}/`, serverId: "legacy", pid: legacy.pid,
     }));
-    assert.match(run("serve", "--send"), /feedback enabled; already running/);
+    assert.match(run("feedback"), /NO_FEEDBACK/, "send-mode: not READ_ONLY");
     const readonly = await serve(dir, []);
     try {
-      const version = await (await fetch(new URL("api/version", readonly.url))).json();
+      const version = await readonly.version();
       assert.notEqual(version.serverId, "legacy");
       assert.equal(version.feedbackEnabled, false);
     } finally { await readonly.stop(); }
@@ -1964,7 +1976,7 @@ test("B1/NIT3: the page's poll, fed the live server's real /api/version, leaves 
   try {
     const built = { version: srv.data.version, skeletonVersion: srv.data.skeletonVersion };
     assert.match(built.version, /^[0-9a-f]{12}$/, "a served page embeds its content version");
-    const answer = async () => (await fetch(new URL("api/version", srv.url))).json();
+    const answer = () => srv.version();
     const fresh = await answer();
     assert.equal(typeof fresh, "object", "#14: /api/version answers an object");
     assert.equal(fresh.skeletonVersion, built.skeletonVersion);
@@ -1986,8 +1998,8 @@ test("B1/NIT3: the page's poll, fed the live server's real /api/version, leaves 
     assert.deepEqual(skelPollDecision(built, shape, true), { reload: false, stale: true });
     assert.deepEqual(skelPollDecision(built, shape, false), { reload: true, stale: false });
   } finally { await srv.stop(); }
-  // The page runs exactly this function: inlined ahead of the client, called by its poll.
-  assert.match(srv.html, /function skelPollDecision\(built, next, busy\)[\s\S]*skelPollDecision\(built, next, typing\(\) \|\| !!openEditor\)/);
+  // The page runs exactly this function: shipped ahead of the client, called by its poll.
+  assert.match(srv.client, /function skelPollDecision\(built, next, busy\)[\s\S]*skelPollDecision\(built, next, typing\(\) \|\| !!openEditor\)/);
 });
 
 test("S1: plain approve under the read-only default checks the version the page last rendered", () => {
@@ -2296,7 +2308,7 @@ test("issue #25 (1): serve picks up a tracked file that gains fences on the next
     // Within 5s of the server's search, so a page load doesn't start another:
     // only the poll can find the new fences.
     for (const f of ["src/types.ts", "src/ignored.ts", ".claude/notes.md"]) fs.writeFileSync(path.join(dir, f), FENCED_N.replace("SKEL[g]", `SKEL[${f.length}]`).replace("/SKEL[g]", `/SKEL[${f.length}]`));
-    const ids = pageData(await (await fetch(srv.url)).text()).steps.map((s) => s.id);
+    const ids = (await srv.read()).steps.map((s) => s.id);
     assert.ok(ids.includes(String("src/types.ts".length)), `the tracked file's fence is a step at once (${ids})`);
     assert.ok(!ids.includes(String("src/ignored.ts".length)), "a gitignored tracked file's fences aren't steps (the CLI agrees)");
     assert.ok(!ids.includes(String(".claude/notes.md".length)), "nor a tracked doc's under .claude/");
@@ -2444,19 +2456,19 @@ test("#14 N2/N3: a mode change defers its reload while a note is typed, Overall 
   const sending = await serve(dir);
   try {
     const page = { serverId: sending.data.serverId, feedbackEnabled: sending.data.feedbackEnabled };
-    const same = await (await fetch(new URL("api/version", sending.url))).json();
+    const same = await sending.version();
     for (const busy of [false, true]) assert.deepEqual(skelModeDecision(page, same, busy), { changed: false, reload: false });
     const readonly = await serve(dir, []);
     try {
-      const next = await (await fetch(new URL("api/version", readonly.url))).json();
+      const next = await readonly.version();
       assert.deepEqual(skelModeDecision(page, next, false), { changed: true, reload: true });
       assert.deepEqual(skelModeDecision(page, next, true), { changed: true, reload: false }, "typing (inline editor or Overall notes): wait");
       assert.deepEqual(skelModeDecision(page, { ...same, serverId: "other" }, true), { changed: true, reload: false }, "a same-mode restart also waits");
       // The page calls it with the same busy flag as the version check, and
       // a changed mode never falls back to the static page's hint.
-      assert.match(readonly.html, /skelModeDecision\(data, next, typing\(\) \|\| !!openEditor\)/);
-      assert.match(readonly.html, /canSend \? "" : h\("div", \{ class: "hint", "data-send-hint": true \}, modeChanged\s*\? MODE_CHANGED_HINT/);
-      assert.match(readonly.html, /if \(!hint && sendButton\) \{ hint = h\("div"[^]*sendButton\.after\(hint\)/, "a deferred Send page gets the hint in place");
+      assert.match(readonly.client, /skelModeDecision\(data, next, typing\(\) \|\| !!openEditor\)/);
+      assert.match(readonly.client, /canSend \? "" : h\("div", \{ class: "hint", "data-send-hint": true \}, lockedOut\s*\? LOCKED_HINT\s*: modeChanged\s*\? MODE_CHANGED_HINT/);
+      assert.match(readonly.client, /if \(!hint && sendButton\) \{ hint = h\("div"[^]*sendButton\.after\(hint\)/, "a deferred Send page gets the hint in place");
     } finally { await readonly.stop(); }
   } finally { await sending.stop(); }
 });
@@ -2524,17 +2536,17 @@ test("#32: a live skel serve poll stops serving a known file swapped for a link 
   run("init", "T");
   const srv = await serve(dir);
   try {
-    assert.match(srv.html, /lib\/evil\.ts/);
-    const before = (await (await fetch(new URL("api/version", srv.url))).json()).version;
+    assert.match(JSON.stringify(srv.data), /lib\/evil\.ts/);
+    const before = (await srv.version()).version;
     // A file link needs a privilege on Windows; a junction over the folder doesn't.
     swap(canSymlink ? "file" : "dir");
     let version = before;
     for (const deadline = Date.now() + 4_000; version === before && Date.now() < deadline; ) {
       await new Promise((r) => setTimeout(r, 100));
-      version = (await (await fetch(new URL("api/version", srv.url))).json()).version;
+      version = (await srv.version()).version;
     }
     assert.notEqual(version, before, "the poll notices the swap");
-    const html = await (await fetch(srv.url)).text();
+    const html = JSON.stringify(await srv.read());
     assert.doesNotMatch(html, new RegExp(OUTSIDE));
     assert.doesNotMatch(html, /lib\/evil\.ts/);
   } finally {
@@ -2590,6 +2602,214 @@ test("#32: scanFiles skips FIFOs, dangling links and directories, follows in-pro
   assert.deepEqual(after.files, expect.filter((f) => !f.startsWith("sub/")));
   assert.doesNotMatch(JSON.stringify(after), /XXXX/);
   assert.equal(cache.has(a), false);
+});
+
+// ---- #39: the read surface: fragment token, authenticated reads, a CSP ----
+
+const authGet = (url, route, token) => fetch(new URL(route, url), token === undefined ? {} : { headers: { "x-skeleton-token": token } });
+const printedUrl = (out) => /skel review: (http:\/\/\S+)/.exec(out)[1];
+const MARK = "export function smooth";
+
+test("#39: without the token, /api/data and /api/version refuse and leak nothing", async () => {
+  const { dir, run } = project();
+  run("init", "Secret title");
+  const srv = await serve(dir, []);
+  try {
+    assert.ok(JSON.stringify(srv.data).includes(MARK), "with the token, the data has the source");
+    const secrets = [MARK, "Secret title", srv.data.serverId, srv.data.skeletonVersion, srv.data.version, srv.data.reviewKey, srv.token];
+    const wrong = [undefined, "", "guess", srv.token.slice(0, -1), srv.token + "0", srv.token.toUpperCase()];
+    for (const route of ["/api/data", "/api/version"]) {
+      for (const token of wrong) {
+        const res = await authGet(srv.url, route, token);
+        assert.equal(res.status, 401, `${route} with ${token}`);
+        const body = await res.text();
+        for (const secret of secrets) assert.ok(!body.includes(secret), `${route} leaks ${secret}`);
+      }
+      // A token in the URL would land in logs and request lines: it isn't one.
+      assert.equal((await authGet(srv.url, `${route}?t=${srv.token}`)).status, 404);
+      assert.equal((await authGet(srv.url, route, srv.token)).status, 200);
+    }
+  } finally { await srv.stop(); }
+});
+
+test("#39: the shell and client hold no source and no token; the token is in the fragment and serve.json only", async () => {
+  const { dir, run } = project();
+  run("init", "Secret title");
+  fs.mkdirSync(path.join(dir, ".skeleton", "diagrams"));
+  fs.writeFileSync(path.join(dir, ".skeleton", "diagrams", "arch.mmd"), "flowchart LR\n  SecretNode-->B\n");
+  const srv = await serve(dir);
+  try {
+    assert.match(srv.printed, /^http:\/\/127\.0\.0\.1:\d+\/#t=[0-9a-f]{48}$/);
+    for (const text of [srv.html, srv.client]) {
+      for (const secret of [MARK, "Secret title", "SecretNode", srv.token, srv.data.serverId, srv.data.reviewKey, dir]) {
+        assert.ok(!text.includes(secret), `the page's public parts hold ${secret}`);
+      }
+    }
+    assert.ok(!JSON.stringify(srv.data).includes(srv.token), "and the data doesn't carry the token");
+    assert.doesNotMatch(srv.html, /<script(?![^>]*\bsrc=)/, "no inline script");
+    assert.doesNotMatch(srv.html, /\son\w+=/, "no inline handler");
+    const serveJson = JSON.parse(fs.readFileSync(path.join(dir, ".skeleton", "serve.json"), "utf-8"));
+    assert.equal(serveJson.token, srv.token);
+    assert.equal(serveJson.url, srv.url, "the recorded url has no fragment: messages can print it");
+    // An unknown route, or a path into the project, serves nothing.
+    assert.equal((await fetch(new URL("/src/a.ts", srv.url))).status, 404);
+    assert.equal((await fetch(new URL("/.skeleton/serve.json", srv.url))).status, 404);
+  } finally { await srv.stop(); }
+});
+
+test("#39: the page reads a token from the fragment and leaves other fragments alone", () => {
+  const { skelTokenFromHash } = new Function(fs.readFileSync(path.join(path.dirname(BIN), "..", "lib", "review-poll.js"), "utf-8") + "\nreturn { skelTokenFromHash };")();
+  const token = "ab".repeat(24);
+  assert.equal(skelTokenFromHash(`#t=${token}`), token);
+  for (const other of ["", "#", "#review-panel", "#t=", "#t=short", "#t=abcdef", `#t=${"ab".repeat(15)}`, `#t=${token}&x=1`, `#x=${token}`, "#t=<script>aaaaaaaaaaaaaaaa"]) {
+    assert.equal(skelTokenFromHash(other), null, other);
+  }
+});
+
+test("#39: the shell carries the CSP, and the client asks for only what it allows", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const srv = await serve(dir, []);
+  try {
+    const res = await fetch(srv.url);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    assert.equal(res.headers.get("referrer-policy"), "no-referrer");
+    assert.equal(res.headers.get("x-frame-options"), "DENY");
+    const csp = Object.fromEntries(res.headers.get("content-security-policy").split("; ").map((d) => { const [k, ...v] = d.split(" "); return [k, v.join(" ")]; }));
+    assert.equal(csp["default-src"], "'none'");
+    assert.equal(csp["connect-src"], "'self'");
+    assert.equal(csp["frame-ancestors"], "'none'");
+    assert.equal(csp["script-src"], "'self' https://cdn.jsdelivr.net/npm/mermaid@10.9.8/dist/mermaid.min.js", "only the pinned file; no inline script, no eval");
+    assert.equal(csp["style-src"], "'unsafe-inline'", "Mermaid injects styles");
+    const js = await fetch(new URL("/assets/review.js", srv.url));
+    assert.match(js.headers.get("content-type"), /javascript/);
+    assert.equal(js.headers.get("x-content-type-options"), "nosniff");
+  } finally { await srv.stop(); }
+  assert.doesNotMatch(srv.client, /\son\w+="/, "no inline handler in what the client builds");
+});
+
+test("#39: one token: it reads and it sends, and the POST's other checks are unchanged", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const srv = await serve(dir);
+  try {
+    const ok = { "content-type": "application/json", "x-skeleton-token": srv.token };
+    const body = { verdict: null, general: "n", comments: [] };
+    assert.equal((await post(srv.url, body, ok)).status, 204);
+    assert.equal((await post(srv.url, body, { ...ok, origin: new URL(srv.url).origin })).status, 204, "same origin");
+    assert.equal((await post(srv.url, body, { ...ok, origin: "http://evil.example" })).status, 403, "another origin");
+    assert.equal((await post(srv.url, body, { ...ok, "content-type": "text/plain" })).status, 403, "not JSON");
+    assert.equal((await post(srv.url, body, { "content-type": "application/json" })).status, 403, "no token");
+    assert.equal((await post(srv.url, body, { ...ok, "x-skeleton-token": "guess" })).status, 403, "wrong token");
+  } finally { await srv.stop(); }
+});
+
+test("#39: only the authenticated read counts as a page view, and approve's rendered fallback still works", async () => {
+  const { dir, a, run } = project();
+  run("init", "T");
+  const srv = await serve(dir, [], {}, { view: false });
+  try {
+    await fetch(srv.url);
+    await authGet(srv.url, "/api/data");
+    await srv.version();
+    assert.deepEqual(readRendered(dir), [], "a shell, a refused read or a poll shows the human nothing");
+    const { skeletonVersion } = await srv.read();
+    assert.equal(readRendered(dir)[0].version, skeletonVersion);
+    // The fallback refuses a skeleton that changed after the page view...
+    const before = fs.readFileSync(a, "utf-8");
+    fs.writeFileSync(a, before.replace(SIG, "smooth(raw: Point[], k: number): Point[]"));
+    assert.match(failure(() => run("approve")), new RegExp(`the review page last showed skeleton version ${skeletonVersion}`));
+    fs.writeFileSync(a, before);
+    // ...and approves the version it showed.
+    assert.match(run("approve"), new RegExp(`version ${skeletonVersion} \\(the version the review page last showed\\)`));
+  } finally { await srv.stop(); }
+});
+
+test("#39: a reused server's URL works, and the CLI finds the server only with its token", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const srv = await serve(dir, []);
+  const servePathOf = path.join(dir, ".skeleton", "serve.json");
+  try {
+    const out = run("serve");
+    assert.match(out, /already running/);
+    assert.equal(printedUrl(out), srv.printed, "the printed URL carries the running server's token");
+    assert.equal((await authGet(srv.url, "/api/data", new URL(printedUrl(out)).hash.slice(3))).status, 200);
+    assert.match(execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 5000 }), /READ_ONLY/, "feedback's probe authenticates");
+    // A serve.json with the wrong token (or a junk one) doesn't count as ours.
+    const good = fs.readFileSync(servePathOf, "utf-8");
+    for (const token of ["00".repeat(24), "ab", "not hex\nx: y", 7]) {
+      fs.writeFileSync(servePathOf, JSON.stringify({ ...JSON.parse(good), token }));
+      assert.match(run("serve", "--stop"), /no review server running/);
+      fs.writeFileSync(servePathOf, good);
+    }
+    assert.equal(typeof (await srv.version()).serverId, "string", "and the server wasn't killed");
+    assert.match(run("serve", "--stop"), /stopped the review server \(http:\/\/127\.0\.0\.1:\d+\/\)/, "--stop verifies with the token, and prints no token");
+  } finally { await srv.stop(); }
+});
+
+test("#39: a mode switch keeps the token, so open tabs follow; any other start gets a fresh one and old tabs are refused", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const first = await serve(dir, []);
+  let second, third, fourth;
+  try {
+    second = await serve(dir);
+    assert.equal(second.token, first.token, "verified takeover");
+    assert.notEqual(second.data.serverId, first.data.serverId, "a different server, which the tab's poll notices and reloads for");
+    assert.equal(second.url, first.url, "on the same port");
+    assert.equal((await authGet(second.url, "/api/version", first.token)).status, 200);
+    await second.stop();
+    // A crash: serve.json stays, naming a dead server and its token.
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".skeleton", "serve.json"), "utf-8")).token, first.token);
+    await new Promise((r) => setTimeout(r, 300));
+    third = await serve(dir);
+    assert.notEqual(third.token, first.token, "a dead server's token isn't picked up");
+    assert.equal(third.url, first.url, "same origin, so the tab's drafts are still there");
+    assert.equal((await authGet(third.url, "/api/version", first.token)).status, 401, "the old tab is told");
+    assert.equal((await post(third.url, { comments: [] }, { "content-type": "application/json", "x-skeleton-token": first.token })).status, 403);
+    assert.deepEqual([(await authGet(third.url, "/api/data", third.token)).status, (await authGet(third.url, "/api/version", third.token)).status], [200, 200]);
+    await third.stop();
+    // A token shipped in a repo's serve.json isn't picked up either.
+    await new Promise((r) => setTimeout(r, 300));
+    const planted = "ab".repeat(24);
+    fs.writeFileSync(path.join(dir, ".skeleton", "serve.json"), JSON.stringify({ url: first.url, serverId: "x", pid: process.pid, token: planted }));
+    fourth = await serve(dir, []);
+    assert.notEqual(fourth.token, planted);
+    assert.equal((await authGet(fourth.url, "/api/data", planted)).status, 401);
+  } finally {
+    await first.stop();
+    await second?.stop();
+    await third?.stop();
+    await fourth?.stop();
+  }
+});
+
+test("#39: the static page embeds its data under a CSP that fits it, and needs no token", () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const read = () => fs.readFileSync(run("review").split("\n")[0], "utf-8");
+  const cspOf = (html) => /<meta http-equiv="Content-Security-Policy" content="([^"]+)">/.exec(html)?.[1];
+  const hashOf = (html) => crypto.createHash("sha256").update(/<script>([\s\S]*)<\/script>\s*<\/body>/.exec(html)[1], "utf-8").digest("base64");
+  let html = read();
+  assert.ok(html.includes(MARK), "the data is in the file");
+  assert.equal(pageData(html).token, undefined);
+  assert.equal(pageData(html).mermaid, null);
+  let csp = cspOf(html);
+  assert.ok(csp, "the file carries a CSP");
+  assert.ok(csp.includes(`'sha256-${hashOf(html)}'`), "the hash is of the script in the file");
+  assert.match(csp, /default-src 'none'/);
+  assert.doesNotMatch(csp, /connect-src/, "a static page connects to nothing");
+  assert.doesNotMatch(html, /jsdelivr/, "no diagrams, no CDN");
+  assert.doesNotMatch(html, /\sonload=/);
+  fs.mkdirSync(path.join(dir, ".skeleton", "diagrams"));
+  fs.writeFileSync(path.join(dir, ".skeleton", "diagrams", "arch.mmd"), "flowchart LR\n  A-->B\n");
+  html = read();
+  csp = cspOf(html);
+  assert.ok(csp.includes("https://cdn.jsdelivr.net/npm/mermaid@10.9.8/dist/mermaid.min.js"));
+  assert.ok(csp.includes(`'sha256-${hashOf(html)}'`));
+  assert.match(pageData(html).mermaid.integrity, /^sha384-/);
+  assert.doesNotMatch(html, /\sonload=/);
 });
 
 // ---- #18: trusted state moves to the state dir, when a human asks ----
@@ -3769,7 +3989,7 @@ test("#18: serve replaces a verified server from before the state dir, and /api/
   const srv = await serve(dir, []);
   try {
     assert.equal(await old.gone(), true, "the old server was stopped");
-    const v = await (await fetch(new URL("api/version", srv.url))).json();
+    const v = await srv.version();
     assert.equal(v.storeProtocol, 2);
     assert.doesNotMatch(JSON.stringify(v), /[\\/]/, "no store path in a public endpoint");
     assert.match(run("serve"), /already running/, "a current server in the same mode is reused, as before");
@@ -3812,14 +4032,212 @@ test("#18: migrate stops a verified server from before the state dir and says so
   n.records();
   const srv = await serve(n.dir, [], n.env);
   try {
-    const was = await (await fetch(new URL("api/version", srv.url))).json();
+    const was = await srv.version();
     const r = n.skel("migrate");
     assert.equal(r.ok, true, r.stderr);
     assert.doesNotMatch(r.stdout, /stopped the review server/);
-    assert.equal((await (await fetch(new URL("api/version", srv.url))).json()).serverId, was.serverId);
+    assert.equal((await srv.version()).serverId, was.serverId);
     n.setPhase("fill");
-    assert.doesNotMatch(await (await fetch(srv.url)).text(), /no record of the approved skeleton/, "it reads the moved record");
+    assert.doesNotMatch(JSON.stringify(await srv.read()), /no record of the approved skeleton/, "it reads the moved record");
   } finally {
     await srv.stop();
   }
+});
+
+// ---- #39: upgrading from a server whose reads don't need a token ----
+
+const OLD_SOURCE = "OLD_SERVER_SOURCE";
+const OLD_TOKEN = "cd".repeat(24);
+/**
+ * A live server of an older (or lying) shape, recorded in serve.json as verified.
+ * guard: the routes that refuse a request without its token. data: /api/data
+ * exists. shell: GET / is a hardened shell, not a page with the source in it.
+ * token: what serve.json records. `routes()` lists what it was asked.
+ */
+const olderServer = async (dir, { guard = [], data = false, shell = false, token, version = {}, serverId = "older-id", feedbackEnabled = false } = {}) => {
+  const base = tmp("skel-older-");
+  const log = path.join(base, "routes.log");
+  const script = path.join(base, "older.mjs");
+  fs.writeFileSync(script, `import fs from "node:fs";
+import http from "node:http";
+const guard = ${JSON.stringify(guard)};
+const s = http.createServer((req, res) => {
+  fs.appendFileSync(${JSON.stringify(log)}, req.url + "\\n");
+  const route = req.url.replace(/^\\/(api\\/)?/, "");
+  if (guard.includes(route) && req.headers["x-skeleton-token"] !== ${JSON.stringify(token ?? "")}) { res.writeHead(401); return res.end("no"); }
+  if (req.url === "/") {
+    if (${JSON.stringify(shell)}) { res.writeHead(200, { "content-security-policy": "default-src 'none'" }); return res.end("<div id=app></div>"); }
+    return res.end('<script id="skeleton-data" type="application/json">{"text":"${OLD_SOURCE}"}</script>');
+  }
+  if (req.url === "/api/data" && ${JSON.stringify(data)}) return res.end(JSON.stringify({ text: "${OLD_SOURCE}" }));
+  if (req.url === "/api/version") return res.end(JSON.stringify({ version: "v", serverId: "older-id", pid: process.pid, feedbackEnabled: ${JSON.stringify(feedbackEnabled)}, ...${JSON.stringify(version)} }));
+  res.writeHead(404); res.end();
+});
+s.listen(0, "127.0.0.1", () => console.log(s.address().port));`);
+  const child = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "ignore"] });
+  const port = await new Promise((resolve) => child.stdout.once("data", (d) => resolve(Number(String(d).trim()))));
+  fs.writeFileSync(path.join(dir, ".skeleton", "serve.json"), JSON.stringify({ url: `http://127.0.0.1:${port}/`, port, pid: child.pid, serverId, feedbackEnabled, ...(token ? { token } : {}) }));
+  const exited = new Promise((resolve) => child.once("exit", () => resolve(true)));
+  return {
+    child,
+    url: `http://127.0.0.1:${port}/`,
+    routes: () => { try { return fs.readFileSync(log, "utf-8").trim().split("\n"); } catch { return []; } },
+    alive: () => child.exitCode === null && child.signalCode === null,
+    gone: () => Promise.race([exited, new Promise((r) => setTimeout(() => r(false), 5000))]),
+    stop: () => { if (child.exitCode === null && child.signalCode === null) child.kill(); return exited; },
+  };
+};
+
+// Each of these answers with its recorded id, so it can be replaced; none has
+// shown that its reads need the token, so none can be reused.
+const UNPROVEN = {
+  "before the state dir (no capability, no token)": {},
+  "#41's shape: the new store protocol, no read auth": { version: { storeProtocol: 2 } },
+  "a send-only token: recorded, ignored on reads, no capability": { version: { storeProtocol: 2 }, token: OLD_TOKEN },
+  "a capability that isn't an integer": { version: { storeProtocol: 2, readAuth: "1" }, token: OLD_TOKEN, guard: ["version", "data"], data: true, shell: true },
+  "the capability, but /api/version answers without the token": { version: { storeProtocol: 2, readAuth: 1 }, token: OLD_TOKEN, guard: ["data"], data: true, shell: true },
+  "the capability, but /api/data answers without the token": { version: { storeProtocol: 2, readAuth: 1 }, token: OLD_TOKEN, guard: ["version"], data: true, shell: true },
+  "the capability, but no /api/data route": { version: { storeProtocol: 2, readAuth: 1 }, token: OLD_TOKEN, guard: ["version"], shell: true },
+  "the capability, but the page still embeds the source": { version: { storeProtocol: 2, readAuth: 1 }, token: OLD_TOKEN, guard: ["version", "data"], data: true },
+};
+for (const [name, shape] of Object.entries(UNPROVEN)) {
+  test(`#39 upgrade: serve replaces a verified older server, never reuses it: ${name}`, { timeout: 60_000 }, async () => {
+    const { dir, run } = project();
+    run("init", "T");
+    const old = await olderServer(dir, shape);
+    let srv;
+    try {
+      assert.equal((await fetch(old.url)).status, 200, "the old page answers before the upgrade");
+      const seen = old.routes().length;
+      srv = await serve(dir, []);
+      assert.equal(await old.gone(), true, "the old server was stopped");
+      // An older server's GET / records a page view: the probe mustn't make one.
+      if (!shape.guard?.includes("version")) assert.ok(!old.routes().slice(seen).includes("/"), "it isn't asked for its page");
+      assert.match(srv.printed, /\/#t=[0-9a-f]{48}$/, "the URL is the hardened one");
+      assert.notEqual(srv.token, OLD_TOKEN, "a token that never guarded reads isn't kept");
+      assert.ok(!srv.html.includes(OLD_SOURCE) && !srv.html.includes(MARK), "the page has no source");
+      assert.equal((await authGet(srv.url, "/api/version")).status, 401);
+      assert.equal((await authGet(srv.url, "/api/data")).status, 401);
+      assert.equal((await srv.version()).readAuth, 1);
+      const again = run("serve");
+      assert.match(again, /already running/, "the replacement is reused");
+      assert.equal(printedUrl(again), srv.printed);
+    } finally {
+      await srv?.stop();
+      await old.stop();
+    }
+  });
+}
+
+test("#39 upgrade: a replaced older Send server stays in Send mode, and the output says it was replaced", { timeout: 60_000 }, async () => {
+  const { dir } = project();
+  execFileSync("node", [BIN, "init", "T"], { cwd: dir });
+  const old = await olderServer(dir, { version: { storeProtocol: 2 }, feedbackEnabled: true });
+  const child = spawn("node", [BIN, "serve", "--send"], { cwd: dir, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    const out = await new Promise((resolve, reject) => {
+      let o = "";
+      child.stdout.on("data", (d) => { o += d; if (/skel review: /.test(o)) resolve(o); });
+      child.once("exit", () => reject(new Error("serve exited: " + o)));
+    });
+    assert.equal(await old.gone(), true);
+    assert.match(out, /replaced the running review server/);
+    assert.match(out, /skel review: http:\/\/127\.0\.0\.1:\d+\/#t=[0-9a-f]{48} \(feedback enabled\)/);
+    assert.doesNotMatch(out, /already running/);
+  } finally {
+    await new Promise((resolve) => { if (child.exitCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
+    await old.stop();
+  }
+});
+
+test("#39 upgrade: a server that shows all of it is reused, and asked nothing that counts as a view", { timeout: 60_000 }, async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const shape = { version: { storeProtocol: 2, readAuth: 1 }, token: OLD_TOKEN, guard: ["version", "data"], data: true, shell: true };
+  const old = await olderServer(dir, shape);
+  try {
+    const out = run("serve");
+    assert.match(out, /already running/);
+    assert.equal(printedUrl(out), `${old.url}#t=${OLD_TOKEN}`);
+    assert.equal(old.alive(), true);
+    // And a future capability still counts.
+    await old.stop();
+    const newer = await olderServer(dir, { ...shape, version: { storeProtocol: 2, readAuth: 2 } });
+    try { assert.match(run("serve"), /already running/); } finally { await newer.stop(); }
+  } finally { await old.stop(); }
+});
+
+test("#39 upgrade: a server that doesn't answer with its recorded id is left running, and its URL isn't handed out", { timeout: 60_000 }, async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const other = await olderServer(dir, { serverId: "someone-else", version: { storeProtocol: 2, readAuth: 1 }, token: OLD_TOKEN });
+  let srv;
+  try {
+    srv = await serve(dir, []);
+    assert.notEqual(srv.url, other.url);
+    assert.notEqual(srv.token, OLD_TOKEN);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(other.alive(), true, "never stop what we can't identify");
+    assert.match(run("serve", "--stop"), /stopped the review server/, "--stop stops our own");
+    assert.equal(other.alive(), true);
+  } finally {
+    await srv?.stop();
+    await other.stop();
+  }
+});
+
+test("#39 upgrade: a too-short token in serve.json isn't sent or kept, even if the server would accept it", { timeout: 60_000 }, async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const short = "ab";
+  const planted = await olderServer(dir, { version: { storeProtocol: 2, readAuth: 1 }, token: short, guard: ["version", "data"], data: true, shell: true });
+  let srv;
+  try {
+    srv = await serve(dir);
+    assert.notEqual(srv.token, short);
+    assert.match(srv.token, /^[0-9a-f]{48}$/);
+    assert.equal(planted.alive(), true, "it refused us without a token, so it isn't identified, and is left alone");
+  } finally {
+    await srv?.stop();
+    await planted.stop();
+  }
+});
+
+test("#39 upgrade: --stop and init still stop a verified older server; migrate stops only one from before the state dir", { timeout: 60_000 }, async () => {
+  for (const shape of [{}, { version: { storeProtocol: 2 } }, { version: { storeProtocol: 2 }, token: OLD_TOKEN }]) {
+    const { dir, run } = project();
+    run("init", "T");
+    const a = await olderServer(dir, shape);
+    try {
+      assert.match(run("serve", "--stop"), /stopped the review server/, JSON.stringify(shape));
+      assert.equal(await a.gone(), true);
+      assert.equal(fs.existsSync(path.join(dir, ".skeleton", "serve.json")), false);
+    } finally { await a.stop(); }
+    const b = await olderServer(dir, shape);
+    try {
+      run("init", "U", "--force");
+      assert.equal(await b.gone(), true, JSON.stringify(shape));
+    } finally { await b.stop(); }
+  }
+  // #18's own check, on the two older shapes: the store protocol decides, not read auth.
+  const m = legacyProject();
+  m.records();
+  const old = await olderServer(m.dir, {});
+  try {
+    assert.equal(m.skel("migrate").ok, true);
+    assert.equal(await old.gone(), true, "before the state dir: stopped");
+  } finally { await old.stop(); }
+  const n = legacyProject();
+  n.records();
+  const current = await olderServer(n.dir, { version: { storeProtocol: 2 } });
+  try {
+    const r = n.skel("migrate");
+    assert.equal(r.ok, true, r.stderr);
+    assert.doesNotMatch(r.stdout, /stopped the review server/);
+    assert.equal(current.alive(), true, "it follows the move; serve replaces it later");
+  } finally { await current.stop(); }
+});
+
+test("#39: newServeSession makes only the session id: the review token is serve's", () => {
+  assert.deepEqual(Object.keys(newServeSession()), ["session"]);
 });
