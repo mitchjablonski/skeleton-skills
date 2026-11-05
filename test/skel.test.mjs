@@ -2657,7 +2657,7 @@ test("#39: the page reads a token from the fragment and leaves other fragments a
   const { skelTokenFromHash } = new Function(fs.readFileSync(path.join(path.dirname(BIN), "..", "lib", "review-poll.js"), "utf-8") + "\nreturn { skelTokenFromHash };")();
   const token = "ab".repeat(24);
   assert.equal(skelTokenFromHash(`#t=${token}`), token);
-  for (const other of ["", "#", "#review-panel", "#t=", "#t=short", `#t=${token}&x=1`, `#x=${token}`, "#t=<script>aaaaaaaaaaaaaaaa"]) {
+  for (const other of ["", "#", "#review-panel", "#t=", "#t=short", "#t=abcdef", `#t=${"ab".repeat(15)}`, `#t=${token}&x=1`, `#x=${token}`, "#t=<script>aaaaaaaaaaaaaaaa"]) {
     assert.equal(skelTokenFromHash(other), null, other);
   }
 });
@@ -2734,7 +2734,7 @@ test("#39: a reused server's URL works, and the CLI finds the server only with i
     assert.match(execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 5000 }), /READ_ONLY/, "feedback's probe authenticates");
     // A serve.json with the wrong token (or a junk one) doesn't count as ours.
     const good = fs.readFileSync(servePathOf, "utf-8");
-    for (const token of ["00".repeat(24), "not hex\nx: y", 7]) {
+    for (const token of ["00".repeat(24), "ab", "not hex\nx: y", 7]) {
       fs.writeFileSync(servePathOf, JSON.stringify({ ...JSON.parse(good), token }));
       assert.match(run("serve", "--stop"), /no review server running/);
       fs.writeFileSync(servePathOf, good);
@@ -4179,6 +4179,23 @@ test("#39 upgrade: a server that doesn't answer with its recorded id is left run
   } finally {
     await srv?.stop();
     await other.stop();
+  }
+});
+
+test("#39 upgrade: a too-short token in serve.json isn't sent or kept, even if the server would accept it", { timeout: 60_000 }, async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const short = "ab";
+  const planted = await olderServer(dir, { version: { storeProtocol: 2, readAuth: 1 }, token: short, guard: ["version", "data"], data: true, shell: true });
+  let srv;
+  try {
+    srv = await serve(dir);
+    assert.notEqual(srv.token, short);
+    assert.match(srv.token, /^[0-9a-f]{48}$/);
+    assert.equal(planted.alive(), true, "it refused us without a token, so it isn't identified, and is left alone");
+  } finally {
+    await srv?.stop();
+    await planted.stop();
   }
 });
 

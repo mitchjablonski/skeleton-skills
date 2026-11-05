@@ -158,7 +158,7 @@ async function liveServer(root) {
   const s = readServe(root);
   if (!s?.url || !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(s.url) || !s.serverId) return null;
   try {
-    const token = /^[0-9a-f]+$/.test(s.token) ? s.token : null;
+    const token = typeof s.token === "string" && /^[0-9a-f]{32,128}$/.test(s.token) ? s.token : null;
     const res = await fetch(new URL("api/version", s.url), { headers: token ? { "x-skeleton-token": token } : {}, signal: AbortSignal.timeout(1500) });
     const v = await res.json();
     if (!(v.serverId === s.serverId && Number.isInteger(v.pid) && v.pid > 1 && (s.pid === undefined || s.pid === v.pid))) return null;
@@ -579,7 +579,9 @@ const commands = {
     // A mode switch replaces a server we just verified, whose reads need its
     // token, and keeps that token, so open tabs follow it and reload. Any other
     // start gets a fresh one: a token left in serve.json by a dead server,
-    // shipped in a repo, or never guarding reads is never picked up.
+    // shipped in a repo, or never guarding reads isn't picked up, unless a
+    // local process answers for it and passes readsProtected (same-user: out of
+    // scope, and it could read the real token anyway).
     const token = protectedReads ? running.token : crypto.randomBytes(24).toString("hex");
     const tokenOk = (req) => {
       const given = Buffer.from(String(req.headers["x-skeleton-token"] ?? ""));
@@ -699,7 +701,7 @@ const commands = {
         } else if (req.method === "POST" && req.url === "/api/feedback") {
           if (!feedbackEnabled) { req.resume(); return void res.writeHead(405, { Allow: "GET", connection: "close" }).end("read-only review; reload and use Copy feedback for Claude"); }
           // Cross-site writes: same origin, a JSON content type (forces a CORS
-          // preflight we never answer), and the per-run token from the page.
+          // preflight we never answer), and the review token from the page.
           const sameOrigin = !req.headers.origin || hosts.has(String(req.headers.origin).replace(/^https?:\/\//, "").toLowerCase());
           const json = String(req.headers["content-type"] ?? "").split(";")[0].trim() === "application/json";
           if (!sameOrigin || !json || !tokenOk(req)) return void refuse(403, "forbidden");
