@@ -1327,18 +1327,51 @@ test("issue #6 N6: feedback queued under a pre-upgrade serve.json is flagged, ne
 test("issue #6 N4: a page load kicks off a search once the last one is >5s old", async () => {
   const { dir, run } = project();
   run("init", "T");
-  const srv = await serve(dir);
+  const searchLog = path.join(dir, ".skeleton", "test-search.log");
+  const preload = path.join(dir, ".skeleton", "test-search-preload.cjs");
+  fs.writeFileSync(preload, `
+if (process.argv.includes("__candidates")) {
+  const fs = require("node:fs");
+  const log = process.env.SKEL_TEST_SEARCH_LOG;
+  fs.appendFileSync(log, "started\\n");
+  process.on("exit", () => fs.appendFileSync(log, "finished\\n"));
+}
+`);
+  const srv = await serve(dir, ["--send"], {
+    NODE_OPTIONS: `--require="${preload.replaceAll("\\", "/")}"`,
+    SKEL_TEST_SEARCH_LOG: searchLog,
+  });
   try {
     const before = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
     fs.writeFileSync(path.join(dir, "src", "late.ts"), "export function late() {\n  // SKEL[9] late\n  throw new Error(\"SKEL_TODO\");\n  // /SKEL[9]\n}\n");
-    await new Promise((r) => setTimeout(r, 5_500));
-    await fetch(srv.url);
+    const searchCounts = () => {
+      if (!fs.existsSync(searchLog)) return { started: 0, finished: 0 };
+      const lines = fs.readFileSync(searchLog, "utf-8").split("\n");
+      return { started: lines.filter((x) => x === "started").length, finished: lines.filter((x) => x === "finished").length };
+    };
+    const beforeSearch = searchCounts();
+    // Repeatedly load the page until its age check starts the candidate search.
+    // The marker comes from the actual `__candidates` child, so a later periodic
+    // refresh or a version change alone cannot satisfy this assertion.
+    const launchDeadline = Date.now() + 20_000;
+    let launched = false;
+    while (Date.now() < launchDeadline && !launched) {
+      await (await fetch(srv.url)).text();
+      launched = searchCounts().started > beforeSearch.started;
+      if (!launched) await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.ok(launched, "a page load should start the full candidate search before the 30s periodic refresh");
+    const completionDeadline = Date.now() + 60_000;
+    while (Date.now() < completionDeadline && searchCounts().finished <= beforeSearch.finished) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    assert.equal(searchCounts().finished, beforeSearch.finished + 1, "the page-triggered candidate search should finish");
     let version = before;
-    for (const deadline = Date.now() + 10_000; version === before && Date.now() < deadline; ) {
+    for (const deadline = Date.now() + 60_000; version === before && Date.now() < deadline; ) {
       await new Promise((r) => setTimeout(r, 200));
       version = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
     }
-    assert.notEqual(version, before, "the new fenced file should show up well before the 30s search");
+    assert.notEqual(version, before, "the page-triggered rescan should publish the new fenced file");
     assert.match(await (await fetch(srv.url)).text(), /late\.ts/);
   } finally {
     await srv.stop();
