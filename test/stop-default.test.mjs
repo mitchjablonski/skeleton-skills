@@ -60,12 +60,26 @@ test("real approval: clean silent, notices preserved, drift corrects once, both 
   const first = stop();
   assert.equal(first.decision, "block");
   assert.match(first.reason, /Resolve this/);
+  assert.match(first.reason, /Edit[\s\S]*ask the human or deny[\s\S]*whole-file[\s\S]*uncommitted fence fills/);
   for (const output of [stop([], true), stop(["--notify-only"]), stop(["--notify-only"], true), stop(["--notify-only"], false, "skel.mjs")]) {
     assert.ok(output.systemMessage);
     assert.equal(output.decision, undefined);
     assert.equal(output.hookSpecificOutput, undefined);
   }
   assert.equal(stop(["--block"]).decision, "block");
+  for (const [entry, args] of [["skel-stop.mjs", []], ["skel.mjs", ["stop-hook"]]]) {
+    const output = JSON.parse(run(entry, args).stdout);
+    assert.ok(output.systemMessage);
+    assert.equal(output.decision, undefined, "omitted continuation state only notifies");
+  }
+  for (const active of [null, 0, "false", {}, []]) {
+    for (const entry of ["skel-stop.mjs", "skel.mjs"]) {
+      const output = stop([], active, entry);
+      assert.ok(output.systemMessage);
+      assert.equal(output.decision, undefined, "unknown continuation state only notifies");
+      assert.equal(output.reason, undefined);
+    }
+  }
 });
 
 test("install keeps notify-only across reinstalls and moved clones; conflicting modes preserve user hooks", t => {
@@ -101,10 +115,39 @@ test("install keeps notify-only across reinstalls and moved clones; conflicting 
   ] });
   write(settings);
   const installed = cli(["install", root]);
+  const installedSkill = fs.readFileSync(path.join(root, ".claude", "skills", "skeleton-fill", "SKILL.md"), "utf8");
+  assert.match(installedSkill, /default requests one corrective continuation/);
+  assert.doesNotMatch(installedSkill, /By default its drift report is shown to the human only/);
   assert.match(installed.stdout, /conflicting Stop hook modes/);
   settings = read();
   assert.equal(ours(settings).length, 1);
   assert.match(ours(settings)[0], / --block$/);
   assert.ok(commands(settings).includes(userCommand));
   assert.ok(commands(settings).includes(chainedCommand));
+});
+
+test("approval-record faults notify without forcing a corrective turn", t => {
+  const { root, run, cli } = fixture(t);
+  cli(["init", "broken approval"]);
+  fs.writeFileSync(path.join(root, "code.js"), "// SKEL[1] value\nconst value=1;\n// /SKEL[1]\n");
+  cli(["approve"]);
+  const store = path.join(root, "config", "skel");
+  const name = fs.readdirSync(store).find(name => name.endsWith(".snapshot.json"));
+  assert.ok(name);
+  const record = path.join(store, name);
+  const original = fs.readFileSync(record, "utf8");
+  const stale = JSON.parse(original);
+  stale.approvedAt -= 1;
+  for (const [label, content] of [["missing", null], ["corrupt", "{"], ["stale", JSON.stringify(stale)]]) {
+    if (content === null) fs.rmSync(record); else fs.writeFileSync(record, content);
+    for (const [entry, args] of [["skel-stop.mjs", []], ["skel.mjs", ["stop-hook"]]]) {
+      const result = run(entry, [...args, "--block"], { stop_hook_active: false });
+      assert.equal(result.status, 0, result.stderr);
+      const output = JSON.parse(result.stdout);
+      assert.match(output.systemMessage, /no record|different approval/, label);
+      assert.equal(output.decision, undefined, label);
+      assert.equal(output.reason, undefined, label);
+    }
+    fs.writeFileSync(record, original);
+  }
 });
