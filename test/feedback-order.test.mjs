@@ -13,9 +13,11 @@ function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "feedback-order-"));
   const old = process.env.XDG_CONFIG_HOME;
   const oldState = process.env.XDG_STATE_HOME;
+  const oldLocal = process.env.LOCALAPPDATA;
   process.env.XDG_CONFIG_HOME = path.join(root, "config");
   process.env.XDG_STATE_HOME = path.join(root, "state");
-  t.after(() => { fs.rmSync(root, { recursive: true, force: true }); if (old === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = old; if (oldState === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = oldState; });
+  process.env.LOCALAPPDATA = path.join(root, "local");
+  t.after(() => { fs.rmSync(root, { recursive: true, force: true }); if (old === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = old; if (oldState === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = oldState; if (oldLocal === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = oldLocal; });
   const cli = (...args) => spawnSync(process.execPath, ["--import", "data:text/javascript,Date.now=()=>1", BIN, ...args], { cwd: root, env: process.env, encoding: "utf8" });
   assert.equal(cli("init", "logical ordering").status, 0);
   fs.writeFileSync(path.join(root, "a.js"), '// SKEL[1] value\nconst value=1;\n// /SKEL[1]\n');
@@ -103,7 +105,7 @@ test("corrupt counter recovers verified maximum; duplicate ordinals refuse", t =
 });
 test("serve replaces verified clock-only server instead of silently reusing it", { timeout: 60000 }, async t => {
   const { root } = fixture(t);
-  const old = spawn(process.execPath, ["-e", 'const http=require("http");const server=http.createServer((req,res)=>res.end(JSON.stringify({serverId:"clock-only",pid:process.pid,feedbackEnabled:true})));server.listen(0,"127.0.0.1",()=>console.log(server.address().port));']);
+  const old = spawn(process.execPath, ["-e", 'const http=require("http");const server=http.createServer((req,res)=>res.end(JSON.stringify({serverId:"clock-only",pid:process.pid,feedbackEnabled:true,storeProtocol:2})));server.listen(0,"127.0.0.1",()=>console.log(server.address().port));']);
   let current;
   try {
     const port = await new Promise((resolve, reject) => {
@@ -118,14 +120,20 @@ test("serve replaces verified clock-only server instead of silently reusing it",
       current.stdout.on("data", data => { output += data; const match = output.match(/http:\/\/127\.0\.0\.1:\d+\//); if (match) { clearTimeout(timer); resolve(match[0]); } });
       current.on("exit", code => { clearTimeout(timer); reject(new Error("server exited " + code)); });
     });
-    const version = await (await fetch(new URL("api/version", url))).json();
+    const token = JSON.parse(fs.readFileSync(path.join(root, ".skeleton/serve.json"), "utf8")).token;
+    const headers = { "x-skeleton-token": token };
+    const version = await (await fetch(new URL("api/version", url), { headers })).json();
     assert.equal(version.feedbackOrder, 1);
     assert.notEqual(version.serverId, "clock-only");
     assert.notEqual(version.pid, old.pid);
-    const html = await (await fetch(url)).text();
-    const data = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1]);
+    assert.equal(version.storeProtocol, 2);
+    assert.equal(version.readAuth, 1);
+    assert.equal((await fetch(new URL("api/data", url))).status, 401);
+    assert.equal((await fetch(new URL("api/version", url), { headers: { "x-skeleton-token": "wrong" } })).status, 401);
+    const data = await (await fetch(new URL("api/data", url), { headers })).json();
+    assert.ok(data.skeletonVersion);
     for (const verdict of ["approve", "changes"]) {
-      const response = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": data.token }, body: JSON.stringify({ verdict, version: version.skeletonVersion, comments: [] }) });
+      const response = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": token }, body: JSON.stringify({ verdict, version: version.skeletonVersion, comments: [] }) });
       assert.equal(response.status, 204);
     }
     assert.equal(lastReview(root).unread, 2);
@@ -134,12 +142,12 @@ test("serve replaces verified clock-only server instead of silently reusing it",
     assert.ok(drained[1].at < drained[0].at);
     assert.equal(mergeRecords(drained).verdict, "changes");
     fs.writeFileSync(path.join(root, ".skeleton/state.json"), "{");
-    const broken = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": data.token }, body: JSON.stringify({ verdict: "approve", comments: [] }) });
+    const broken = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": token }, body: JSON.stringify({ verdict: "approve", comments: [] }) });
     assert.equal(broken.status, 503);
     const diagnostic = await broken.text();
     assert.ok(diagnostic.includes(path.join(root, ".skeleton/state.json")));
     assert.match(diagnostic, /external terminal/);
-    const invalid = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": data.token }, body: "{" });
+    const invalid = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": token }, body: "{" });
     assert.equal(invalid.status, 400);
   } finally {
     if (current && current.exitCode === null) current.kill();

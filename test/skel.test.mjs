@@ -4070,7 +4070,7 @@ const s = http.createServer((req, res) => {
     return res.end('<script id="skeleton-data" type="application/json">{"text":"${OLD_SOURCE}"}</script>');
   }
   if (req.url === "/api/data" && ${JSON.stringify(data)}) return res.end(JSON.stringify({ text: "${OLD_SOURCE}" }));
-  if (req.url === "/api/version") return res.end(JSON.stringify({ version: "v", serverId: "older-id", pid: process.pid, feedbackEnabled: ${JSON.stringify(feedbackEnabled)}, ...${JSON.stringify(version)} }));
+  if (req.url === "/api/version") return res.end(JSON.stringify({ version: "v", serverId: "older-id", pid: process.pid, feedbackEnabled: ${JSON.stringify(feedbackEnabled)}, feedbackOrder: 1, ...${JSON.stringify(version)} }));
   res.writeHead(404); res.end();
 });
 s.listen(0, "127.0.0.1", () => console.log(s.address().port));`);
@@ -4240,4 +4240,22 @@ test("#39 upgrade: --stop and init still stop a verified older server; migrate s
 
 test("#39: newServeSession makes only the session id: the review token is serve's", () => {
   assert.deepEqual(Object.keys(newServeSession()), ["session"]);
+});
+
+
+test("#48 upgrade: a protected #43-only server without feedback ordering is replaced", { timeout: 60000 }, async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const old = await olderServer(dir, { version: { storeProtocol: 2, readAuth: 1, feedbackOrder: null }, token: OLD_TOKEN, guard: ["version", "data"], data: true, shell: true });
+  let current;
+  try {
+    current = await serve(dir, []);
+    assert.equal(await old.gone(), true);
+    const version = await current.version();
+    assert.equal(version.storeProtocol, 2);
+    assert.equal(version.readAuth, 1);
+    assert.equal(version.feedbackOrder, 1);
+    assert.equal((await authGet(current.url, "/api/data")).status, 401);
+    assert.match(run("serve"), /already running/);
+  } finally { await current?.stop(); await old.stop(); }
 });
