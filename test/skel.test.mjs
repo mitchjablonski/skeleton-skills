@@ -1223,13 +1223,15 @@ test("#16: the Stop hook is silent with no skeleton, outside a fill, and while t
   assert.equal(stopHook(dir), "", "finalized: no fill");
 });
 
-test("#16: during a fill the Stop hook reports drift to the human without blocking; --block sends Claude back once", () => {
+test("#38: drift requests one correction by default; --notify-only opts out", () => {
   const { dir, a, run } = approved();
   // A Bash edit outside the fence: the PreToolUse hook never saw it.
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(SIG, "smooth(raw: Point[], k = 1): Point[]"));
   const out = JSON.parse(stopHook(dir));
   assert.match(out.systemMessage, /drift from the approved skeleton[\s\S]*src\/a\.ts:3[\s\S]*\+ export function smooth\(raw: Point\[\], k = 1\)/);
-  assert.equal(out.decision, undefined, "notify by default");
+  assert.equal(out.decision, "block", "request a correction by default");
+  assert.equal(JSON.parse(stopHook(dir, { stop_hook_active: true })).decision, undefined, "the continuation only notifies");
+  assert.equal(JSON.parse(stopHook(dir, {}, ["--notify-only"])).decision, undefined, "explicit notify-only opts out");
   const blocked = JSON.parse(stopHook(dir, {}, ["--block"]));
   assert.equal(blocked.decision, "block");
   assert.match(blocked.reason, /src\/a\.ts:3[\s\S]*skel reshape/);
