@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
-import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, realish, skelStateDir, writeFileAtomic } from "../lib/state.mjs";
+import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { installStatus, isSkelHook, rulePath } from "../lib/install-status.mjs";
 import { enrollment } from "../lib/config-hook.mjs";
@@ -20,7 +20,8 @@ import {
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
   storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
-import { legacyNotice, migrateStores, migrationPlan, storePath } from "../lib/stores.mjs";
+import { migrateProject, migrationPlan } from "../lib/migrate.mjs";
+import { storeNotice } from "../lib/store-notice.mjs";
 import {
   clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
 } from "../lib/snapshot.mjs";
@@ -149,7 +150,7 @@ async function liveServer(root) {
   try {
     const res = await fetch(new URL("api/version", s.url), { signal: AbortSignal.timeout(1500) });
     const v = await res.json();
-    return v.serverId === s.serverId && Number.isInteger(v.pid) ? { url: s.url, pid: v.pid, feedbackEnabled: v.feedbackEnabled !== false, storeProtocol: v.storeProtocol ?? 1 } : null;
+    return v.serverId === s.serverId && Number.isInteger(v.pid) && v.pid > 1 && (s.pid === undefined || s.pid === v.pid) ? { url: s.url, pid: v.pid, feedbackEnabled: v.feedbackEnabled !== false, storeProtocol: v.storeProtocol ?? 1 } : null;
   } catch {
     return null;
   }
@@ -161,6 +162,9 @@ async function liveServer(root) {
  * serve.json looks exactly like a real one, so trusting its list would let a
  * repo vouch for its own feedback again. Tell the human to send it again.
  */
+/** Does this project's next store access read the old location? */
+const usesLegacy = (root) => storePath(root).startsWith(legacyConfigDir() + path.sep);
+
 function warnLegacyQueue(root) {
   const n = legacyQueued(root);
   if (n) {
@@ -293,11 +297,11 @@ function launchWarning(target) {
     else if (!same(top, real)) why = `the project isn't its git repository's root (${top}), and Claude Code loads it from the root, or from the directory you start in`;
     else {
       try {
-        if (!same(path.resolve(real, git("rev-parse", "--git-dir")), path.resolve(real, git("rev-parse", "--git-common-dir")))) why = "in a git worktree, Claude Code loads it from the main checkout's root";
+        if (!same(path.resolve(real, git("rev-parse", "--git-dir")), path.resolve(real, git("rev-parse", "--git-common-dir")))) why = "in a git worktree, Claude Code loads it from the main checkout's root, so what install just wrote here isn't loaded: run `skel install` in the main checkout too";
       } catch {}
     }
   }
-  if (why) console.log(`warning: the hook and the deny rules live in .claude/settings.local.json, and ${why}. Start Claude Code in ${real} itself, not a subdirectory.`);
+  if (why) console.log(`warning: the hook and the deny rules live in .claude/settings.local.json, and ${why}. ${/main checkout too$/.test(why) ? "" : `Start Claude Code in ${real} itself, not a subdirectory.`}`.trimEnd());
 }
 
 /**
@@ -440,7 +444,7 @@ const commands = {
     console.log(`tracking ${rels.join(", ")}`);
   },
 
-  status(args) {
+  async status(args) {
     const root = findRoot(process.cwd());
     const configNotice = readConfigNotice(process.env.CLAUDE_PROJECT_DIR || process.cwd()) || (root && readConfigNotice(root));
     if (!root) {
@@ -460,9 +464,9 @@ const commands = {
     }
     const { steps, errors, files } = snapshot(root);
     const drift = state.phase === "fill" ? verifySnapshot(root, state, files) : null;
-    const legacy = legacyNotice(root);
+    const stores = await storeNotice(root);
     if (args.includes("--json")) {
-      console.log(JSON.stringify({ ...state, errors, drift, configNotice, ...(legacy ? { legacy } : {}), steps: steps.map(({ fences, ...s }) => ({
+      console.log(JSON.stringify({ ...state, errors, drift, configNotice, ...(stores ? { storeNotice: stores } : {}), steps: steps.map(({ fences, ...s }) => ({
         ...s, fences: fences.map(({ body, ...f }) => f),
       })) }, null, 2));
       return;
@@ -475,7 +479,7 @@ const commands = {
       console.log(`  ${mark} ${s.id.padEnd(5)} ${s.title}  (${s.fences.map((f) => `${f.file}:${f.openLine}`).join(", ")})`);
     }
     for (const e of errors) console.log(`  ! ${e}`);
-    if (legacy) console.log(`  ! ${legacy}`);
+    if (stores) console.log(`  ! ${stores}`);
     if (drift && !drift.ok) console.log(`  ! ${formatDrift(drift).replace(/\n/g, "\n    ")}\n    (skel done and skel finalize refuse until it's resolved)`);
     // Diagram nodes named step_<id> that match no step are silently uncolored
     // on the page; say so here.
@@ -505,7 +509,7 @@ const commands = {
     requireState(root);
     const feedbackEnabled = args.includes("--send");
     const mode = feedbackEnabled ? "feedback enabled" : "read-only";
-    if (running && running.feedbackEnabled === feedbackEnabled && running.storeProtocol === STORE_PROTOCOL) {
+    if (running && running.feedbackEnabled === feedbackEnabled && running.storeProtocol >= STORE_PROTOCOL) {
       console.log(`skel review: ${running.url} (${mode}; already running; \`skel serve --stop\` stops it)`);
       return;
     }
@@ -861,7 +865,7 @@ const commands = {
     await runStopHook({ block: BLOCK_ON_DRIFT || args.includes("--block") });
   },
 
-  install([dir = process.cwd()]) {
+  async install([dir = process.cwd()]) {
     // The hook command runs through a shell: refuse an install path that a
     // shell would interpret rather than quote it and hope. Windows paths are
     // written with forward slashes (Node accepts them), so their backslashes
@@ -966,8 +970,8 @@ const commands = {
     reportLeftInPlace(settings, rules);
     launchWarning(target);
     if (enrollment(target).protected) console.log("note: a fill is active, so a running Claude Code session won't reload these settings: it keeps enforcing the rules it loaded until you restart it.");
-    const legacy = legacyNotice(target);
-    if (legacy) console.log(`note: ${legacy}`);
+    const storesNote = await storeNotice(target);
+    if (storesNote) console.log(`note: ${storesNote}`);
     console.log(`optional: Claude Code's Bash sandbox can enforce those rules at the OS level; see "Security model" in the README (skel needs "excludedCommands": ["node \\"${SELF}\\" *"])`);
   },
 
@@ -979,35 +983,48 @@ const commands = {
    * so the rest is the note at the end.
    */
   async migrate(args) {
-    const dir = args.find((a) => !a.startsWith("--"));
-    const root = dir ? path.resolve(dir) : findRoot(process.cwd()) ?? process.cwd();
+    const unknown = args.find((a) => a.startsWith("-") && a !== "--dry-run");
+    if (unknown) die(`unknown option ${unknown}\nusage: skel migrate [--dry-run] [projectDir]`);
+    const dirs = args.filter((a) => a !== "--dry-run");
+    if (dirs.length > 1) die("usage: skel migrate [--dry-run] [projectDir]");
+    const root = dirs[0] ? path.resolve(dirs[0]) : findRoot(process.cwd()) ?? process.cwd();
+    if (!fs.existsSync(root)) die(`${root} doesn't exist`);
     const plan = migrationPlan(root);
-    if (!plan.outcomes.length && !plan.resuming) return console.log(`nothing to migrate for ${root}: it uses ${plan.to}`);
+    if (!plan.outcomes.length) return console.log(`nothing to migrate for ${root}: it uses ${usesLegacy(root) ? plan.from : plan.to}`);
     if (args.includes("--dry-run")) {
-      console.log(`would move this project's records from ${plan.from} to ${plan.to} (nothing was changed):`);
+      console.log(`what \`skel migrate\` would do with this project's records, from ${plan.from} to ${plan.to} (nothing was changed):`);
       for (const o of plan.outcomes) console.log(`  ${path.basename(o.source)}: ${o.outcome}${o.why ? ` (${o.why})` : ""}`);
       return;
     }
-    for (const base of new Set([root, process.env.CLAUDE_PROJECT_DIR].filter(Boolean))) {
-      const status = enrollment(base);
-      if (status.protected) die(`not migrating: ${status.reason}. Settings reloads are held until then, so the running session may enforce only the rule for ${plan.from}. Finish the skeleton or \`skel reshape\`, then restart Claude Code and run \`skel migrate\`. Its records stay where they are, and skel keeps using them.`);
+    // Finishing a committed move changes nothing a session relies on.
+    if (!plan.marked) {
+      for (const base of new Set([root, process.env.CLAUDE_PROJECT_DIR].filter(Boolean))) {
+        const status = enrollment(base);
+        if (status.protected) die(`not migrating: ${status.reason}. Settings reloads are held until then, so the running session may enforce only the rule for ${plan.from}. Finish the skeleton first, or run \`skel reshape\`, which discards the approval so it has to be given again. Then restart Claude Code and run \`skel migrate\`. The records stay where they are, and skel keeps using them.`);
+      }
+      const install = installStatus(root, plan.to);
+      if (install.status === "stale") die(`not migrating: ${install.why ?? `the settings in ${install.where} have no deny rule for ${plan.to}`}. Run \`skel install\` ${install.where ? `in ${install.where}` : "in the main checkout"} first, restart Claude Code so it loads the rule, then run \`skel migrate\`.`);
     }
-    const install = installStatus(root, plan.to);
-    if (install.status === "stale") die(`not migrating: the settings in ${install.where} have no deny rule for ${plan.to}. Run \`skel install\` there first, restart Claude Code so it loads the rule, then run \`skel migrate\`.`);
+    if (plan.problems.length) {
+      // The real run words the refusal.
+      try { migrateProject({ key: projectKey(root), from: plan.from, to: plan.to, keyOf: projectKey }); } catch (err) { die(err.message); }
+    }
+    // A server from before the state dir reads only the old location, and could
+    // write to it during the move: stop it first. A current one follows the move.
+    const running = await liveServer(root);
+    if (running && running.storeProtocol < STORE_PROTOCOL) {
+      try { process.kill(running.pid); } catch (err) { if (err.code !== "ESRCH") throw err; }
+      console.log(`stopped the review server at ${running.url}: it could only read the old location. Run \`skel serve\` to start it again.`);
+    }
     let moved;
     try {
-      moved = migrateStores(root);
+      moved = migrateProject({ key: projectKey(root), from: plan.from, to: plan.to, keyOf: projectKey });
     } catch (err) {
       if (err.code === "SKEL_STATE_MIGRATION") die(err.message);
       throw err;
     }
+    if (plan.marked) return console.log(`removed ${plan.stale.length} leftover file(s) from ${plan.from}`);
     console.log(`moved ${moved} of this project's records from ${plan.from} to ${plan.to}`);
-    // A current server follows the move; one from before it reads only the old dir.
-    const running = await liveServer(root);
-    if (running && running.storeProtocol !== STORE_PROTOCOL) {
-      try { process.kill(running.pid); } catch (err) { if (err.code !== "ESRCH") throw err; }
-      console.log(`stopped the review server at ${running.url}: it could only read the old location. Run \`skel serve\` to start it again.`);
-    }
     launchWarning(root);
     console.log("note: a Claude Code session started before `skel install` still enforces only the old rule: restart it.");
   },
