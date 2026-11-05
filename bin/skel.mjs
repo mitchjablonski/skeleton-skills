@@ -11,14 +11,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, realish, skelStateDir, writeFileAtomic } from "../lib/state.mjs";
-import { bodyEscapesFence } from "../lib/gate.mjs";
-import { isSkelHook, rulePath } from "../lib/install-status.mjs";
+import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
+import { installStatus, isSkelHook, rulePath } from "../lib/install-status.mjs";
+import { enrollment } from "../lib/config-hook.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
-  addSession, clearSessions, forgetStoreHomes, historyDir, legacyQueued, migrationBlock, pendingCount, queueDir, readServe, reinstallNotice, servePath,
-  storeFeedback, storePath, takeFeedback,
+  addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
+  storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
+import { legacyNotice, migrateStores, migrationPlan, storePath } from "../lib/stores.mjs";
 import {
   clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
 } from "../lib/snapshot.mjs";
@@ -28,6 +30,7 @@ const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const SELF = path.join(PKG_ROOT, "bin", "skel.mjs").split(path.sep).join("/");
 const HOOK = path.join(PKG_ROOT, "bin", "skel-hook.mjs").split(path.sep).join("/");
 const STOP_HOOK = path.join(PKG_ROOT, "bin", "skel-stop.mjs").split(path.sep).join("/");
+const CONFIG_HOOK = path.join(PKG_ROOT, "bin", "skel-config-hook.mjs").split(path.sep).join("/");
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
@@ -38,17 +41,20 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   review                             write .skeleton/review.html (static; copy feedback by hand)
   serve [--port N] [--send] [--stop] serve live read-only; --send enables feedback
   feedback [--wait SECONDS]          print (and archive) the human's latest feedback (waits up to 110s)
-  approve [--reviewed VERSION]       enter the fill phase (inside Claude Code the hook asks the human first);
+  approve [--reviewed VERSION]       enter the fill phase (the loaded hook requests permission;
+                                     permission modes and integrations control who answers);
                                      refuses if the version the human last reviewed isn't the current one
   next                               start the first pending step and print its fences
   start <id> [--force]               start a specific step (--force abandons an unfinished active step,
                                      or reopens a filled one for rework)
   done                               finish the active step (fails if SKEL_TODO remains, or on drift
                                      outside the fences from the approved skeleton)
-  reshape                            back to skeleton review (inside Claude Code the hook asks the human first)
+  reshape                            back to skeleton review (the loaded hook requests permission)
   finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
   stop-hook [--block]                Stop hook: reports drift from the approved skeleton during a fill
+  migrate [--dry-run] [projectDir]   move this project's records from the old config dir to the state dir
+                                     (run skel install and restart Claude Code first; refused during a fill)
   install [projectDir]               install skills, filler subagent, hooks and deny rules (.skeleton/ state,
                                      skel's state dir) into a project's .claude/
   uninstall [projectDir]             remove what install added (leaves .skeleton/ and .gitignore alone)
@@ -73,7 +79,25 @@ function requireRoot() {
   return root;
 }
 
-function snapshot(root, state = readState(root)) {
+function validState(state) {
+  return !!state && ["scaffold", "fill", "done"].includes(state.phase) && ["ask", "deny"].includes(state.gate) && typeof state.title === "string" && Array.isArray(state.files) && state.files.every(file => typeof file === "string") && (state.activeStep === null || typeof state.activeStep === "string") && Number.isFinite(state.reviewEpoch);
+}
+
+function requireState(root) {
+  const state = readState(root);
+  if (!validState(state)) {
+    die(`can't read valid state from ${path.join(root, STATE_DIR, "state.json")}; repair it from a terminal or Claude Code's ! shell mode, or run skel init --force "<title>" from ${root} to replace the prior fill state`);
+  }
+  return state;
+}
+
+function clearConfigNotices(root) {
+  for (const owner of new Set([root, process.env.CLAUDE_PROJECT_DIR].filter(Boolean))) {
+    try { clearConfigNotice(owner); } catch (err) { console.error(`skel: couldn't clear the historical settings notice (${err.code ?? err.message})`); }
+  }
+}
+
+function snapshot(root, state = requireState(root)) {
   const { fences, errors, files } = scanSkeleton(root, state);
   return { steps: toSteps(fences), errors, files };
 }
@@ -111,13 +135,21 @@ function printFences(step) {
 /** How long `skel feedback --wait` waits for a review server to answer before saying there's none. */
 const NO_SERVER_GRACE = 10_000;
 
+/**
+ * Which store layout a server understands, in /api/version. No path: that
+ * endpoint is readable by anything on the machine. A server without it is from
+ * before the state dir: it only ever reads the old location, so it reports a
+ * missing approval record once a project has migrated.
+ */
+const STORE_PROTOCOL = 2;
+
 async function liveServer(root) {
   const s = readServe(root);
   if (!s?.url || !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(s.url) || !s.serverId) return null;
   try {
     const res = await fetch(new URL("api/version", s.url), { signal: AbortSignal.timeout(1500) });
     const v = await res.json();
-    return v.serverId === s.serverId && Number.isInteger(v.pid) ? { url: s.url, pid: v.pid, feedbackEnabled: v.feedbackEnabled !== false } : null;
+    return v.serverId === s.serverId && Number.isInteger(v.pid) ? { url: s.url, pid: v.pid, feedbackEnabled: v.feedbackEnabled !== false, storeProtocol: v.storeProtocol ?? 1 } : null;
   } catch {
     return null;
   }
@@ -274,22 +306,20 @@ function launchWarning(target) {
  * already had survives install + uninstall.
  */
 const ownedStorePath = (target) => storePath(target, "-install");
-/**
- * Ownership decides which rules are the user's, and an unreadable record reads
- * as "not ours": so install and uninstall stop, before changing anything, when
- * the project's old records can't be moved.
- */
-function refuseBlockedMigration(target, opts) {
-  const blocked = migrationBlock(target, opts);
-  if (blocked) die(blocked);
-}
 function readOwned(target) {
+  const file = ownedStorePath(target);
+  let text;
   try {
-    const o = JSON.parse(fs.readFileSync(ownedStorePath(target), "utf-8")).ownedDeny;
-    return Array.isArray(o) ? o.filter((x) => typeof x === "string") : null;
-  } catch {
-    return null;
+    text = fs.readFileSync(file, "utf-8");
+  } catch (err) {
+    if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
+    die(`can't read install's ownership record ${file} (${err.code ?? err.message}). Fix it first: without it, install would treat its own rules as yours.`);
   }
+  // Unreadable isn't missing: guessing here would orphan rules, or take the user's.
+  let o;
+  try { o = JSON.parse(text).ownedDeny; } catch {}
+  if (!Array.isArray(o)) die(`install's ownership record ${file} is corrupt. Delete it to treat every current rule as yours, or restore a good copy, then run this again.`);
+  return o.filter((x) => typeof x === "string");
 }
 function writeOwned(target, owned) {
   if (!owned.length) return fs.rmSync(ownedStorePath(target), { force: true });
@@ -318,6 +348,8 @@ const skelStopHook = (cmd) => {
   const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?:\s+--\w[\w-]*)*)\s*$/.exec(cmd);
   return m ? { block: m[1].split(/\s+/).includes("--block") } : null;
 };
+/** Exact standalone commands only: a chained command remains the user's. */
+const isSkelConfigHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/]skel-config-hook\.mjs"$/.test(cmd);
 
 /**
  * A project's .claude/settings.local.json, parsed, for install/uninstall to
@@ -355,6 +387,7 @@ function openProjectSettings(dir, { forInstall = false } = {}) {
     : settings.hooks !== undefined && !isObj(settings.hooks) ? '"hooks"'
     : settings.hooks?.PreToolUse !== undefined && !Array.isArray(settings.hooks.PreToolUse) ? '"hooks.PreToolUse"'
     : settings.hooks?.Stop !== undefined && !Array.isArray(settings.hooks.Stop) ? '"hooks.Stop"'
+    : settings.hooks?.ConfigChange !== undefined && !Array.isArray(settings.hooks.ConfigChange) ? '"hooks.ConfigChange"'
     : null;
   if (bad) die(`${settingsPath}: ${bad} isn't shaped the way Claude Code expects; fix it first (we won't overwrite it)`);
   return { target, claudeDir, settingsPath, settings };
@@ -372,13 +405,13 @@ const commands = {
     const title = args.filter((a) => a !== "--force").join(" ").trim();
     if (!title) die('usage: skel init "<title>"');
     const root = findRoot(process.cwd()) ?? process.cwd();
-    refuseBlockedMigration(root); // before state.json: the check at dispatch needs one to exist
     const existing = readState(root);
     if (existing && existing.phase !== "done" && !force) {
       die(`a skeleton is already in progress here: "${existing.title}" (phase: ${existing.phase}). Use --force to replace it.`);
     }
     initState(root, title);
     writeState(root, { ...readState(root), gate });
+    clearConfigNotices(root);
     // A new skeleton starts with no feedback and no review server: nothing
     // left over (or shipped in the repo) can pose as this review's notes.
     const old = await liveServer(root);
@@ -397,7 +430,7 @@ const commands = {
   track(args) {
     if (!args.length) die("usage: skel track <file...>");
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     const rels = args.map((a) => path.relative(root, path.resolve(a)).split(path.sep).join("/"));
     const missing = rels.filter((r) => !fs.existsSync(path.join(root, r)));
     if (missing.length) die(`not found: ${missing.join(", ")}`);
@@ -408,25 +441,41 @@ const commands = {
   },
 
   status(args) {
-    const root = requireRoot();
+    const root = findRoot(process.cwd());
+    const configNotice = readConfigNotice(process.env.CLAUDE_PROJECT_DIR || process.cwd()) || (root && readConfigNotice(root));
+    if (!root) {
+      if (configNotice) console.error(configNotice);
+      die(`no ${STATE_DIR}/state.json here or above — run \`skel init "<title>"\` first`);
+    }
     const state = readState(root);
+    if (!validState(state)) {
+      const error = `can't read ${path.join(root, STATE_DIR, "state.json")}; repair that file or run \`skel init --force "<title>"\` from ${root} (requires approval in Claude Code)`;
+      if (args.includes("--json")) {
+        console.log(JSON.stringify({ error, configNotice }, null, 2));
+        process.exitCode = 1;
+        return;
+      }
+      if (configNotice) console.error(configNotice);
+      die(error);
+    }
     const { steps, errors, files } = snapshot(root);
     const drift = state.phase === "fill" ? verifySnapshot(root, state, files) : null;
-    const reinstall = reinstallNotice(root);
+    const legacy = legacyNotice(root);
     if (args.includes("--json")) {
-      console.log(JSON.stringify({ ...state, errors, drift, ...(reinstall ? { reinstall } : {}), steps: steps.map(({ fences, ...s }) => ({
+      console.log(JSON.stringify({ ...state, errors, drift, configNotice, ...(legacy ? { legacy } : {}), steps: steps.map(({ fences, ...s }) => ({
         ...s, fences: fences.map(({ body, ...f }) => f),
       })) }, null, 2));
       return;
     }
     const done = steps.filter((s) => s.status === "filled").length;
     console.log(`${state.title} — phase: ${state.phase}${state.activeStep ? `, active: ${state.activeStep}` : ""} — ${done}/${steps.length} filled`);
+    if (configNotice) console.log(configNotice);
     for (const s of steps) {
       const mark = s.id === state.activeStep ? "▶" : s.status === "filled" ? "✓" : "·";
       console.log(`  ${mark} ${s.id.padEnd(5)} ${s.title}  (${s.fences.map((f) => `${f.file}:${f.openLine}`).join(", ")})`);
     }
     for (const e of errors) console.log(`  ! ${e}`);
-    if (reinstall) console.log(`  ! ${reinstall}`);
+    if (legacy) console.log(`  ! ${legacy}`);
     if (drift && !drift.ok) console.log(`  ! ${formatDrift(drift).replace(/\n/g, "\n    ")}\n    (skel done and skel finalize refuse until it's resolved)`);
     // Diagram nodes named step_<id> that match no step are silently uncolored
     // on the page; say so here.
@@ -439,7 +488,7 @@ const commands = {
 
   review() {
     const root = requireRoot();
-    const out = writeReview(root, readState(root));
+    const out = writeReview(root, requireState(root));
     console.log(out);
     console.log(`file://${out}`);
   },
@@ -453,9 +502,10 @@ const commands = {
       fs.rmSync(servePath(root), { force: true });
       return;
     }
+    requireState(root);
     const feedbackEnabled = args.includes("--send");
     const mode = feedbackEnabled ? "feedback enabled" : "read-only";
-    if (running && running.feedbackEnabled === feedbackEnabled) {
+    if (running && running.feedbackEnabled === feedbackEnabled && running.storeProtocol === STORE_PROTOCOL) {
       console.log(`skel review: ${running.url} (${mode}; already running; \`skel serve --stop\` stops it)`);
       return;
     }
@@ -553,7 +603,7 @@ const commands = {
           lastPoll = Date.now();
           res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           const now = current();
-          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled }));
+          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled, storeProtocol: STORE_PROTOCOL }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
           if (!feedbackEnabled) { req.resume(); return void res.writeHead(405, { Allow: "GET", connection: "close" }).end("read-only review; reload and use Copy feedback for Claude"); }
           // Cross-site writes: same origin, a JSON content type (forces a CORS
@@ -642,7 +692,7 @@ const commands = {
           "They are not the human's feedback; don't act on them.\n",
       );
     }
-    if (taken.status === "ok") console.log(feedbackMarkdown(readState(root).title, mergeRecords(taken.records)));
+    if (taken.status === "ok") console.log(feedbackMarkdown(requireState(root).title, mergeRecords(taken.records)));
     else if (readonly) console.log("READ_ONLY: the review is read-only; the human's feedback arrives as a chat message. Wait for it; don't poll. Only if the human asks for direct Send: skel serve --send.");
     else if (noServer) console.log("NO_SERVER: no review server is running (a static review, or it stopped), so nothing can be sent; the human's feedback arrives as a chat message. Wait for it; don't poll.");
     else console.log(`NO_FEEDBACK${wait ? ` (waited ${wait}s)` : ""}`);
@@ -652,14 +702,14 @@ const commands = {
     const given = flag(args, "reviewed", null);
     if (given !== null && !isVersion(given)) die('--reviewed takes the 12-character version the human reviewed (the "Reviewed skeleton version: …" line of their feedback)');
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
     const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     if (!steps.length) die("no SKEL[...] fences found — nothing to approve");
-    // The human's say-so is Claude Code's permission prompt: the hook always
-    // asks before an agent runs `skel approve` (see evaluateBash). This checks
-    // freshness, not authority: that what is approved is the version the human
+    // The loaded hook requests permission (see evaluateBash); permission modes
+    // and integrations determine who answers. This checks freshness, not
+    // human authority: that what is approved is the version the human
     // last reviewed, so an edit made after their "looks good" can't ride along.
     // A tracked file's malformed markers throw SKEL_MARKERS; anything else is I/O.
     let record;
@@ -701,7 +751,7 @@ const commands = {
 
   next() {
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     if (state.phase !== "fill") die(`phase is ${state.phase} — the skeleton must be approved first (skel approve)`);
     const { steps } = snapshot(root);
     if (state.activeStep) {
@@ -725,7 +775,7 @@ const commands = {
     const id = args.find((a) => a !== "--force");
     if (!id) die("usage: skel start <id> [--force]");
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     if (state.phase !== "fill") die(`phase is ${state.phase} — the skeleton must be approved first (skel approve)`);
     const { steps } = snapshot(root);
     const step = steps.find((s) => s.id === id);
@@ -739,9 +789,9 @@ const commands = {
     setActive(root, state, step, force);
   },
 
-  done() {
+  async done() {
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     if (!state.activeStep) die("no active step");
     const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
@@ -756,6 +806,9 @@ const commands = {
     // a new one before the fence ends (the code after the fence is unchanged).
     // The hook's heuristic catches that for Edit/Write; repeat it here, as a
     // note, for fills it didn't see. A heuristic, so it never blocks.
+    let bodyEscapesFence;
+    try { ({ bodyEscapesFence } = await import("../lib/gate.mjs")); }
+    catch (err) { die(`can't load the gate; restore or repair the skeleton-skills checkout from a terminal or ! shell mode (${err.message})`); }
     for (const f of step.fences) {
       const marker = fs.readFileSync(path.join(root, f.file), "utf-8").split("\n")[f.openLine - 1] ?? "";
       const escape = bodyEscapesFence(f.body.replace(/\r$/gm, ""), marker.replace(/\r$/, ""), f.file);
@@ -768,17 +821,18 @@ const commands = {
 
   reshape(args) {
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
     writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now() });
     // The record is of the shape being reopened; approve writes the new one.
     clearSnapshot(root);
+    clearConfigNotices(root);
     console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
   },
 
   finalize() {
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     const phase = state.phase;
     if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");
     const { fences, errors, files: fenced } = scanSkeleton(root, state);
@@ -793,6 +847,7 @@ const commands = {
     }
     writeState(root, { ...readState(root), phase: "done", activeStep: null });
     clearSnapshot(root);
+    clearConfigNotices(root);
     console.log(`finalized: stripped markers from ${files.length} file(s)`);
   },
 
@@ -815,8 +870,6 @@ const commands = {
       die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
     }
     const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
-    // Checked now, moved once the settings name the state dir (below).
-    refuseBlockedMigration(target, { preview: true });
     const { rules: stateRules, why } = denyRules(target);
     const stores = storeDenyRules();
     const rules = [...new Set([...stateRules, ...stores.map((s) => s.rule).filter(Boolean)])];
@@ -860,6 +913,21 @@ const commands = {
     settings.hooks.Stop = settings.hooks.Stop.filter((m) => !emptied.has(m));
     if (stopOurs) stopOurs.command = stopCommand + (block ? " --block" : "");
     else settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand }] });
+    // Freeze ordinary settings reloads during a fill. Keep other hooks and
+    // groups; remove only our exact standalone command, including moved clones.
+    settings.hooks.ConfigChange ??= [];
+    const configGroups = settings.hooks.ConfigChange;
+    const emptiedConfigs = new Set();
+    for (const group of configGroups) {
+      if (!Array.isArray(group?.hooks) || !group.hooks.length) continue;
+      group.hooks = group.hooks.filter((hk) => !isSkelConfigHook(hk?.command));
+      if (!group.hooks.length) emptiedConfigs.add(group);
+    }
+    settings.hooks.ConfigChange = configGroups.filter((g) => !emptiedConfigs.has(g));
+    settings.hooks.ConfigChange.push({
+      matcher: "user_settings|project_settings|local_settings",
+      hooks: [{ type: "command", command: `node "${CONFIG_HOOK}"` }],
+    });
     settings.permissions ??= {};
     settings.permissions.deny = (settings.permissions.deny ?? []).filter((r) => !stale.includes(r));
     const added = rules.filter((r) => !settings.permissions.deny.includes(r));
@@ -868,9 +936,6 @@ const commands = {
     // A rule that was already there and isn't recorded stays the user's.
     // Settings first: a failed write must never record rules that weren't added.
     writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-    // The rule is in place, so the project's records move now, this one first.
-    forgetStoreHomes();
-    refuseBlockedMigration(target);
     writeOwned(target, rules.filter((r) => added.includes(r) || prevOwned?.includes(r)));
     // .skeleton/ is per-run state (and holds the human's feedback): keep it
     // out of commits, so a repo can't ship a verdict.
@@ -881,6 +946,7 @@ const commands = {
     console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
     console.log(stopOurs ? "drift check (Stop) hook updated" : `added drift check (Stop) hook to ${settingsPath}`);
+    console.log(`settings-reload guard (ConfigChange) configured; settings changes are held during a fill`);
     const addedState = added.filter((r) => stateRules.includes(r));
     if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
     else console.log(addedState.length ? `added ${addedState.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
@@ -890,12 +956,55 @@ const commands = {
     }
     reportLeftInPlace(settings, rules);
     launchWarning(target);
+    if (enrollment(target).protected) console.log("note: a fill is active, so a running Claude Code session won't reload these settings: it keeps enforcing the rules it loaded until you restart it.");
+    const legacy = legacyNotice(target);
+    if (legacy) console.log(`note: ${legacy}`);
     console.log(`optional: Claude Code's Bash sandbox can enforce those rules at the OS level; see "Security model" in the README (skel needs "excludedCommands": ["node \\"${SELF}\\" *"])`);
+  },
+
+  /**
+   * The one thing that moves records out of the old config dir. A human asks for
+   * it (the hook asks them when an agent runs it), and never during a fill: the
+   * guard then holds settings reloads, so the session's loaded deny rule still
+   * names only the old dir. What a session has loaded can't be read from here,
+   * so the rest is the note at the end.
+   */
+  async migrate(args) {
+    const dir = args.find((a) => !a.startsWith("--"));
+    const root = dir ? path.resolve(dir) : findRoot(process.cwd()) ?? process.cwd();
+    const plan = migrationPlan(root);
+    if (!plan.outcomes.length && !plan.resuming) return console.log(`nothing to migrate for ${root}: it uses ${plan.to}`);
+    if (args.includes("--dry-run")) {
+      console.log(`would move this project's records from ${plan.from} to ${plan.to} (nothing was changed):`);
+      for (const o of plan.outcomes) console.log(`  ${path.basename(o.source)}: ${o.outcome}${o.why ? ` (${o.why})` : ""}`);
+      return;
+    }
+    for (const base of new Set([root, process.env.CLAUDE_PROJECT_DIR].filter(Boolean))) {
+      const status = enrollment(base);
+      if (status.protected) die(`not migrating: ${status.reason}. Settings reloads are held until then, so the running session may enforce only the rule for ${plan.from}. Finish the skeleton or \`skel reshape\`, then restart Claude Code and run \`skel migrate\`. Its records stay where they are, and skel keeps using them.`);
+    }
+    const install = installStatus(root, plan.to);
+    if (install.status === "stale") die(`not migrating: the settings in ${install.where} have no deny rule for ${plan.to}. Run \`skel install\` there first, restart Claude Code so it loads the rule, then run \`skel migrate\`.`);
+    let moved;
+    try {
+      moved = migrateStores(root);
+    } catch (err) {
+      if (err.code === "SKEL_STATE_MIGRATION") die(err.message);
+      throw err;
+    }
+    console.log(`moved ${moved} of this project's records from ${plan.from} to ${plan.to}`);
+    // A current server follows the move; one from before it reads only the old dir.
+    const running = await liveServer(root);
+    if (running && running.storeProtocol !== STORE_PROTOCOL) {
+      try { process.kill(running.pid); } catch (err) { if (err.code !== "ESRCH") throw err; }
+      console.log(`stopped the review server at ${running.url}: it could only read the old location. Run \`skel serve\` to start it again.`);
+    }
+    launchWarning(root);
+    console.log("note: a Claude Code session started before `skel install` still enforces only the old rule: restart it.");
   },
 
   uninstall([dir = process.cwd()]) {
     const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir);
-    refuseBlockedMigration(target, { preview: true });
     const prevOwned = readOwned(target);
     const owned = [...(prevOwned ?? []), ...legacyOwned(settings, prevOwned)];
     const groups = settings.hooks?.PreToolUse ?? [];
@@ -915,6 +1024,17 @@ const commands = {
     if (settings.hooks?.Stop) {
       settings.hooks.Stop = stops.filter((m) => !emptiedStops.has(m));
       if (!settings.hooks.Stop.length) delete settings.hooks.Stop;
+    }
+    const configs = settings.hooks?.ConfigChange ?? [];
+    const emptiedConfigs = new Set();
+    for (const group of configs) {
+      if (!Array.isArray(group?.hooks) || !group.hooks.length) continue;
+      group.hooks = group.hooks.filter((hk) => !isSkelConfigHook(hk?.command));
+      if (!group.hooks.length) emptiedConfigs.add(group);
+    }
+    if (settings.hooks?.ConfigChange) {
+      settings.hooks.ConfigChange = configs.filter((g) => !emptiedConfigs.has(g));
+      if (!settings.hooks.ConfigChange.length) delete settings.hooks.ConfigChange;
     }
     if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
     let removed = 0;
@@ -936,7 +1056,8 @@ const commands = {
     }
     // The agents folder may hold the user's own subagents: leave it.
     fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
-    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook and the drift check (Stop) hook from ${claudeDir}`);
+    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook, the drift check (Stop) hook and the settings-reload (ConfigChange) hook from ${claudeDir}`);
+    console.log("restart Claude Code if these hooks are already loaded; an external uninstall may not trigger a settings-reload event");
     console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
     if (removedStores) console.log(`removed ${removedStores} store-dir permission deny rule(s) install added`);
     reportLeftInPlace(settings, []);
@@ -947,11 +1068,4 @@ const commands = {
 const [cmd = "help", ...rest] = process.argv.slice(2);
 const run = Object.hasOwn(commands, cmd) ? commands[cmd] : null;
 if (!run) die(`unknown command "${cmd}"\n\n${HELP}`);
-// A project whose old records can't be moved stops here with the reason, before
-// a command can read the gap as "no record". Hooks fail closed on their own
-// paths; install and uninstall take their target as an argument, and check it.
-if (!["help", "hook", "stop-hook", "install", "uninstall", "__candidates"].includes(cmd)) {
-  const here = findRoot(process.cwd());
-  if (here) refuseBlockedMigration(here);
-}
 await run(rest);

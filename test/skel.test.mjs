@@ -4,15 +4,15 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { scanFiles, scanText, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { bodyEscapesFence, evaluate, evaluateBash } from "../lib/gate.mjs";
 import { cleanFeedback, feedbackMarkdown, projectKey, sessionStorePath, storePath } from "../lib/feedback.mjs";
-import { migrateProject } from "../lib/migrate.mjs";
+import { migrateProject, planMigration } from "../lib/migrate.mjs";
 import { compareWith, exterior, lineDiff, readRendered, readSnapshot, recordSkeleton, renderedPath, safeKey, scanSkeleton, snapshotPath, whitespaceOnly } from "../lib/snapshot.mjs";
 import { buildReviewData } from "../lib/review.mjs";
-import { inSkelConfig, legacyConfigDir, readState, skelStateDir } from "../lib/state.mjs";
+import { inSkelStores, legacyConfigDir, readState, skelStateDir } from "../lib/state.mjs";
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "skel.mjs");
 
@@ -241,7 +241,8 @@ function project(parent) {
   fs.mkdirSync(path.join(dir, "src"));
   const a = path.join(dir, "src", "a.ts");
   fs.writeFileSync(a, SRC);
-  const run = (...args) => execFileSync("node", [BIN, ...args], { cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  // A bounded wait: `skel serve` that starts a server instead of reusing one would otherwise hang the suite.
+  const run = (...args) => execFileSync("node", [BIN, ...args], { cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 });
   const hook = (input) => execFileSync("node", [BIN, "hook"], { cwd: dir, input: JSON.stringify({ cwd: dir, ...input }), encoding: "utf-8" });
   return { dir, a, run, hook };
 }
@@ -1330,18 +1331,51 @@ test("issue #6 N6: feedback queued under a pre-upgrade serve.json is flagged, ne
 test("issue #6 N4: a page load kicks off a search once the last one is >5s old", async () => {
   const { dir, run } = project();
   run("init", "T");
-  const srv = await serve(dir);
+  const searchLog = path.join(dir, ".skeleton", "test-search.log");
+  const preload = path.join(dir, ".skeleton", "test-search-preload.cjs");
+  fs.writeFileSync(preload, `
+if (process.argv.includes("__candidates")) {
+  const fs = require("node:fs");
+  const log = process.env.SKEL_TEST_SEARCH_LOG;
+  fs.appendFileSync(log, "started\\n");
+  process.on("exit", () => fs.appendFileSync(log, "finished\\n"));
+}
+`);
+  const srv = await serve(dir, ["--send"], {
+    NODE_OPTIONS: `--require="${preload.replaceAll("\\", "/")}"`,
+    SKEL_TEST_SEARCH_LOG: searchLog,
+  });
   try {
     const before = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
     fs.writeFileSync(path.join(dir, "src", "late.ts"), "export function late() {\n  // SKEL[9] late\n  throw new Error(\"SKEL_TODO\");\n  // /SKEL[9]\n}\n");
-    await new Promise((r) => setTimeout(r, 5_500));
-    await fetch(srv.url);
+    const searchCounts = () => {
+      if (!fs.existsSync(searchLog)) return { started: 0, finished: 0 };
+      const lines = fs.readFileSync(searchLog, "utf-8").split("\n");
+      return { started: lines.filter((x) => x === "started").length, finished: lines.filter((x) => x === "finished").length };
+    };
+    const beforeSearch = searchCounts();
+    // Repeatedly load the page until its age check starts the candidate search.
+    // The marker comes from the actual `__candidates` child, so a later periodic
+    // refresh or a version change alone cannot satisfy this assertion.
+    const launchDeadline = Date.now() + 20_000;
+    let launched = false;
+    while (Date.now() < launchDeadline && !launched) {
+      await (await fetch(srv.url)).text();
+      launched = searchCounts().started > beforeSearch.started;
+      if (!launched) await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.ok(launched, "a page load should start the full candidate search before the 30s periodic refresh");
+    const completionDeadline = Date.now() + 60_000;
+    while (Date.now() < completionDeadline && searchCounts().finished <= beforeSearch.finished) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    assert.equal(searchCounts().finished, beforeSearch.finished + 1, "the page-triggered candidate search should finish");
     let version = before;
-    for (const deadline = Date.now() + 10_000; version === before && Date.now() < deadline; ) {
+    for (const deadline = Date.now() + 60_000; version === before && Date.now() < deadline; ) {
       await new Promise((r) => setTimeout(r, 200));
       version = (await (await fetch(new URL("/api/version", srv.url))).json()).version;
     }
-    assert.notEqual(version, before, "the new fenced file should show up well before the 30s search");
+    assert.notEqual(version, before, "the page-triggered rescan should publish the new fenced file");
     assert.match(await (await fetch(srv.url)).text(), /late\.ts/);
   } finally {
     await srv.stop();
@@ -1892,7 +1926,7 @@ test("read-only feedback wait returns immediately, drains pending sends, and sto
 test("legacy version metadata without feedbackEnabled is send-mode and restarts for read-only", async () => {
   const { dir, run } = project();
   run("init", "T");
-  const legacy = spawn(process.execPath, ["-e", `const http=require('node:http'); const server=http.createServer((req,res)=>res.end(JSON.stringify({serverId:'legacy',pid:process.pid})));server.listen(0,'127.0.0.1',()=>console.log(server.address().port));`], { stdio: ["ignore", "pipe", "pipe"] });
+  const legacy = spawn(process.execPath, ["-e", `const http=require('node:http'); const server=http.createServer((req,res)=>res.end(JSON.stringify({serverId:'legacy',pid:process.pid,storeProtocol:2})));server.listen(0,'127.0.0.1',()=>console.log(server.address().port));`], { stdio: ["ignore", "pipe", "pipe"] });
   try {
     const port = await new Promise((resolve, reject) => {
       legacy.stdout.once("data", (d) => resolve(Number(String(d).trim())));
@@ -2177,19 +2211,19 @@ test("#26: after XDG_STATE_HOME changes, install adds the new dir's rule and rep
 });
 
 test("#26: the gate asks about edits into a skel store dir from any project, denies in deny mode, and ignores other outside paths", async () => {
-  const { evaluateConfigEdit } = await import("../lib/gate.mjs");
+  const { evaluateStoreEdit } = await import("../lib/gate.mjs");
   const cfg = tmp("skel-cfgdir-");
-  const configDir = path.join(cfg, "skel");
-  fs.mkdirSync(configDir);
+  const storeDirs = path.join(cfg, "skel");
+  fs.mkdirSync(storeDirs);
   const base = tmp("skel-cfgproj-");
-  const at = (toolName, file, state = null) => evaluateConfigEdit({ toolName, toolInput: toolName === "NotebookEdit" ? { notebook_path: file } : { file_path: file }, base, state, configDir });
-  const record = path.join(configDir, "abc.snapshot.json");
+  const at = (toolName, file, state = null) => evaluateStoreEdit({ toolName, toolInput: toolName === "NotebookEdit" ? { notebook_path: file } : { file_path: file }, base, state, storeDirs });
+  const record = path.join(storeDirs, "abc.snapshot.json");
   for (const tool of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) {
     const v = at(tool, record);
     assert.equal(v?.decision, "ask", tool);
     assert.match(v.reason, /state dir/);
   }
-  assert.equal(at("Edit", path.join(configDir, "new", "x.json")).decision, "ask", "a new file too");
+  assert.equal(at("Edit", path.join(storeDirs, "new", "x.json")).decision, "ask", "a new file too");
   assert.equal(at("Edit", record.toUpperCase()).decision, "ask", "case-insensitively");
   assert.equal(at("Write", record, { gate: "deny" }).decision, "deny");
   assert.equal(at("Edit", path.join(cfg, "skel-other", "x.json")), null, "a sibling isn't the dir");
@@ -2199,10 +2233,10 @@ test("#26: the gate asks about edits into a skel store dir from any project, den
   if (canSymlink) {
     // Outside the project, a symlink into the dir is resolved and caught.
     const outside = path.join(tmp("skel-outlink-"), "sneaky");
-    fs.symlinkSync(configDir, outside, "junction");
+    fs.symlinkSync(storeDirs, outside, "junction");
     assert.equal(at("Write", path.join(outside, "abc.snapshot.json"))?.decision, "ask", "through a symlink outside the project");
     // Inside it, the hook stays textual: install's deny rule covers a symlink's target.
-    fs.symlinkSync(configDir, path.join(base, "sneaky"), "junction");
+    fs.symlinkSync(storeDirs, path.join(base, "sneaky"), "junction");
     assert.equal(at("Write", path.join("sneaky", "abc.snapshot.json")), null, "left to the deny rule (checked against the link's target)");
   }
 
@@ -2210,10 +2244,10 @@ test("#26: the gate asks about edits into a skel store dir from any project, den
   const resolved = [];
   const spy = (p) => { resolved.push(p); return p; };
   const deep = path.join(base, "a", "b", "c", "new", "file.ts");
-  assert.equal(evaluateConfigEdit({ toolName: "Write", toolInput: { file_path: deep }, base, state: null, configDir, resolve: spy }), null);
-  assert.deepEqual(resolved, [configDir], "one resolve, of the store dir");
+  assert.equal(evaluateStoreEdit({ toolName: "Write", toolInput: { file_path: deep }, base, state: null, storeDirs, resolve: spy }), null);
+  assert.deepEqual(resolved, [storeDirs], "one resolve, of the store dir");
   resolved.length = 0;
-  evaluateConfigEdit({ toolName: "Write", toolInput: { file_path: path.join(tmp("skel-elsewhere-"), "x.ts") }, base, state: null, configDir, resolve: spy });
+  evaluateStoreEdit({ toolName: "Write", toolInput: { file_path: path.join(tmp("skel-elsewhere-"), "x.ts") }, base, state: null, storeDirs, resolve: spy });
   assert.equal(resolved.length, 2, "outside the project, the edited path is resolved too");
 
   // The hook itself, with no skeleton anywhere, and Bash commands that name the dir.
@@ -2223,7 +2257,7 @@ test("#26: the gate asks about edits into a skel store dir from any project, den
   };
   assert.equal(hook({ tool_name: "Edit", tool_input: { file_path: record, old_string: "a", new_string: "b" } })?.permissionDecision, "ask");
   assert.equal(hook({ tool_name: "Edit", tool_input: { file_path: path.join(tmp("skel-elsewhere-"), "x.json"), old_string: "a", new_string: "b" } }), null);
-  for (const command of ["cat ~/.config/skel/abc.snapshot.json", "rm \"$XDG_CONFIG_HOME/skel/abc.json\"", "rm ${XDG_CONFIG_HOME}/skel/x", `echo {} > "${record}"`, `cd ${configDir} && ls`]) {
+  for (const command of ["cat ~/.config/skel/abc.snapshot.json", "rm \"$XDG_CONFIG_HOME/skel/abc.json\"", "rm ${XDG_CONFIG_HOME}/skel/x", `echo {} > "${record}"`, `cd ${storeDirs} && ls`]) {
     assert.equal(hook({ tool_name: "Bash", tool_input: { command } })?.permissionDecision, "ask", command);
   }
   for (const command of ["ls ~/.config/skeleton-tools", "ls ~/.config", "npm test", `ls ${cfg}/skel-other`]) {
@@ -2554,7 +2588,7 @@ test("#32: scanFiles skips FIFOs, dangling links and directories, follows in-pro
   assert.equal(cache.has(a), false);
 });
 
-// ---- #18: trusted state moves to the state dir ----
+// ---- #18: trusted state moves to the state dir, when a human asks ----
 
 const SUFFIXES = ["", ".snapshot", ".rendered", "-install"];
 
@@ -2562,19 +2596,25 @@ const SUFFIXES = ["", ".snapshot", ".rendered", "-install"];
  * A project under its own XDG homes, with a real filled-in store set moved back
  * to the old config dir, as an older skel would have left it.
  */
-const legacyProject = () => legacyProjectIn();
-const legacyProjectIn = (parent) => {
-  const { dir } = project(parent);
+const legacyProject = () => legacyProjectAt(project().dir);
+const legacyProjectAt = (dir) => {
+  fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+  if (!fs.existsSync(path.join(dir, "src", "a.ts"))) fs.writeFileSync(path.join(dir, "src", "a.ts"), SRC);
   const cfgHome = tmp("skel-m-cfg-");
   const stateHome = tmp("skel-m-state-");
   const oldDir = path.join(cfgHome, "skel");
   const newDir = path.join(stateHome, "skel");
-  const env = { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome };
-  const spawnIt = (args, input) => execFileSync("node", [BIN, ...args], { cwd: dir, env, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], input });
+  const env = { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome, CLAUDE_PROJECT_DIR: "" };
+  delete env.CLAUDE_PROJECT_DIR;
+  const spawnIt = (args, input) => execFileSync("node", [BIN, ...args], { cwd: dir, env, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], input, timeout: 60_000 });
   const key = projectKey(dir);
   const oldFile = (s) => path.join(oldDir, `${key}${s}.json`);
   const newFile = (s) => path.join(newDir, `${key}${s}.json`);
-  const records = () => {
+  const setPhase = (phase) => {
+    const f = path.join(dir, ".skeleton", "state.json");
+    fs.writeFileSync(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, "utf-8")), phase }));
+  };
+  const records = ({ phase = "scaffold" } = {}) => {
     spawnIt(["init", "T"]);
     spawnIt(["review"]);
     spawnIt(["approve"]);
@@ -2582,6 +2622,7 @@ const legacyProjectIn = (parent) => {
     fs.writeFileSync(newFile("-install"), JSON.stringify({ root: dir, ownedDeny: [] }));
     fs.mkdirSync(oldDir, { recursive: true });
     for (const s of SUFFIXES) fs.renameSync(newFile(s), oldFile(s));
+    setPhase(phase);
     return Object.fromEntries(SUFFIXES.map((s) => [s, fs.readFileSync(oldFile(s))]));
   };
   const skel = (...args) => {
@@ -2589,18 +2630,35 @@ const legacyProjectIn = (parent) => {
     try { r.stdout = spawnIt(args); } catch (e) { r.ok = false; r.stdout = e.stdout; r.stderr = e.stderr; }
     return r;
   };
-  return { dir, cfgHome, stateHome, oldDir, newDir, env, oldFile, newFile, records, skel, spawnIt, key };
-};
-/** The stderr of a `skel status` that must fail, under the project's env plus `extra`. */
-const execFileFailure = (m, extra = {}) => {
-  try {
-    execFileSync("node", [BIN, "status"], { cwd: m.dir, env: { ...m.env, ...extra }, encoding: "utf-8", stdio: "pipe" });
-  } catch (e) {
-    return e.stderr;
-  }
-  assert.fail("status should have refused");
+  const stop = (input = {}, ...flags) => {
+    const out = spawnIt(["stop-hook", ...flags], JSON.stringify({ cwd: dir, ...input }));
+    return out ? JSON.parse(out) : null;
+  };
+  return { dir, cfgHome, stateHome, oldDir, newDir, env, oldFile, newFile, records, setPhase, skel, spawnIt, key, stop };
 };
 const onlyFiles = (d) => (fs.existsSync(d) ? fs.readdirSync(d).sort() : []);
+const inOld = (m, before) => {
+  for (const s of Object.keys(before)) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], `${s} stays under the rule that guards it`);
+  assert.deepEqual(onlyFiles(m.newDir).filter((f) => f.startsWith(m.key)), []);
+};
+const inNew = (m, before) => {
+  for (const s of Object.keys(before)) {
+    assert.deepEqual(fs.readFileSync(m.newFile(s)), before[s], `${s} arrived whole`);
+    assert.equal(fs.existsSync(m.oldFile(s)), false, `${s} left the old dir`);
+  }
+};
+/** What main's install left: the hook and the old dir's rule in settings, its ownership record in the old dir. */
+const mainInstalled = (m, settingsDir = m.dir) => {
+  const hookPath = path.join(path.dirname(BIN), "skel-hook.mjs").split(path.sep).join("/");
+  const oldRule = `Edit(/${ruleSpelling(m.cfgHome)}/skel/**)`;
+  const owned = [...stateDenyFor(settingsDir), oldRule];
+  fs.mkdirSync(path.join(settingsDir, ".claude"), { recursive: true });
+  const settingsPath = path.join(settingsDir, ".claude", "settings.local.json");
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Edit", hooks: [{ type: "command", command: `node "${hookPath}"` }] }] }, permissions: { deny: ["Read(./.env)", ...owned] } }));
+  fs.mkdirSync(m.oldDir, { recursive: true });
+  fs.writeFileSync(path.join(m.oldDir, `${projectKey(settingsDir)}-install.json`), JSON.stringify({ root: settingsDir, ownedDeny: owned }));
+  return { oldRule, owned, settingsPath };
+};
 
 test("#18: fresh install: stores go to the state dir, rules cover both dirs, the old dir isn't created", () => {
   const cfgHome = tmp("skel-f-cfg-");
@@ -2614,60 +2672,158 @@ test("#18: fresh install: stores go to the state dir, rules cover both dirs, the
   assert.deepEqual(onlyFiles(path.join(stateHome, "skel")), [`${projectKey(target)}-install.json`]);
 });
 
-test("#18: migration moves every store together, byte for byte, and a later run has nothing to do", () => {
+test("#18: nothing but `skel migrate` moves records: commands and hooks keep using the old location, and say how to move", () => {
+  const m = legacyProject();
+  const before = m.records({ phase: "fill" });
+  const { settingsPath } = mainInstalled(m);
+  before["-install"] = fs.readFileSync(m.oldFile("-install"));
+
+  const status = m.skel("status");
+  assert.equal(status.ok, true, status.stderr);
+  assert.match(status.stdout, /still in .*`skel install`, restart Claude Code.*`skel migrate` outside a fill/);
+  assert.doesNotMatch(status.stdout, /no record of the approved skeleton/, "it reads the old record");
+  assert.ok(JSON.parse(m.skel("status", "--json").stdout).legacy);
+  inOld(m, before);
+
+  assert.match(m.stop().systemMessage, /`skel migrate`/);
+  inOld(m, before);
+  for (const entry of ["skel-hook.mjs", "skel-config-hook.mjs"]) {
+    const r = spawnSync(process.execPath, [path.join(path.dirname(BIN), entry)], { cwd: m.dir, input: JSON.stringify({ cwd: m.dir, tool_name: "Bash", tool_input: { command: "ls" }, source: "local_settings" }), encoding: "utf-8", env: m.env, timeout: 60_000 });
+    assert.equal(r.status, 0, r.stderr);
+  }
+  inOld(m, before);
+
+  // The Stop reminder comes once a session: it runs every turn, and a fill may be under way.
+  assert.match(m.stop({ session_id: "s1" }).systemMessage, /`skel migrate`/);
+  assert.equal(m.stop({ session_id: "s1" }), null);
+  assert.match(m.stop({ session_id: "s2" }).systemMessage, /`skel migrate`/);
+
+  // A record written into the unguarded state dir meanwhile vouches for nothing.
+  fs.mkdirSync(m.newDir, { recursive: true });
+  fs.writeFileSync(m.newFile(".snapshot"), JSON.stringify({ root: m.dir, files: {}, approvedAt: 1 }));
+  assert.equal(m.stop({ session_id: "s1" }), null, "still the old record: no drift report");
+  fs.rmSync(m.newFile(".snapshot"));
+
+  // Install adds the rule and moves nothing; it says what comes next, and that this fill holds reloads.
+  const out = m.skel("install", m.dir);
+  assert.equal(out.ok, true, out.stderr);
+  assert.match(out.stdout, /added a permission deny rule for skel's state dir/);
+  assert.match(out.stdout, /permission deny rule for skel's old config dir already present/);
+  assert.match(out.stdout, /note: a fill is active.*restart/);
+  assert.match(out.stdout, /note: this project's records are still in/);
+  for (const s of [".snapshot", ".rendered", ""]) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s]);
+  assert.ok(fs.readFileSync(settingsPath, "utf-8").includes(`/${ruleSpelling(m.newDir)}/**`));
+});
+
+test("#18: `skel migrate` moves every store together, byte for byte, then has nothing to do", () => {
   const m = legacyProject();
   const before = m.records();
-  const first = execFileSync("node", [BIN, "status"], { cwd: m.dir, env: m.env, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
-  for (const s of SUFFIXES) {
-    assert.deepEqual(fs.readFileSync(m.newFile(s)), before[s], `${s} arrived whole`);
-    assert.equal(fs.existsSync(m.oldFile(s)), false, `${s} left the old dir`);
-    if (process.platform !== "win32") assert.equal(fs.statSync(m.newFile(s)).mode & 0o777, 0o600);
-  }
-  assert.equal(fs.existsSync(m.oldDir), false, "the emptied old dir is gone");
-  assert.deepEqual(onlyFiles(m.newDir).filter((f) => f.includes(".migrate.")), [], "no temp files left");
-  assert.match(first, /phase: fill/);
-  assert.doesNotMatch(first, /no record of the approved skeleton/, "the approval came with it");
-  assert.equal(m.skel("status").stderr, "", "a later run has nothing to say");
-  // Other projects' files stay in the old dir until those projects run.
   const other = path.join(m.oldDir, `${"0".repeat(24)}.snapshot.json`);
-  const again = legacyProject();
-  again.records();
-  fs.writeFileSync(path.join(again.oldDir, path.basename(other)), "someone else's");
-  again.skel("status");
-  assert.deepEqual(onlyFiles(again.oldDir), [path.basename(other)]);
+  fs.writeFileSync(other, "someone else's");
+  const r = m.skel("migrate");
+  assert.equal(r.ok, true, r.stderr);
+  assert.match(r.stdout, /moved 4 of this project's records/);
+  assert.match(r.stdout, /session started before `skel install` still enforces only the old rule: restart it/);
+  inNew(m, before);
+  if (process.platform !== "win32") for (const s of SUFFIXES) assert.equal(fs.statSync(m.newFile(s)).mode & 0o777, 0o600);
+  assert.deepEqual(onlyFiles(m.newDir).filter((f) => f.includes(".migrate.")), [], "no temp files left");
+  assert.deepEqual(onlyFiles(m.oldDir), [path.basename(other)], "another project's file waits for that project");
+  fs.rmSync(other);
+  assert.match(m.skel("migrate").stdout, /nothing to migrate/);
+  assert.doesNotMatch(m.skel("status").stdout, /still in/);
+  m.setPhase("fill");
+  assert.equal(m.stop(), null, "the approval came with it: no drift");
+  assert.equal(fs.existsSync(m.oldDir), true, "the old dir only goes when a migrate empties it");
+  m.setPhase("scaffold");
+  assert.match(m.skel("migrate", m.dir).stdout, /nothing to migrate/);
 });
 
-test("#18: the first run announces the move and asks for a reinstall", () => {
+test("#18: `skel migrate` empties and removes the old dir", () => {
   const m = legacyProject();
   m.records();
-  const store = { ...m.env };
-  const child = spawn("node", [BIN, "status"], { cwd: m.dir, env: store, stdio: ["ignore", "ignore", "pipe"] });
-  let err = "";
-  child.stderr.on("data", (d) => { err += d; });
-  return new Promise((resolve) => child.on("exit", () => {
-    assert.match(err, /moved this project's state from .* to .*re-run `skel install`/s);
-    resolve();
-  }));
+  assert.equal(m.skel("migrate").ok, true);
+  assert.equal(fs.existsSync(m.oldDir), false);
 });
 
-test("#18: a conflicting destination is refused: nothing moves, nothing is overwritten, and the human can clear it", () => {
+test("#18: `skel migrate` is refused during a fill, here or in the session's project, and without the state dir's rule", () => {
+  const m = legacyProject();
+  const before = m.records({ phase: "fill" });
+  const r = m.skel("migrate");
+  assert.equal(r.ok, false);
+  assert.match(r.stderr, /not migrating: a skeleton fill is active.*restart Claude Code and run `skel migrate`/s);
+  assert.doesNotMatch(r.stderr, /\n\s+at /);
+  inOld(m, before);
+
+  // The session's project is mid-fill, even if this one isn't.
+  m.setPhase("scaffold");
+  const session = legacyProject();
+  session.spawnIt(["init", "S"]);
+  session.spawnIt(["approve"]);
+  const via = spawnSync(process.execPath, [BIN, "migrate"], { cwd: m.dir, encoding: "utf-8", env: { ...m.env, CLAUDE_PROJECT_DIR: session.dir }, timeout: 60_000 });
+  assert.notEqual(via.status, 0);
+  assert.match(via.stderr, /fill is active/);
+  inOld(m, before);
+
+  // skel's hook without the new rule: install first.
+  const { settingsPath } = mainInstalled(m);
+  const noRule = m.skel("migrate");
+  assert.equal(noRule.ok, false);
+  assert.match(noRule.stderr, /have no deny rule for .*Run `skel install` there first/s);
+  assert.ok(fs.existsSync(m.oldFile(".snapshot")));
+  assert.equal(m.skel("install", m.dir).ok, true);
+  const ok = m.skel("migrate");
+  assert.equal(ok.ok, true, ok.stderr);
+  assert.ok(fs.existsSync(m.newFile(".snapshot")));
+  assert.ok(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).permissions.deny.some((d) => d.includes("skel-m-state-")));
+});
+
+test("#18: the hook asks before an agent migrates; a dry run moves nothing and doesn't ask", () => {
+  assert.equal(evaluateBash({ command: "node bin/skel.mjs migrate", state: null, storeDirs: [] })?.decision, "ask");
+  assert.equal(evaluateBash({ command: "skel migrate --dry-run", state: null, storeDirs: [] }), null);
+  const m = legacyProject();
+  const before = m.records();
+  fs.writeFileSync(m.oldFile(".rendered"), "{broken");
+  before[".rendered"] = Buffer.from("{broken");
+  const r = m.skel("migrate", "--dry-run");
+  assert.equal(r.ok, true);
+  assert.match(r.stdout, /nothing was changed/);
+  assert.match(r.stdout, new RegExp(`${m.key}\\.snapshot\\.json: move`));
+  assert.match(r.stdout, new RegExp(`${m.key}\\.rendered\\.json: refuse .*corrupt source`));
+  inOld(m, before);
+});
+
+test("#18: planMigration reports each file's outcome and touches nothing", () => {
+  const m = legacyProject();
+  m.records();
+  fs.writeFileSync(m.oldFile(".rendered"), "{broken");
+  fs.writeFileSync(m.oldFile(".config-notice"), "{broken");
+  const listing = () => fs.readdirSync(m.oldDir).map((f) => [f, fs.statSync(path.join(m.oldDir, f)).mtimeMs]).sort();
+  const was = listing();
+  const { outcomes } = planMigration({ key: m.key, from: m.oldDir, to: m.newDir, keyOf: projectKey });
+  assert.deepEqual(Object.fromEntries(outcomes.map((o) => [o.suffix, o.outcome])), { "": "move", ".snapshot": "move", ".rendered": "refuse", "-install": "move", ".config-notice": "drop" });
+  assert.deepEqual(listing(), was);
+  assert.deepEqual(onlyFiles(m.newDir), []);
+});
+
+test("#18: a conflicting destination is refused: nothing moves, nothing is overwritten, the project stays put, and the human can clear it", () => {
   const m = legacyProject();
   const before = m.records();
   fs.mkdirSync(m.newDir, { recursive: true });
   const theirs = JSON.stringify({ root: m.dir, sessions: ["different"] });
   fs.writeFileSync(m.newFile(""), theirs);
-  const r = m.skel("status");
+  const r = m.skel("migrate");
   assert.equal(r.ok, false);
   assert.match(r.stderr, /already exists and differs from/);
   assert.ok(r.stderr.includes(m.newFile("")) && r.stderr.includes(m.oldFile("")), r.stderr);
   assert.match(r.stderr, /nothing was moved/);
+  assert.match(r.stderr, /keeps using the old location/);
   assert.doesNotMatch(r.stderr, /\n\s+at /, "no stack trace");
   assert.equal(fs.readFileSync(m.newFile(""), "utf-8"), theirs, "destination untouched");
   for (const s of SUFFIXES) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], `${s} still in the old dir`);
   for (const s of SUFFIXES.slice(1)) assert.equal(fs.existsSync(m.newFile(s)), false, `${s} wasn't moved on its own`);
-  // The refusal isn't remembered: once the human chooses, the rest moves.
+  assert.equal(m.skel("status").ok, true, "ordinary commands carry on from the old location");
   fs.rmSync(m.oldFile(""));
-  assert.equal(m.skel("status").ok, true);
+  assert.equal(m.skel("migrate").ok, true);
   for (const s of SUFFIXES.slice(1)) assert.deepEqual(fs.readFileSync(m.newFile(s)), before[s]);
   assert.equal(fs.readFileSync(m.newFile(""), "utf-8"), theirs);
 });
@@ -2677,7 +2833,7 @@ test("#18: a corrupt destination is refused too, and a symlink there isn't writt
   const before = m.records();
   fs.mkdirSync(m.newDir, { recursive: true });
   fs.writeFileSync(m.newFile(".snapshot"), "{broken");
-  const r = m.skel("done");
+  const r = m.skel("migrate");
   assert.equal(r.ok, false);
   assert.match(r.stderr, /already exists and differs .*\(and is corrupt\)/);
   assert.equal(fs.readFileSync(m.newFile(".snapshot"), "utf-8"), "{broken");
@@ -2687,12 +2843,12 @@ test("#18: a corrupt destination is refused too, and a symlink there isn't writt
     const aim = path.join(m.stateHome, "aim.json");
     fs.writeFileSync(aim, "untouched");
     fs.symlinkSync(aim, m.newFile(".snapshot"));
-    assert.equal(m.skel("status").ok, false);
+    assert.equal(m.skel("migrate").ok, false);
     assert.equal(fs.readFileSync(aim, "utf-8"), "untouched");
   }
 });
 
-test("#18: a corrupt source fails closed: done, the Stop hook and the library all refuse, and it stays put", () => {
+test("#18: a corrupt source is refused and left in place, and meanwhile snapshot checks fail closed", () => {
   const corruptions = [
     ["{broken", /not valid JSON/],
     [JSON.stringify({ root: "x", files: "nope" }), /not the shape skel writes/],
@@ -2702,40 +2858,26 @@ test("#18: a corrupt source fails closed: done, the Stop hook and the library al
   for (const [text, why] of corruptions) {
     const m = legacyProject();
     const before = m.records();
-    // A step filled and ready to finish, so the snapshot check is all that's left for `done`.
-    const step = m.skel("next");
-    assert.equal(step.ok, true, step.stderr);
-    const a = path.join(m.dir, "src", "a.ts");
-    fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
-    // `next` has moved the records; put them back for the first run this test is about.
-    for (const s of SUFFIXES) if (fs.existsSync(m.newFile(s))) { fs.mkdirSync(m.oldDir, { recursive: true }); fs.renameSync(m.newFile(s), m.oldFile(s)); }
     fs.writeFileSync(m.oldFile(".snapshot"), text);
-    const done = m.skel("done");
-    assert.equal(done.ok, false, text);
-    assert.match(done.stderr, why);
-    assert.match(done.stderr, /corrupt source/);
+    const r = m.skel("migrate");
+    assert.equal(r.ok, false, text);
+    assert.match(r.stderr, why);
+    assert.match(r.stderr, /corrupt source/);
     assert.equal(fs.readFileSync(m.oldFile(".snapshot"), "utf-8"), text, "left for the human");
     for (const s of ["", ".rendered", "-install"]) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], "the rest waits with it");
     assert.deepEqual(onlyFiles(m.newDir), [], "nothing half-moved");
-    // The Stop hook has no CLI preflight: it must not read the gap as all clear.
-    const stop = JSON.parse(m.spawnIt(["stop-hook"], JSON.stringify({ cwd: m.dir })));
-    assert.match(stop.systemMessage, /corrupt source/);
-    // Deleting the corrupt file is the human's way out, and it fails closed as a missing record.
-    fs.rmSync(m.oldFile(".snapshot"));
-    const after = m.skel("done");
-    assert.equal(after.ok, false);
-    assert.doesNotMatch(after.stderr, /corrupt source/);
-    assert.match(after.stderr, /no record of the approved skeleton/);
   }
-  // In-process, the readers answer "no record", which their callers fail closed on.
-  const { dir } = project();
-  const key = projectKey(dir);
-  const old = path.join(process.env.XDG_CONFIG_HOME, "skel");
-  fs.mkdirSync(old, { recursive: true });
-  fs.writeFileSync(path.join(old, `${key}.snapshot.json`), "{broken");
-  assert.equal(readSnapshot(dir), null);
-  assert.throws(() => snapshotPath(dir), { code: "SKEL_STATE_MIGRATION" });
-  fs.rmSync(path.join(old, `${key}.snapshot.json`));
+  // A step filled and ready to finish, so the snapshot check is all that's left for `done`.
+  const m = legacyProject();
+  m.records({ phase: "fill" });
+  assert.equal(m.skel("next").ok, true);
+  const a = path.join(m.dir, "src", "a.ts");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
+  fs.writeFileSync(m.oldFile(".snapshot"), JSON.stringify({ root: m.dir, files: "nope" }));
+  const done = m.skel("done");
+  assert.equal(done.ok, false);
+  assert.match(done.stderr, /no record of the approved skeleton/);
+  assert.match(m.stop().systemMessage, /no record of the approved skeleton/);
 });
 
 test("#18: a symlinked source is refused, not followed", { skip: !canSymlink }, () => {
@@ -2744,37 +2886,57 @@ test("#18: a symlinked source is refused, not followed", { skip: !canSymlink }, 
   const elsewhere = path.join(m.cfgHome, "elsewhere.json");
   fs.renameSync(m.oldFile(".snapshot"), elsewhere);
   fs.symlinkSync(elsewhere, m.oldFile(".snapshot"));
-  const r = m.skel("status");
+  const r = m.skel("migrate");
   assert.equal(r.ok, false);
   assert.match(r.stderr, /not a regular file/);
 });
 
-test("#18: a part-done migration resumes; a file already at the destination is cleared from the old dir", () => {
-  const m = legacyProject();
-  const before = m.records();
+test("#18: a crash at any point reads as one whole location, never as no record, and migrate finishes it", () => {
+  // Before the commit marker: some copies made, the old location whole and in use.
+  let m = legacyProject();
+  let before = m.records({ phase: "fill" });
   fs.mkdirSync(m.newDir, { recursive: true });
-  // A crash after one move, and after one copy whose source wasn't removed yet.
-  fs.renameSync(m.oldFile(".snapshot"), m.newFile(".snapshot"));
   fs.copyFileSync(m.oldFile(".rendered"), m.newFile(".rendered"));
-  assert.equal(m.skel("status").ok, true);
-  for (const s of SUFFIXES) {
-    assert.deepEqual(fs.readFileSync(m.newFile(s)), before[s]);
-    assert.equal(fs.existsSync(m.oldFile(s)), false);
-  }
+  assert.doesNotMatch(m.stop().systemMessage, /no record|drift/, "the old snapshot is read");
+  assert.match(m.skel("status").stdout, /still in/);
+  m.setPhase("scaffold");
+  assert.equal(m.skel("migrate").ok, true);
+  inNew(m, before);
+
+  // After it: everything copied, some deletes done, the state dir whole and in use.
+  m = legacyProject();
+  before = m.records({ phase: "fill" });
+  fs.mkdirSync(m.newDir, { recursive: true });
+  for (const s of SUFFIXES) fs.copyFileSync(m.oldFile(s), m.newFile(s));
+  fs.writeFileSync(path.join(m.oldDir, `${m.key}.migrating`), "");
+  fs.rmSync(m.oldFile(".snapshot"));
+  fs.rmSync(m.oldFile(".rendered"));
+  assert.equal(m.stop(), null, "the new snapshot is read: no drift");
+  assert.doesNotMatch(m.skel("status").stdout, /still in|no record/);
+  m.setPhase("scaffold");
+  assert.equal(m.skel("migrate").ok, true);
+  inNew(m, before);
+  assert.equal(fs.existsSync(m.oldDir), false, "marker and old dir gone");
+
+  // Only the marker left.
+  m = legacyProject();
+  before = m.records();
+  fs.mkdirSync(m.newDir, { recursive: true });
+  for (const s of SUFFIXES) fs.renameSync(m.oldFile(s), m.newFile(s));
+  fs.writeFileSync(path.join(m.oldDir, `${m.key}.migrating`), "");
+  assert.match(m.skel("migrate").stdout, /moved 0/);
+  assert.equal(fs.existsSync(m.oldDir), false);
 });
 
-test("#18: skel processes racing the migration all succeed and lose nothing", async () => {
+test("#18: skel processes racing the migration all succeed and lose nothing", { timeout: 120_000 }, async () => {
   for (let round = 0; round < 3; round++) {
     const m = legacyProject();
     const before = m.records();
     const codes = await Promise.all(Array.from({ length: 6 }, () => new Promise((resolve) => {
-      spawn("node", [BIN, "status"], { cwd: m.dir, env: m.env, stdio: "ignore" }).on("exit", resolve);
+      spawn("node", [BIN, "migrate"], { cwd: m.dir, env: m.env, stdio: "ignore" }).on("exit", resolve);
     })));
     assert.deepEqual(codes, [0, 0, 0, 0, 0, 0]);
-    for (const s of SUFFIXES) {
-      assert.deepEqual(fs.readFileSync(m.newFile(s)), before[s]);
-      assert.equal(fs.existsSync(m.oldFile(s)), false);
-    }
+    inNew(m, before);
     assert.deepEqual(onlyFiles(m.newDir).filter((f) => f.includes(".migrate.")), []);
   }
 });
@@ -2790,7 +2952,7 @@ test("#18: migrateProject: a lost race, a filesystem without hard links, and one
     const key = crypto.randomBytes(12).toString("hex");
     const text = JSON.stringify({ root, sessions: ["a"] });
     fs.writeFileSync(path.join(from, `${key}.json`), text);
-    return { from, to, key, text, keyOf: () => key, source: path.join(from, `${key}.json`), dest: path.join(to, `${key}.json`), log: () => {} };
+    return { from, to, key, text, keyOf: () => key, source: path.join(from, `${key}.json`), dest: path.join(to, `${key}.json`) };
   };
   // The other process gets there first with the same bytes.
   let t = setup();
@@ -2838,8 +3000,13 @@ test("#18: skelStateDir: env override, POSIX default, native Windows, relative v
   assert.equal(skelStateDir({ ...win, env: {} }), "C:\\Users\\me\\AppData\\Local\\skel");
   assert.equal(skelStateDir({ ...win, env: { LOCALAPPDATA: "relative" } }), "C:\\Users\\me\\AppData\\Local\\skel");
   assert.equal(skelStateDir({ ...win, env: { LOCALAPPDATA: "C:\\L", XDG_STATE_HOME: "D:\\xdg" } }), "D:\\xdg\\skel", "an explicit override wins, as XDG_CONFIG_HOME did");
+  assert.equal(skelStateDir({ ...win, env: { XDG_STATE_HOME: "/tmp/x", LOCALAPPDATA: "C:\\L" } }), "C:\\L\\skel", "drive-relative isn't absolute");
+  assert.equal(skelStateDir({ ...win, env: { XDG_STATE_HOME: "\\\\srv\\share" } }), "\\\\srv\\share\\skel", "a UNC path is");
   assert.equal(legacyConfigDir({ env: {}, home: os.homedir() }), path.join(os.homedir(), ".config", "skel"));
   assert.equal(legacyConfigDir({ env: { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } }), path.join(process.env.XDG_CONFIG_HOME, "skel"));
+  assert.equal(legacyConfigDir({ env: { XDG_CONFIG_HOME: "/abs" }, platform: "linux", home: "/h" }), "/abs/skel");
+  assert.equal(legacyConfigDir({ env: { XDG_CONFIG_HOME: "rel" }, platform: "linux", home: "/h" }), "/h/.config/skel");
+  assert.equal(legacyConfigDir({ env: { XDG_CONFIG_HOME: "\\tmp\\x" }, platform: "win32", home: "C:\\h" }), "C:\\h\\.config\\skel");
 });
 
 test("#18: on native Windows the CLI stores under %LOCALAPPDATA%", { skip: process.platform !== "win32" }, () => {
@@ -2847,52 +3014,58 @@ test("#18: on native Windows the CLI stores under %LOCALAPPDATA%", { skip: proce
   const local = tmp("skel-local-");
   const env = { ...process.env, LOCALAPPDATA: local };
   delete env.XDG_STATE_HOME;
-  execFileSync("node", [BIN, "init", "T"], { cwd: dir, env, stdio: "pipe" });
-  execFileSync("node", [BIN, "approve"], { cwd: dir, env, stdio: "pipe" });
+  execFileSync("node", [BIN, "init", "T"], { cwd: dir, env, stdio: "pipe", timeout: 60_000 });
+  execFileSync("node", [BIN, "approve"], { cwd: dir, env, stdio: "pipe", timeout: 60_000 });
   assert.ok(fs.existsSync(path.join(local, "skel", `${projectKey(dir)}.snapshot.json`)));
 });
 
-test("#18: reinstall after a migration: both rules, old ownership carries over, re-run identical, uninstall removes only owned rules", () => {
-  const cfgHome = tmp("skel-r-cfg-");
-  const stateHome = tmp("skel-r-state-");
-  const target = tmp("skel-r-proj-");
-  const env = { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome };
-  const run = (...a) => execFileSync("node", [BIN, ...a, target], { encoding: "utf-8", env, stdio: ["ignore", "pipe", "pipe"] });
-  const settingsPath = path.join(target, ".claude", "settings.local.json");
+test("#18: upgrade: install adds the rule, migrate carries ownership over, re-runs are identical, uninstall removes only owned rules", () => {
+  const m = legacyProject();
+  m.records();
+  const target = m.dir;
+  const { owned, settingsPath } = mainInstalled(m);
   const read = () => JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
-  const [newRule, oldRule] = storeDeny(stateHome, cfgHome);
-  const mine = ["Read(./.env)", "Edit(//somewhere/skel/**)"];
-  // What an older install left: its rules in settings, its record in the old dir.
-  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  const olderOwned = [...stateDenyFor(target), oldRule];
-  fs.writeFileSync(settingsPath, JSON.stringify({ permissions: { deny: [...mine, ...olderOwned] } }));
-  const key = projectKey(target);
-  fs.mkdirSync(path.join(cfgHome, "skel"), { recursive: true });
-  fs.writeFileSync(path.join(cfgHome, "skel", `${key}-install.json`), JSON.stringify({ root: fs.realpathSync.native(target), ownedDeny: olderOwned }));
-
-  const out = run("install");
-  assert.match(out, /added a permission deny rule for skel's state dir/);
-  assert.match(out, /permission deny rule for skel's old config dir already present/);
-  assert.equal(fs.existsSync(path.join(cfgHome, "skel", `${key}-install.json`)), false, "the record moved");
-  const deny = read().permissions.deny;
-  assert.deepEqual(deny, [...mine, ...olderOwned, newRule]);
+  const newRule = `Edit(/${ruleSpelling(m.newDir.replace(/skel$/, ""))}/skel/**)`;
+  fs.mkdirSync(m.newDir, { recursive: true });
+  const mine = ["Read(./.env)"];
+  const out = m.skel("install", target);
+  assert.equal(out.ok, true, out.stderr);
+  assert.match(out.stdout, /added a permission deny rule for skel's state dir/);
+  assert.match(out.stdout, /permission deny rule for skel's old config dir already present/);
+  assert.deepEqual(read().permissions.deny, [...mine, ...owned, `Edit(/${ruleSpelling(m.newDir)}/**)`]);
+  assert.ok(newRule);
+  const ownedNow = () => JSON.parse(fs.readFileSync(m.oldFile("-install"), "utf-8")).ownedDeny.sort();
+  assert.deepEqual(ownedNow(), [...owned, `Edit(/${ruleSpelling(m.newDir)}/**)`].sort(), "recorded where the project's records are");
   const text = fs.readFileSync(settingsPath, "utf-8");
-  run("install");
+  assert.equal(m.skel("install", target).ok, true);
   assert.equal(fs.readFileSync(settingsPath, "utf-8"), text, "byte-identical on a re-run");
 
-  const un = run("uninstall");
-  assert.match(un, /removed 5 \.skeleton\/ permission deny rule/);
-  assert.match(un, /removed 2 store-dir permission deny rule/);
-  assert.match(un, /left in place: 1 deny rule\(s\) for a \.\.\.\/skel\/\*\* dir/);
+  assert.equal(m.skel("migrate").ok, true);
+  assert.equal(fs.existsSync(m.oldFile("-install")), false, "the record moved");
+  assert.equal(m.skel("install", target).ok, true);
+  assert.equal(fs.readFileSync(settingsPath, "utf-8"), text, "and after the move");
+
+  const un = m.skel("uninstall", target);
+  assert.match(un.stdout, /removed 5 \.skeleton\/ permission deny rule/);
+  assert.match(un.stdout, /removed 2 store-dir permission deny rule/);
   assert.deepEqual(read().permissions.deny, mine);
 });
 
-test("#18: ownership is never inferred: without a record, identical rules stay the user's; a corrupt old record stops install and uninstall", () => {
+test("#18: uninstall works before a migration too", () => {
+  const m = legacyProject();
+  m.records();
+  const { settingsPath } = mainInstalled(m);
+  assert.match(m.skel("uninstall", m.dir).stdout, /removed 1 store-dir permission deny rule/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).permissions.deny, ["Read(./.env)"]);
+  assert.equal(fs.existsSync(m.oldFile("-install")), false, "its record is gone from where it was");
+});
+
+test("#18: ownership is never inferred: without a record, identical rules stay the user's; a corrupt record stops install and uninstall", () => {
   const cfgHome = tmp("skel-o-cfg-");
   const stateHome = tmp("skel-o-state-");
   const target = tmp("skel-o-proj-");
   const env = { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome };
-  const run = (...a) => execFileSync("node", [BIN, ...a, target], { encoding: "utf-8", env, stdio: ["ignore", "pipe", "pipe"] });
+  const run = (...a) => execFileSync("node", [BIN, ...a, target], { encoding: "utf-8", env, stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 });
   const settingsPath = path.join(target, ".claude", "settings.local.json");
   const [newRule, oldRule] = storeDeny(stateHome, cfgHome);
   const pre = { permissions: { deny: [newRule, oldRule] } };
@@ -2908,7 +3081,7 @@ test("#18: ownership is never inferred: without a record, identical rules stay t
   const record = path.join(cfgHome, "skel", `${projectKey(target)}-install.json`);
   fs.writeFileSync(record, "{broken");
   for (const cmd of ["install", "uninstall"]) {
-    assert.throws(() => run(cmd), (e) => /corrupt source/.test(e.stderr) && !/\n\s+at /.test(e.stderr), cmd);
+    assert.throws(() => run(cmd), (e) => /ownership record .* is corrupt/.test(e.stderr) && !/\n\s+at /.test(e.stderr), cmd);
     assert.equal(fs.readFileSync(settingsPath, "utf-8"), before, `${cmd} changed nothing`);
   }
   assert.equal(fs.readFileSync(record, "utf-8"), "{broken");
@@ -2916,12 +3089,12 @@ test("#18: ownership is never inferred: without a record, identical rules stay t
 });
 
 test("#18: the hook guards both locations, for edits and for the Bash word match, and stays textual in the project", async () => {
-  const { evaluateConfigEdit } = await import("../lib/gate.mjs");
+  const { evaluateStoreEdit } = await import("../lib/gate.mjs");
   const cfgHome = tmp("skel-h-cfg-");
   const stateHome = tmp("skel-h-state-");
   const base = tmp("skel-h-proj-");
   const hook = (input) => {
-    const out = execFileSync("node", [BIN, "hook"], { cwd: base, input: JSON.stringify({ cwd: base, ...input }), encoding: "utf-8", env: { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome } });
+    const out = execFileSync("node", [BIN, "hook"], { cwd: base, input: JSON.stringify({ cwd: base, ...input }), encoding: "utf-8", env: { ...process.env, XDG_CONFIG_HOME: cfgHome, XDG_STATE_HOME: stateHome }, timeout: 60_000 });
     return out ? JSON.parse(out).hookSpecificOutput : null;
   };
   const edit = (file_path) => hook({ tool_name: "Edit", tool_input: { file_path, old_string: "a", new_string: "b" } });
@@ -2938,6 +3111,7 @@ test("#18: the hook guards both locations, for edits and for the Bash word match
     "cat ~/.local/state/skel/abc.snapshot.json", "rm $HOME/.local/state/skel/abc.json", "rm \"$XDG_STATE_HOME/skel/abc.json\"", "ls ${XDG_STATE_HOME}/skel",
     "type %LOCALAPPDATA%\\skel\\abc.json", "rm $LOCALAPPDATA/skel/abc.json", "rm \"$env:LOCALAPPDATA\\skel\\abc.json\"", "ls ${LOCALAPPDATA}/skel", "dir C:\\Users\\me\\AppData\\Local\\skel", "ls /c/Users/me/AppData/Local/skel/",
     "cat ~/.config/skel/abc.json", "rm \"$XDG_CONFIG_HOME/skel/abc.json\"",
+    "cat ${XDG_STATE_HOME:-$HOME/.local/state}/skel/x.json", "cat ${XDG_CONFIG_HOME:-$HOME/.config}/skel/x.json",
     `echo {} > "${path.join(stateHome, "skel", "abc.json")}"`, `cd ${path.join(cfgHome, "skel")} && ls`,
   ];
   for (const command of spellings) assert.equal(hook({ tool_name: "Bash", tool_input: { command } })?.permissionDecision, "ask", command);
@@ -2946,160 +3120,58 @@ test("#18: the hook guards both locations, for edits and for the Bash word match
   }
   // Drive-path forms of the resolved dir, for Git Bash.
   const dirs = ["C:\\State\\skel", "/home/me/.config/skel"];
-  assert.equal(evaluateBash({ command: "rm /c/State/skel/x", state: null, configDir: dirs })?.decision, "ask");
-  assert.equal(evaluateBash({ command: "rm C:/state/SKEL/x", state: null, configDir: dirs })?.decision, "ask");
-  assert.equal(evaluateBash({ command: "rm /c/State/skelly", state: null, configDir: dirs }), null);
+  assert.equal(evaluateBash({ command: "rm /c/State/skel/x", state: null, storeDirs: dirs })?.decision, "ask");
+  assert.equal(evaluateBash({ command: "rm C:/state/SKEL/x", state: null, storeDirs: dirs })?.decision, "ask");
+  assert.equal(evaluateBash({ command: "rm /c/State/skelly", state: null, storeDirs: dirs }), null);
 
   // In the project: only the store dirs are resolved, once each, never the edited path (#30).
   const resolved = [];
   const spy = (p) => { resolved.push(p); return p; };
   const both = [path.join(stateHome, "skel"), path.join(cfgHome, "skel")];
-  assert.equal(evaluateConfigEdit({ toolName: "Write", toolInput: { file_path: path.join(base, "deep", "new", "f.ts") }, base, state: null, configDir: both, resolve: spy }), null);
+  assert.equal(evaluateStoreEdit({ toolName: "Write", toolInput: { file_path: path.join(base, "deep", "new", "f.ts") }, base, state: null, storeDirs: both, resolve: spy }), null);
   assert.deepEqual(resolved, both);
-  assert.equal(inSkelConfig(path.join(both[1], "x"), { dir: both, project: base, resolve: spy }), true);
+  assert.equal(inSkelStores(path.join(both[1], "x"), { dir: both, project: base, resolve: spy }), true);
 });
 
-// ---- #18 review: records don't move out from under the deny rule ----
-
-/** What main's install left: the hook and the old dir's rule in settings, its ownership record in the old dir. */
-const mainInstalled = (m, settingsDir = m.dir) => {
-  const before = m.records();
-  const hookPath = path.join(path.dirname(BIN), "skel-hook.mjs").split(path.sep).join("/");
-  const oldRule = `Edit(/${ruleSpelling(m.cfgHome)}/skel/**)`;
-  const owned = [...stateDenyFor(settingsDir), oldRule];
-  fs.mkdirSync(path.join(settingsDir, ".claude"), { recursive: true });
-  const settingsPath = path.join(settingsDir, ".claude", "settings.local.json");
-  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Edit", hooks: [{ type: "command", command: `node "${hookPath}"` }] }] }, permissions: { deny: ["Read(./.env)", ...owned] } }));
-  const record = JSON.stringify({ root: settingsDir, ownedDeny: owned });
-  fs.writeFileSync(settingsDir === m.dir ? m.oldFile("-install") : path.join(m.oldDir, `${projectKey(settingsDir)}-install.json`), record);
-  if (settingsDir === m.dir) before["-install"] = Buffer.from(record);
-  return { before, oldRule, owned, settingsPath };
-};
-const migStop = (m, ...flags) => {
-  const out = m.spawnIt(["stop-hook", ...flags], JSON.stringify({ cwd: m.dir }));
-  return out ? JSON.parse(out) : null;
-};
-
-test("#18 review 1: with the hook but no state-dir rule, the Stop hook and the CLI leave records under the old rule, and warn; install adds the rule, then moves them", () => {
-  const m = legacyProject();
-  const { before, owned, settingsPath } = mainInstalled(m);
-  const stay = () => {
-    for (const s of SUFFIXES) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], `${s} stays under the rule that guards it`);
-    assert.deepEqual(onlyFiles(m.newDir), []);
-  };
-
-  const stop = migStop(m);
-  assert.match(stop.systemMessage, /don't cover skel's state dir.*Re-run `skel install`/s);
-  stay();
-  const status = m.skel("status");
-  assert.equal(status.ok, true, status.stderr);
-  assert.match(status.stdout, /Re-run `skel install`/);
-  assert.doesNotMatch(status.stdout, /no record of the approved skeleton/, "it reads the old record");
-  assert.equal(status.stderr, "", "nothing moved, so nothing to announce");
-  assert.ok(JSON.parse(m.skel("status", "--json").stdout).reinstall);
-  stay();
-
-  // A record written into the unguarded state dir meanwhile vouches for nothing.
-  fs.mkdirSync(m.newDir, { recursive: true });
-  fs.writeFileSync(m.newFile(".snapshot"), JSON.stringify({ root: m.dir, files: {}, approvedAt: 1 }));
-  assert.doesNotMatch(m.skel("status").stdout, /moved|phase: scaffold/);
-  assert.match(migStop(m).systemMessage, /Re-run/, "still the old record: no drift report, only the reminder");
-  // ... and it stops the move until the human has looked: install changes nothing.
-  const settingsBefore = fs.readFileSync(settingsPath, "utf-8");
-  const refused = m.skel("install", m.dir);
-  assert.equal(refused.ok, false);
-  assert.match(refused.stderr, /already exists and differs/);
-  assert.equal(fs.readFileSync(settingsPath, "utf-8"), settingsBefore);
-  fs.rmSync(m.newFile(".snapshot"));
-
-  const out = m.skel("install", m.dir);
-  assert.equal(out.ok, true, out.stderr);
-  assert.match(out.stdout, /added a permission deny rule for skel's state dir/);
-  assert.match(out.stdout, /permission deny rule for skel's old config dir already present/);
-  const newRule = `Edit(/${ruleSpelling(m.newDir)}/**)`;
-  const deny = JSON.parse(fs.readFileSync(settingsPath, "utf-8")).permissions.deny;
-  assert.deepEqual(deny, ["Read(./.env)", ...owned, newRule]);
-  for (const s of ["", ".snapshot", ".rendered"]) assert.deepEqual(fs.readFileSync(m.newFile(s)), before[s], `${s} moved`);
-  assert.deepEqual(JSON.parse(fs.readFileSync(m.newFile("-install"), "utf-8")).ownedDeny.sort(), [...owned, newRule].sort(), "ownership came along, with the new rule");
-  assert.equal(fs.existsSync(m.oldDir), false);
-  assert.equal(migStop(m), null, "no more reminders");
-  assert.doesNotMatch(m.skel("status").stdout, /Re-run/);
-
-  const text = fs.readFileSync(settingsPath, "utf-8");
-  assert.equal(m.skel("install", m.dir).ok, true);
-  assert.equal(fs.readFileSync(settingsPath, "utf-8"), text, "byte-identical on a re-run");
-  const un = m.skel("uninstall", m.dir);
-  assert.match(un.stdout, /removed 2 store-dir permission deny rule/);
-  assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).permissions.deny, ["Read(./.env)"]);
-});
-
-test("#18 review 1: the hook is found in settings above the skeleton; unreadable settings keep the old location; uninstall from the old location works", () => {
-  // Settings at a git-root-like parent, with the skeleton below it.
-  const outer = tmp("skel-outer-");
-  const inner = legacyProjectIn(outer);
-  const { before } = mainInstalled(inner, outer);
-  assert.match(migStop(inner).systemMessage, /Re-run/);
-  for (const s of [".snapshot", ".rendered"]) assert.deepEqual(fs.readFileSync(inner.oldFile(s)), before[s]);
-
-  const broken = legacyProject();
-  broken.records();
-  fs.mkdirSync(path.join(broken.dir, ".claude"));
-  fs.writeFileSync(path.join(broken.dir, ".claude", "settings.local.json"), "{not json");
-  assert.match(broken.skel("status").stdout, /Re-run/);
-  assert.ok(fs.existsSync(broken.oldFile(".snapshot")));
-
-  const un = legacyProject();
-  const { settingsPath } = mainInstalled(un);
-  assert.match(un.skel("uninstall", un.dir).stdout, /removed 1 store-dir permission deny rule/);
-  assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).permissions.deny, ["Read(./.env)"]);
-  assert.equal(fs.existsSync(un.oldFile("-install")), false, "its record is gone from where it was");
-  // No hook any more: the rest moves as for any other project.
-  assert.equal(un.skel("status").ok, true);
-  assert.ok(fs.existsSync(un.newFile(".snapshot")));
-});
-
-test("#18 review 2: a server from before the upgrade writing the old rendered store merges in, newest first; a corrupt side still refuses", () => {
+test("#18: a server's rendered history written to the old dir after a move merges in, newest first; a corrupt side still refuses", () => {
   const m = legacyProject();
   m.records();
-  assert.equal(m.skel("status").ok, true);
+  assert.equal(m.skel("migrate").ok, true);
   const mine = JSON.parse(fs.readFileSync(m.newFile(".rendered"), "utf-8"));
   const shown = { ...mine.versions[0], version: "abcabcabcabc", at: mine.versions[0].at + 1000 };
   fs.mkdirSync(m.oldDir, { recursive: true });
   fs.writeFileSync(m.oldFile(".rendered"), JSON.stringify({ root: m.dir, versions: [shown] }));
-  const r = m.skel("status");
+  const r = m.skel("migrate");
   assert.equal(r.ok, true, r.stderr);
   const merged = JSON.parse(fs.readFileSync(m.newFile(".rendered"), "utf-8"));
   assert.deepEqual(merged.versions.map((v) => v.version), ["abcabcabcabc", mine.versions[0].version], "approve falls back to the first");
   assert.equal(fs.existsSync(m.oldFile(".rendered")), false);
 
-  // Corrupt on either side: refused, so it can't read as "never rendered".
   fs.mkdirSync(m.oldDir, { recursive: true });
   fs.writeFileSync(m.oldFile(".rendered"), JSON.stringify({ root: m.dir, versions: [shown] }));
   fs.writeFileSync(m.newFile(".rendered"), "{broken");
-  const bad = m.skel("approve");
+  const bad = m.skel("migrate");
   assert.equal(bad.ok, false);
   assert.match(bad.stderr, /already exists and differs .*\(and is corrupt\)/);
   assert.equal(fs.readFileSync(m.newFile(".rendered"), "utf-8"), "{broken");
-  assert.doesNotMatch(bad.stderr + bad.stdout, /never rendered/);
   fs.writeFileSync(m.newFile(".rendered"), JSON.stringify(merged));
   fs.writeFileSync(m.oldFile(".rendered"), "{broken");
-  assert.match(m.skel("status").stderr, /corrupt source/);
+  assert.match(m.skel("migrate").stderr, /corrupt source/);
 });
 
-test("#18 review 3: a record whose root no longer resolves is unverifiable, not another project's", () => {
+test("#18: a record whose root no longer resolves is unverifiable, not another project's", () => {
   const m = legacyProject();
   const before = m.records();
   const gone = tmp("skel-junction-");
   fs.rmSync(gone, { recursive: true });
   const rec = JSON.parse(before[".snapshot"].toString());
   fs.writeFileSync(m.oldFile(".snapshot"), JSON.stringify({ ...rec, root: gone }));
-  const r = m.skel("status");
+  const r = m.skel("migrate");
   assert.equal(r.ok, true, r.stderr);
   assert.ok(fs.existsSync(m.newFile(".snapshot")));
-  assert.doesNotMatch(r.stdout, /no record of the approved skeleton/);
 });
 
-test("#18 review 3: approving through a junction later deleted still migrates", { skip: process.platform !== "win32" }, () => {
+test("#18: approving through a junction later deleted still migrates", { skip: process.platform !== "win32" }, () => {
   const m = legacyProject();
   m.records();
   const link = path.join(tmp("skel-jn-"), "link");
@@ -3109,42 +3181,29 @@ test("#18 review 3: approving through a junction later deleted still migrates", 
   fs.writeFileSync(m.oldFile(".snapshot"), JSON.stringify({ ...rec, root: link }));
   fs.rmSync(link, { recursive: true, force: true });
   assert.equal(fs.existsSync(m.dir), true, "only the junction went");
-  assert.equal(m.skel("status").ok, true);
+  assert.equal(m.skel("migrate").ok, true);
   assert.ok(fs.existsSync(m.newFile(".snapshot")));
 });
 
-test("#18 review 4: init refuses a blocked project with no .skeleton: no stack trace, nothing written", () => {
+test("#18: init and the Stop hook aren't stopped by what migrate would refuse", () => {
   const m = legacyProject();
   m.records();
   fs.writeFileSync(m.oldFile(".snapshot"), "{broken");
-  fs.rmSync(path.join(m.dir, ".skeleton"), { recursive: true });
-  const r = m.skel("init", "Again");
-  assert.equal(r.ok, false);
-  assert.match(r.stderr, /corrupt source/);
-  assert.doesNotMatch(r.stderr, /\n\s+at /);
-  assert.equal(fs.existsSync(path.join(m.dir, ".skeleton", "state.json")), false, "no half-started skeleton");
+  const init = m.skel("init", "Again", "--force");
+  assert.equal(init.ok, true, init.stderr);
+  assert.doesNotMatch(init.stderr, /\n\s+at /);
+  assert.equal(fs.existsSync(m.oldFile(".snapshot")), false, "init clears the old location's records, where the project still is");
+  assert.equal(fs.existsSync(m.newFile(".snapshot")), false);
 });
 
-test("#18 review 5: a blocked project's Stop report gives the real recovery, not reshape", () => {
-  const m = legacyProject();
-  m.records();
-  fs.writeFileSync(m.oldFile(".snapshot"), "{broken");
-  const plain = migStop(m);
-  assert.match(plain.systemMessage, /corrupt source/);
-  assert.doesNotMatch(plain.systemMessage, /reshape/);
-  assert.match(plain.systemMessage, /delete it, or restore a good copy/);
-  const blocking = migStop(m, "--block");
-  assert.equal(blocking.decision, "block");
-  assert.doesNotMatch(blocking.reason, /reshape/);
-  assert.match(blocking.reason, /show this to the human/);
-});
-
-test("#18 review 6: the refusal says what fits the problem", () => {
-  const says = (setup, env) => {
+test("#18: the refusal says what fits the problem", () => {
+  const says = (setup, extra) => {
     const m = legacyProject();
     m.records();
     setup(m);
-    return execFileFailure(m, env?.(m));
+    const r = spawnSync(process.execPath, [BIN, "migrate"], { cwd: m.dir, env: { ...m.env, ...extra?.(m) }, encoding: "utf-8", timeout: 60_000 });
+    assert.notEqual(r.status, 0);
+    return r.stderr;
   };
   const loneCorrupt = says((m) => fs.writeFileSync(m.oldFile(".rendered"), "{broken"));
   assert.match(loneCorrupt, /delete it, or restore a good copy/);
@@ -3154,51 +3213,222 @@ test("#18 review 6: the refusal says what fits the problem", () => {
   assert.doesNotMatch(sessions, /re-approving/);
   const snapshot = says((m) => fs.writeFileSync(m.oldFile(".snapshot"), "{broken"));
   assert.match(snapshot, /re-approving/);
-  const conflict = says((m) => fs.writeFileSync(m.newFile(".snapshot"), "shor"));
+  const conflict = says((m) => { fs.mkdirSync(m.newDir, { recursive: true }); fs.writeFileSync(m.newFile(".snapshot"), "shor"); });
   assert.match(conflict, /keep the one you trust/);
   assert.match(conflict, /interrupted copy, is safe to delete: the move resumes/);
   // The state home is a file: that path, and no talk of choosing between files.
   const io = says((m) => fs.writeFileSync(path.join(m.stateHome, "file"), "x"), (m) => ({ XDG_STATE_HOME: path.join(m.stateHome, "file") }));
   assert.match(io, /Fix that path or its permissions/);
-  assert.match(io, /file/);
   assert.doesNotMatch(io, /keep the one you trust|re-approving/);
 });
 
-test("#18 review 7: a relative XDG_CONFIG_HOME is ignored: a repo can't supply records to migrate", () => {
-  const home = process.platform === "win32" ? "C:\\Users\\me" : "/home/me";
-  const dflt = legacyConfigDir({ env: {}, home });
-  assert.equal(legacyConfigDir({ env: { XDG_CONFIG_HOME: "rel" }, home }), dflt);
-  assert.equal(legacyConfigDir({ env: { XDG_CONFIG_HOME: "/abs" }, platform: "linux", home: "/h" }), "/abs/skel");
-  assert.equal(legacyConfigDir({ env: { XDG_CONFIG_HOME: "\\tmp\\x" }, platform: "win32", home: "C:\\h" }), "C:\\h\\.config\\skel", "drive-relative isn't absolute");
-  assert.equal(skelStateDir({ env: { XDG_STATE_HOME: "/tmp/x", LOCALAPPDATA: "C:\\L" }, platform: "win32", home: "C:\\h" }), "C:\\L\\skel", "drive-relative isn't absolute");
-  assert.equal(skelStateDir({ env: { XDG_STATE_HOME: "\\\\srv\\share" }, platform: "win32", home: "C:\\h" }), "\\\\srv\\share\\skel", "a UNC path is");
-
+test("#18: a relative XDG_CONFIG_HOME is ignored: a repo can't supply records", () => {
   const m = legacyProject();
   m.spawnIt(["init", "T"]);
   const planted = path.join(m.dir, "rel", "skel");
   fs.mkdirSync(planted, { recursive: true });
   fs.writeFileSync(path.join(planted, `${m.key}.snapshot.json`), JSON.stringify({ root: m.dir, files: {} }));
-  execFileSync("node", [BIN, "status"], { cwd: m.dir, env: { ...m.env, XDG_CONFIG_HOME: "rel", HOME: m.cfgHome, USERPROFILE: m.cfgHome }, stdio: "pipe" });
+  const out = execFileSync("node", [BIN, "migrate"], { cwd: m.dir, env: { ...m.env, XDG_CONFIG_HOME: "rel", HOME: m.cfgHome, USERPROFILE: m.cfgHome }, encoding: "utf-8", stdio: "pipe", timeout: 60_000 });
+  assert.match(out, /nothing to migrate/);
   assert.ok(fs.existsSync(path.join(planted, `${m.key}.snapshot.json`)), "left where the repo put it");
   assert.equal(fs.existsSync(m.newFile(".snapshot")), false);
 });
 
-test("#18 review nits: word match through a default expansion; a crash's temp file is swept; one line when both dirs are one", () => {
-  for (const command of ["cat ${XDG_STATE_HOME:-$HOME/.local/state}/skel/x.json", "cat ${XDG_CONFIG_HOME:-$HOME/.config}/skel/x.json"]) {
-    assert.equal(evaluateBash({ command, state: null, configDir: [] })?.decision, "ask", command);
-  }
+test("#18: a crash's temp file is swept; one line when both dirs are one", () => {
   const m = legacyProject();
   m.records();
+  fs.mkdirSync(m.newDir, { recursive: true });
   const crashed = `${m.newFile(".snapshot")}.migrate.99999999.abcd1234`;
   const live = `${m.newFile(".snapshot")}.migrate.${process.pid}.abcd1234`;
   fs.writeFileSync(crashed, "x");
   fs.writeFileSync(live, "x");
-  assert.equal(m.skel("status").ok, true);
+  assert.equal(m.skel("migrate").ok, true);
   assert.equal(fs.existsSync(crashed), false);
   assert.equal(fs.existsSync(live), true, "a live process's isn't touched");
 
   const same = tmp("skel-same-");
   const target = tmp("skel-same-proj-");
-  const out = execFileSync("node", [BIN, "install", target], { encoding: "utf-8", env: { ...process.env, XDG_CONFIG_HOME: same, XDG_STATE_HOME: same }, stdio: "pipe" });
+  const out = execFileSync("node", [BIN, "install", target], { encoding: "utf-8", env: { ...process.env, XDG_CONFIG_HOME: same, XDG_STATE_HOME: same }, stdio: "pipe", timeout: 60_000 });
   assert.equal(out.match(/skel's (state|old config) dir: /g).length, 1, out);
+});
+
+test("#18 + #35: the installed hook entry points load and gate", () => {
+  const m = legacyProject();
+  m.records({ phase: "fill" });
+  m.spawnIt(["next"]);
+  const binDir = path.dirname(BIN);
+  const spawnHook = (entry, input) => spawnSync(process.execPath, [path.join(binDir, entry)], { cwd: m.dir, input: JSON.stringify({ cwd: m.dir, ...input }), encoding: "utf-8", env: { ...m.env, CLAUDE_PROJECT_DIR: m.dir }, timeout: 60_000 });
+  const hook = (input) => {
+    const r = spawnHook("skel-hook.mjs", input);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stderr, "");
+    return r.stdout ? JSON.parse(r.stdout).hookSpecificOutput : null;
+  };
+  const a = path.join(m.dir, "src", "a.ts");
+  const outside = hook({ tool_name: "Edit", tool_input: { file_path: a, old_string: "import { Point }", new_string: "import { Pointy }" } });
+  assert.ok(outside && outside.permissionDecision !== "allow", "an edit outside the fence is stopped");
+  for (const dir of [m.newDir, m.oldDir]) assert.equal(hook({ tool_name: "Write", tool_input: { file_path: path.join(dir, "x.snapshot.json"), content: "{}" } })?.permissionDecision, "ask", dir);
+  assert.equal(hook({ tool_name: "Bash", tool_input: { command: "cat ~/.local/state/skel/x" } })?.permissionDecision, "ask");
+  assert.equal(hook({ tool_name: "Bash", tool_input: { command: "npm test" } }), null);
+  assert.equal(spawnHook("skel-stop.mjs", {}).status, 0);
+  const guard = spawnHook("skel-config-hook.mjs", { source: "local_settings" });
+  assert.equal(guard.status, 0, guard.stderr);
+  assert.doesNotMatch(guard.stderr, /SyntaxError|does not provide/);
+  assert.equal(JSON.parse(guard.stdout).decision, "block", "held during a fill");
+});
+
+test("#18 + #35: a project is enrolled by an approval record in either location, without moving it", () => {
+  const receipt = (m, dir) => execFileSync(process.execPath, ["--input-type=module", "-e", `import { approvalReceiptStatus } from ${JSON.stringify(new URL("../lib/state.mjs", import.meta.url).href)}; process.stdout.write(approvalReceiptStatus(${JSON.stringify(dir)}))`], { env: m.env, encoding: "utf-8", timeout: 60_000 });
+  const guard = (m) => JSON.parse(spawnSync(process.execPath, [path.join(path.dirname(BIN), "skel-config-hook.mjs")], { cwd: m.dir, input: JSON.stringify({ cwd: m.dir, source: "local_settings" }), encoding: "utf-8", env: { ...m.env, CLAUDE_PROJECT_DIR: m.dir }, timeout: 60_000 }).stdout);
+  for (const where of ["old", "new"]) {
+    const m = legacyProject();
+    const before = m.records();
+    fs.rmSync(path.join(m.dir, ".skeleton"), { recursive: true });
+    if (where === "new") {
+      fs.mkdirSync(m.newDir, { recursive: true });
+      for (const s of SUFFIXES) fs.renameSync(m.oldFile(s), m.newFile(s));
+    }
+    assert.equal(guard(m).decision, "block", `record in the ${where} location`);
+    assert.equal(receipt(m, m.dir), "present", where);
+    assert.equal(receipt(m, tmp("skel-other-")), "absent", "another project's record, in either dir, isn't this one's");
+    if (where === "old") assert.deepEqual(fs.readFileSync(m.oldFile(".snapshot")), before[".snapshot"], "and the guard moved nothing");
+  }
+});
+
+test("#18 + #35: settings notices migrate, with their delivery metadata, and never refuse a project", () => {
+  const notice = (at, delivered) => JSON.stringify({ at, source: "local_settings", file: "f", ...(delivered ? { delivered } : {}) });
+  const m = legacyProject();
+  const before = m.records();
+  fs.writeFileSync(m.oldFile(".config-notice"), notice("2026-01-01T00:00:00.000Z", ["aaa"]));
+  assert.match(m.skel("status").stdout, /a settings change was blocked at 2026-01-01/, "read from the old location before the move");
+  assert.equal(m.skel("migrate").ok, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(m.newFile(".config-notice"), "utf-8")).delivered, ["aaa"]);
+  assert.equal(fs.existsSync(m.oldFile(".config-notice")), false);
+  assert.deepEqual(fs.readFileSync(m.newFile(".snapshot")), before[".snapshot"]);
+  assert.match(m.skel("status").stdout, /a settings change was blocked at 2026-01-01/, "and from the new one after");
+  const again = (text) => {
+    fs.mkdirSync(m.oldDir, { recursive: true });
+    fs.writeFileSync(m.oldFile(".config-notice"), text);
+    assert.equal(m.skel("migrate").ok, true);
+    assert.equal(fs.existsSync(m.oldFile(".config-notice")), false);
+    return JSON.parse(fs.readFileSync(m.newFile(".config-notice"), "utf-8"));
+  };
+  // Both exist: the newer wins and no session is told twice.
+  const merged = again(notice("2026-03-01T00:00:00.000Z", ["bbb"]));
+  assert.equal(merged.at, "2026-03-01T00:00:00.000Z");
+  assert.deepEqual(merged.delivered.sort(), ["aaa", "bbb"]);
+  // Corrupt on the old side: dropped, not a refusal.
+  assert.equal(again("{broken").at, "2026-03-01T00:00:00.000Z");
+  // Corrupt on the new side: its reader shows nothing, so the good one replaces it.
+  fs.writeFileSync(m.newFile(".config-notice"), "{broken");
+  assert.equal(again(notice("2026-04-01T00:00:00.000Z")).at, "2026-04-01T00:00:00.000Z");
+});
+
+const git = (cwd, ...args) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { cwd, encoding: "utf-8", stdio: "pipe", timeout: 60_000 });
+const canGit = (() => { try { execFileSync("git", ["--version"], { stdio: "ignore" }); return true; } catch { return false; } })();
+
+test("#18: a linked worktree whose session loads the main checkout's settings: only `skel migrate` moves its records, with a warning", { skip: !canGit }, () => {
+  const outer = tmp("skel-wt-");
+  const main = path.join(outer, "main");
+  const linked = path.join(outer, "linked");
+  fs.mkdirSync(main);
+  git(main, "init", "-q");
+  git(main, "commit", "-q", "--allow-empty", "-m", "x");
+  git(main, "worktree", "add", "-q", linked, "-b", "wt-branch");
+  try {
+    const m = legacyProjectAt(linked);
+    const before = m.records();
+    delete before["-install"];
+    // The hook and the old rule are in the main checkout only, which no walk up from here finds.
+    mainInstalled(m, main);
+    assert.equal(m.skel("status").ok, true);
+    m.setPhase("fill");
+    assert.equal(m.stop({}) !== undefined, true);
+    m.setPhase("scaffold");
+    for (const s of Object.keys(before)) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], s);
+    // Nor does installing in the main checkout move this project's records.
+    const r = spawnSync(process.execPath, [BIN, "install", main], { cwd: main, env: m.env, encoding: "utf-8", timeout: 60_000 });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(fs.readFileSync(m.oldFile(".snapshot")), before[".snapshot"]);
+    const moved = m.skel("migrate");
+    assert.equal(moved.ok, true, moved.stderr);
+    assert.match(moved.stdout, process.platform === "win32" ? /on native Windows, Claude Code loads it from the directory you start in/ : /in a git worktree, Claude Code loads it from the main checkout's root/);
+    assert.match(moved.stdout, /restart it/);
+    assert.ok(fs.existsSync(m.newFile(".snapshot")));
+  } finally {
+    git(main, "worktree", "remove", "--force", linked);
+  }
+});
+
+/** A process that answers /api/version like a review server from before the state dir (no storeProtocol). */
+const fakeOldServer = async (dir, { lieAboutId = false } = {}) => {
+  const script = path.join(tmp("skel-fake-"), "fake.mjs");
+  fs.writeFileSync(script, `import http from "node:http";
+const s = http.createServer((req, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ version: "v", serverId: ${JSON.stringify(lieAboutId ? "someone-else" : "fake-id")}, pid: process.pid, feedbackEnabled: false })); });
+s.listen(0, "127.0.0.1", () => console.log(s.address().port));`);
+  const child = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "ignore"] });
+  const port = await new Promise((resolve) => child.stdout.once("data", (d) => resolve(Number(String(d).trim()))));
+  fs.mkdirSync(path.join(dir, ".skeleton"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".skeleton", "serve.json"), JSON.stringify({ url: `http://127.0.0.1:${port}/`, port, pid: child.pid, serverId: "fake-id", feedbackEnabled: false }));
+  const exited = new Promise((resolve) => child.once("exit", () => resolve(true)));
+  return { child, port, gone: () => Promise.race([exited, new Promise((r) => setTimeout(() => r(false), 5000))]), stop: () => { child.kill(); return exited; } };
+};
+
+test("#18: serve replaces a verified server from before the state dir, and /api/version carries no path", { timeout: 60_000 }, async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const old = await fakeOldServer(dir);
+  const srv = await serve(dir, []);
+  try {
+    assert.equal(await old.gone(), true, "the old server was stopped");
+    const v = await (await fetch(new URL("api/version", srv.url))).json();
+    assert.equal(v.storeProtocol, 2);
+    assert.doesNotMatch(JSON.stringify(v), /[\\/]/, "no store path in a public endpoint");
+    assert.match(run("serve"), /already running/, "a current server in the same mode is reused, as before");
+  } finally {
+    await srv.stop();
+  }
+});
+
+test("#18: serve and migrate leave alone a server they can't verify", { timeout: 60_000 }, async () => {
+  const m = legacyProject();
+  m.records();
+  const stranger = await fakeOldServer(m.dir, { lieAboutId: true });
+  try {
+    assert.equal(m.skel("migrate").ok, true);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(stranger.child.exitCode, null);
+    assert.equal(stranger.child.signalCode, null, "a pid in serve.json alone is never stopped");
+  } finally {
+    await stranger.stop();
+  }
+});
+
+test("#18: migrate stops a verified server from before the state dir and says so; a current one is left, and follows the move", { timeout: 60_000 }, async () => {
+  const m = legacyProject();
+  m.records();
+  const old = await fakeOldServer(m.dir);
+  try {
+    assert.equal(old.child.exitCode, null, "only a migrate touches it");
+    const r = m.skel("migrate");
+    assert.equal(r.ok, true, r.stderr);
+    assert.match(r.stdout, /stopped the review server at .*could only read the old location.*`skel serve`/);
+    assert.equal(await old.gone(), true);
+  } finally {
+    await old.stop();
+  }
+  const n = legacyProject();
+  n.records();
+  const srv = await serve(n.dir, [], n.env);
+  try {
+    const was = await (await fetch(new URL("api/version", srv.url))).json();
+    const r = n.skel("migrate");
+    assert.equal(r.ok, true, r.stderr);
+    assert.doesNotMatch(r.stdout, /stopped the review server/);
+    assert.equal((await (await fetch(new URL("api/version", srv.url))).json()).serverId, was.serverId);
+    n.setPhase("fill");
+    assert.doesNotMatch(await (await fetch(srv.url)).text(), /no record of the approved skeleton/, "it reads the moved record");
+  } finally {
+    await srv.stop();
+  }
 });
