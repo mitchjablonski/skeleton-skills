@@ -156,6 +156,13 @@ test("serve replaces verified clock-only server instead of silently reusing it",
     const diagnostic = await broken.text();
     assert.ok(diagnostic.includes(path.join(root, ".skeleton/state.json")));
     assert.match(diagnostic, /external terminal/);
+    for (const route of ["api/version", "api/data", "api/version"]) {
+      const failed = await fetch(new URL(route, url), { headers });
+      assert.equal(failed.status, 500, route);
+      assert.equal(await failed.text(), "internal error");
+    }
+    assert.equal((await fetch(url)).status, 200, "corrupt state leaves the server running");
+    assert.equal((await fetch(new URL("api/version", url))).status, 401);
     const invalid = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": token }, body: "{" });
     assert.equal(invalid.status, 400);
   } finally {
