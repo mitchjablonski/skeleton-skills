@@ -455,3 +455,31 @@ test("Stop advisory migration moves valid metadata and never refuses corrupt or 
   fs.writeFileSync(path.join(to, key + ".stop-notice.json"), valid);
   assert.ok(planMigration({ key, from, to, keyOf: projectKey }).problems.some(p => p.kind === "marker"), "advisory metadata cannot establish migrated authority");
 });
+
+
+test("a legacy Stop cache follows authority without routing snapshot or rendered records", t => {
+  const f = fixture(t);
+  const stateModule = pathToFileURL(path.resolve("lib/state.mjs")).href;
+  const code = [
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    'import assert from "node:assert/strict";',
+    'import { projectKey, legacyConfigDir, skelStateDir, storePath, usesLegacyStore, migratedMarker } from ' + JSON.stringify(stateModule) + ';',
+    'const root = ' + JSON.stringify(f.root) + ';',
+    'const key = projectKey(root), from = legacyConfigDir(), to = skelStateDir();',
+    'fs.mkdirSync(from, {recursive:true});',
+    'fs.writeFileSync(path.join(from, key + ".stop-notice.json"), "{}");',
+    'const check = legacy => {',
+    ' assert.equal(usesLegacyStore(key), legacy);',
+    ' for (const suffix of [".snapshot", ".rendered", ".stop-notice"]) assert.equal(storePath(root,suffix), path.join(legacy ? from : to,key + suffix + ".json"));',
+    '};',
+    'check(false);',
+    'for (const suffix of ["", ".snapshot", ".rendered", "-install", ".config-notice"]) {',
+    ' const file=path.join(from,key+suffix+".json"); fs.writeFileSync(file,"{}"); check(true);',
+    ' const marker=path.join(from,migratedMarker(key)); fs.writeFileSync(marker,""); check(false); fs.rmSync(marker); check(true);',
+    ' fs.rmSync(file); check(false);',
+    '}',
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd:f.root, env:f.env, encoding:"utf8" });
+  assert.equal(result.status, 0, result.stderr);
+});
