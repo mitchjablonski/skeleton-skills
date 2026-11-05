@@ -1153,7 +1153,8 @@ test("#15: approve refuses when the skeleton changed after the human's review on
   let v2;
   try {
     const v1 = pageData(srv.html).skeletonVersion;
-    await post(srv.url, { verdict: "approve", general: "", comments: [], version: v1 }, h);
+    const sent = await post(srv.url, { verdict: "approve", general: "", comments: [], version: v1 }, h);
+    assert.equal(sent.status, 204, `feedback POST failed: ${sent.status} ${await sent.text()}`);
     assert.match(failure(() => run("approve")), /feedback you haven't read yet[\s\S]*skel feedback/, "unread sends come first");
     run("feedback");
     // The agent edits the skeleton after the human's "looks good".
@@ -1223,16 +1224,18 @@ test("#16: the Stop hook is silent with no skeleton, outside a fill, and while t
   assert.equal(stopHook(dir), "", "finalized: no fill");
 });
 
-test("#16: during a fill the Stop hook reports drift to the human without blocking; --block sends Claude back once", () => {
+test("#38: drift requests one correction by default; --notify-only opts out", () => {
   const { dir, a, run } = approved();
   // A Bash edit outside the fence: the PreToolUse hook never saw it.
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(SIG, "smooth(raw: Point[], k = 1): Point[]"));
   const out = JSON.parse(stopHook(dir));
   assert.match(out.systemMessage, /drift from the approved skeleton[\s\S]*src\/a\.ts:3[\s\S]*\+ export function smooth\(raw: Point\[\], k = 1\)/);
-  assert.equal(out.decision, undefined, "notify by default");
+  assert.equal(out.decision, "block", "request a correction by default");
+  assert.equal(JSON.parse(stopHook(dir, { stop_hook_active: true })).decision, undefined, "the continuation only notifies");
+  assert.equal(JSON.parse(stopHook(dir, {}, ["--notify-only"])).decision, undefined, "explicit notify-only opts out");
   const blocked = JSON.parse(stopHook(dir, {}, ["--block"]));
-  assert.equal(blocked.decision, "block");
-  assert.match(blocked.reason, /src\/a\.ts:3[\s\S]*skel reshape/);
+  assert.equal(blocked.decision, undefined, "unchanged drift already requested its correction");
+  assert.match(out.reason, /src\/a\.ts:3[\s\S]*skel reshape/);
   assert.equal(JSON.parse(stopHook(dir, { stop_hook_active: true }, ["--block"])).decision, undefined, "blocks once, then notifies");
   // A deleted record fails closed here too.
   fs.rmSync(snapshotPath(dir));
