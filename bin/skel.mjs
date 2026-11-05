@@ -11,8 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, skelConfigDir, writeFileAtomic } from "../lib/state.mjs";
-import { bodyEscapesFence } from "../lib/gate.mjs";
-import { readConfigNotice } from "../lib/config-notice.mjs";
+import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
@@ -75,7 +74,25 @@ function requireRoot() {
   return root;
 }
 
-function snapshot(root, state = readState(root)) {
+function validState(state) {
+  return !!state && ["scaffold", "fill", "done"].includes(state.phase) && ["ask", "deny"].includes(state.gate) && typeof state.title === "string" && Array.isArray(state.files) && state.files.every(file => typeof file === "string") && (state.activeStep === null || typeof state.activeStep === "string") && Number.isFinite(state.reviewEpoch);
+}
+
+function requireState(root) {
+  const state = readState(root);
+  if (!validState(state)) {
+    die(`can't read valid state from ${path.join(root, STATE_DIR, "state.json")}; repair it from a terminal or Claude Code's ! shell mode, or run skel init --force "<title>" from ${root} to replace the prior fill state`);
+  }
+  return state;
+}
+
+function clearConfigNotices(root) {
+  for (const owner of new Set([root, process.env.CLAUDE_PROJECT_DIR].filter(Boolean))) {
+    try { clearConfigNotice(owner); } catch (err) { console.error(`skel: couldn't clear the historical settings notice (${err.code ?? err.message})`); }
+  }
+}
+
+function snapshot(root, state = requireState(root)) {
   const { fences, errors, files } = scanSkeleton(root, state);
   return { steps: toSteps(fences), errors, files };
 }
@@ -390,6 +407,7 @@ const commands = {
     }
     initState(root, title);
     writeState(root, { ...readState(root), gate });
+    clearConfigNotices(root);
     // A new skeleton starts with no feedback and no review server: nothing
     // left over (or shipped in the repo) can pose as this review's notes.
     const old = await liveServer(root);
@@ -408,7 +426,7 @@ const commands = {
   track(args) {
     if (!args.length) die("usage: skel track <file...>");
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     const rels = args.map((a) => path.relative(root, path.resolve(a)).split(path.sep).join("/"));
     const missing = rels.filter((r) => !fs.existsSync(path.join(root, r)));
     if (missing.length) die(`not found: ${missing.join(", ")}`);
@@ -426,7 +444,7 @@ const commands = {
       die(`no ${STATE_DIR}/state.json here or above — run \`skel init "<title>"\` first`);
     }
     const state = readState(root);
-    if (!state) {
+    if (!validState(state)) {
       const error = `can't read ${path.join(root, STATE_DIR, "state.json")}; repair that file or run \`skel init --force "<title>"\` from ${root} (requires approval in Claude Code)`;
       if (args.includes("--json")) {
         console.log(JSON.stringify({ error, configNotice }, null, 2));
@@ -464,7 +482,7 @@ const commands = {
 
   review() {
     const root = requireRoot();
-    const out = writeReview(root, readState(root));
+    const out = writeReview(root, requireState(root));
     console.log(out);
     console.log(`file://${out}`);
   },
@@ -478,6 +496,7 @@ const commands = {
       fs.rmSync(servePath(root), { force: true });
       return;
     }
+    requireState(root);
     const feedbackEnabled = args.includes("--send");
     const mode = feedbackEnabled ? "feedback enabled" : "read-only";
     if (running && running.feedbackEnabled === feedbackEnabled) {
@@ -667,7 +686,7 @@ const commands = {
           "They are not the human's feedback; don't act on them.\n",
       );
     }
-    if (taken.status === "ok") console.log(feedbackMarkdown(readState(root).title, mergeRecords(taken.records)));
+    if (taken.status === "ok") console.log(feedbackMarkdown(requireState(root).title, mergeRecords(taken.records)));
     else if (readonly) console.log("READ_ONLY: the review is read-only; the human's feedback arrives as a chat message. Wait for it; don't poll. Only if the human asks for direct Send: skel serve --send.");
     else if (noServer) console.log("NO_SERVER: no review server is running (a static review, or it stopped), so nothing can be sent; the human's feedback arrives as a chat message. Wait for it; don't poll.");
     else console.log(`NO_FEEDBACK${wait ? ` (waited ${wait}s)` : ""}`);
@@ -677,7 +696,7 @@ const commands = {
     const given = flag(args, "reviewed", null);
     if (given !== null && !isVersion(given)) die('--reviewed takes the 12-character version the human reviewed (the "Reviewed skeleton version: …" line of their feedback)');
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
     const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
@@ -726,7 +745,7 @@ const commands = {
 
   next() {
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     if (state.phase !== "fill") die(`phase is ${state.phase} — the skeleton must be approved first (skel approve)`);
     const { steps } = snapshot(root);
     if (state.activeStep) {
@@ -750,7 +769,7 @@ const commands = {
     const id = args.find((a) => a !== "--force");
     if (!id) die("usage: skel start <id> [--force]");
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     if (state.phase !== "fill") die(`phase is ${state.phase} — the skeleton must be approved first (skel approve)`);
     const { steps } = snapshot(root);
     const step = steps.find((s) => s.id === id);
@@ -764,9 +783,9 @@ const commands = {
     setActive(root, state, step, force);
   },
 
-  done() {
+  async done() {
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     if (!state.activeStep) die("no active step");
     const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
@@ -781,29 +800,34 @@ const commands = {
     // a new one before the fence ends (the code after the fence is unchanged).
     // The hook's heuristic catches that for Edit/Write; repeat it here, as a
     // note, for fills it didn't see. A heuristic, so it never blocks.
+    let bodyEscapesFence;
+    try { ({ bodyEscapesFence } = await import("../lib/gate.mjs")); }
+    catch (err) { die(`can't load the gate; restore or repair the skeleton-skills checkout from a terminal or ! shell mode (${err.message})`); }
     for (const f of step.fences) {
       const marker = fs.readFileSync(path.join(root, f.file), "utf-8").split("\n")[f.openLine - 1] ?? "";
       const escape = bodyEscapesFence(f.body.replace(/\r$/gm, ""), marker.replace(/\r$/, ""), f.file);
       if (escape) console.log(`note: in ${f.file}:${f.openLine}-${f.closeLine}, ${escape} (a heuristic; check that the fill stays inside its block)`);
     }
     writeState(root, { ...state, activeStep: null });
+    clearConfigNotices(root);
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
     console.log(`STEP ${state.activeStep} done. ${pending.length} pending${pending[0] ? `; next: ${pending[0].id} ${pending[0].title}` : ""}.`);
   },
 
   reshape(args) {
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
     writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now() });
     // The record is of the shape being reopened; approve writes the new one.
     clearSnapshot(root);
+    clearConfigNotices(root);
     console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
   },
 
   finalize() {
     const root = requireRoot();
-    const state = readState(root);
+    const state = requireState(root);
     const phase = state.phase;
     if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");
     const { fences, errors, files: fenced } = scanSkeleton(root, state);
@@ -818,6 +842,7 @@ const commands = {
     }
     writeState(root, { ...readState(root), phase: "done", activeStep: null });
     clearSnapshot(root);
+    clearConfigNotices(root);
     console.log(`finalized: stripped markers from ${files.length} file(s)`);
   },
 
@@ -981,6 +1006,7 @@ const commands = {
     // The agents folder may hold the user's own subagents: leave it.
     fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
     console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook, the drift check (Stop) hook and the settings-reload (ConfigChange) hook from ${claudeDir}`);
+    console.log("restart Claude Code if these hooks are already loaded; an external uninstall may not trigger a settings-reload event");
     console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
     if (removedConfig) console.log(`removed the config-dir permission deny rule install added`);
     reportLeftInPlace(settings, []);

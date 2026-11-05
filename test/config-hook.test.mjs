@@ -1,10 +1,19 @@
-import test from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { configDecision } from "../lib/config-hook.mjs";
+
+const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+const isolatedXdgConfigHome = fs.mkdtempSync(path.join(os.tmpdir(), "skel-config-suite-"));
+process.env.XDG_CONFIG_HOME = isolatedXdgConfigHome;
+after(() => {
+  if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+  fs.rmSync(isolatedXdgConfigHome, { recursive: true, force: true, maxRetries: 5 });
+});
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "skel-config-"));
@@ -48,7 +57,7 @@ test("PreToolUse faults stay open outside fill, and corrupt enrolled state denie
   state(root, '{');
   const result = run(JSON.stringify({ cwd: root, tool_name: "Edit", tool_input: { file_path: "x" } }));
   assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, "deny");
-  assert.match(result.stderr, /cannot be read/);
+  assert.match(result.stderr, /malformed JSON: .*state\.json/);
 });
 
 test("install/reinstall/uninstall owns only standalone ConfigChange commands", t => {
@@ -83,7 +92,7 @@ test("valid input gate exception denies using session enrollment even with outsi
   const hookUrl = new URL("../lib/hook.mjs", import.meta.url).href;
   for (const thrown of ['new Error("gate broke")', 'null']) {
     const code = `import { runHook } from ${JSON.stringify(hookUrl)}; await runHook({ loadGate: async () => { throw ${thrown}; } });`;
-    const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { input: JSON.stringify({ cwd: outside, tool_name: "Bash", tool_input: { command: "skel approve" } }), encoding: "utf8", env: { ...process.env, CLAUDE_PROJECT_DIR: root } });
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { input: JSON.stringify({ cwd: outside, tool_name: "Edit", tool_input: { file_path: path.join(root, "x.js"), old_string: "x", new_string: "y" } }), encoding: "utf8", env: { ...process.env, CLAUDE_PROJECT_DIR: root } });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, "deny");
     assert.match(result.stderr, /gate broke|null/);
@@ -93,7 +102,7 @@ test("valid input gate exception denies using session enrollment even with outsi
 test("corrupt session state denies valid outside calls and corrupt outer overrides nested fill", t => {
   const root = fixture(t), outside = fixture(t), child = path.join(root, "child");
   state(root, '{'); state(child, '{"phase":"fill"}');
-  assert.match(configDecision({ cwd: child }, root).reason, /cannot be read/);
+  assert.match(configDecision({ cwd: child }, root).reason, /malformed JSON: .*state\.json/);
   for (const cwd of [outside, child]) {
     const result = spawnSync(process.execPath, [path.resolve("bin/skel-hook.mjs")], { input: JSON.stringify({ cwd, tool_name: "Bash", tool_input: { command: "echo hi" } }), encoding: "utf8", env: { ...process.env, CLAUDE_PROJECT_DIR: root } });
     assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, "deny");
