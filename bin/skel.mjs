@@ -18,7 +18,7 @@ import { SHELL_CSP, buildReviewData, clientScript, pagePayload, readDiagrams, re
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
-  storeFeedback, takeFeedback,
+  storeFeedback, takeFeedback, withFeedbackLock, ensureReviewRound,
 } from "../lib/feedback.mjs";
 import { discardUnusedStateDirFiles, migrateProject, migrationPlan } from "../lib/migrate.mjs";
 import { storeNotice } from "../lib/store-notice.mjs";
@@ -188,6 +188,7 @@ async function liveServer(root) {
       storeProtocol: v.storeProtocol ?? 1,
       token,
       readAuth: v.readAuth,
+      feedbackOrder: v.feedbackOrder,
       // The server accepted this token: a server that ignores the header
       // answers 200 as well, so this alone proves nothing (see readsProtected).
       tokenAccepted: !!token && res.status === 200,
@@ -591,7 +592,7 @@ const commands = {
     // A verified server is reused, and its token kept, only if its reads are
     // shown to need that token. Anything else from before #39 is replaced.
     const protectedReads = running ? await readsProtected(running) : false;
-    if (running && protectedReads && running.feedbackEnabled === feedbackEnabled && running.storeProtocol >= STORE_PROTOCOL) {
+    if (running && protectedReads && running.feedbackEnabled === feedbackEnabled && running.storeProtocol >= STORE_PROTOCOL && running.feedbackOrder === 1) {
       console.log(`skel review: ${running.url}#t=${running.token} (${mode}; already running; \`skel serve --stop\` stops it)`);
       return;
     }
@@ -723,7 +724,7 @@ const commands = {
           lastPoll = Date.now();
           res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           const now = current();
-          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled, storeProtocol: STORE_PROTOCOL, readAuth: READ_AUTH }));
+          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled, storeProtocol: STORE_PROTOCOL, readAuth: READ_AUTH, feedbackOrder: 1 }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
           if (!feedbackEnabled) { req.resume(); return void res.writeHead(405, { Allow: "GET", connection: "close" }).end("read-only review; reload and use Copy feedback for Claude"); }
           // Cross-site writes: same origin, a JSON content type (forces a CORS
@@ -747,8 +748,8 @@ const commands = {
               if (fb.version && fb.version !== now) {
                 res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ stale: true, reviewed: fb.version, current: now }));
               } else res.writeHead(204).end();
-            } catch {
-              res.writeHead(400).end("bad feedback payload");
+            } catch (err) {
+              res.writeHead(err.code === "SKEL_FEEDBACK_ORDER" ? 503 : 400).end(err.code === "SKEL_FEEDBACK_ORDER" ? err.message : "bad feedback payload");
             }
           });
         } else {
@@ -821,7 +822,7 @@ const commands = {
     const given = flag(args, "reviewed", null);
     if (given !== null && !isVersion(given)) die('--reviewed takes the 12-character version the human reviewed (the "Reviewed skeleton version: …" line of their feedback)');
     const root = requireRoot();
-    const state = requireState(root);
+    let state = requireState(root);
     if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
     const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
@@ -834,7 +835,10 @@ const commands = {
     // a lock taken for the checks below (#50's feedback lock) isn't held through it.
     const sourceStart = Date.now();
     const { record, source } = await captureApproval(root, state, files);
-    const { record: last, unread } = lastReview(root, state.reviewEpoch);
+    return withFeedbackLock(root, async () => {
+    state = ensureReviewRound(root);
+    if (state.phase !== "scaffold") die("the skeleton is no longer open for approval; retry after the other operation");
+    const { record: last, unread, unknown } = lastReview(root, state.reviewRound);
     if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
     // What the human reviewed: the version named in the feedback the agent
     // was given (copied markdown → --reviewed), else the page's latest send,
@@ -871,6 +875,7 @@ const commands = {
       await clearStopNotice(root);
     } catch {}
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
+    });
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
     if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`);
   },
@@ -947,13 +952,15 @@ const commands = {
 
   reshape(args) {
     const root = requireRoot();
-    const state = requireState(root);
-    if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
-    writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now() });
-    // The record is of the shape being reopened; approve writes the new one.
-    clearSnapshot(root);
-    clearConfigNotices(root);
-    console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
+    return withFeedbackLock(root, () => {
+      const state = requireState(root);
+      if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
+      writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now(), reviewRound: crypto.randomUUID() });
+      // The record is of the shape being reopened; approve writes the new one.
+      clearSnapshot(root);
+      clearConfigNotices(root);
+      console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
+    });
   },
 
   async finalize() {

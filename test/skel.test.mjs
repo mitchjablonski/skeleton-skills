@@ -1941,7 +1941,7 @@ test("read-only feedback wait returns immediately, drains pending sends, and sto
 test("legacy version metadata without feedbackEnabled is send-mode and restarts for read-only", async () => {
   const { dir, run } = project();
   run("init", "T");
-  const legacy = spawn(process.execPath, ["-e", `const http=require('node:http'); const server=http.createServer((req,res)=>res.end(JSON.stringify({serverId:'legacy',pid:process.pid,storeProtocol:2})));server.listen(0,'127.0.0.1',()=>console.log(server.address().port));`], { stdio: ["ignore", "pipe", "pipe"] });
+  const legacy = spawn(process.execPath, ["-e", `const http=require('node:http'); const server=http.createServer((req,res)=>res.end(JSON.stringify({serverId:'legacy',pid:process.pid,storeProtocol:2,feedbackOrder:1})));server.listen(0,'127.0.0.1',()=>console.log(server.address().port));`], { stdio: ["ignore", "pipe", "pipe"] });
   try {
     const port = await new Promise((resolve, reject) => {
       legacy.stdout.once("data", (d) => resolve(Number(String(d).trim())));
