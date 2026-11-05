@@ -2403,9 +2403,9 @@ test("#14 N4: feedback --wait with no review server returns NO_SERVER after a sh
   const { dir, run } = project();
   run("init", "T");
   run("review");
-  const started = Date.now();
+  const started = performance.now();
   const out = execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 30_000 });
-  const took = Date.now() - started;
+  const took = performance.now() - started;
   assert.ok(took >= 9_500 && took < 25_000, `waited the ~10s grace, not 110s (${took}ms)`);
   assert.match(out, /^NO_SERVER: /);
   assert.match(out, /chat message\. Wait for it; don't poll\./, "the READ_ONLY wording");
