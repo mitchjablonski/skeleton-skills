@@ -3342,6 +3342,66 @@ test("#18: anything at the marker's path reads as the marker, everywhere, before
   }
 });
 
+const canDenyDirs = process.platform !== "win32" && process.getuid?.() !== 0;
+
+test("#18: an unreadable marker lookup never selects the state dir: approval checks fail closed", { skip: !canDenyDirs }, () => {
+  for (const moved of [false, true]) {
+    const m = legacyProject();
+    const before = m.records({ phase: "fill" });
+    if (moved) {
+      m.setPhase("scaffold");
+      assert.equal(m.skel("migrate").ok, true);
+      m.setPhase("fill");
+    }
+    assert.equal(m.skel("next").ok, true);
+    const a = path.join(m.dir, "src", "a.ts");
+    fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
+    fs.chmodSync(m.oldDir, 0o000);
+    try {
+      const done = m.skel("done");
+      assert.equal(done.ok, false, "done doesn't pass");
+      assert.match(done.stderr, /no record of the approved skeleton/);
+      assert.match(m.skel("status").stdout, /can't tell whether this project's records have moved/);
+      assert.match(m.stop().systemMessage, /no record of the approved skeleton/);
+      m.setPhase("scaffold");
+      const plan = m.skel("migrate");
+      assert.equal(plan.ok, false);
+      assert.match(plan.stderr, /can't tell whether this project has moved/);
+      assert.match(plan.stderr, /Fix that path or its permissions/);
+      assert.doesNotMatch(plan.stderr, /\n\s+at /);
+    } finally {
+      fs.chmodSync(m.oldDir, 0o700);
+    }
+    if (!moved) {
+      assert.deepEqual(fs.readFileSync(m.oldFile(".snapshot")), before[".snapshot"], "nothing moved");
+      assert.equal(fs.existsSync(m.newFile(".snapshot")), false);
+    }
+    // Readable again, and every record is where it was.
+    m.setPhase("fill");
+    assert.doesNotMatch(m.skel("status").stdout, /no record of the approved skeleton/);
+  }
+});
+
+test("#18: an old dir that can't be listed still answers for this project's record: migrate refuses an unknown fill state", { skip: !canDenyDirs }, () => {
+  const m = legacyProject();
+  const before = m.records();
+  fs.writeFileSync(path.join(m.dir, ".skeleton", "state.json"), "{}");
+  fs.chmodSync(m.oldDir, 0o300);
+  try {
+    const receipt = execFileSync(process.execPath, ["--input-type=module", "-e", `import { approvalReceiptStatus } from ${JSON.stringify(new URL("../lib/state.mjs", import.meta.url).href)}; process.stdout.write(approvalReceiptStatus(${JSON.stringify(m.dir)}))`], { env: m.env, encoding: "utf-8", timeout: 60_000 });
+    assert.equal(receipt, "present", "the exact name is looked up though the listing failed");
+    const other = execFileSync(process.execPath, ["--input-type=module", "-e", `import { approvalReceiptStatus } from ${JSON.stringify(new URL("../lib/state.mjs", import.meta.url).href)}; process.stdout.write(approvalReceiptStatus(${JSON.stringify(tmp("skel-other-"))}))`], { env: m.env, encoding: "utf-8", timeout: 60_000 });
+    assert.equal(other, "unreadable", "and a miss isn't evidence of no enrollment");
+    const r = m.skel("migrate");
+    assert.equal(r.ok, false);
+    assert.match(r.stderr, /not migrating: .*skeleton state is invalid|not migrating: approved skeleton state is invalid/);
+  } finally {
+    fs.chmodSync(m.oldDir, 0o700);
+  }
+  for (const s of SUFFIXES) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], s);
+  assert.deepEqual(onlyFiles(m.newDir).filter((f) => f.startsWith(m.key)), []);
+});
+
 test("#18: the migrate ask makes sense when the command is something else", () => {
   const v = evaluateBash({ command: "cd skel-app && rails db:migrate", state: null, storeDirs: [] });
   assert.equal(v?.decision, "ask");
