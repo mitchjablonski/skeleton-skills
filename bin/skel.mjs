@@ -14,7 +14,7 @@ import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, lega
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { installStatus, isSkelHook, rulePath } from "../lib/install-status.mjs";
 import { enrollment } from "../lib/config-hook.mjs";
-import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
+import { SHELL_CSP, buildReviewData, clientScript, pagePayload, readDiagrams, renderShell, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
@@ -131,28 +131,74 @@ function printFences(step) {
 /**
  * The review server named in serve.json, if it is really ours and running:
  * a 127.0.0.1 URL that answers with the serverId we recorded. A bare pid (or
- * a serve.json shipped in a repo) is never trusted, killed or handed out.
+ * a serve.json shipped in a repo) is never trusted, killed or handed out. Its
+ * review token lives in serve.json too, and only ever goes back to that URL.
+ * A server from before the token answers without one: that identifies it well
+ * enough to stop or replace it, not to reuse it (readsProtected).
  */
 /** How long `skel feedback --wait` waits for a review server to answer before saying there's none. */
 const NO_SERVER_GRACE = 10_000;
 
 /**
- * Which store layout a server understands, in /api/version. No path: that
- * endpoint is readable by anything on the machine. A server without it is from
+ * Which store layout a server understands, in /api/version. No path: anything
+ * holding the token can read that endpoint. A server without it is from
  * before the state dir: it only ever reads the old location, so it reports a
  * missing approval record once a project has migrated.
  */
 const STORE_PROTOCOL = 2;
 
+/**
+ * That a server's reads need the review token, in /api/version. Separate from
+ * STORE_PROTOCOL: a server can understand the state dir and still serve source
+ * to anyone (#41's did).
+ */
+const READ_AUTH = 1;
+
 async function liveServer(root) {
   const s = readServe(root);
   if (!s?.url || !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(s.url) || !s.serverId) return null;
   try {
-    const res = await fetch(new URL("api/version", s.url), { signal: AbortSignal.timeout(1500) });
+    const token = typeof s.token === "string" && /^[0-9a-f]{32,128}$/.test(s.token) ? s.token : null;
+    const res = await fetch(new URL("api/version", s.url), { headers: token ? { "x-skeleton-token": token } : {}, signal: AbortSignal.timeout(1500) });
     const v = await res.json();
-    return v.serverId === s.serverId && Number.isInteger(v.pid) && v.pid > 1 && (s.pid === undefined || s.pid === v.pid) ? { url: s.url, pid: v.pid, feedbackEnabled: v.feedbackEnabled !== false, storeProtocol: v.storeProtocol ?? 1 } : null;
+    if (!(v.serverId === s.serverId && Number.isInteger(v.pid) && v.pid > 1 && (s.pid === undefined || s.pid === v.pid))) return null;
+    return {
+      url: s.url,
+      pid: v.pid,
+      feedbackEnabled: v.feedbackEnabled !== false,
+      storeProtocol: v.storeProtocol ?? 1,
+      token,
+      readAuth: v.readAuth,
+      // The server accepted this token: a server that ignores the header
+      // answers 200 as well, so this alone proves nothing (see readsProtected).
+      tokenAccepted: !!token && res.status === 200,
+    };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Is it safe to hand out this verified server's URL as hardened? It must claim
+ * the capability, have accepted our token, and refuse the same reads without
+ * it. A token in serve.json proves none of that, and a stale or planted marker
+ * is caught by the refusals. /api/version is asked first: an older server's
+ * GET / would record a page view nobody saw. Any doubt, a timeout included,
+ * counts as no: the caller replaces the server, which costs a reload.
+ */
+async function readsProtected(server) {
+  if (!server.token || !server.tokenAccepted || !Number.isInteger(server.readAuth) || server.readAuth < READ_AUTH) return false;
+  try {
+    const get = (route) => fetch(new URL(route, server.url), { signal: AbortSignal.timeout(1500) });
+    for (const route of ["api/version", "api/data"]) {
+      const res = await get(route);
+      await res.body?.cancel();
+      if (res.status !== 401) return false;
+    }
+    const shell = await get("");
+    return shell.ok && !!shell.headers.get("content-security-policy") && !(await shell.text()).includes('id="skeleton-data"');
+  } catch {
+    return false;
   }
 }
 
@@ -516,12 +562,32 @@ const commands = {
     requireState(root);
     const feedbackEnabled = args.includes("--send");
     const mode = feedbackEnabled ? "feedback enabled" : "read-only";
-    if (running && running.feedbackEnabled === feedbackEnabled && running.storeProtocol >= STORE_PROTOCOL) {
-      console.log(`skel review: ${running.url} (${mode}; already running; \`skel serve --stop\` stops it)`);
+    // A verified server is reused, and its token kept, only if its reads are
+    // shown to need that token. Anything else from before #39 is replaced.
+    const protectedReads = running ? await readsProtected(running) : false;
+    if (running && protectedReads && running.feedbackEnabled === feedbackEnabled && running.storeProtocol >= STORE_PROTOCOL) {
+      console.log(`skel review: ${running.url}#t=${running.token} (${mode}; already running; \`skel serve --stop\` stops it)`);
       return;
     }
-    if (running) { try { process.kill(running.pid); } catch (err) { if (err.code !== "ESRCH") throw err; } }
-    const { session, token } = feedbackEnabled ? newServeSession() : {};
+    if (running) {
+      try { process.kill(running.pid); } catch (err) { if (err.code !== "ESRCH") throw err; }
+      if (!protectedReads) console.log("replaced the running review server: it didn't show that its reads need the review token. Reload any tab still open on it, using the URL below.");
+    }
+    const { session } = feedbackEnabled ? newServeSession() : {};
+    // One token, for reading and for Send: the page must hold it to do either,
+    // so a second one would protect nothing from whatever can read the first.
+    // A mode switch replaces a server we just verified, whose reads need its
+    // token, and keeps that token, so open tabs follow it and reload. Any other
+    // start gets a fresh one: a token left in serve.json by a dead server,
+    // shipped in a repo, or never guarding reads isn't picked up, unless a
+    // local process answers for it and passes readsProtected (same-user: out of
+    // scope, and it could read the real token anyway).
+    const token = protectedReads ? running.token : crypto.randomBytes(24).toString("hex");
+    const tokenOk = (req) => {
+      const given = Buffer.from(String(req.headers["x-skeleton-token"] ?? ""));
+      const want = Buffer.from(token);
+      return given.length === want.length && crypto.timingSafeEqual(given, want);
+    };
     const serverId = crypto.randomBytes(12).toString("hex");
     // The session store vouches for this run's feedback. If it can't be
     // written, still serve the page (it's useful to read), but say plainly
@@ -596,33 +662,49 @@ const commands = {
         // DNS rebinding: only answer requests addressed to us by name.
         if (!hosts.has(String(req.headers.host ?? "").toLowerCase())) return void refuse(421, "misdirected request");
         if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/?"))) {
+          // The shell and the client script are the same for every project:
+          // no source, no token. Everything else needs the token.
+          res.writeHead(200, {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+            "x-frame-options": "DENY",
+            "x-content-type-options": "nosniff",
+            "referrer-policy": "no-referrer",
+            "content-security-policy": SHELL_CSP,
+          });
+          res.end(renderShell());
+        } else if (req.method === "GET" && req.url === "/assets/review.js") {
+          res.writeHead(200, {
+            "content-type": "text/javascript; charset=utf-8",
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff",
+          });
+          res.end(clientScript());
+        } else if (req.method === "GET" && (req.url === "/api/data" || req.url === "/api/version") && !tokenOk(req)) {
+          refuse(401, "this needs the review token: open the URL `skel serve` prints");
+        } else if (req.method === "GET" && req.url === "/api/data") {
           lastPoll = Date.now();
           // Serve what we know now; the page's polls pick up the search's result.
           if (Date.now() - lastSearch > 5_000) refresh();
           const { data, record, version } = current();
           // Remember what the human was shown, so `skel approve` can diff
-          // against the version they reviewed.
+          // against the version they reviewed. This is the read that shows
+          // it: the shell alone shows nothing.
           noteRendered(root, record);
-          res.writeHead(200, {
-            "content-type": "text/html; charset=utf-8",
-            "cache-control": "no-store",
-            "x-frame-options": "DENY",
-            "referrer-policy": "no-referrer",
-          });
-          res.end(renderHtml({ ...data, version }, { token: token ?? null, feedbackEnabled, serverId }));
+          res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+          res.end(JSON.stringify(pagePayload(data, { version, feedbackEnabled, serverId })));
         } else if (req.method === "GET" && req.url === "/api/version") {
           lastPoll = Date.now();
           res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           const now = current();
-          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled, storeProtocol: STORE_PROTOCOL }));
+          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled, storeProtocol: STORE_PROTOCOL, readAuth: READ_AUTH }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
           if (!feedbackEnabled) { req.resume(); return void res.writeHead(405, { Allow: "GET", connection: "close" }).end("read-only review; reload and use Copy feedback for Claude"); }
           // Cross-site writes: same origin, a JSON content type (forces a CORS
-          // preflight we never answer), and the per-run token from the page.
+          // preflight we never answer), and the review token from the page.
           const sameOrigin = !req.headers.origin || hosts.has(String(req.headers.origin).replace(/^https?:\/\//, "").toLowerCase());
           const json = String(req.headers["content-type"] ?? "").split(";")[0].trim() === "application/json";
-          const tokenOk = String(req.headers["x-skeleton-token"] ?? "") === token;
-          if (!sameOrigin || !json || !tokenOk) return void refuse(403, "forbidden");
+          if (!sameOrigin || !json || !tokenOk(req)) return void refuse(403, "forbidden");
           // A newer server (or a new skeleton) took over: don't accept notes
           // the agent would no longer trust.
           if (superseded()) return void refuse(409, `this review page is out of date; reload ${readServe(root)?.url ?? "the new review URL"}`);
@@ -657,8 +739,8 @@ const commands = {
       const p = server.address().port;
       for (const h of [`127.0.0.1:${p}`, `localhost:${p}`]) hosts.add(h);
       origin = `http://127.0.0.1:${p}`;
-      writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, port: p, pid: process.pid, serverId, feedbackEnabled }), 0o600);
-      console.log(`skel review: ${origin}/ (${mode})`);
+      writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, port: p, pid: process.pid, serverId, feedbackEnabled, token }), 0o600);
+      console.log(`skel review: ${origin}/#t=${token} (${mode})`);
     };
     server.once("error", (err) => {
       if (err.code !== "EADDRINUSE") throw err;

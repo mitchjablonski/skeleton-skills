@@ -27,7 +27,7 @@ test("PreToolUse deduplicates moved and legacy commands while preserving user gr
   ] } }));
   const run = action => {
     const result = spawnSync(process.execPath, [BIN, action, root], {
-      env: { ...process.env, XDG_CONFIG_HOME: path.join(root, "config"), XDG_STATE_HOME: path.join(root, "state") }, encoding: "utf8",
+      env: { ...process.env, XDG_CONFIG_HOME: path.join(root, "config"), XDG_STATE_HOME: path.join(root, "state"), LOCALAPPDATA: path.join(root, "localappdata") }, encoding: "utf8",
     });
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(fs.readFileSync(file, "utf8")).hooks.PreToolUse;

@@ -18,7 +18,7 @@ Arguments:
 
 ## For each step
 
-1. **Start it.** Run `skel serve` in the background and share its URL, or `skel serve --send` instead if the human explicitly opted in to direct Send. Keep that mode when reusing a server. The default live review is read-only: comments are copied into chat. If using static review instead, retain that choice. Then run `skel next` (or `skel start <id>`); it prints each fence's file, line range and body.
+1. **Start it.** Run `skel serve` in the background and share its whole URL, including `#t=…`, or `skel serve --send` instead if the human explicitly opted in to direct Send. Keep that mode when reusing a server. The default live review is read-only: comments are copied into chat. If using static review instead, retain that choice. Then run `skel next` (or `skel start <id>`); it prints each fence's file, line range and body.
 2. **State your opinion first, in 2–4 lines:** how the step should be done and the one non-obvious choice in it (e.g. "Keep this pure and do the dedupe in one pass. Mutating the input would be faster, but the signature promises a new array."). Read the code around the fences first so the opinion is grounded. In step-by-step mode this is the human's moment to redirect, so keep it short and concrete.
 3. **Delegate the edit.** First, in a git repo, run `git status --porcelain` and keep its output: it is the "before" for step 4's check (a skeleton nobody has committed is all untracked files, and earlier fills or unrelated work show up as already changed). Then call the Agent tool with `subagent_type: "skeleton-filler"` and wait for its report. It starts with none of this conversation, so the brief must carry everything it needs:
 
