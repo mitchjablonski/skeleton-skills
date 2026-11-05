@@ -9,21 +9,24 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { scanRepo, toSteps, stripMarkers } from "../lib/markers.mjs";
-import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, writeFileAtomic } from "../lib/state.mjs";
+import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
+import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, skelConfigDir, writeFileAtomic } from "../lib/state.mjs";
 import { bodyEscapesFence } from "../lib/gate.mjs";
 import { buildReviewData, readDiagrams, renderHtml, writeReview } from "../lib/review.mjs";
 import {
-  cleanFeedback, feedbackMarkdown, mergeRecords, newServeSession,
+  cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
   addSession, clearSessions, configPath, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
   sessionStorePath, storeFeedback, takeFeedback,
 } from "../lib/feedback.mjs";
-import { clearSnapshot, formatDrift, scanSkeleton, verifySnapshot, writeSnapshot } from "../lib/snapshot.mjs";
+import {
+  clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
+} from "../lib/snapshot.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Forward slashes on every platform: these land in shell commands and skill text.
 const SELF = path.join(PKG_ROOT, "bin", "skel.mjs").split(path.sep).join("/");
 const HOOK = path.join(PKG_ROOT, "bin", "skel-hook.mjs").split(path.sep).join("/");
+const STOP_HOOK = path.join(PKG_ROOT, "bin", "skel-stop.mjs").split(path.sep).join("/");
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
@@ -32,9 +35,10 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   track <file...>                    show unfenced skeleton files (types, wiring) in the review too
   status [--json]                    phase, active step, every step's status
   review                             write .skeleton/review.html (static; copy feedback by hand)
-  serve [--port N] [--stop]          serve the review live (reuses a running server); feedback is sent back
+  serve [--port N] [--send] [--stop] serve live read-only; --send enables feedback
   feedback [--wait SECONDS]          print (and archive) the human's latest feedback (waits up to 110s)
-  approve                            enter the fill phase (inside Claude Code the hook asks the human first)
+  approve [--reviewed VERSION]       enter the fill phase (inside Claude Code the hook asks the human first);
+                                     refuses if the version the human last reviewed isn't the current one
   next                               start the first pending step and print its fences
   start <id> [--force]               start a specific step (--force abandons an unfinished active step,
                                      or reopens a filled one for rework)
@@ -43,8 +47,9 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   reshape                            back to skeleton review (inside Claude Code the hook asks the human first)
   finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
-  install [projectDir]               install skills, filler subagent, hook and .skeleton/ deny rules into a
-                                     project's .claude/
+  stop-hook [--block]                Stop hook: reports drift from the approved skeleton during a fill
+  install [projectDir]               install skills, filler subagent, hooks and deny rules (.skeleton/ state,
+                                     skel's config dir) into a project's .claude/
   uninstall [projectDir]             remove what install added (leaves .skeleton/ and .gitignore alone)
 `;
 
@@ -78,6 +83,18 @@ function requireNoDrift(root, state, fencedFiles, what) {
   if (!drift.ok) die(`can't ${what}: ${formatDrift(drift)}`);
 }
 
+/** Why approve refuses a stale review: what changed since the version the human saw. */
+function staleReview(root, state, files, reviewed, how = "the human reviewed") {
+  // The current version is not printed: the agent must only ever pass a
+  // version it got from the human, so it isn't handed one to copy.
+  const head = `can't approve: ${how} skeleton version ${reviewed}, and the skeleton has changed since.`;
+  const tail = "Have the human reload the review page (a live page reloads by itself; regenerate a static one with `skel review`) and review it again. Approve with the version from the feedback they copy and paste (`--reviewed`), or after their next send in Send mode. Don't pass a version the human didn't give you.";
+  const seen = readRendered(root).find((r) => r.version === reviewed);
+  if (!seen) return `${head}\nVersion ${reviewed} isn't one this project's review page rendered recently, so there is no diff to show.\n${tail}`;
+  const diff = compareWith(seen, root, state, files);
+  return `${head}\n${formatDrift(diff, 8, { header: "Changed since that version (outside the fence bodies):", footer: tail })}`;
+}
+
 function printFences(step) {
   for (const f of step.fences) {
     console.log(`\n--- ${f.file}:${f.openLine}-${f.closeLine} (${f.status})`);
@@ -90,13 +107,16 @@ function printFences(step) {
  * a 127.0.0.1 URL that answers with the serverId we recorded. A bare pid (or
  * a serve.json shipped in a repo) is never trusted, killed or handed out.
  */
+/** How long `skel feedback --wait` waits for a review server to answer before saying there's none. */
+const NO_SERVER_GRACE = 10_000;
+
 async function liveServer(root) {
   const s = readServe(root);
   if (!s?.url || !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(s.url) || !s.serverId) return null;
   try {
     const res = await fetch(new URL("api/version", s.url), { signal: AbortSignal.timeout(1500) });
     const v = await res.json();
-    return v.serverId === s.serverId && Number.isInteger(v.pid) ? { url: s.url, pid: v.pid } : null;
+    return v.serverId === s.serverId && Number.isInteger(v.pid) ? { url: s.url, pid: v.pid, feedbackEnabled: v.feedbackEnabled !== false } : null;
   } catch {
     return null;
   }
@@ -162,24 +182,51 @@ const LEGACY_DENY_RULES = STATE_PATHS.map((p) => `Edit(/${STATE_DIR}/${p})`);
 const realDir = (target) => fs.realpathSync.native(target);
 
 /**
- * The deny rules for a project, or a reason they can't be written. The rule
- * path is a gitignore pattern: `[ ] * ?` are backslash-escaped so they match
- * literally (`( ) { }` aren't pattern characters and match as they are). A
- * path a rule can't spell (a newline, a literal backslash on POSIX, a Windows
- * path without a drive letter) gets no rules rather than rules that guard
- * something else; install still adds the hook and the skills.
+ * An absolute real path as a rule spells it (`/home/you/proj`, `/c/proj` on
+ * Windows), or a reason it can't be. The rule path is a gitignore pattern:
+ * `[ ] * ?` are backslash-escaped so they match literally (`( ) { }` aren't
+ * pattern characters and match as they are). A path a rule can't spell (a
+ * newline, a literal backslash on POSIX, a Windows path without a drive
+ * letter) gets no rule rather than one that guards something else.
  */
-function denyRules(target) {
-  let real = realDir(target);
+function rulePath(real) {
   if (process.platform === "win32") {
     const m = /^([A-Za-z]):[\\/](.*)$/.exec(real);
-    if (!m) return { rules: [], why: "only drive-letter paths can be written as rules on Windows" };
+    if (!m) return { path: null, why: "only drive-letter paths can be written as rules on Windows" };
     real = `/${m[1].toLowerCase()}/${m[2].split("\\").join("/")}`;
   }
   real = real.replace(/\/+$/, "");
-  if (/[\n\r\\]/.test(real)) return { rules: [], why: "the path contains a newline or a backslash, which a rule can't spell" };
-  const escaped = real.replace(/[[\]*?]/g, (c) => `\\${c}`);
-  return { rules: STATE_PATHS.map((p) => `Edit(/${escaped}/${STATE_DIR}/${p})`), why: null };
+  if (/[\n\r\\]/.test(real)) return { path: null, why: "the path contains a newline or a backslash, which a rule can't spell" };
+  return { path: real.replace(/[[\]*?]/g, (c) => `\\${c}`), why: null };
+}
+
+/** The deny rules for a project's .skeleton/ state, or why there are none (install still adds the hook and the skills). */
+function denyRules(target) {
+  const { path: p, why } = rulePath(realDir(target));
+  return why ? { rules: [], why } : { rules: STATE_PATHS.map((s) => `Edit(/${p}/${STATE_DIR}/${s})`), why: null };
+}
+
+/**
+ * The deny rule for skel's config dir ($XDG_CONFIG_HOME/skel, else
+ * ~/.config/skel), or why there is none. The approved-skeleton records, the
+ * rendered review versions, the serve sessions and the ownership records live
+ * there, outside every project, where the hook's fence doesn't reach and only
+ * Claude Code's outside-the-working-directory prompt (skipped by
+ * bypassPermissions) would otherwise stand in the way. skel writes them from
+ * its own process, which deny rules don't apply to. Resolved now: a later
+ * change of XDG_CONFIG_HOME leaves the rule guarding the old dir.
+ */
+function configDenyRule() {
+  const dir = skelConfigDir();
+  let real;
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    real = realDir(dir);
+  } catch (err) {
+    return { rule: null, why: `can't create or resolve ${dir} (${err.code ?? err.message})` };
+  }
+  const { path: p, why } = rulePath(real);
+  return why ? { rule: null, why } : { rule: `Edit(/${p}/**)`, why: null };
 }
 
 /**
@@ -189,11 +236,20 @@ function denyRules(target) {
  * was lost), never to remove them.
  */
 const SKEL_SHAPED = new RegExp(`^Edit\\((//.*)?/\\.skeleton/(${STATE_PATHS.map((p) => p.replace(/[.*]/g, (c) => `\\${c}`)).join("|")})\\)$`);
+/** The config-dir rule's shape, any dir: `Edit(//<abs>/skel/**)`. Loose (any skel/ dir matches), so only ever reported as "possibly" ours. */
+const CONFIG_SHAPED = /^Edit\(\/\/.*\/skel\/\*\*\)$/;
 function reportLeftInPlace(settings, notOurs) {
-  const left = (settings.permissions?.deny ?? []).filter((r) => typeof r === "string" && SKEL_SHAPED.test(r) && !notOurs.includes(r));
-  if (!left.length) return;
-  console.log(`left in place: ${left.length} ${STATE_DIR}/ deny rule(s) this install didn't add (a moved project's, a lost ownership record's, or your own); remove any you no longer want by hand:`);
-  for (const r of left) console.log(`  ${r}`);
+  const deny = (settings.permissions?.deny ?? []).filter((r) => typeof r === "string" && !notOurs.includes(r));
+  const left = deny.filter((r) => SKEL_SHAPED.test(r));
+  if (left.length) {
+    console.log(`left in place: ${left.length} ${STATE_DIR}/ deny rule(s) this install didn't add (a moved project's, a lost ownership record's, or your own); remove any you no longer want by hand:`);
+    for (const r of left) console.log(`  ${r}`);
+  }
+  const cfg = deny.filter((r) => CONFIG_SHAPED.test(r));
+  if (cfg.length) {
+    console.log(`left in place: ${cfg.length} deny rule(s) for a .../skel/** dir that this install didn't add; possibly skel's config-dir rule from an old XDG_CONFIG_HOME, a moved project or a lost ownership record, or your own. Remove any you no longer want by hand:`);
+    for (const r of cfg) console.log(`  ${r}`);
+  }
 }
 
 /**
@@ -257,6 +313,15 @@ function legacyOwned(settings, owned) {
   return hooked && LEGACY_DENY_RULES.every((r) => deny.includes(r)) ? LEGACY_DENY_RULES : [];
 }
 
+/**
+ * Our Stop hook (bin/skel-stop.mjs, or `skel.mjs stop-hook`) from any checkout,
+ * recognised by its script whatever flags (`--x`) follow; block: one of them is
+ * --block. Anything else after it (`&& notify-send done`) makes it the user's.
+ */
+const skelStopHook = (cmd) => {
+  const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?:\s+--\w[\w-]*)*)\s*$/.exec(cmd);
+  return m ? { block: m[1].split(/\s+/).includes("--block") } : null;
+};
 /** The scope-gate hook command from any skel checkout (current or legacy form). */
 const isSkelHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](skel-hook\.mjs"|skel\.mjs" hook)$/.test(cmd);
 
@@ -295,6 +360,7 @@ function openProjectSettings(dir, { forInstall = false } = {}) {
     : settings.permissions?.deny !== undefined && !Array.isArray(settings.permissions.deny) ? '"permissions.deny"'
     : settings.hooks !== undefined && !isObj(settings.hooks) ? '"hooks"'
     : settings.hooks?.PreToolUse !== undefined && !Array.isArray(settings.hooks.PreToolUse) ? '"hooks.PreToolUse"'
+    : settings.hooks?.Stop !== undefined && !Array.isArray(settings.hooks.Stop) ? '"hooks.Stop"'
     : null;
   if (bad) die(`${settingsPath}: ${bad} isn't shaped the way Claude Code expects; fix it first (we won't overwrite it)`);
   return { target, claudeDir, settingsPath, settings };
@@ -326,6 +392,7 @@ const commands = {
     try {
       clearSessions(root);
       clearSnapshot(root);
+      clearRendered(root);
     } catch (err) {
       console.error(`skel: warning: couldn't clear the previous skeleton's review sessions and approval record in ${path.dirname(sessionStorePath(root))} (${err.code ?? err.message})`);
     }
@@ -384,23 +451,26 @@ const commands = {
     const root = requireRoot();
     const running = await liveServer(root);
     if (args.includes("--stop")) {
-      if (running) { process.kill(running.pid); console.log(`stopped the review server (${running.url})`); }
+      if (running) { try { process.kill(running.pid); } catch (err) { if (err.code !== "ESRCH") throw err; } console.log(`stopped the review server (${running.url})`); }
       else console.log("no review server running");
       fs.rmSync(servePath(root), { force: true });
       return;
     }
-    if (running) {
-      console.log(`skel review: ${running.url} (already running; \`skel serve --stop\` stops it)`);
+    const feedbackEnabled = args.includes("--send");
+    const mode = feedbackEnabled ? "feedback enabled" : "read-only";
+    if (running && running.feedbackEnabled === feedbackEnabled) {
+      console.log(`skel review: ${running.url} (${mode}; already running; \`skel serve --stop\` stops it)`);
       return;
     }
-    const { session, token } = newServeSession();
+    if (running) { try { process.kill(running.pid); } catch (err) { if (err.code !== "ESRCH") throw err; } }
+    const { session, token } = feedbackEnabled ? newServeSession() : {};
     const serverId = crypto.randomBytes(12).toString("hex");
     // The session store vouches for this run's feedback. If it can't be
     // written, still serve the page (it's useful to read), but say plainly
     // that what's sent from it won't reach the agent (and refuse sends).
     let recorded = true;
     try {
-      addSession(root, session);
+      if (feedbackEnabled) addSession(root, session);
     } catch (err) {
       recorded = false;
       console.error(
@@ -409,15 +479,30 @@ const commands = {
       );
     }
     warnLegacyQueue(root);
-    // Polls re-stat only the skeleton's own files; finding fences in NEW files
-    // takes a full search, which runs in a child process so it never blocks a
-    // request (a git grep on WSL's /mnt/c can take seconds). It runs every 30s
-    // while a page is polling, and on a page load once the last one is >5s old.
+    // Polls re-stat only the skeleton's own files (fenced and tracked); finding
+    // fences in NEW files takes a full search, which runs in a child process
+    // so it never blocks a request (a git grep on WSL's /mnt/c can take
+    // seconds). It runs every 30s while a page is polling, and on a page load
+    // once the last one is >5s old.
     const cache = new Map();
     let known = scanRepo(root, cache).files.map((f) => path.join(root, f));
     let searching = false;
     let lastSearch = Date.now();
     let lastPoll = 0;
+    // Tracked files the search would look in (not gitignored, not under a
+    // skipped dir), so one that gains fences shows up on the next poll, not
+    // the next search. Ones the search excludes stay out: the page and the
+    // CLI agree on the steps. Asked once per file between searches.
+    const trackedSearchable = new Map();
+    const pollTracked = (state) => {
+      const rels = (state.files ?? []).map(String).filter((rel) => insideRoot(root, path.join(root, rel)));
+      const fresh = rels.filter((rel) => !trackedSearchable.has(rel));
+      if (fresh.length) {
+        const ok = new Set(searchable(root, fresh));
+        for (const rel of fresh) trackedSearchable.set(rel, ok.has(rel));
+      }
+      return rels.filter((rel) => trackedSearchable.get(rel)).map((rel) => path.join(root, rel));
+    };
     const refresh = () => {
       if (searching) return;
       searching = true;
@@ -425,20 +510,22 @@ const commands = {
         searching = false;
         lastSearch = Date.now();
         if (!err) { try { known = JSON.parse(out); } catch {} }
+        // .gitignore may have changed: ask again about tracked files.
+        trackedSearchable.clear();
       });
     };
     setInterval(() => { if (Date.now() - lastPoll < 60_000) refresh(); }, 30_000).unref();
     const current = () => {
       const state = readState(root);
-      // Tracked files aren't polled for fences: the CLI's search doesn't see
-      // the ones it excludes (gitignored, under .claude/), so neither does the
-      // page. buildReviewData reads their text itself. Keep watching files
-      // that have fences or malformed markers until the next search.
-      const data = buildReviewData(root, state, cache, known);
+      // Tracked files are polled for fences only if the search would look in
+      // them (pollTracked); buildReviewData reads the others' text itself.
+      // Keep watching files that have fences or malformed markers until the
+      // next search.
+      const { record, ...data } = buildReviewData(root, state, cache, [...new Set([...known, ...pollTracked(state)])]);
       const watched = [...data.steps.flatMap((st) => st.locations.map((l) => l.file)), ...data.errored];
       known = [...new Set([...known, ...watched.map((f) => path.join(root, f))])];
       const { generatedAt, errored, ...stable } = data;
-      return { data, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
+      return { data, record, version: crypto.createHash("sha1").update(JSON.stringify(stable)).digest("hex").slice(0, 12) };
     };
     const superseded = () => readServe(root)?.serverId !== serverId;
     let origin = "";
@@ -454,19 +541,24 @@ const commands = {
           lastPoll = Date.now();
           // Serve what we know now; the page's polls pick up the search's result.
           if (Date.now() - lastSearch > 5_000) refresh();
-          const { data, version } = current();
+          const { data, record, version } = current();
+          // Remember what the human was shown, so `skel approve` can diff
+          // against the version they reviewed.
+          noteRendered(root, record);
           res.writeHead(200, {
             "content-type": "text/html; charset=utf-8",
             "cache-control": "no-store",
             "x-frame-options": "DENY",
             "referrer-policy": "no-referrer",
           });
-          res.end(renderHtml({ ...data, version }, { token }));
+          res.end(renderHtml({ ...data, version }, { token: token ?? null, feedbackEnabled, serverId }));
         } else if (req.method === "GET" && req.url === "/api/version") {
           lastPoll = Date.now();
           res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-          res.end(JSON.stringify({ version: current().version, serverId, pid: process.pid }));
+          const now = current();
+          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
+          if (!feedbackEnabled) { req.resume(); return void res.writeHead(405, { Allow: "GET", connection: "close" }).end("read-only review; reload and use Copy feedback for Claude"); }
           // Cross-site writes: same origin, a JSON content type (forces a CORS
           // preflight we never answer), and the per-run token from the page.
           const sameOrigin = !req.headers.origin || hosts.has(String(req.headers.origin).replace(/^https?:\/\//, "").toLowerCase());
@@ -481,8 +573,14 @@ const commands = {
           req.on("data", (c) => { body += c; if (body.length > 2_000_000) req.destroy(); });
           req.on("end", () => {
             try {
-              storeFeedback(root, session, cleanFeedback(JSON.parse(body)));
-              res.writeHead(204).end();
+              const fb = cleanFeedback(JSON.parse(body));
+              const now = current().data.skeletonVersion;
+              storeFeedback(root, session, fb, now);
+              // A page that was already out of date is told so (the notes are
+              // still delivered, marked stale).
+              if (fb.version && fb.version !== now) {
+                res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ stale: true, reviewed: fb.version, current: now }));
+              } else res.writeHead(204).end();
             } catch {
               res.writeHead(400).end("bad feedback payload");
             }
@@ -501,8 +599,8 @@ const commands = {
       const p = server.address().port;
       for (const h of [`127.0.0.1:${p}`, `localhost:${p}`]) hosts.add(h);
       origin = `http://127.0.0.1:${p}`;
-      writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, port: p, pid: process.pid, serverId }), 0o600);
-      console.log(`skel review: ${origin}/`);
+      writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, port: p, pid: process.pid, serverId, feedbackEnabled }), 0o600);
+      console.log(`skel review: ${origin}/ (${mode})`);
     };
     server.once("error", (err) => {
       if (err.code !== "EADDRINUSE") throw err;
@@ -523,7 +621,20 @@ const commands = {
     // it and let the skill loop.
     const wait = Math.min(Number(flag(args, "wait", "0")) || 0, 110);
     const deadline = Date.now() + wait * 1000;
-    while (pendingCount(root) === 0 && Date.now() < deadline) {
+    let readonly = false;
+    // No server (a static review, or it stopped): nothing can send, so don't
+    // sit out the wait. Only once none has answered for NO_SERVER_GRACE in a
+    // row: `skel serve` scans the project before it listens (and only then
+    // writes serve.json), so one just started in the background, or
+    // restarting, must not be mistaken for none.
+    let noServer = false;
+    let missingSince = null;
+    while (pendingCount(root) === 0) {
+      const live = await liveServer(root);
+      if (live?.feedbackEnabled === false) { readonly = true; break; }
+      missingSince = live ? null : missingSince ?? Date.now();
+      if (wait && missingSince !== null && Date.now() - missingSince >= NO_SERVER_GRACE) { noServer = true; break; }
+      if (Date.now() >= deadline) break;
       await new Promise((r) => setTimeout(r, 1000));
     }
     warnLegacyQueue(root);
@@ -535,10 +646,14 @@ const commands = {
       );
     }
     if (taken.status === "ok") console.log(feedbackMarkdown(readState(root).title, mergeRecords(taken.records)));
+    else if (readonly) console.log("READ_ONLY: the review is read-only; the human's feedback arrives as a chat message. Wait for it; don't poll. Only if the human asks for direct Send: skel serve --send.");
+    else if (noServer) console.log("NO_SERVER: no review server is running (a static review, or it stopped), so nothing can be sent; the human's feedback arrives as a chat message. Wait for it; don't poll.");
     else console.log(`NO_FEEDBACK${wait ? ` (waited ${wait}s)` : ""}`);
   },
 
   approve(args) {
+    const given = flag(args, "reviewed", null);
+    if (given !== null && !isVersion(given)) die('--reviewed takes the 12-character version the human reviewed (the "Reviewed skeleton version: …" line of their feedback)');
     const root = requireRoot();
     const state = readState(root);
     if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
@@ -546,17 +661,45 @@ const commands = {
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     if (!steps.length) die("no SKEL[...] fences found — nothing to approve");
     // The human's say-so is Claude Code's permission prompt: the hook always
-    // asks before an agent runs `skel approve` (see evaluateBash). What they
-    // approved is recorded, so done/finalize can check the fill against it.
-    const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
+    // asks before an agent runs `skel approve` (see evaluateBash). This checks
+    // freshness, not authority: that what is approved is the version the human
+    // last reviewed, so an edit made after their "looks good" can't ride along.
+    // A tracked file's malformed markers throw SKEL_MARKERS; anything else is I/O.
+    let record;
     try {
-      writeSnapshot(root, next, files);
+      record = recordSkeleton(root, state, files, undefined, { strict: true });
     } catch (err) {
       if (err.code === "SKEL_MARKERS") die(`fix marker errors first:\n  ${err.message}`);
+      die(`couldn't read the skeleton to record it: ${err.message}`);
+    }
+    const { record: last, unread } = lastReview(root, state.reviewEpoch);
+    if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
+    // What the human reviewed: the version named in the feedback the agent
+    // was given (copied markdown → --reviewed), else the page's latest send,
+    // else the version the review page (live or `skel review`) last rendered.
+    // Under the read-only default the last is the common case: approving what
+    // the page showed is fine, approving something it never showed is not.
+    let review = null;
+    if (given) review = { version: given, source: "reviewed-flag", at: null, how: "the human reviewed" };
+    else if (last?.version) review = { version: last.version, source: "review-page", at: last.at, how: "the human reviewed" };
+    let storeError = null;
+    if (!review) {
+      const store = readRenderedStore(root);
+      storeError = store.unreadable;
+      const shown = store.versions[0];
+      if (shown) review = { version: shown.version, source: "rendered", at: shown.at, how: "no --reviewed was given and nothing was sent; the review page last showed" };
+    }
+    if (review && review.version !== record.version) die(staleReview(root, state, files, review.version, review.how));
+    if (!review) console.log(`note: no reviewed version given (pass --reviewed <v> from the "Reviewed skeleton version" line of the feedback the human pasted), no send on record, and ${storeError ? `the rendered-versions store couldn't be read (${storeError}), so there's no rendered version to check against` : "no review page was ever rendered for this project"}. Approving on the human's word alone.`);
+    console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
+    const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
+    try {
+      writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at });
+    } catch (err) {
       die(`couldn't record the approved skeleton: ${err.message}`);
     }
     writeState(root, next);
-    console.log(`skeleton approved: ${steps.length} steps. Run \`skel next\` to start filling.`);
+    console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
   },
 
   next() {
@@ -661,6 +804,11 @@ const commands = {
     await runHook();
   },
 
+  async "stop-hook"(args) {
+    const { BLOCK_ON_DRIFT, runStopHook } = await import("../lib/stop.mjs");
+    await runStopHook({ block: BLOCK_ON_DRIFT || args.includes("--block") });
+  },
+
   install([dir = process.cwd()]) {
     // The hook command runs through a shell: refuse an install path that a
     // shell would interpret rather than quote it and hope. Windows paths are
@@ -670,7 +818,9 @@ const commands = {
       die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
     }
     const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
-    const { rules, why } = denyRules(target);
+    const { rules: stateRules, why } = denyRules(target);
+    const config = configDenyRule();
+    const rules = [...stateRules, ...(config.rule ? [config.rule] : [])];
     const prevOwned = readOwned(target);
     const stale = [...legacyOwned(settings, prevOwned), ...(prevOwned ?? []).filter((r) => !rules.includes(r))];
     for (const [src, dest] of installedFiles(claudeDir)) {
@@ -687,6 +837,30 @@ const commands = {
     } else {
       settings.hooks.PreToolUse.push({ matcher, hooks: [{ type: "command", command }] });
     }
+    // The Stop hook checks for drift at the end of every turn during a fill.
+    // Found by its script, so a moved clone is updated in place, duplicates
+    // (two installs, a hand-added copy) collapse to the first, and a `--block`
+    // on any of them survives a reinstall.
+    const stopCommand = `node "${STOP_HOOK}"`;
+    settings.hooks.Stop ??= [];
+    let stopOurs = null;
+    let block = false;
+    const emptied = new Set();
+    for (const m of settings.hooks.Stop) {
+      if (!Array.isArray(m?.hooks) || !m.hooks.length) continue;
+      m.hooks = m.hooks.filter((hk) => {
+        const found = skelStopHook(hk?.command);
+        if (!found) return true;
+        block ||= found.block;
+        if (stopOurs) return false;
+        stopOurs = hk;
+        return true;
+      });
+      if (!m.hooks.length) emptied.add(m);
+    }
+    settings.hooks.Stop = settings.hooks.Stop.filter((m) => !emptied.has(m));
+    if (stopOurs) stopOurs.command = stopCommand + (block ? " --block" : "");
+    else settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand }] });
     settings.permissions ??= {};
     settings.permissions.deny = (settings.permissions.deny ?? []).filter((r) => !stale.includes(r));
     const added = rules.filter((r) => !settings.permissions.deny.includes(r));
@@ -704,8 +878,12 @@ const commands = {
     console.log(`installed /skeleton and /skeleton-fill into ${claudeDir}/skills`);
     console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
     console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
+    console.log(stopOurs ? "drift check (Stop) hook updated" : `added drift check (Stop) hook to ${settingsPath}`);
+    const addedState = added.filter((r) => stateRules.includes(r));
     if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
-    else console.log(added.length ? `added ${added.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
+    else console.log(addedState.length ? `added ${addedState.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
+    if (config.why) console.log(`warning: no permission deny rule for skel's config dir: ${config.why}. The hook still asks about edits there`);
+    else console.log(`${added.includes(config.rule) ? "added a permission deny rule for skel's config dir" : "permission deny rule for skel's config dir already present"}: ${config.rule} (it is resolved now: re-run install if you change XDG_CONFIG_HOME)`);
     reportLeftInPlace(settings, rules);
     launchWarning(target);
     console.log(`optional: Claude Code's Bash sandbox can enforce those rules at the OS level; see "Security model" in the README (skel needs "excludedCommands": ["node \\"${SELF}\\" *"])`);
@@ -720,13 +898,27 @@ const commands = {
     if (settings.hooks?.PreToolUse) {
       settings.hooks.PreToolUse = groups.filter((m) => !Array.isArray(m?.hooks) || m.hooks.length);
       if (!settings.hooks.PreToolUse.length) delete settings.hooks.PreToolUse;
-      if (!Object.keys(settings.hooks).length) delete settings.hooks;
     }
+    // The drift check (Stop) hook, with or without --block.
+    const stops = settings.hooks?.Stop ?? [];
+    const emptiedStops = new Set();
+    for (const m of stops) {
+      if (!Array.isArray(m?.hooks) || !m.hooks.length) continue;
+      m.hooks = m.hooks.filter((hk) => !skelStopHook(hk?.command));
+      if (!m.hooks.length) emptiedStops.add(m);
+    }
+    if (settings.hooks?.Stop) {
+      settings.hooks.Stop = stops.filter((m) => !emptiedStops.has(m));
+      if (!settings.hooks.Stop.length) delete settings.hooks.Stop;
+    }
+    if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
     let removed = 0;
+    let removedConfig = 0;
     if (settings.permissions?.deny) {
-      const before = settings.permissions.deny.length;
+      const gone = settings.permissions.deny.filter((r) => owned.includes(r));
       settings.permissions.deny = settings.permissions.deny.filter((r) => !owned.includes(r));
-      removed = before - settings.permissions.deny.length;
+      removedConfig = gone.filter((r) => CONFIG_SHAPED.test(r)).length;
+      removed = gone.length - removedConfig;
       if (!settings.permissions.deny.length) delete settings.permissions.deny;
       if (!Object.keys(settings.permissions).length) delete settings.permissions;
     }
@@ -739,8 +931,9 @@ const commands = {
     }
     // The agents folder may hold the user's own subagents: leave it.
     fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
-    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent and the scope gate hook from ${claudeDir}`);
+    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook and the drift check (Stop) hook from ${claudeDir}`);
     console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
+    if (removedConfig) console.log(`removed the config-dir permission deny rule install added`);
     reportLeftInPlace(settings, []);
     console.log(`left in place: ${STATE_DIR}/ (delete it once you're done with it) and the ${STATE_DIR}/ line in .gitignore`);
   },
