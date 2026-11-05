@@ -53,7 +53,7 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   reshape                            back to skeleton review (the loaded hook requests permission)
   finalize                           all steps filled and no drift: strip markers, phase done
   hook                               PreToolUse scope gate (reads hook JSON on stdin)
-  stop-hook [--block]                Stop hook: reports drift from the approved skeleton during a fill
+  stop-hook [--notify-only|--block]  Stop hook: one corrective continuation on drift, then notify
   migrate [--dry-run] [projectDir]   move this project's records from the old config dir to the state dir
                                      (run skel install and restart Claude Code first; refused during a fill)
   install [projectDir]               install skills, filler subagent, hooks and deny rules (.skeleton/ state,
@@ -352,11 +352,11 @@ function legacyOwned(settings, owned) {
 /**
  * Our Stop hook (bin/skel-stop.mjs, or `skel.mjs stop-hook`) from any checkout,
  * recognised by its script whatever flags (`--x`) follow; block: one of them is
- * --block. Anything else after it (`&& notify-send done`) makes it the user's.
+ * --block or --notify-only. Anything else after it (`&& notify-send done`) makes it the user's.
  */
 const skelStopHook = (cmd) => {
   const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?:\s+--\w[\w-]*)*)\s*$/.exec(cmd);
-  return m ? { block: m[1].split(/\s+/).includes("--block") } : null;
+  return m ? { block: m[1].split(/\s+/).includes("--block"), notifyOnly: m[1].split(/\s+/).includes("--notify-only") } : null;
 };
 /** Exact standalone commands only: a chained command remains the user's. */
 const isSkelConfigHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/]skel-config-hook\.mjs"$/.test(cmd);
@@ -757,6 +757,12 @@ const commands = {
       die(`couldn't record the approved skeleton: ${err.message}`);
     }
     writeState(root, next);
+    // Successful approval re-arms delivery even if a frozen or reversed clock
+    // repeats the old approval identity. Advisory cache faults never undo it.
+    try {
+      const { clearStopNotice } = await import("../lib/stop-notice.mjs");
+      await clearStopNotice(root);
+    } catch {}
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
     if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`);
@@ -870,8 +876,10 @@ const commands = {
   },
 
   async "stop-hook"(args) {
-    const { BLOCK_ON_DRIFT, runStopHook } = await import("../lib/stop.mjs");
-    await runStopHook({ block: BLOCK_ON_DRIFT || args.includes("--block") });
+    const { stopMode, runStopHook } = await import("../lib/stop.mjs");
+    let block;
+    try { block = stopMode(args); } catch (err) { die(err.message); }
+    await runStopHook({ block });
   },
 
   async install([dir = process.cwd()]) {
@@ -919,6 +927,7 @@ const commands = {
     settings.hooks.Stop ??= [];
     let stopOurs = null;
     let block = false;
+    let notifyOnly = false;
     const emptied = new Set();
     for (const m of settings.hooks.Stop) {
       if (!Array.isArray(m?.hooks) || !m.hooks.length) continue;
@@ -926,6 +935,7 @@ const commands = {
         const found = skelStopHook(hk?.command);
         if (!found) return true;
         block ||= found.block;
+        notifyOnly ||= found.notifyOnly;
         if (stopOurs) return false;
         stopOurs = hk;
         return true;
@@ -933,7 +943,9 @@ const commands = {
       if (!m.hooks.length) emptied.add(m);
     }
     settings.hooks.Stop = settings.hooks.Stop.filter((m) => !emptied.has(m));
-    if (stopOurs) stopOurs.command = stopCommand + (block ? " --block" : "");
+    const stopFlags = block ? " --block" : notifyOnly ? " --notify-only" : "";
+    if (block && notifyOnly) console.log("warning: conflicting Stop hook modes; keeping --block. Remove the old --block entry to use --notify-only");
+    if (stopOurs) stopOurs.command = stopCommand + stopFlags;
     else settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand }] });
     // Freeze ordinary settings reloads during a fill. Keep other hooks and
     // groups; remove only our exact standalone command, including moved clones.
