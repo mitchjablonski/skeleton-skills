@@ -10,7 +10,11 @@
 // dummy, nothing inherits your credentials, and the dir is removed at the end
 // unless --keep is passed.
 //
-//   node test/live/plugin-probe.mjs [--keep] [--claude <path>]
+//   node test/live/plugin-probe.mjs [--keep] [--claude <path>] [--source owner/repo#ref]
+//
+// --source installs from a git-hosted marketplace (copied into the temp
+// config's plugin cache) instead of this checkout in place; that needs network
+// access to GitHub, but still no model calls.
 //
 // Arms:
 //   plugin    the plugin's PreToolUse hook denies the out-of-fence Edit
@@ -35,6 +39,8 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".
 const SKEL = path.join(REPO, "bin", "skel.mjs");
 const keep = process.argv.includes("--keep");
 const claudeBin = process.argv.includes("--claude") ? process.argv[process.argv.indexOf("--claude") + 1] : "claude";
+// --source owner/repo#ref installs from GitHub (a cached copy) instead of this checkout in place.
+const source = process.argv.includes("--source") ? process.argv[process.argv.indexOf("--source") + 1] : REPO;
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "skel-plugin-probe-"));
 const log = (...a) => console.log("[probe]", ...a);
 
@@ -117,7 +123,7 @@ function project(e) {
 }
 
 function installPlugin(e) {
-  e.claude("plugin", "marketplace", "add", REPO, "--scope", "local");
+  e.claude("plugin", "marketplace", "add", source, "--scope", "local");
   e.claude("plugin", "install", "skel@skeleton-skills", "--scope", "local");
 }
 

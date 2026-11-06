@@ -641,7 +641,8 @@ async function installForPlugin(dir, mode) {
   if (enrollment(target).protected) console.log("note: a fill is active, so a running Claude Code session won't reload these settings: it keeps enforcing the rules it loaded until you restart it.");
   const storesNote = await storeNotice(target);
   if (storesNote) console.log(`note: ${storesNote}`);
-  console.log(`To run skel from a terminal (recovery, uninstall, migrate), use this checkout: ${TERMINAL_SKEL}`);
+  if (/[\\/]plugins[\\/]cache[\\/]/.test(PKG_ROOT)) console.log(`note: this skel runs from Claude Code's plugin cache (${PKG_ROOT}), which moves with every update and is removed after one. For terminal recovery, keep a clone of skeleton-skills and run its bin/skel.mjs.`);
+  else console.log(`To run skel from a terminal (recovery, uninstall, migrate), use this checkout: ${TERMINAL_SKEL}`);
 }
 
 /** `skel install --legacy`: today's full install, kept for one release. */
