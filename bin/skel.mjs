@@ -726,8 +726,8 @@ const commands = {
           res.end(JSON.stringify(pagePayload(data, { version, feedbackEnabled, serverId })));
         } else if (req.method === "GET" && req.url === "/api/version") {
           lastPoll = Date.now();
-          res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           const now = current();
+          res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled, storeProtocol: STORE_PROTOCOL, readAuth: READ_AUTH, feedbackOrder: 1 }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
           if (!feedbackEnabled) { req.resume(); return void res.writeHead(405, { Allow: "GET", connection: "close" }).end("read-only review; reload and use Copy feedback for Claude"); }
