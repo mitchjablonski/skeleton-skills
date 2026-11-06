@@ -4,6 +4,7 @@
 
 import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
+import { performance } from "node:perf_hooks";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -19,7 +20,7 @@ import { SHELL_CSP, buildReviewData, clientScript, pagePayload, readDiagrams, re
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
-  storeFeedback, takeFeedback,
+  storeFeedback, takeFeedback, withFeedbackLock, ensureReviewRound, feedbackLockNotice, feedbackOrderNotice, storeFeedbackForHttp, isFeedbackError,
 } from "../lib/feedback.mjs";
 import { discardUnusedStateDirFiles, migrateProject, migrationPlan } from "../lib/migrate.mjs";
 import { storeNotice } from "../lib/store-notice.mjs";
@@ -193,6 +194,7 @@ async function liveServer(root) {
       storeProtocol: v.storeProtocol ?? 1,
       token,
       readAuth: v.readAuth,
+      feedbackOrder: v.feedbackOrder,
       // The server accepted this token: a server that ignores the header
       // answers 200 as well, so this alone proves nothing (see readsProtected).
       tokenAccepted: !!token && res.status === 200,
@@ -792,15 +794,17 @@ const commands = {
       if (configNotice) console.error(configNotice);
       die(`no ${STATE_DIR}/state.json here or above — run \`skel init "<title>"\` first`);
     }
+    const feedbackLock = [feedbackLockNotice(root), feedbackOrderNotice(root)].filter(Boolean).join("\n") || null;
     const state = readState(root);
     if (!validState(state)) {
       const error = `can't read ${path.join(root, STATE_DIR, "state.json")}; repair that file or run \`skel init --force "<title>"\` from ${root} (requires approval in Claude Code)`;
       if (args.includes("--json")) {
-        console.log(JSON.stringify({ error, configNotice }, null, 2));
+        console.log(JSON.stringify({ error, configNotice, ...(feedbackLock ? { feedbackLockNotice: feedbackLock } : {}) }, null, 2));
         process.exitCode = 1;
         return;
       }
       if (configNotice) console.error(configNotice);
+      if (feedbackLock) console.error(feedbackLock);
       die(error);
     }
     const { steps, errors, files } = snapshot(root);
@@ -814,7 +818,7 @@ const commands = {
     let registration = null;
     try { registration = registrationNotice(root, "cli"); } catch {}
     if (args.includes("--json")) {
-      console.log(JSON.stringify({ ...state, errors, drift, ...sourceCheck, configNotice, ...(stores ? { storeNotice: stores } : {}), ...(registration ? { registrationNotice: registration } : {}), steps: steps.map(({ fences, ...s }) => ({
+      console.log(JSON.stringify({ ...state, errors, drift, ...sourceCheck, configNotice, ...(feedbackLock ? { feedbackLockNotice: feedbackLock } : {}), ...(stores ? { storeNotice: stores } : {}), ...(registration ? { registrationNotice: registration } : {}), steps: steps.map(({ fences, ...s }) => ({
         ...s, fences: fences.map(({ body, ...f }) => f),
       })) }, null, 2));
       return;
@@ -822,6 +826,7 @@ const commands = {
     const done = steps.filter((s) => s.status === "filled").length;
     console.log(`${state.title} — phase: ${state.phase}${state.activeStep ? `, active: ${state.activeStep}` : ""} — ${done}/${steps.length} filled`);
     if (configNotice) console.log(configNotice);
+    if (feedbackLock) console.log(`  ! ${feedbackLock}`);
     for (const s of steps) {
       const mark = s.id === state.activeStep ? "▶" : s.status === "filled" ? "✓" : "·";
       console.log(`  ${mark} ${s.id.padEnd(5)} ${s.title}  (${s.fences.map((f) => `${f.file}:${f.openLine}`).join(", ")})`);
@@ -863,7 +868,7 @@ const commands = {
     // A verified server is reused, and its token kept, only if its reads are
     // shown to need that token. Anything else from before #39 is replaced.
     const protectedReads = running ? await readsProtected(running) : false;
-    if (running && protectedReads && running.feedbackEnabled === feedbackEnabled && running.storeProtocol >= STORE_PROTOCOL) {
+    if (running && protectedReads && running.feedbackEnabled === feedbackEnabled && running.storeProtocol >= STORE_PROTOCOL && running.feedbackOrder === 1) {
       console.log(`skel review: ${running.url}#t=${running.token} (${mode}; already running; \`skel serve --stop\` stops it)`);
       return;
     }
@@ -993,9 +998,9 @@ const commands = {
           res.end(JSON.stringify(pagePayload(data, { version, feedbackEnabled, serverId })));
         } else if (req.method === "GET" && req.url === "/api/version") {
           lastPoll = Date.now();
-          res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           const now = current();
-          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled, storeProtocol: STORE_PROTOCOL, readAuth: READ_AUTH }));
+          res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled, storeProtocol: STORE_PROTOCOL, readAuth: READ_AUTH, feedbackOrder: 1 }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
           if (!feedbackEnabled) { req.resume(); return void res.writeHead(405, { Allow: "GET", connection: "close" }).end("read-only review; reload and use Copy feedback for Claude"); }
           // Cross-site writes: same origin, a JSON content type (forces a CORS
@@ -1009,18 +1014,18 @@ const commands = {
           if (!recorded) return void refuse(503, "skel serve couldn't record its session, so Claude wouldn't trust this feedback; copy it to Claude by hand");
           let body = "";
           req.on("data", (c) => { body += c; if (body.length > 2_000_000) req.destroy(); });
-          req.on("end", () => {
+          req.on("end", async () => {
             try {
               const fb = cleanFeedback(JSON.parse(body));
-              const now = current().data.skeletonVersion;
-              storeFeedback(root, session, fb, now);
+              let now;
+              await storeFeedbackForHttp(root, session, fb, () => (now = current().data.skeletonVersion));
               // A page that was already out of date is told so (the notes are
               // still delivered, marked stale).
               if (fb.version && fb.version !== now) {
                 res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ stale: true, reviewed: fb.version, current: now }));
               } else res.writeHead(204).end();
-            } catch {
-              res.writeHead(400).end("bad feedback payload");
+            } catch (err) {
+              res.writeHead(isFeedbackError(err) ? 503 : 400).end(isFeedbackError(err) ? err.message : "bad feedback payload");
             }
           });
         } else {
@@ -1058,7 +1063,7 @@ const commands = {
     // The agent's Bash tool times out at 120s by default: keep each wait under
     // it and let the skill loop.
     const wait = Math.min(Number(flag(args, "wait", "0")) || 0, 110);
-    const deadline = Date.now() + wait * 1000;
+    const deadline = performance.now() + wait * 1000;
     let readonly = false;
     // No server (a static review, or it stopped): nothing can send, so don't
     // sit out the wait. Only once none has answered for NO_SERVER_GRACE in a
@@ -1070,9 +1075,9 @@ const commands = {
     while (pendingCount(root) === 0) {
       const live = await liveServer(root);
       if (live?.feedbackEnabled === false) { readonly = true; break; }
-      missingSince = live ? null : missingSince ?? Date.now();
-      if (wait && missingSince !== null && Date.now() - missingSince >= NO_SERVER_GRACE) { noServer = true; break; }
-      if (Date.now() >= deadline) break;
+      missingSince = live ? null : missingSince ?? performance.now();
+      if (wait && missingSince !== null && performance.now() - missingSince >= NO_SERVER_GRACE) { noServer = true; break; }
+      if (performance.now() >= deadline) break;
       await new Promise((r) => setTimeout(r, 1000));
     }
     warnLegacyQueue(root);
@@ -1083,7 +1088,10 @@ const commands = {
           "They are not the human's feedback; don't act on them.\n",
       );
     }
-    if (taken.status === "ok") console.log(feedbackMarkdown(requireState(root).title, mergeRecords(taken.records)));
+    if (taken.status === "ok") {
+      const state = requireState(root);
+      console.log(feedbackMarkdown(state.title, mergeRecords(taken.records, state.reviewRound ?? null)));
+    }
     else if (readonly) console.log("READ_ONLY: the review is read-only; the human's feedback arrives as a chat message. Wait for it; don't poll. Only if the human asks for direct Send: skel serve --send.");
     else if (noServer) console.log("NO_SERVER: no review server is running (a static review, or it stopped), so nothing can be sent; the human's feedback arrives as a chat message. Wait for it; don't poll.");
     else console.log(`NO_FEEDBACK${wait ? ` (waited ${wait}s)` : ""}`);
@@ -1093,7 +1101,7 @@ const commands = {
     const given = flag(args, "reviewed", null);
     if (given !== null && !isVersion(given)) die('--reviewed takes the 12-character version the human reviewed (the "Reviewed skeleton version: …" line of their feedback)');
     const root = requireRoot();
-    const state = requireState(root);
+    let state = requireState(root);
     if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
     const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
@@ -1106,36 +1114,45 @@ const commands = {
     // a lock taken for the checks below (#50's feedback lock) isn't held through it.
     const sourceStart = Date.now();
     const { record, source } = await captureApproval(root, state, files);
-    const { record: last, unread } = lastReview(root, state.reviewEpoch);
-    if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
-    // What the human reviewed: the version named in the feedback the agent
-    // was given (copied markdown → --reviewed), else the page's latest send,
-    // else the version the review page (live or `skel review`) last rendered.
-    // Under the read-only default the last is the common case: approving what
-    // the page showed is fine, approving something it never showed is not.
-    let review = null;
-    if (given) review = { version: given, source: "reviewed-flag", at: null, how: "the human reviewed" };
-    else if (last?.version) review = { version: last.version, source: "review-page", at: last.at, how: "the human reviewed" };
-    let storeError = null;
-    if (!review) {
-      const store = readRenderedStore(root);
-      storeError = store.unreadable;
-      const shown = store.versions[0];
-      if (shown) review = { version: shown.version, source: "rendered", at: shown.at, how: "no --reviewed was given and nothing was sent; the review page last showed" };
-    }
-    if (review && review.version !== record.version) die(staleReview(root, state, files, review.version, review.how));
-    if (!review) console.log(`note: no reviewed version given (pass --reviewed <v> from the "Reviewed skeleton version" line of the feedback the human pasted), no send on record, and ${storeError ? `the rendered-versions store couldn't be read (${storeError}), so there's no rendered version to check against` : "no review page was ever rendered for this project"}. Approving on the human's word alone.`);
-    console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
-    for (const line of describeCoverage(source.coverage, Object.keys(record.files).length)) console.log(line);
-    const sourceTook = Date.now() - sourceStart;
-    if (sourceTook > 3000) console.log(`  note: reading the source set took ${(sourceTook / 1000).toFixed(1)}s. \`done\` and \`finalize\` re-read it.`);
-    const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
-    try {
-      writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at }, source.coverage);
-    } catch (err) {
-      die(`couldn't record the approved skeleton: ${err.message}`);
-    }
-    writeState(root, next);
+    const capturedState = state;
+    const review = withFeedbackLock(root, () => {
+      const checked = requireState(root);
+      if (checked.reviewEpoch !== capturedState.reviewEpoch || checked.reviewRound !== capturedState.reviewRound || JSON.stringify(checked.files) !== JSON.stringify(capturedState.files)) die("review state changed during source capture; retry approval");
+      if (checked.phase !== "scaffold") die("the skeleton is no longer open for approval; retry after the other operation");
+      state = ensureReviewRound(root);
+      const { record: last, unread, unknown } = lastReview(root, state.reviewRound);
+      if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
+      if (unknown && !last && !given) die("legacy feedback has no reliable review round/order. Review again and have the human explicitly provide --reviewed <version>, or resend their review. The last rendered page cannot replace that review.");
+      // What the human reviewed: the version named in the feedback the agent
+      // was given (copied markdown → --reviewed), else the page's latest send,
+      // else the version the review page (live or `skel review`) last rendered.
+      // Under the read-only default the last is the common case: approving what
+      // the page showed is fine, approving something it never showed is not.
+      let review = null;
+      if (given) review = { version: given, source: "reviewed-flag", at: null, how: "the human reviewed" };
+      else if (last?.version) review = { version: last.version, source: "review-page", at: last.at, how: "the human reviewed" };
+      let storeError = null;
+      if (!review) {
+        const store = readRenderedStore(root);
+        storeError = store.unreadable;
+        const shown = store.versions[0];
+        if (shown) review = { version: shown.version, source: "rendered", at: shown.at, how: "no --reviewed was given and nothing was sent; the review page last showed" };
+      }
+      if (review && review.version !== record.version) die(staleReview(root, state, files, review.version, review.how));
+      if (!review) console.log(`note: no reviewed version given (pass --reviewed <v> from the "Reviewed skeleton version" line of the feedback the human pasted), no send on record, and ${storeError ? `the rendered-versions store couldn't be read (${storeError}), so there's no rendered version to check against` : "no review page was ever rendered for this project"}. Approving on the human's word alone.`);
+      console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
+      for (const line of describeCoverage(source.coverage, Object.keys(record.files).length)) console.log(line);
+      const sourceTook = Date.now() - sourceStart;
+      if (sourceTook > 3000) console.log(`  note: reading the source set took ${(sourceTook / 1000).toFixed(1)}s. \`done\` and \`finalize\` re-read it.`);
+      const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
+      try {
+        writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at }, source.coverage);
+      } catch (err) {
+        die(`couldn't record the approved skeleton: ${err.message}`);
+      }
+      writeState(root, next);
+      return review;
+    });
     // Successful approval re-arms delivery even if a frozen or reversed clock
     // repeats the old approval identity. Advisory cache faults never undo it.
     try {
@@ -1144,7 +1161,8 @@ const commands = {
     } catch {}
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
-    if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`);
+    try { if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`); }
+    catch (err) { console.error(`note: approval succeeded; storage notice unavailable (${err.message})`); }
   },
 
   next() {
@@ -1219,13 +1237,15 @@ const commands = {
 
   reshape(args) {
     const root = requireRoot();
-    const state = requireState(root);
-    if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
-    writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now() });
-    // The record is of the shape being reopened; approve writes the new one.
-    clearSnapshot(root);
-    clearConfigNotices(root);
-    console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
+    return withFeedbackLock(root, () => {
+      const state = requireState(root);
+      if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
+      writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now(), reviewRound: crypto.randomUUID() });
+      // The record is of the shape being reopened; approve writes the new one.
+      clearSnapshot(root);
+      clearConfigNotices(root);
+      console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
+    });
   },
 
   async finalize() {
@@ -1374,4 +1394,4 @@ const commands = {
 const [cmd = "help", ...rest] = process.argv.slice(2);
 const run = Object.hasOwn(commands, cmd) ? commands[cmd] : null;
 if (!run) die(`unknown command "${cmd}"\n\n${HELP}`);
-await run(rest);
+try { await run(rest); } catch (err) { if (isFeedbackError(err)) die(err.message); throw err; }
