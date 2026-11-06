@@ -10,14 +10,16 @@ import { readState } from "../lib/state.mjs";
 const BIN = fileURLToPath(new URL("../bin/skel.mjs", import.meta.url));
 const MODULE = new URL("../lib/feedback.mjs", import.meta.url).href;
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "feedback-order-"));
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "feedback-order-"));
+  const root = path.join(base, "project");
+  fs.mkdirSync(root);
   const old = process.env.XDG_CONFIG_HOME;
   const oldState = process.env.XDG_STATE_HOME;
   const oldLocal = process.env.LOCALAPPDATA;
-  process.env.XDG_CONFIG_HOME = path.join(root, "config");
-  process.env.XDG_STATE_HOME = path.join(root, "state");
-  process.env.LOCALAPPDATA = path.join(root, "local");
-  t.after(() => { fs.rmSync(root, { recursive: true, force: true }); if (old === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = old; if (oldState === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = oldState; if (oldLocal === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = oldLocal; });
+  process.env.XDG_CONFIG_HOME = path.join(base, "config");
+  process.env.XDG_STATE_HOME = path.join(base, "state");
+  process.env.LOCALAPPDATA = path.join(base, "local");
+  t.after(() => { fs.rmSync(base, { recursive: true, force: true }); if (old === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = old; if (oldState === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = oldState; if (oldLocal === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = oldLocal; });
   const cli = (...args) => spawnSync(process.execPath, ["--import", "data:text/javascript,Date.now=()=>1", BIN, ...args], { cwd: root, env: process.env, encoding: "utf8" });
   assert.equal(cli("init", "logical ordering").status, 0);
   fs.writeFileSync(path.join(root, "a.js"), '// SKEL[1] value\nconst value=1;\n// /SKEL[1]\n');
@@ -64,7 +66,7 @@ test("reshape changes round while older unread remains visible; legacy never win
   assert.equal(merged.verdict, null);
   assert.equal(merged.version, null);
   assert.match(merged.general, /legacy note/);
-  assert.match(merged.general, /send any old notes that still apply again/);
+  assert.match(merged.general, /send any old notes that still apply|resend any notes that still apply/);
 });
 test("concurrent accepted sends get unique order; busy lock refuses without stealing", async t => {
   const { root } = fixture(t);
@@ -141,6 +143,13 @@ test("serve replaces verified clock-only server instead of silently reusing it",
     const drained = takeFeedback(root).records;
     assert.ok(drained[1].at < drained[0].at);
     assert.equal(mergeRecords(drained).verdict, "changes");
+    fs.mkdirSync(path.join(queueDir(root), ".order-lock"));
+    const busy = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": token }, body: JSON.stringify({ comments: [] }) });
+    assert.equal(busy.status, 503);
+    const busyText = await busy.text();
+    assert.match(busyText, /busy/i);
+    assert.doesNotMatch(busyText, /remove|external terminal/i);
+    fs.rmdirSync(path.join(queueDir(root), ".order-lock"));
     fs.writeFileSync(path.join(root, ".skeleton/state.json"), "{");
     const broken = await fetch(new URL("api/feedback", url), { method: "POST", headers: { "content-type": "application/json", "x-skeleton-token": token }, body: JSON.stringify({ verdict: "approve", comments: [] }) });
     assert.equal(broken.status, 503);
@@ -257,4 +266,76 @@ test("status reports a present ordering lock read-only and approval recovers aft
   const approved = cli("approve");
   assert.equal(approved.status, 0, approved.stderr);
   assert.equal(readState(root).phase, "fill");
+});
+test("legacy review blocks rendered fallback until explicitly reviewed, and duplicate diagnostics name both files", t => {
+  const { root, cli } = fixture(t);
+  assert.equal(cli("review").status, 0);
+  fs.mkdirSync(queueDir(root), { recursive: true });
+  fs.writeFileSync(path.join(queueDir(root), "legacy.json"), JSON.stringify({ session: "known-session", at: 10, version: "111111111111", verdict: "approve", general: "legacy" }));
+  assert.match(cli("feedback").stdout, /informational only: 111111111111/);
+  fs.appendFileSync(path.join(root, "a.js"), '// changed exterior\n');
+  assert.equal(cli("review").status, 0);
+  const refused = cli("approve");
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /last rendered page cannot replace/);
+  assert.doesNotMatch(refused.stderr, /at .*\.mjs:\d+/);
+  const html = fs.readFileSync(path.join(root, ".skeleton/review.html"), "utf8");
+  const data = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1]);
+  assert.equal(cli("approve", "--reviewed", data.skeletonVersion).status, 0);
+  assert.equal(cli("reshape").status, 0);
+  send(root, 1, data.skeletonVersion);
+  const first = fs.readdirSync(queueDir(root)).find(n => n.endsWith('.json'));
+  const copy = path.join(historyDir(root), "duplicate.json");
+  fs.copyFileSync(path.join(queueDir(root), first), copy);
+  const status = cli("status", "--json");
+  const notice = JSON.parse(status.stdout).feedbackLockNotice;
+  assert.ok(notice.includes(copy));
+  assert.ok(notice.includes(path.join(queueDir(root), first)));
+  assert.ok(fs.existsSync(copy));
+  const queueFile = path.join(queueDir(root), first);
+  const beforeQueue = fs.readFileSync(queueFile, "utf8");
+  const beforeHistory = fs.readFileSync(copy, "utf8");
+  for (const command of ["feedback", "approve"]) {
+    const refused = cli(command);
+    assert.notEqual(refused.status, 0);
+    assert.ok(refused.stderr.includes(queueFile));
+    assert.ok(refused.stderr.includes(copy));
+    assert.doesNotMatch(refused.stderr, /at .*\.mjs:\d+/);
+  }
+  assert.equal(fs.readFileSync(queueFile, "utf8"), beforeQueue);
+  assert.equal(fs.readFileSync(copy, "utf8"), beforeHistory);
+});
+test("HTTP feedback retries only transient acquisition busy and never suggests removing live locks", async t => {
+  const { root } = fixture(t);
+  const { storeFeedbackForHttp } = await import("../lib/feedback.mjs");
+  fs.mkdirSync(path.join(queueDir(root), ".order-lock"), { recursive: true });
+  const timer = setTimeout(() => fs.rmdirSync(path.join(queueDir(root), ".order-lock")), 100);
+  try { await storeFeedbackForHttp(root, "known-session", { comments: [] }); }
+  finally { clearTimeout(timer); }
+  assert.equal(lastReview(root).unread, 1);
+  fs.mkdirSync(path.join(queueDir(root), ".order-lock"));
+  const start = performance.now();
+  await assert.rejects(storeFeedbackForHttp(root, "known-session", {}), err => /busy/i.test(err.message) && !/remove|external terminal/i.test(err.message));
+  assert.ok(performance.now() - start >= 1400 && performance.now() - start < 4000);
+  fs.rmdirSync(path.join(queueDir(root), ".order-lock"));
+  let calls = 0;
+  await assert.rejects(storeFeedbackForHttp(root, "known-session", {}, () => { calls++; throw new Error("callback failure"); }), /callback failure/);
+  assert.equal(calls, 1);
+});
+test("owned async lock releases on SIGINT and SIGTERM and the process still terminates", { skip: process.platform === "win32", timeout: 15000 }, async t => {
+  const { root } = fixture(t);
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    const code = `import {withFeedbackLock} from ${JSON.stringify(MODULE)}; await withFeedbackLock(${JSON.stringify(root)},async()=>{console.log("locked");await new Promise(r=>setTimeout(r,60000))}); console.log("continued");`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", code]);
+    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+    let output = "";
+    child.stdout.on("data", chunk => output += chunk);
+    await new Promise(resolve => child.stdout.once("data", resolve));
+    const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
+    child.kill(signal);
+    const result = await exited;
+    assert.equal(result.signal, signal);
+    assert.doesNotMatch(output, /continued/);
+    assert.equal(fs.existsSync(path.join(queueDir(root), ".order-lock")), false);
+  }
 });

@@ -222,3 +222,5 @@ npm test     # node --test, no dependencies
 ```
 
 MIT
+
+Feedback ordering uses logical positions and review-round IDs, not wall-clock timestamps. Legacy notes remain readable, but if no current-round review is available, approval requires a fresh review or an explicit human-provided `--reviewed` version; a later page render cannot replace it. Send retries brief ordering contention, then reports busy and keeps the draft. Duplicate logical positions are refused with both file paths in `skel status`; inspect and resolve those records externally without discarding the notes.
