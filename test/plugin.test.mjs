@@ -519,3 +519,53 @@ test("#57 review: a copy a Windows install wrote with backslashes is still recog
   assert.ok(win.includes('C:\\Users\\me'));
   assert.equal(copyHash(win), copyHash(renderLegacy(src, "/any")));
 });
+
+test("#57 re-review: fills under build/, target/ or a linked dir keep the legacy hooks", (t) => {
+  const fill = (dir) => {
+    fs.mkdirSync(path.join(dir, ".skeleton"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".skeleton", "state.json"), JSON.stringify({ title: "x", phase: "fill", activeStep: null }));
+  };
+  const cases = {
+    "build/svc": (p) => fill(path.join(p.root, "build", "svc")),
+    "target/x": (p) => fill(path.join(p.root, "target", "x")),
+    "linked pkg": (p) => {
+      const outside = path.join(p.base, "outside-pkg");
+      fill(outside);
+      try { fs.symlinkSync(outside, path.join(p.root, "pkg"), "dir"); } catch { return "skip"; }
+    },
+  };
+  for (const [name, setup] of Object.entries(cases)) {
+    const p = project(t, name.replace(/\W+/g, "-"));
+    p.ok("install", "--legacy");
+    p.enablePlugin();
+    if (setup(p) === "skip") { t.diagnostic(`${name}: can't make a dir link here`); continue; }
+    const before = hookCommands(p.settings(), "PreToolUse");
+    const out = p.ok("install");
+    assert.match(out, /not removing the older install's hooks or skill copies: a skeleton fill is active/, name);
+    assert.deepEqual(hookCommands(p.settings(), "PreToolUse"), before, name);
+  }
+  // A link cycle is walked once, not forever.
+  const q = project(t, "cycle");
+  q.ok("install", "--legacy");
+  q.enablePlugin();
+  try { fs.symlinkSync(q.root, path.join(q.root, "loop"), "dir"); } catch { return; }
+  q.ok("install");
+  assert.deepEqual(hookCommands(q.settings(), "PreToolUse"), []);
+});
+
+test("#57 re-review: a declared source reached through a link isn't evidence (the marketplace root may be a link)", (t) => {
+  const p = project(t);
+  const market = p.fakeMarket({ source: "./sub" });
+  const real = path.join(p.base, "real-sub");
+  for (const d of ["bin", "hooks", ".claude-plugin"]) fs.cpSync(path.join(REPO, d), path.join(real, d), { recursive: true });
+  try { fs.symlinkSync(real, path.join(market, "sub"), "dir"); } catch { return t.skip("can't make a dir link here"); }
+  p.writeSettings(path.join(p.claude, "plugins", "installed_plugins.json"), { plugins: { [PLUGIN_ID]: [{ scope: "local", projectPath: p.root, installPath: real }] } });
+  assert.match(p.withEnv(() => pluginEvidence(p.root)).problems.join(), /goes through a link/);
+  // The same plugin reached through a linked marketplace root is fine.
+  fs.rmSync(path.join(market, "sub"));
+  fs.cpSync(real, path.join(market, "sub"), { recursive: true });
+  const linkedRoot = path.join(p.base, "market-link");
+  fs.symlinkSync(market, linkedRoot, "dir");
+  p.writeSettings(path.join(p.claude, "plugins", "known_marketplaces.json"), { "skeleton-skills": { source: { source: "directory", path: linkedRoot } } });
+  assert.deepEqual(p.withEnv(() => pluginEvidence(p.root)).problems, []);
+});

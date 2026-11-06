@@ -10,7 +10,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { SKIP_DIRS, scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
+import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { PLUGIN_ID, claudeConfigDir, hasLegacyHooks, installStatus, isSkelConfigHook, isSkelHook, pluginEvidence, pluginStatus, registrationNotice, rulePath, skelStopHook } from "../lib/install-status.mjs";
@@ -559,25 +559,44 @@ function removeSkelHooks(settings) {
 /**
  * A fill (or unreadable skeleton state) that removing the project's hooks would
  * leave unguarded: one at or above `target` or CLAUDE_PROJECT_DIR, or any
- * skeleton below `target`, found the way the scanner walks (skipping the dirs
- * it skips, not following links). Returns enrollment's verdict, or null.
+ * skeleton below `target`. The legacy gate guards a skeleton wherever an edited
+ * file sits (it walks up from the file), so this looks everywhere but `.git`
+ * and `node_modules`, including the scanner's skipped dirs (build/, target/…),
+ * and follows directory links (each real dir once). It fails closed: a dir it
+ * can't list or a tree deeper than it will walk counts as a possible fill.
+ * Returns enrollment's verdict (or one shaped like it), or null.
  */
+const FILL_WALK_SKIP = new Set([".git", "node_modules"]);
+const FILL_WALK_DEPTH = 40;
 function fillAtOrBelow(target) {
   const above = [target, process.env.CLAUDE_PROJECT_DIR].filter(Boolean).map((b) => enrollment(b)).find((s) => s.protected);
   if (above) return above;
-  const stack = [path.resolve(target)];
+  const unsure = (why) => ({ protected: true, reason: `skel can't rule out a fill below the project (${why})` });
+  const seen = new Set();
+  const stack = [[path.resolve(target), 0]];
   while (stack.length) {
-    const dir = stack.pop();
+    const [dir, depth] = stack.pop();
+    let real;
+    try { real = fs.realpathSync.native(dir); } catch (err) { if (err.code === "ENOENT") continue; return unsure(`can't resolve ${dir}: ${err.code ?? err.message}`); }
+    if (seen.has(real)) continue;
+    seen.add(real);
+    if (depth > FILL_WALK_DEPTH) return unsure(`${dir} is more than ${FILL_WALK_DEPTH} levels deep`);
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (err) {
+      if (err.code === "ENOENT" || err.code === "ENOTDIR") continue;
+      return unsure(`can't list ${dir}: ${err.code ?? err.message}`);
+    }
     for (const e of entries) {
-      if (!e.isDirectory()) continue;
+      const child = path.join(dir, e.name);
       if (e.name === STATE_DIR) {
         const status = enrollment(dir, new Map(), { boundary: dir });
         if (status.protected) return status;
         continue;
       }
-      if (!SKIP_DIRS.has(e.name)) stack.push(path.join(dir, e.name));
+      if (FILL_WALK_SKIP.has(e.name)) continue;
+      let isDir = e.isDirectory();
+      if (e.isSymbolicLink()) { try { isDir = fs.statSync(child).isDirectory(); } catch { isDir = false; } }
+      if (isDir) stack.push([child, depth + 1]);
     }
   }
   return null;
