@@ -68,6 +68,8 @@ If a project's old records can't be moved, `skel migrate` moves none of them and
 
 Changing `XDG_CONFIG_HOME` or `XDG_STATE_HOME` later doesn't migrate anything: skel looks only where they point now, so re-run `skel install` after a change.
 
+**Feedback ordering lock recovery.** Send, feedback draining and approval share `.skeleton/feedback/.order-lock` so accepted notes cannot race approval. `skel status` reports a present lock (also as `feedbackLockNotice` in `--json`); presence does not mean it is stale. Retry after the active operation finishes. If a crash left the lock behind, stop all skel servers and commands, then remove only that empty lock directory from an external terminal and retry. Skel never expires or automatically deletes this authority lock. Do not remove the feedback queue or approval records to recover it.
+
 ## The loop
 
 ```
@@ -220,3 +222,5 @@ npm test     # node --test, no dependencies
 ```
 
 MIT
+
+Feedback ordering uses logical positions and review-round IDs, not wall-clock timestamps. Legacy notes remain readable, but if no current-round review is available, approval requires a fresh review or an explicit human-provided `--reviewed` version; a later page render cannot replace it. Send retries brief ordering contention, then reports busy and keeps the draft. Duplicate logical positions are refused with both file paths in `skel status`; inspect and resolve those records externally without discarding the notes.

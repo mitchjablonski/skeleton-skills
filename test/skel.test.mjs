@@ -1941,7 +1941,7 @@ test("read-only feedback wait returns immediately, drains pending sends, and sto
 test("legacy version metadata without feedbackEnabled is send-mode and restarts for read-only", async () => {
   const { dir, run } = project();
   run("init", "T");
-  const legacy = spawn(process.execPath, ["-e", `const http=require('node:http'); const server=http.createServer((req,res)=>res.end(JSON.stringify({serverId:'legacy',pid:process.pid,storeProtocol:2})));server.listen(0,'127.0.0.1',()=>console.log(server.address().port));`], { stdio: ["ignore", "pipe", "pipe"] });
+  const legacy = spawn(process.execPath, ["-e", `const http=require('node:http'); const server=http.createServer((req,res)=>res.end(JSON.stringify({serverId:'legacy',pid:process.pid,storeProtocol:2,feedbackOrder:1})));server.listen(0,'127.0.0.1',()=>console.log(server.address().port));`], { stdio: ["ignore", "pipe", "pipe"] });
   try {
     const port = await new Promise((resolve, reject) => {
       legacy.stdout.once("data", (d) => resolve(Number(String(d).trim())));
@@ -2403,9 +2403,9 @@ test("#14 N4: feedback --wait with no review server returns NO_SERVER after a sh
   const { dir, run } = project();
   run("init", "T");
   run("review");
-  const started = Date.now();
+  const started = performance.now();
   const out = execFileSync("node", [BIN, "feedback", "--wait", "110"], { cwd: dir, encoding: "utf-8", timeout: 30_000 });
-  const took = Date.now() - started;
+  const took = performance.now() - started;
   assert.ok(took >= 9_500 && took < 25_000, `waited the ~10s grace, not 110s (${took}ms)`);
   assert.match(out, /^NO_SERVER: /);
   assert.match(out, /chat message\. Wait for it; don't poll\./, "the READ_ONLY wording");
@@ -4070,7 +4070,7 @@ const s = http.createServer((req, res) => {
     return res.end('<script id="skeleton-data" type="application/json">{"text":"${OLD_SOURCE}"}</script>');
   }
   if (req.url === "/api/data" && ${JSON.stringify(data)}) return res.end(JSON.stringify({ text: "${OLD_SOURCE}" }));
-  if (req.url === "/api/version") return res.end(JSON.stringify({ version: "v", serverId: "older-id", pid: process.pid, feedbackEnabled: ${JSON.stringify(feedbackEnabled)}, ...${JSON.stringify(version)} }));
+  if (req.url === "/api/version") return res.end(JSON.stringify({ version: "v", serverId: "older-id", pid: process.pid, feedbackEnabled: ${JSON.stringify(feedbackEnabled)}, feedbackOrder: 1, ...${JSON.stringify(version)} }));
   res.writeHead(404); res.end();
 });
 s.listen(0, "127.0.0.1", () => console.log(s.address().port));`);
@@ -4240,4 +4240,22 @@ test("#39 upgrade: --stop and init still stop a verified older server; migrate s
 
 test("#39: newServeSession makes only the session id: the review token is serve's", () => {
   assert.deepEqual(Object.keys(newServeSession()), ["session"]);
+});
+
+
+test("#48 upgrade: a protected #43-only server without feedback ordering is replaced", { timeout: 60000 }, async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const old = await olderServer(dir, { version: { storeProtocol: 2, readAuth: 1, feedbackOrder: null }, token: OLD_TOKEN, guard: ["version", "data"], data: true, shell: true });
+  let current;
+  try {
+    current = await serve(dir, []);
+    assert.equal(await old.gone(), true);
+    const version = await current.version();
+    assert.equal(version.storeProtocol, 2);
+    assert.equal(version.readAuth, 1);
+    assert.equal(version.feedbackOrder, 1);
+    assert.equal((await authGet(current.url, "/api/data")).status, 401);
+    assert.match(run("serve"), /already running/);
+  } finally { await current?.stop(); await old.stop(); }
 });
