@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { approvalReceiptStatus, leavesBase, storePath } from "../lib/state.mjs";
+import { approvalReceiptStatus, storePath } from "../lib/state.mjs";
 import { configDecision } from "../lib/config-hook.mjs";
 import { spawnSync } from "node:child_process";
 import { enrollment } from "../lib/config-hook.mjs";
@@ -203,10 +203,8 @@ test("an approval record protects a skeleton link redirected to a regular file",
   assert.equal(configDecision({ cwd: root }, root).decision, "block");
 });
 
-// #44: once any project has an approval record, the hook must not realpath every project it runs in.
+// #44: the approval-record lookup once any project on the machine has a record.
 const HOOK = fileURLToPath(new URL("../bin/skel-hook.mjs", import.meta.url));
-// Records each realpath the hook makes; printed to stderr on exit.
-const REALPATH_SPY = "data:text/javascript," + encodeURIComponent(`import fs from "node:fs"; const seen = []; const n = fs.realpathSync.native; fs.realpathSync.native = function (p, ...a) { seen.push(String(p)); return n.call(this, p, ...a); }; process.on("exit", () => process.stderr.write("REALPATHS" + JSON.stringify(seen) + "\\n"));`);
 function receiptFixture(t) {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "skel-receipts-")));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -223,23 +221,37 @@ function receiptFixture(t) {
     fs.writeFileSync(path.join(store, `${key}.snapshot.json`), "{}");
   };
   const hook = (input, cwd = project, projectDir = cwd) => {
-    const result = spawnSync(process.execPath, ["--import", REALPATH_SPY, HOOK], { cwd, env: { ...env, CLAUDE_PROJECT_DIR: projectDir }, input: JSON.stringify({ cwd, ...input }), encoding: "utf8", timeout: 60_000 });
+    const result = spawnSync(process.execPath, [HOOK], { cwd, env: { ...env, CLAUDE_PROJECT_DIR: projectDir }, input: JSON.stringify({ cwd, ...input }), encoding: "utf8", timeout: 60_000 });
     assert.equal(result.status, 0, result.stderr);
-    const realpaths = JSON.parse(/REALPATHS(.*)/.exec(result.stderr)[1]);
-    return { decision: result.stdout ? JSON.parse(result.stdout).hookSpecificOutput.permissionDecision : null, realpaths, stderr: result.stderr };
+    return { decision: result.stdout ? JSON.parse(result.stdout).hookSpecificOutput.permissionDecision : null, stderr: result.stderr };
   };
   return { home, env, store, project, record, hook };
 }
 const edit = (file) => ({ tool_name: "Edit", tool_input: { file_path: file, old_string: "1", new_string: "2" } });
 
-test("#44: another project's record doesn't make the hook realpath a project with no skeleton", { skip: process.platform !== "linux" && "the lexical shortcut is Linux-only" }, t => {
+test("#44: a listable store answers by name, and a read-only one isn't \"unreadable\"", t => {
   const f = receiptFixture(t);
   f.record(path.join(f.home, "elsewhere"));
-  const inProject = (p) => !leavesBase(path.relative(f.project, p));
-  for (const input of [edit(path.join(f.project, "src", "a.js")), { tool_name: "Write", tool_input: { file_path: path.join(f.project, "src", "new", "b.js"), content: "x" } }, { tool_name: "Bash", tool_input: { command: "ls" } }]) {
-    const r = f.hook(input);
-    assert.equal(r.decision, null, `${input.tool_name}: no skeleton, nothing to say`);
-    assert.deepEqual(r.realpaths.filter(inProject), [], `${input.tool_name}: no realpath inside the project`);
+  f.record(f.project);
+  const status = (dir) => {
+    const code = `import fs from "node:fs"; const l = fs.lstatSync; let store = 0; fs.lstatSync = function (p, ...a) { if (String(p).startsWith(${JSON.stringify(f.store)})) store++; return l.call(this, p, ...a); }; const { approvalReceiptStatus } = await import(${JSON.stringify(new URL("../lib/state.mjs", import.meta.url).href)}); process.stdout.write(JSON.stringify([approvalReceiptStatus(${JSON.stringify(dir)}), store]))`;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { env: f.env, encoding: "utf8", timeout: 60_000 });
+    assert.equal(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout);
+  };
+  assert.deepEqual(status(f.project), ["present", 0], "found in the listing, no lstat into the store");
+  assert.deepEqual(status(path.join(f.home, "other")), ["absent", 0], "another project's record isn't this one's");
+  if (process.platform === "win32") return;
+  // r-- : listable, but no name in it can be looked up.
+  fs.chmodSync(f.store, 0o400);
+  try {
+    let searchable = true;
+    try { fs.lstatSync(path.join(f.store, "x"), { throwIfNoEntry: false }); } catch (err) { searchable = err.code !== "EACCES"; }
+    if (searchable) return t.skip("effective user can search r-- directories");
+    assert.deepEqual(status(f.project), ["present", 0], "read-only store: enrolled");
+    assert.deepEqual(status(path.join(f.home, "other")), ["absent", 0], "read-only store: a miss is a miss");
+  } finally {
+    fs.chmodSync(f.store, 0o700);
   }
 });
 
