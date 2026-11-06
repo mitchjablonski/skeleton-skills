@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { approvalReceiptStatus, storePath } from "../lib/state.mjs";
+import { approvalReceiptStatus, leavesBase, storePath } from "../lib/state.mjs";
 import { configDecision } from "../lib/config-hook.mjs";
 import { spawnSync } from "node:child_process";
 import { enrollment } from "../lib/config-hook.mjs";
@@ -201,4 +201,86 @@ test("an approval record protects a skeleton link redirected to a regular file",
   fs.mkdirSync(path.dirname(receipt), { recursive: true });
   fs.writeFileSync(receipt, "{}");
   assert.equal(configDecision({ cwd: root }, root).decision, "block");
+});
+
+// #44: once any project has an approval record, the hook must not realpath every project it runs in.
+const HOOK = fileURLToPath(new URL("../bin/skel-hook.mjs", import.meta.url));
+// Records each realpath the hook makes; printed to stderr on exit.
+const REALPATH_SPY = "data:text/javascript," + encodeURIComponent(`import fs from "node:fs"; const seen = []; const n = fs.realpathSync.native; fs.realpathSync.native = function (p, ...a) { seen.push(String(p)); return n.call(this, p, ...a); }; process.on("exit", () => process.stderr.write("REALPATHS" + JSON.stringify(seen) + "\\n"));`);
+function receiptFixture(t) {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "skel-receipts-")));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const env = { ...process.env, XDG_STATE_HOME: path.join(home, "state"), XDG_CONFIG_HOME: path.join(home, "config"), LOCALAPPDATA: path.join(home, "local") };
+  const store = path.join(env.XDG_STATE_HOME, "skel");
+  fs.mkdirSync(store, { recursive: true });
+  const project = path.join(home, "project");
+  fs.mkdirSync(path.join(project, "src"), { recursive: true });
+  fs.writeFileSync(path.join(project, "src", "a.js"), "let a = 1;\n");
+  const record = (dir) => {
+    const code = `import { projectKey } from ${JSON.stringify(new URL("../lib/state.mjs", import.meta.url).href)}; process.stdout.write(projectKey(${JSON.stringify(dir)}))`;
+    const key = spawnSync(process.execPath, ["--input-type=module", "-e", code], { env, encoding: "utf8", timeout: 60_000 }).stdout;
+    assert.match(key, /^[0-9a-f]{24}$/);
+    fs.writeFileSync(path.join(store, `${key}.snapshot.json`), "{}");
+  };
+  const hook = (input, cwd = project, projectDir = cwd) => {
+    const result = spawnSync(process.execPath, ["--import", REALPATH_SPY, HOOK], { cwd, env: { ...env, CLAUDE_PROJECT_DIR: projectDir }, input: JSON.stringify({ cwd, ...input }), encoding: "utf8", timeout: 60_000 });
+    assert.equal(result.status, 0, result.stderr);
+    const realpaths = JSON.parse(/REALPATHS(.*)/.exec(result.stderr)[1]);
+    return { decision: result.stdout ? JSON.parse(result.stdout).hookSpecificOutput.permissionDecision : null, realpaths, stderr: result.stderr };
+  };
+  return { home, env, store, project, record, hook };
+}
+const edit = (file) => ({ tool_name: "Edit", tool_input: { file_path: file, old_string: "1", new_string: "2" } });
+
+test("#44: another project's record doesn't make the hook realpath a project with no skeleton", { skip: process.platform !== "linux" && "the lexical shortcut is Linux-only" }, t => {
+  const f = receiptFixture(t);
+  f.record(path.join(f.home, "elsewhere"));
+  const inProject = (p) => !leavesBase(path.relative(f.project, p));
+  for (const input of [edit(path.join(f.project, "src", "a.js")), { tool_name: "Write", tool_input: { file_path: path.join(f.project, "src", "new", "b.js"), content: "x" } }, { tool_name: "Bash", tool_input: { command: "ls" } }]) {
+    const r = f.hook(input);
+    assert.equal(r.decision, null, `${input.tool_name}: no skeleton, nothing to say`);
+    assert.deepEqual(r.realpaths.filter(inProject), [], `${input.tool_name}: no realpath inside the project`);
+  }
+});
+
+test("#44: an enrolled project whose state was deleted still denies, from inside it", t => {
+  const f = receiptFixture(t);
+  f.record(f.project);
+  fs.mkdirSync(path.join(f.project, ".skeleton"));
+  fs.writeFileSync(path.join(f.project, ".skeleton", "state.json"), JSON.stringify({ phase: "fill", activeStep: "1", files: [] }));
+  fs.rmSync(path.join(f.project, ".skeleton", "state.json"));
+  assert.equal(f.hook(edit(path.join(f.project, "src", "a.js"))).decision, "deny", "state.json gone");
+  fs.rmSync(path.join(f.project, ".skeleton"), { recursive: true });
+  for (const input of [edit(path.join(f.project, "src", "a.js")), { tool_name: "Bash", tool_input: { command: "ls" } }]) {
+    const r = f.hook(input);
+    assert.equal(r.decision, "deny", `${input.tool_name}: .skeleton gone`);
+    assert.match(r.stderr, /approval record exists but \.skeleton is missing/);
+  }
+  // A hook process started in a subdirectory: the project is an ancestor of its cwd.
+  assert.equal(f.hook(edit(path.join(f.project, "src", "a.js")), path.join(f.project, "src"), f.project).decision, "deny", "from a subdirectory");
+});
+
+test("#44: a project reached through a symlink still finds its record", t => {
+  const f = receiptFixture(t);
+  f.record(f.project);
+  const link = path.join(f.home, "link");
+  const inside = path.join(f.home, "cwd");
+  fs.mkdirSync(inside);
+  try {
+    fs.symlinkSync(f.project, link, "junction");
+    fs.symlinkSync(f.project, path.join(inside, "link"), "junction");
+  } catch (err) {
+    if (["EPERM", "EACCES"].includes(err.code)) return t.skip("directory links require platform privilege");
+    throw err;
+  }
+  const status = (dir, cwd) => {
+    const code = `import { approvalReceiptStatus } from ${JSON.stringify(new URL("../lib/state.mjs", import.meta.url).href)}; process.stdout.write(approvalReceiptStatus(${JSON.stringify(dir)}))`;
+    return spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd, env: f.env, encoding: "utf8", timeout: 60_000 }).stdout;
+  };
+  assert.equal(status(link, f.home), "present", "link beside the cwd");
+  assert.equal(status(path.join(inside, "link"), inside), "present", "link below the cwd");
+  assert.equal(status(link, link), "present", "link as the cwd");
+  assert.equal(status(path.join(f.home, "elsewhere"), f.home), "absent", "an unrelated path isn't enrolled");
+  // And the hook, run from the link with .skeleton deleted, denies.
+  assert.equal(f.hook(edit(path.join(link, "src", "a.js")), link).decision, "deny", "hook from the link");
 });
