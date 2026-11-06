@@ -339,3 +339,110 @@ test("owned async lock releases on SIGINT and SIGTERM and the process still term
     assert.equal(fs.existsSync(path.join(queueDir(root), ".order-lock")), false);
   }
 });
+
+// A shared guard must cover same-turn nesting without building up per-call listeners.
+test("shared signal guard stays bounded across nested owners and same-turn operations", async t => {
+  const { root } = fixture(t);
+  await new Promise(resolve => setImmediate(() => setImmediate(resolve)));
+  const before = ["SIGINT", "SIGTERM"].map(signal => process.listenerCount(signal));
+  const other = path.join(root, "other");
+  fs.mkdirSync(path.join(other, ".skeleton"), { recursive: true });
+  const owned = path.join(queueDir(root), ".order-lock");
+  const foreign = path.join(queueDir(other), ".order-lock");
+  withFeedbackLock(root, () => {
+    withFeedbackLock(other, () => {
+      assert.equal(fs.existsSync(owned), true);
+      assert.equal(fs.existsSync(foreign), true);
+    });
+    assert.equal(fs.existsSync(owned), true);
+    assert.equal(fs.existsSync(foreign), false);
+  });
+  const guarded = ["SIGINT", "SIGTERM"].map(signal => process.listenerCount(signal));
+  assert.ok(guarded.every((n, i) => n >= before[i] && n <= before[i] + 1));
+  for (let n = 0; n < 30; n++) withFeedbackLock(root, () => n);
+  assert.deepEqual(["SIGINT", "SIGTERM"].map(signal => process.listenerCount(signal)), guarded);
+  fs.mkdirSync(owned);
+  fs.writeFileSync(path.join(owned, "foreign-owner"), "keep");
+  assert.throws(() => withFeedbackLock(root, () => assert.fail("must not run")), /locked/);
+  assert.equal(fs.readFileSync(path.join(owned, "foreign-owner"), "utf8"), "keep");
+  await new Promise(resolve => setImmediate(() => setImmediate(resolve)));
+  assert.deepEqual(["SIGINT", "SIGTERM"].map(signal => process.listenerCount(signal)), guarded);
+});
+
+function childExit(child) {
+  return new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
+}
+async function bounded(promise, label, ms = 8000) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label + " timed out")), ms); })]); }
+  finally { clearTimeout(timer); }
+}
+async function killChild(child, exited) {
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  await exited;
+}
+
+test("signals queued during a synchronous locked callback still terminate after release", { skip: process.platform === "win32", timeout: 20000 }, async t => {
+  const { root } = fixture(t);
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    const code = `import fs from 'node:fs';import {withFeedbackLock} from ${JSON.stringify(MODULE)};setInterval(()=>{},1000);withFeedbackLock(${JSON.stringify(root)},()=>{fs.writeSync(1,'locked\\n');const end=performance.now()+750;while(performance.now()<end){}});`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", code]);
+    const exited = childExit(child);
+    try {
+      await bounded(new Promise((resolve, reject) => { child.stdout.once("data", resolve); child.once("error", reject); }), "sync child readiness");
+      assert.equal(fs.existsSync(path.join(queueDir(root), ".order-lock")), true);
+      child.kill(signal);
+      assert.equal((await bounded(exited, "sync signal exit")).signal, signal);
+      assert.equal(fs.existsSync(path.join(queueDir(root), ".order-lock")), false);
+    } finally { await killChild(child, exited); }
+  }
+});
+
+test("serve --stop terminates the real server during a feedback POST burst", { skip: process.platform === "win32", timeout: 40000 }, async t => {
+  const { root } = fixture(t);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const server = spawn(process.execPath, [BIN, "serve", "--send", "--port", "0"], { cwd: root, env: process.env });
+    const exited = childExit(server);
+    let stop = false;
+    const workers = [];
+    try {
+      const url = await bounded(new Promise((resolve, reject) => {
+        let output = "";
+        server.stdout.on("data", chunk => { output += chunk; const match = output.match(/http:\/\/127\.0\.0\.1:\d+\//); if (match) resolve(match[0]); });
+        server.once("error", reject);
+        server.once("exit", code => reject(new Error("server exited before ready: " + code)));
+      }), "server readiness");
+      const token = JSON.parse(fs.readFileSync(path.join(root, ".skeleton/serve.json"), "utf8")).token;
+      let accepted = 0;
+      let ready;
+      const posted = new Promise(resolve => ready = resolve);
+      for (let i = 0; i < 8; i++) workers.push((async () => {
+        for (let n = 0; n < 100 && !stop; n++) {
+          try {
+            const response = await fetch(new URL("api/feedback", url), { method:"POST", headers:{"content-type":"application/json", "x-skeleton-token":token}, body:JSON.stringify({comments:[]}), signal:AbortSignal.timeout(3000) });
+            await response.text();
+            if (response.status === 204 && ++accepted >= 8) ready();
+          } catch { break; }
+        }
+      })());
+      await bounded(posted, "accepted POST burst");
+      const command = spawn(process.execPath, [BIN, "serve", "--stop"], { cwd: root, env: process.env });
+      const commandExit = childExit(command);
+      let stopOutput = "";
+      command.stdout.on("data", chunk => stopOutput += chunk);
+      try {
+        assert.equal((await bounded(commandExit, "stop command")).code, 0);
+        assert.match(stopOutput, /stopped the review server/, "stop must verify and signal the server");
+      }
+      finally { await killChild(command, commandExit); }
+      assert.equal((await bounded(exited, "stopped server exit")).signal, "SIGTERM");
+      assert.equal(fs.existsSync(path.join(queueDir(root), ".order-lock")), false);
+      assert.equal(fs.existsSync(path.join(root, ".skeleton/serve.json")), false);
+      await assert.rejects(fetch(url, { signal:AbortSignal.timeout(2000) }), "stopped server no longer serves");
+    } finally {
+      stop = true;
+      await killChild(server, exited);
+      await Promise.all(workers);
+    }
+  }
+});
