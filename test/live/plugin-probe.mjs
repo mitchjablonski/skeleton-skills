@@ -164,7 +164,7 @@ const mainRequests = (s) => s.requests.filter((r) => Array.isArray(r.body.tools)
 
 const results = {};
 try {
-  log("claude version:", spawnSync(claudeBin, ["--version"], { encoding: "utf8", timeout: 30_000 }).stdout.trim());
+  log("claude version:", makeEnv("version").run(claudeBin, ["--version"], { timeout: 30_000 }).stdout.trim());
 
   // ---- plugin arm ----
   {
@@ -216,7 +216,8 @@ try {
       slashCommands: (init?.slash_commands ?? []).filter((c) => /skeleton/.test(c)),
       agents: (init?.agents ?? []).filter((a) => /skeleton/.test(a)),
       editResult: text(editResult(s)).slice(0, 400),
-      denyMessages: (text(editResult(s)).match(/skel:/g) ?? []).length,
+      // How many gate verdicts reached the Edit's result: one per registered PreToolUse copy that denied.
+      gateMessages: (text(editResult(s)).match(/skeleton scope gate/g) ?? []).length,
       stopContinuations: stopContinuations(s),
       result: (({ num_turns, total_cost_usd }) => ({ num_turns, total_cost_usd }))(s.events.find((ev) => ev.type === "result") ?? {}),
     };

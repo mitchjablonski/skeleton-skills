@@ -10,7 +10,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
+import { SKIP_DIRS, scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { PLUGIN_ID, claudeConfigDir, hasLegacyHooks, installStatus, isSkelConfigHook, isSkelHook, pluginEvidence, pluginStatus, registrationNotice, rulePath, skelStopHook } from "../lib/install-status.mjs";
@@ -556,6 +556,33 @@ function removeSkelHooks(settings) {
   return { removed, block, notifyOnly };
 }
 
+/**
+ * A fill (or unreadable skeleton state) that removing the project's hooks would
+ * leave unguarded: one at or above `target` or CLAUDE_PROJECT_DIR, or any
+ * skeleton below `target`, found the way the scanner walks (skipping the dirs
+ * it skips, not following links). Returns enrollment's verdict, or null.
+ */
+function fillAtOrBelow(target) {
+  const above = [target, process.env.CLAUDE_PROJECT_DIR].filter(Boolean).map((b) => enrollment(b)).find((s) => s.protected);
+  if (above) return above;
+  const stack = [path.resolve(target)];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (e.name === STATE_DIR) {
+        const status = enrollment(dir, new Map(), { boundary: dir });
+        if (status.protected) return status;
+        continue;
+      }
+      if (!SKIP_DIRS.has(e.name)) stack.push(path.join(dir, e.name));
+    }
+  }
+  return null;
+}
+
 /** The Stop flags skel's Stop hook entries in these settings carry. */
 function legacyStopFlags(settings) {
   let block = false;
@@ -597,7 +624,7 @@ async function installForPlugin(dir, mode) {
   let removedCopies = [];
   const customized = [];
   if (legacyHooks || copies.length) {
-    const fill = [target, process.env.CLAUDE_PROJECT_DIR].filter(Boolean).map((b) => enrollment(b)).find((s) => s.protected);
+    const fill = fillAtOrBelow(target);
     const evidence = pluginEvidence(target);
     if (fill) {
       kept.push(`not removing the older install's hooks or skill copies: ${fill.reason}. Removing the gate mid-fill is what the settings guard holds, and the running session keeps its hooks anyway. Finish the skeleton or run \`skel reshape\`, then run \`skel install\` again.`);

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -441,4 +441,81 @@ test("uninstall after migration leaves customized skill and agent copies, and re
   assert.equal(fs.existsSync(path.join(q.root, ".claude", "skills")), true, "the skills folder itself stays");
   assert.deepEqual(fs.readdirSync(path.join(q.root, ".claude", "skills")), []);
   assert.equal(fs.existsSync(path.join(q.root, ".claude", "agents", "skeleton-filler.md")), false);
+});
+
+test("#57 review: a mid-fill skeleton in a subdirectory keeps the legacy hooks too", (t) => {
+  const p = project(t);
+  p.ok("install", "--legacy");
+  p.enablePlugin();
+  const pkg = path.join(p.root, "packages", "pkg");
+  fs.mkdirSync(path.join(pkg, ".skeleton"), { recursive: true });
+  fs.writeFileSync(path.join(pkg, ".skeleton", "state.json"), JSON.stringify({ title: "x", phase: "fill", activeStep: null }));
+  // Skipped dirs aren't walked: a fill under node_modules isn't the project's.
+  const before = hookCommands(p.settings(), "PreToolUse");
+  const out = p.ok("install");
+  assert.match(out, /not removing the older install's hooks or skill copies: a skeleton fill is active/);
+  assert.deepEqual(hookCommands(p.settings(), "PreToolUse"), before);
+  fs.writeFileSync(path.join(pkg, ".skeleton", "state.json"), JSON.stringify({ title: "x", phase: "scaffold", activeStep: null }));
+  fs.mkdirSync(path.join(p.root, "node_modules", "dep", ".skeleton"), { recursive: true });
+  fs.writeFileSync(path.join(p.root, "node_modules", "dep", ".skeleton", "state.json"), JSON.stringify({ title: "y", phase: "fill", activeStep: null }));
+  p.ok("install");
+  assert.deepEqual(hookCommands(p.settings(), "PreToolUse"), [], "outside a fill the migration goes ahead");
+});
+
+test("#57 review: with both copies running at once, the double-registration notice isn't lost", async (t) => {
+  const p = project(t);
+  p.ok("install", "--legacy");
+  p.enablePlugin();
+  p.ok("init", "race");
+  const once = (sid, plugin) => new Promise((resolve) => {
+    const env = { ...p.env, ...(plugin ? { CLAUDE_PLUGIN_ROOT: REPO } : {}) };
+    const child = spawn(process.execPath, [path.join(REPO, "bin", "skel-stop.mjs")], { cwd: p.root, env });
+    let out = "";
+    child.stdout.on("data", (c) => (out += c));
+    child.on("close", () => resolve(out));
+    child.stdin.end(JSON.stringify({ cwd: p.root, session_id: sid, stop_hook_active: false }));
+  });
+  for (let i = 0; i < 8; i++) {
+    const outs = await Promise.all([once(`s${i}`, true), once(`s${i}`, false)]);
+    assert.match(outs.join("\n"), /registered twice/, `trial ${i}`);
+    // Once per session: a second Stop in the same session doesn't repeat it.
+    const again = await Promise.all([once(`s${i}`, true), once(`s${i}`, false)]);
+    assert.doesNotMatch(again.join("\n"), /registered twice/, `trial ${i} repeat`);
+  }
+});
+
+test("#57 review: when migration can't confirm the plugin, the notice lists why instead of sending you back to install", (t) => {
+  const p = project(t);
+  p.ok("install", "--legacy");
+  p.enablePlugin({ registry: false });
+  const note = p.withEnv(() => registrationNotice(p.root, "cli"));
+  assert.match(note, /may be registered twice/);
+  assert.match(note, /no install of skel@skeleton-skills for this project is recorded/);
+  assert.doesNotMatch(note, /Run `skel install` there \(outside a fill\) to remove/);
+  // User scope enabled, this project explicitly off.
+  p.writeSettings(path.join(p.claude, "settings.json"), { enabledPlugins: { [PLUGIN_ID]: true } });
+  p.merge({ enabledPlugins: { [PLUGIN_ID]: false } });
+  assert.match(p.withEnv(() => registrationNotice(p.root, "plugin")), /every project that doesn't disable it \(this one does\)/);
+});
+
+test("#57 review: an install recorded from a linked worktree counts for the main checkout that holds its settings", { skip: process.platform === "win32" && "native Windows loads settings from the launch directory" }, (t) => {
+  const p = project(t);
+  const git = (...a) => execFileSync("git", ["-C", p.root, "-c", "user.email=t@x", "-c", "user.name=t", ...a], { stdio: "ignore", timeout: 30_000 });
+  fs.writeFileSync(path.join(p.root, "a.txt"), "a");
+  git("add", "."); git("commit", "-qm", "a");
+  const wt = path.join(p.base, "wt");
+  git("worktree", "add", "-q", wt);
+  p.enablePlugin();
+  p.writeSettings(path.join(p.claude, "plugins", "installed_plugins.json"), { plugins: { [PLUGIN_ID]: [{ scope: "local", projectPath: wt, installPath: REPO }] } });
+  assert.deepEqual(p.withEnv(() => pluginEvidence(p.root)).problems, []);
+  // Two worktrees' installs for the same main checkout are ambiguous.
+  p.writeSettings(path.join(p.claude, "plugins", "installed_plugins.json"), { plugins: { [PLUGIN_ID]: [{ scope: "local", projectPath: wt, installPath: REPO }, { scope: "local", projectPath: wt, installPath: REPO }] } });
+  assert.match(p.withEnv(() => pluginEvidence(p.root)).problems.join(), /records 2 installs .* linked worktrees/);
+});
+
+test("#57 review: a copy a Windows install wrote with backslashes is still recognized", () => {
+  const src = fs.readFileSync(path.join(REPO, "skills", "skeleton", "SKILL.md"), "utf8");
+  const win = renderLegacy(src, "C:/x").replace('node "C:/x/bin/skel.mjs"', 'node "C:\\Users\\me\\skeleton-skills\\bin\\skel.mjs"');
+  assert.ok(win.includes('C:\\Users\\me'));
+  assert.equal(copyHash(win), copyHash(renderLegacy(src, "/any")));
 });
