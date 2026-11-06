@@ -1349,14 +1349,19 @@ const commands = {
     }
     if (fs.existsSync(settingsPath)) writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
     writeOwned(target, []);
-    for (const name of SKILLS) {
-      const skillDir = path.join(claudeDir, "skills", name);
-      fs.rmSync(path.join(skillDir, "SKILL.md"), { force: true });
-      try { fs.rmdirSync(skillDir); } catch {} // only if we left it empty
+    // Only copies a release of skel installed, byte for byte: a file you changed
+    // (which a migration to the plugin also keeps) stays, and is named.
+    const keptCopies = [];
+    for (const [src, dest] of installedFiles(claudeDir)) {
+      let text = null;
+      try { text = fs.readFileSync(dest, "utf-8"); } catch { continue; }
+      if (!isLegacyCopy(path.relative(PKG_ROOT, src).split(path.sep).join("/"), text, fs.readFileSync(src, "utf-8"))) { keptCopies.push(dest); continue; }
+      fs.rmSync(dest, { force: true });
+      // The agents folder may hold the user's own subagents: leave it. A skill dir goes only if we left it empty.
+      if (path.basename(dest) === "SKILL.md") { try { fs.rmdirSync(path.dirname(dest)); } catch {} }
     }
-    // The agents folder may hold the user's own subagents: leave it.
-    fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
-    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook, the drift check (Stop) hook and the settings-reload (ConfigChange) hook from ${claudeDir}`);
+    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent (where unmodified), the scope gate hook, the drift check (Stop) hook and the settings-reload (ConfigChange) hook from ${claudeDir}`);
+    for (const dest of keptCopies) console.log(`left in place: ${dest} isn't a copy skel shipped (you changed it, or it's yours); delete it by hand if you don't want it`);
     console.log("restart Claude Code if these hooks are already loaded; an external uninstall may not trigger a settings-reload event");
     console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
     if (removedStores) console.log(`removed ${removedStores} store-dir permission deny rule(s) install added`);

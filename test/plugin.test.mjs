@@ -53,14 +53,33 @@ function project(t, name = "proj") {
   /** Make the plugin look installed and enabled at local scope, from this checkout. */
   const enablePlugin = ({ registry = true } = {}) => {
     merge({ enabledPlugins: { [PLUGIN_ID]: true } });
-    if (registry) writeSettings(path.join(claude, "plugins", "installed_plugins.json"), { version: 2, plugins: { [PLUGIN_ID]: [{ scope: "local", projectPath: root, installPath: REPO, version: "0.2.0" }] } });
+    if (registry) {
+      writeSettings(path.join(claude, "plugins", "installed_plugins.json"), { version: 2, plugins: { [PLUGIN_ID]: [{ scope: "local", projectPath: root, installPath: REPO, version: "0.2.0" }] } });
+      writeSettings(path.join(claude, "plugins", "known_marketplaces.json"), { [PLUGIN_ID.split("@")[1]]: { source: { source: "directory", path: REPO } } });
+    }
+  };
+  /**
+   * A local-path marketplace at `market` (a valid skel package at its root),
+   * whose marketplace.json declares skel's source as `source`, installed with
+   * `installPath`.
+   */
+  const fakeMarket = ({ source = "./", installPath, plugins } = {}) => {
+    const market = path.join(base, "market");
+    for (const d of ["bin", "hooks", ".claude-plugin"]) fs.cpSync(path.join(REPO, d), path.join(market, d), { recursive: true });
+    const mkt = readJson(".claude-plugin/marketplace.json");
+    mkt.plugins = plugins ?? [{ ...mkt.plugins[0], source }];
+    writeSettings(path.join(market, ".claude-plugin", "marketplace.json"), mkt);
+    merge({ enabledPlugins: { [PLUGIN_ID]: true } });
+    writeSettings(path.join(claude, "plugins", "installed_plugins.json"), { version: 2, plugins: { [PLUGIN_ID]: [{ scope: "local", projectPath: root, installPath: installPath ?? market }] } });
+    writeSettings(path.join(claude, "plugins", "known_marketplaces.json"), { [mkt.name]: { source: { source: "directory", path: market } } });
+    return market;
   };
   const withEnv = (fn) => {
     const saved = { ...process.env };
     Object.assign(process.env, env);
     try { return fn(); } finally { for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]; Object.assign(process.env, saved); }
   };
-  return { base, root, claude, env, skel, ok, settingsFile, settings, writeSettings, merge, enablePlugin, withEnv };
+  return { base, root, claude, env, skel, ok, settingsFile, settings, writeSettings, merge, enablePlugin, fakeMarket, withEnv };
 }
 
 const hookCommands = (settings, event) => (settings.hooks?.[event] ?? []).flatMap((g) => (g.hooks ?? []).map((h) => h.command));
@@ -259,6 +278,19 @@ test("migration keeps legacy hooks without positive plugin evidence: no registry
     "same-name collision": (p) => { p.enablePlugin(); p.merge({ enabledPlugins: { [PLUGIN_ID]: true, "skel@someone-else": true } }); },
     "disableAllHooks": (p) => { p.enablePlugin(); p.writeSettings(path.join(p.root, ".claude", "settings.json"), { disableAllHooks: true }); },
     "broken plugin root": (p) => { p.enablePlugin(); p.writeSettings(path.join(p.claude, "plugins", "installed_plugins.json"), { plugins: { [PLUGIN_ID]: [{ scope: "local", projectPath: p.root, installPath: path.join(p.base, "nowhere") }] } }); },
+    "array user settings": (p) => { p.enablePlugin(); p.writeSettings(path.join(p.claude, "settings.json"), "[]"); },
+    "null project settings": (p) => { p.enablePlugin(); p.writeSettings(path.join(p.root, ".claude", "settings.json"), "null"); },
+    "scalar user settings": (p) => { p.enablePlugin(); p.writeSettings(path.join(p.claude, "settings.json"), "42"); },
+    "string user settings": (p) => { p.enablePlugin(); p.writeSettings(path.join(p.claude, "settings.json"), '"x"'); },
+    "array enabledPlugins": (p) => { p.enablePlugin(); p.writeSettings(path.join(p.claude, "settings.json"), { enabledPlugins: [] }); },
+    "nested declared source without a plugin": (p) => { const m = p.fakeMarket({ source: "./broken" }); fs.mkdirSync(path.join(m, "broken")); },
+    "declared source and install path both broken": (p) => { const m = p.fakeMarket({ source: "./broken", installPath: path.join(p.base, "market", "broken") }); fs.mkdirSync(path.join(m, "broken")); },
+    "valid declared root, broken installed copy": (p) => { p.fakeMarket({ installPath: path.join(p.base, "market", "broken") }); },
+    "declared source leaves the marketplace": (p) => { p.fakeMarket({ source: "../" }); },
+    "two plugins named skel": (p) => { const m = readJson(".claude-plugin/marketplace.json"); p.fakeMarket({ plugins: [m.plugins[0], m.plugins[0]] }); },
+    "marketplace not recorded": (p) => { p.enablePlugin(); fs.rmSync(path.join(p.claude, "plugins", "known_marketplaces.json")); },
+    "unknown marketplace source type": (p) => { p.enablePlugin(); p.writeSettings(path.join(p.claude, "plugins", "known_marketplaces.json"), { [PLUGIN_ID.split("@")[1]]: { source: { source: "mystery", path: REPO } } }); },
+    "two install records for the project": (p) => { p.enablePlugin(); const e = { scope: "local", projectPath: p.root, installPath: REPO }; p.writeSettings(path.join(p.claude, "plugins", "installed_plugins.json"), { plugins: { [PLUGIN_ID]: [e, { ...e, scope: "project" }] } }); },
   };
   for (const [name, setup] of Object.entries(cases)) {
     const p = project(t, name.replace(/\W+/g, "-"));
@@ -369,4 +401,44 @@ test("the plugin's Stop hook (no flag) follows the project's recorded mode; a le
   assert.ok(quiet.systemMessage);
   assert.equal(quiet.decision, undefined, "notify-only recorded for the project");
   assert.equal(stop(["--block"]).decision, "block", "an explicit legacy flag wins");
+});
+
+test("a local marketplace whose declared skel source is a valid nested folder is positive evidence", (t) => {
+  const p = project(t);
+  const market = p.fakeMarket({ source: "./plugins/skel", installPath: undefined });
+  // The root package is broken; the declared nested copy is the one that loads.
+  fs.rmSync(path.join(market, "hooks"), { recursive: true });
+  const nested = path.join(market, "plugins", "skel");
+  for (const d of ["bin", "hooks", ".claude-plugin"]) fs.cpSync(path.join(REPO, d), path.join(nested, d), { recursive: true });
+  p.writeSettings(path.join(p.claude, "plugins", "installed_plugins.json"), { plugins: { [PLUGIN_ID]: [{ scope: "local", projectPath: p.root, installPath: nested }] } });
+  const ev = p.withEnv(() => pluginEvidence(p.root));
+  assert.deepEqual(ev.problems, []);
+  assert.equal(ev.root, nested);
+});
+
+test("uninstall after migration leaves customized skill and agent copies, and removes stock ones", (t) => {
+  const p = project(t);
+  p.ok("install", "--legacy");
+  const skill = path.join(p.root, ".claude", "skills", "skeleton", "SKILL.md");
+  const fill = path.join(p.root, ".claude", "skills", "skeleton-fill", "SKILL.md");
+  const agent = path.join(p.root, ".claude", "agents", "skeleton-filler.md");
+  fs.appendFileSync(skill, "\nmine\n");
+  fs.appendFileSync(agent, "\nmine too\n");
+  p.enablePlugin();
+  let out = p.ok("install");
+  assert.ok(fs.existsSync(skill) && fs.existsSync(agent), "migration keeps customized copies");
+  assert.equal(fs.existsSync(fill), false, "and removes the stock one");
+  const skillText = fs.readFileSync(skill, "utf8");
+  const agentText = fs.readFileSync(agent, "utf8");
+  out = p.ok("uninstall");
+  assert.equal(fs.readFileSync(skill, "utf8"), skillText, "uninstall keeps the customized skill");
+  assert.equal(fs.readFileSync(agent, "utf8"), agentText, "and the customized agent");
+  assert.match(out, new RegExp(`left in place: ${skill.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")} isn't a copy skel shipped`));
+  // A plain legacy install's stock copies still go.
+  const q = project(t, "stock");
+  q.ok("install", "--legacy");
+  q.ok("uninstall");
+  assert.equal(fs.existsSync(path.join(q.root, ".claude", "skills")), true, "the skills folder itself stays");
+  assert.deepEqual(fs.readdirSync(path.join(q.root, ".claude", "skills")), []);
+  assert.equal(fs.existsSync(path.join(q.root, ".claude", "agents", "skeleton-filler.md")), false);
 });

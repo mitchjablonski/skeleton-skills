@@ -10,7 +10,10 @@
 // dummy, nothing inherits your credentials, and the dir is removed at the end
 // unless --keep is passed.
 //
-//   node test/live/plugin-probe.mjs [--keep] [--claude <path>] [--source owner/repo#ref]
+//   node test/live/plugin-probe.mjs [--keep] [--results <new file>] [--claude <path>] [--source owner/repo#ref]
+//
+// Nothing is retained unless asked: --keep keeps the scratch dir, --results
+// writes the results JSON to a file it creates (never overwriting one).
 //
 // --source installs from a git-hosted marketplace (copied into the temp
 // config's plugin cache) instead of this checkout in place; that needs network
@@ -39,6 +42,8 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".
 const SKEL = path.join(REPO, "bin", "skel.mjs");
 const keep = process.argv.includes("--keep");
 const claudeBin = process.argv.includes("--claude") ? process.argv[process.argv.indexOf("--claude") + 1] : "claude";
+// --results <file> keeps the results as JSON in a file that must not exist yet.
+const resultsFile = process.argv.includes("--results") ? path.resolve(process.argv[process.argv.indexOf("--results") + 1]) : null;
 // --source owner/repo#ref installs from GitHub (a cached copy) instead of this checkout in place.
 const source = process.argv.includes("--source") ? process.argv[process.argv.indexOf("--source") + 1] : REPO;
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "skel-plugin-probe-"));
@@ -281,7 +286,11 @@ try {
 
   const calls = requests.length;
   log(`mock requests in the last arm: ${calls}; no request left this machine (ANTHROPIC_BASE_URL=${API}).`);
-  fs.writeFileSync(path.join(os.tmpdir(), "skel-plugin-probe-results.json"), JSON.stringify(results, null, 2));
+  // Results go only where asked (--results <new file>), never to a fixed shared path.
+  if (resultsFile) {
+    fs.writeFileSync(resultsFile, JSON.stringify(results, null, 2), { flag: "wx" });
+    log("results written to", resultsFile, "(kept; everything else is removed)");
+  }
 } finally {
   server.close();
   if (!keep) fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 5 });
