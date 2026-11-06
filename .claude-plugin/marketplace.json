@@ -1,0 +1,12 @@
+{
+  "name": "skeleton-skills",
+  "owner": { "name": "Mitch Jablonski" },
+  "description": "skel: plan as code skeleton for Claude Code.",
+  "plugins": [
+    {
+      "name": "skel",
+      "source": "./",
+      "description": "Plan as code skeleton: review the shape in a local page, then fill one fenced step at a time behind a scope gate."
+    }
+  ]
+}
