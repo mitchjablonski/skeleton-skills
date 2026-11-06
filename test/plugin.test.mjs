@@ -94,11 +94,14 @@ test("hooks.json registers the three hooks in exec form, with install's matchers
   assert.match(src, /matcher: "user_settings\|project_settings\|local_settings"/);
 });
 
-test("bin/skel is an executable sh wrapper committed with LF", () => {
+test("bin/skel is an executable sh wrapper committed with LF", (t) => {
   const text = fs.readFileSync(path.join(REPO, "bin", "skel"), "utf8");
   assert.match(text, /^#!\/bin\/sh\n/);
   assert.ok(!text.includes("\r"));
-  const mode = execFileSync("git", ["-C", REPO, "ls-files", "-s", "bin/skel"], { encoding: "utf8" });
+  let mode;
+  // A worktree made by WSL git isn't readable by Windows git (and an npm copy isn't a checkout).
+  try { mode = execFileSync("git", ["-C", REPO, "ls-files", "-s", "bin/skel"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000 }); }
+  catch { return t.skip("git can't read this checkout"); }
   assert.match(mode, /^100755 /);
 });
 
