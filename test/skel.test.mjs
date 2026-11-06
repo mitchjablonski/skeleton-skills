@@ -454,16 +454,16 @@ test("security M3: review and install never write through symlinks, and install 
   const target = tmp("skel-install-");
   fs.mkdirSync(path.join(target, ".claude"));
   fs.writeFileSync(path.join(target, ".claude", "settings.local.json"), '{ // comment\n "permissions": { "deny": ["Bash(rm:*)"] } }');
-  assert.throws(() => run("install", target), /isn't valid JSON/);
+  assert.throws(() => run("install", "--legacy", target), /isn't valid JSON/);
   assert.match(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"), /deny/);
   fs.rmSync(path.join(target, ".claude", "settings.local.json"));
   if (canSymlink) {
     fs.symlinkSync(victim, path.join(target, ".claude", "settings.local.json"));
-    assert.throws(() => run("install", target), /symlink/);
+    assert.throws(() => run("install", "--legacy", target), /symlink/);
     assert.equal(fs.readFileSync(victim, "utf-8"), "original");
     fs.rmSync(path.join(target, ".claude", "settings.local.json"));
   }
-  run("install", target);
+  run("install", "--legacy", target);
   const settings = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"));
   assert.equal(settings.hooks.PreToolUse[0].matcher, "Write|Edit|MultiEdit|NotebookEdit|Bash");
   assert.match(fs.readFileSync(path.join(target, ".gitignore"), "utf-8"), /^\.skeleton\/$/m);
@@ -500,7 +500,7 @@ const installTarget = () => {
 
 test("issue #4: install adds deny rules for .skeleton/ state to a fresh project, never for diagrams/", () => {
   const { read, run, SKEL_DENY } = installTarget();
-  assert.match(run("install"), /added 5 permission deny rule/);
+  assert.match(run("install", "--legacy"), /added 5 permission deny rule/);
   const s = read();
   assert.deepEqual(s.permissions.deny, SKEL_DENY);
   assert.ok(s.permissions.deny.every((r) => r.startsWith("Edit(") && !r.includes("diagrams")), "only Edit rules match paths; diagrams stay writable");
@@ -518,7 +518,7 @@ test("issue #4: install preserves the user's settings and rules, and a re-run ch
     sandbox: { enabled: true },
   };
   write(mine);
-  assert.match(run("install"), /added 4 permission deny rule/);
+  assert.match(run("install", "--legacy"), /added 4 permission deny rule/);
   const once = read();
   assert.equal(once.model, "opus");
   assert.deepEqual(once.permissions.allow, mine.permissions.allow);
@@ -531,14 +531,14 @@ test("issue #4: install preserves the user's settings and rules, and a re-run ch
   assert.deepEqual(once.sandbox, { enabled: true });
 
   const text = fs.readFileSync(settingsPath, "utf-8");
-  assert.match(run("install"), /already present/);
+  assert.match(run("install", "--legacy"), /already present/);
   assert.equal(fs.readFileSync(settingsPath, "utf-8"), text, "idempotent: byte-identical on a re-run");
 
   // A hook from an older or moved checkout is updated in place, not duplicated.
   const moved = read();
   moved.hooks.PreToolUse[1].hooks[0].command = 'node "/old/clone/bin/skel.mjs" hook';
   write(moved);
-  run("install");
+  run("install", "--legacy");
   assert.equal(read().hooks.PreToolUse.length, 2);
   assert.match(read().hooks.PreToolUse[1].hooks[0].command, /skel-hook\.mjs"$/);
 });
@@ -571,7 +571,7 @@ test("issue #4: uninstall removes only what install added", () => {
   const { target, read, write, run } = installTarget();
   const mine = { permissions: { deny: ["Read(./.env)"] }, hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo mine" }] }] } };
   write(mine);
-  run("install");
+  run("install", "--legacy");
   fs.writeFileSync(path.join(target, ".claude", "skills", "mine.md"), "x");
   assert.ok(fs.existsSync(path.join(target, ".claude", "agents", "skeleton-filler.md")));
   fs.writeFileSync(path.join(target, ".claude", "agents", "mine.md"), "x");
@@ -583,7 +583,7 @@ test("issue #4: uninstall removes only what install added", () => {
   assert.ok(fs.existsSync(path.join(target, ".claude", "agents", "mine.md")), "the user's own subagents and the agents folder stay");
 
   const fresh = installTarget();
-  fresh.run("install");
+  fresh.run("install", "--legacy");
   fresh.run("uninstall");
   assert.deepEqual(fresh.read(), {}, "a settings file install created is left empty, not deleted");
 });
@@ -649,7 +649,7 @@ test("issue #3: install writes the restricted filler subagent, idempotently, and
   const { dir, run } = project();
   const target = tmp("skel-install-");
   const agentPath = path.join(target, ".claude", "agents", "skeleton-filler.md");
-  run("install", target);
+  run("install", "--legacy", target);
   const agent = fs.readFileSync(agentPath, "utf-8");
   const front = /^---\n([\s\S]*?)\n---\n/.exec(agent)[1];
   const field = (name) => new RegExp(`^${name}: (.*)$`, "m").exec(front)?.[1];
@@ -665,7 +665,7 @@ test("issue #3: install writes the restricted filler subagent, idempotently, and
 
   // Idempotent: a second install leaves the same files and one hook entry.
   const before = fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8");
-  run("install", target);
+  run("install", "--legacy", target);
   assert.equal(fs.readFileSync(agentPath, "utf-8"), agent);
   assert.equal(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"), before);
   assert.equal(fs.readFileSync(path.join(target, ".gitignore"), "utf-8").match(/\.skeleton\//g).length, 1);
@@ -676,14 +676,14 @@ test("issue #3: install writes the restricted filler subagent, idempotently, and
   fs.writeFileSync(victim, "original");
   fs.rmSync(agentPath);
   fs.symlinkSync(victim, agentPath);
-  assert.throws(() => run("install", target), /skeleton-filler\.md is a symlink/);
+  assert.throws(() => run("install", "--legacy", target), /skeleton-filler\.md is a symlink/);
   assert.equal(fs.readFileSync(victim, "utf-8"), "original");
   assert.ok(fs.lstatSync(agentPath).isSymbolicLink());
 
   const elsewhere = tmp("skel-elsewhere-");
   fs.rmSync(path.join(target, ".claude", "agents"), { recursive: true });
   fs.symlinkSync(elsewhere, path.join(target, ".claude", "agents"));
-  assert.throws(() => run("install", target), /agents is a symlink/);
+  assert.throws(() => run("install", "--legacy", target), /agents is a symlink/);
   assert.deepEqual(fs.readdirSync(elsewhere), []);
 });
 
@@ -1262,7 +1262,7 @@ test("#16: install registers the Stop hook next to the PreToolUse hook, idempote
   fs.mkdirSync(path.join(target, ".claude"));
   const mine = { hooks: [{ type: "command", command: "echo mine" }] };
   fs.writeFileSync(path.join(target, ".claude", "settings.local.json"), JSON.stringify({ hooks: { Stop: [mine] } }));
-  const install = () => execFileSync("node", [BIN, "install", target], { encoding: "utf-8" });
+  const install = () => execFileSync("node", [BIN, "install", "--legacy", target], { encoding: "utf-8" });
   assert.match(install(), /added drift check \(Stop\) hook/);
   assert.match(install(), /drift check \(Stop\) hook updated/);
   const read = () => JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8"));
@@ -1401,7 +1401,7 @@ test("installed skills' example fences are documentation, not steps (walk and gi
   for (const git of [false, true]) {
     const { dir, run, hook } = project();
     if (git) execFileSync("git", ["init", "-q", dir]);
-    run("install", dir);
+    run("install", "--legacy", dir);
     const skill = path.join(dir, ".claude", "skills", "skeleton", "SKILL.md");
     assert.match(fs.readFileSync(skill, "utf-8"), /SKEL\[2\]/, "the example is there");
     run("init", "T");
@@ -1426,7 +1426,7 @@ test("PR#11 review #2: project paths with ( ) { } [ ] keep their rules; [ ] * ? 
   const parent = tmp("skel-chars-");
   const target = path.join(parent, "Program Files (x86)", "proj{a}[1]");
   fs.mkdirSync(target, { recursive: true });
-  const out = execFileSync("node", [BIN, "install", target], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  const out = execFileSync("node", [BIN, "install", "--legacy", target], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
   assert.match(out, /added 5 permission deny rule/);
   const deny = JSON.parse(fs.readFileSync(path.join(target, ".claude", "settings.local.json"), "utf-8")).permissions.deny;
   assert.deepEqual(deny, denyFor(target));
@@ -1437,7 +1437,7 @@ test("PR#11 review #2: project paths with ( ) { } [ ] keep their rules; [ ] * ? 
     // A literal backslash can't be spelled in a rule on POSIX: no rules, but the hook and skills go in, and install says so.
     const odd = path.join(parent, "back\\slash");
     fs.mkdirSync(odd);
-    const r = execFileSync("node", [BIN, "install", odd], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+    const r = execFileSync("node", [BIN, "install", "--legacy", odd], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
     assert.match(r, /warning: no permission deny rules/);
     const s = JSON.parse(fs.readFileSync(path.join(odd, ".claude", "settings.local.json"), "utf-8"));
     assert.deepEqual(s.permissions.deny, storeDeny(), "only the store dirs' rules (#26, #18), which don't depend on the project path");
@@ -1780,13 +1780,13 @@ test("#16 on #11's install flow: uninstall removes the Stop hook (with or withou
   const { read, write, run } = installTarget();
   const mineStop = { hooks: [{ type: "command", command: "echo stop" }] };
   write({ hooks: { Stop: [mineStop] } });
-  run("install");
+  run("install", "--legacy");
   const s = read();
   assert.equal(s.hooks.Stop.length, 2);
   // A moved clone with --block: updated in place, flag kept, nothing duplicated.
   s.hooks.Stop[1].hooks[0].command = 'node "/old/clone/bin/skel-stop.mjs" --block';
   write(s);
-  assert.match(run("install"), /drift check \(Stop\) hook updated/);
+  assert.match(run("install", "--legacy"), /drift check \(Stop\) hook updated/);
   assert.equal(read().hooks.Stop.length, 2);
   assert.match(read().hooks.Stop[1].hooks[0].command, /^node ".*\/bin\/skel-stop\.mjs" --block$/);
   assert.doesNotMatch(read().hooks.Stop[1].hooks[0].command, /old\/clone/);
@@ -1795,7 +1795,7 @@ test("#16 on #11's install flow: uninstall removes the Stop hook (with or withou
 
   // Alone, uninstall drops the Stop key (and hooks) entirely.
   const fresh = installTarget();
-  fresh.run("install");
+  fresh.run("install", "--legacy");
   assert.equal(fresh.read().hooks.Stop.length, 1);
   fresh.run("uninstall");
   assert.deepEqual(fresh.read(), {});
@@ -2094,13 +2094,13 @@ test("NIT2: install collapses duplicate skel Stop hooks to one (keeping --block)
     { hooks: [{ type: "command", command: 'node "/x/bin/skel.mjs" stop-hook --block' }, { type: "command", command: "echo also mine" }] },
     { hooks: [{ type: "command", command: 'node "/y/bin/skel-stop.mjs"' }] },
   ] } });
-  assert.match(run("install"), /drift check \(Stop\) hook updated/);
+  assert.match(run("install", "--legacy"), /drift check \(Stop\) hook updated/);
   const stops = read().hooks.Stop;
   const ours = stops.flatMap((m) => m.hooks).filter((hk) => /skel(-stop)?\.mjs/.test(hk.command));
   assert.equal(ours.length, 1, "one skel Stop hook left");
   assert.match(ours[0].command, /^node ".*\/bin\/skel-stop\.mjs" --block$/, "current checkout, --block kept");
   assert.deepEqual(stops, [{ hooks: [ours[0]] }, mineStop, { hooks: [{ type: "command", command: "echo also mine" }] }], "the first slot is reused, the user's hooks stay, emptied entries go");
-  run("install");
+  run("install", "--legacy");
   assert.deepEqual(read().hooks.Stop, stops, "a re-run changes nothing");
   // Uninstall removes every one of ours, flags or not.
   const s = read();
@@ -2137,7 +2137,7 @@ test("NIT1/NIT4 review: a chained Stop command stays the user's; uninstall keeps
   const chained = { hooks: [{ type: "command", command: 'node "/x/bin/skel-stop.mjs" && notify-send done' }] };
   const empty = { hooks: [] };
   write({ hooks: { Stop: [chained, empty] } });
-  run("install");
+  run("install", "--legacy");
   const stops = read().hooks.Stop;
   assert.deepEqual(stops.slice(0, 2), [chained, empty], "neither rewritten nor dropped");
   assert.equal(stops.length, 3, "ours is added alongside");

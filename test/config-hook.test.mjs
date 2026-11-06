@@ -75,18 +75,18 @@ test("install/reinstall/uninstall owns only standalone ConfigChange commands", t
   const old = { matcher: "local_settings", hooks: [{ type: "command", command: 'node "/old/bin/skel-config-hook.mjs"' }, { type: "command", command: "echo shared" }] };
   fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { ConfigChange: [chained, empty, user, old] } }));
   const run = cmd => {
-    const out = spawnSync(process.execPath, [path.resolve("bin/skel.mjs"), cmd, project], { encoding: "utf8", env: { ...process.env, XDG_STATE_HOME: cfg } });
+    const out = spawnSync(process.execPath, [path.resolve("bin/skel.mjs"), ...cmd.split(" "), project], { encoding: "utf8", env: { ...process.env, XDG_STATE_HOME: cfg } });
     assert.equal(out.status, 0, out.stderr);
     return JSON.parse(fs.readFileSync(settingsPath, "utf8"));
   };
-  let settings = run("install");
+  let settings = run("install --legacy");
   assert.equal(settings.hooks.ConfigChange.length, 5);
   assert.deepEqual(settings.hooks.ConfigChange.slice(0, 3), [chained, empty, user]);
   assert.deepEqual(settings.hooks.ConfigChange[3], { ...old, hooks: [{ type: "command", command: "echo shared" }] });
   const guard = settings.hooks.ConfigChange[4];
   assert.equal(guard.matcher, "user_settings|project_settings|local_settings");
   assert.match(guard.hooks[0].command, /skel-config-hook\.mjs"$/);
-  settings = run("install");
+  settings = run("install --legacy");
   assert.equal(settings.hooks.ConfigChange.length, 5, "idempotent");
   settings = run("uninstall");
   assert.deepEqual(settings.hooks.ConfigChange, [chained, empty, user, { ...old, hooks: [{ type: "command", command: "echo shared" }] }]);
