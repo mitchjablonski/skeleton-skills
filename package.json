@@ -1,6 +1,6 @@
 {
   "name": "skeleton-skills",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Plan as code skeleton for Claude Code: review the shape in a local page, then fill one fenced step at a time.",
   "type": "module",
   "bin": { "skel": "bin/skel.mjs" },

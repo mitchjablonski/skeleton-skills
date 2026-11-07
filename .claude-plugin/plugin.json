@@ -1,6 +1,6 @@
 {
   "name": "skel",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Plan as code skeleton: review the shape in a local page, then fill one fenced step at a time behind a scope gate.",
   "author": { "name": "Mitch Jablonski" },
   "homepage": "https://github.com/mitchjablonski/skeleton-skills",
