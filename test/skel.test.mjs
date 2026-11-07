@@ -750,7 +750,7 @@ test("N5: projects in an ignored dir of a parent repo, or holding a nested repo,
   execFileSync("git", ["init", "-q", path.join(dir, "nested")]);
   fs.writeFileSync(path.join(dir, "nested", "b.ts"), "// SKEL[9] n\nthrow 'SKEL_TODO';\n// /SKEL[9]\n");
   execFileSync("node", [BIN, "init", "T"], { cwd: dir });
-  assert.match(execFileSync("node", [BIN, "status"], { cwd: dir, encoding: "utf-8" }), /0\/3 filled/);
+  assert.match(execFileSync("node", [BIN, "status"], { cwd: dir, encoding: "utf-8" }), /0\/3 done/);
 });
 
 test("N6: the hook finds the skeleton from the edited file, not just the session cwd", () => {
@@ -837,7 +837,7 @@ test("N5/R4: fences in a nested repo are found alongside the outer repo's; big i
   fs.mkdirSync(path.join(dir, "data"));
   fs.writeFileSync(path.join(dir, "data", "big.bin"), Buffer.alloc(5_000_000, 65));
   execFileSync("node", [BIN, "init", "T"], { cwd: dir });
-  assert.match(execFileSync("node", [BIN, "status"], { cwd: dir, encoding: "utf-8" }), /0\/3 filled/);
+  assert.match(execFileSync("node", [BIN, "status"], { cwd: dir, encoding: "utf-8" }), /0\/3 done/);
 });
 
 // ---- PR #1 review ----
@@ -942,7 +942,7 @@ test("PR#1 G1: the project's own git worktrees are not scanned", () => {
   execFileSync("git", ["-C", dir, "worktree", "add", "-q", ".worktrees/old"]);
   execFileSync("node", [BIN, "init", "T"], { cwd: dir });
   const status = execFileSync("node", [BIN, "status"], { cwd: dir, encoding: "utf-8" });
-  assert.match(status, /0\/2 filled/);
+  assert.match(status, /0\/2 done/);
   assert.doesNotMatch(status, /\.worktrees/);
 });
 
@@ -1154,7 +1154,7 @@ test("#15: the page shows the skeleton version, and sent or copied feedback carr
   const client = fs.readFileSync(path.join(path.dirname(BIN), "..", "lib", "review-client.js"), "utf-8");
   // The markdown and the payload themselves are lib/review-feedback.js's (test/review-feedback.test.mjs).
   assert.match(client, /const toMarkdown = \(\) => skelFeedbackMarkdown\(data, outgoing\(\)\)/);
-  assert.match(client, /const outgoing = \(\) => skelOutgoing\(draft, data\.skeletonVersion\)/);
+  assert.match(client, /const outgoing = \(\) => skelOutgoing\(draft, data\.skeletonVersion, data\.phase\)/);
   assert.match(client, /body: JSON\.stringify\(outgoing\(\)\)/);
   assert.match(client, /class: "pill version"/);
 });
@@ -1408,7 +1408,7 @@ test("installed skills' example fences are documentation, not steps (walk and gi
     assert.match(fs.readFileSync(skill, "utf-8"), /SKEL\[2\]/, "the example is there");
     run("init", "T");
     const status = run("status");
-    assert.match(status, /0\/2 filled/);
+    assert.match(status, /0\/2 done/);
     assert.match(status, /2 {5}catmull-rom between a and b/, "step 2 keeps its own title");
     assert.doesNotMatch(status, /\.claude/);
     run("approve");
@@ -1524,7 +1524,7 @@ test("review #10 (1): a tracked doc's example fences never become steps, and a s
   run("init", "T");
   run("track", ".claude/skills/x/SKILL.md");
   run("approve");
-  assert.match(run("status"), /0\/2 filled/);
+  assert.match(run("status"), /0\/2 done/);
   assert.doesNotMatch(run("status"), /\bex\b/);
   run("next");
   fs.writeFileSync(a, SRC.replace(STUB, "return raw;"));
@@ -1654,7 +1654,7 @@ test("review #10 nit 1: a tracked file the scan excludes never becomes a step af
   fs.writeFileSync(path.join(dir, "n.ts"), 'export function g() {\n  // SKEL[g] ignored helper\n  throw new Error("SKEL_TODO");\n  // /SKEL[g]\n}\n');
   run("init", "T");
   run("track", "n.ts");
-  assert.match(run("status"), /0\/2 filled/, "the scan excludes the gitignored file");
+  assert.match(run("status"), /0\/2 done/, "the scan excludes the gitignored file");
   assert.match(run("approve"), /skeleton approved: 2 steps/);
   const snap = readSnapshot(dir);
   assert.deepEqual(snap.fenced, ["src/a.ts"], "the record lists the approve-time fenced files");
@@ -1662,7 +1662,7 @@ test("review #10 nit 1: a tracked file the scan excludes never becomes a step af
   assert.ok(!snap.fences.some((f) => f.file === "n.ts"), "issue #25 (2): its fences aren't the skeleton's fences");
   assert.ok(snap.files["n.ts"].lines.includes('  throw new Error("SKEL_TODO");'), "issue #25 (2): its fence body is recorded");
   const status = run("status");
-  assert.match(status, /0\/2 filled/, "still the approve-time step count");
+  assert.match(status, /0\/2 done/, "still the approve-time step count");
   assert.doesNotMatch(status, /\bg\b.*ignored helper/);
   const state = stateOf(dir);
   assert.equal(toSteps(scanSkeleton(dir, state).fences).length, 2);
@@ -1821,7 +1821,7 @@ test("issue #23 F2: a case variant of a skipped dir is skipped on a case-folding
   run("install", dir);
   run("init", "T");
   run("approve");
-  assert.match(run("status"), /0\/2 filled/, "the scan skips .claude/");
+  assert.match(run("status"), /0\/2 done/, "the scan skips .claude/");
   const askOf = (input) => { const out = hook(input); return out ? JSON.parse(out).hookSpecificOutput : null; };
   const edit = (spelling) => ({ tool_name: "Edit", tool_input: { file_path: path.join(dir, spelling, "skills", "skeleton", "SKILL.md"), old_string: 'throw new Error("SKEL_TODO");', new_string: "return 1;" } });
   for (const spelling of [".Claude", ".CLAUDE"]) {
@@ -1842,7 +1842,7 @@ test("issue #23 F2: a real Build/ dir is code to the scan and the gate (no blind
   fs.mkdirSync(path.dirname(b));
   fs.writeFileSync(b, 'export function b() {\n  // SKEL[3] build the thing\n  throw new Error("SKEL_TODO");\n  // /SKEL[3]\n}\n');
   run("init", "T");
-  assert.match(run("status"), /0\/3 filled/, "the scan counts Build/'s fence");
+  assert.match(run("status"), /0\/3 done/, "the scan counts Build/'s fence");
   run("approve");
   run("start", "3");
   const out = hook({ tool_name: "Edit", tool_input: { file_path: b, old_string: 'throw new Error("SKEL_TODO");', new_string: "return 3;" } });

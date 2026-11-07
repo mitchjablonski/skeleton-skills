@@ -140,7 +140,7 @@ test("an unfenced edit to a source file nobody fenced stops done and finalize; s
   // Undoing it clears the report below; status doesn't run this check, and says so.
   const text = p.ok(["status"]);
   assert.doesNotMatch(text, /src\/plain\.ts/);
-  assert.match(text, /the full check of source baseline [0-9a-f]{12} runs at done\/finalize/);
+  assert.match(text, /this checked only the skeleton.s own files: new, deleted or changed files elsewhere are checked against source baseline [0-9a-f]{12} at skel done and skel finalize/);
   const json = JSON.parse(p.ok(["status", "--json"]));
   assert.equal(json.drift.ok, true);
   assert.equal(json.coverage.policy, SOURCE_POLICY);
