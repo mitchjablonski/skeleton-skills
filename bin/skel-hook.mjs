@@ -97,13 +97,22 @@ async function startupFailure(kind, cause) {
           let index = null;
           try {
             const parsed = JSON.parse(fs.readFileSync(path.join(store.dir, "receipt-roots.json"), "utf8"));
-            if (parsed?.format === 1 && parsed.records && typeof parsed.records === "object" && !Array.isArray(parsed.records)) index = parsed.records;
+            if (parsed?.format === 2 && parsed.records && typeof parsed.records === "object" && !Array.isArray(parsed.records)) index = parsed.records;
           } catch {}
           for (const name of store.listed) {
             if (!/^[0-9a-f]{24}\.snapshot\.json$/.test(name)) continue;
             const key = name.slice(0, 24);
-            const listed = index && Object.hasOwn(index, key) && (index[key] === null || typeof index[key] === "string");
-            aliasRecords.push({ key, root: listed ? index[key] : headRoot(path.join(store.dir, name)) });
+            const entry = index && Object.hasOwn(index, key) ? index[key] : null;
+            const listed = entry && typeof entry === "object" && !Array.isArray(entry)
+              && typeof entry.root === "string" && typeof entry.witness === "string"
+              && path.posix.isAbsolute(entry.witness) && hash(entry.witness) === key;
+            const root = listed ? entry.root : headRoot(path.join(store.dir, name));
+            let witness = listed ? entry.witness : null;
+            if (!listed && typeof root === "string" && path.posix.isAbsolute(root)) {
+              if (hash(root) === key) witness = root;
+              else try { const resolved = fs.realpathSync.native(root); if (hash(resolved) === key) witness = resolved; } catch {}
+            }
+            aliasRecords.push({ key, root: witness ?? root });
           }
         }
       }

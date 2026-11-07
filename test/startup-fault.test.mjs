@@ -17,7 +17,7 @@ function fixture(t, fault = null) {
   for (const dir of ["bin", "lib"]) fs.cpSync(path.join(REPO, dir), path.join(tool, dir), { recursive: true });
   fs.copyFileSync(path.join(REPO, "package.json"), path.join(tool, "package.json"));
   if (fault) fs.writeFileSync(path.join(tool, "lib", fault), 'throw new Error("injected startup import failure");');
-  const env = { ...process.env, CLAUDE_PROJECT_DIR: root, HOME: path.join(base, "home"), USERPROFILE: path.join(base, "home"), XDG_CONFIG_HOME: path.join(base, "config"), XDG_STATE_HOME: path.join(base, "state"), LOCALAPPDATA: path.join(base, "local") };
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: root, HOME: path.join(base, "home"), USERPROFILE: path.join(base, "home"), XDG_CONFIG_HOME: path.join(base, "config"), XDG_STATE_HOME: path.join(base, "state"), LOCALAPPDATA: path.join(base, "local"), CLAUDE_CONFIG_DIR: path.join(base, "claude") };
   const writeState = (phase, target = root) => {
     fs.mkdirSync(path.join(target, ".skeleton"), { recursive: true });
     fs.writeFileSync(path.join(target, ".skeleton/state.json"), JSON.stringify({ title: "startup test", phase, gate: "ask", files: [], activeStep: "1", reviewEpoch: 1 }));
@@ -349,4 +349,102 @@ test("#55: a record unreadable when the index was built still protects through t
   const variant = flipBelow(path.dirname(f.base), f.root);
   assert.equal(f.run("PreToolUse", edit("a.js"), variant, { CLAUDE_PROJECT_DIR: variant }).decision, "deny");
   assert.equal(f.run("ConfigChange", { source: "local_settings" }, variant, { CLAUDE_PROJECT_DIR: variant }).decision, "block");
+});
+
+// #63: use real approval and the public writer; fault only the derived index.
+test("#63: same-key caller rewrites and rootless repairs remain protective after index refresh fails", { ...DRVFS, timeout: 120000 }, t => {
+  const f = fixture(t);
+  const cli = (...args) => {
+    const r = spawnSync(process.execPath, [path.join(f.tool, "bin/skel.mjs"), ...args], { cwd: f.root, env: f.env, encoding: "utf8", timeout: 60000 });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  cli("init", "index witness");
+  fs.writeFileSync(path.join(f.root, "a.js"), "// SKEL[1] a\nlet a=1;\n// /SKEL[1]\n");
+  cli("approve");
+  const link = path.join(f.base, "caller-link");
+  fs.symlinkSync(f.root, link);
+  const setup = (rootless = false) => {
+    const code = `import fs from 'node:fs';
+      const s = await import(${JSON.stringify(pathToFileURL(path.join(f.tool, "lib/state.mjs")).href)});
+      const p = await import(${JSON.stringify(pathToFileURL(path.join(f.tool, "lib/snapshot.mjs")).href)});
+      const root = ${JSON.stringify(f.root)}, alias = ${JSON.stringify(link)};
+      const snap = p.readFullSnapshot(root), state = JSON.parse(fs.readFileSync(root + '/.skeleton/state.json'));
+      const write = dir => p.writeSnapshot(dir, state, snap.fenced, snap, snap.review, snap.coverage);
+      if (${rootless}) {
+        fs.writeFileSync(p.snapshotPath(root), '{}');
+        s.refreshReceiptIndex({force:true});
+      } else write(alias);
+      const index = p.snapshotPath(root).replace(/[^/]+$/, 'receipt-roots.json');
+      const old = fs.readFileSync(index, 'utf8'), rename = fs.renameSync; let faults = 0;
+      fs.renameSync = function(a,b) { if (b === index) { faults++; throw Object.assign(new Error('index-only busy'), {code:'EBUSY'}); } return rename.call(this,a,b); };
+      try { write(root); } finally { fs.renameSync = rename; }
+      if(faults !== 1) throw new Error('expected one index rename failure');
+      if(fs.readFileSync(index,'utf8') !== old) throw new Error('index changed despite failure');
+      process.stdout.write(JSON.stringify({sameKey:s.projectKey(alias)===s.projectKey(root)}));`;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { env: f.env, encoding: "utf8", timeout: 60000 });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(JSON.parse(r.stdout).sameKey, true);
+  };
+  setup();
+  const healthyState = fs.readFileSync(path.join(f.root, ".skeleton/state.json"));
+  const variant = flipBelow(path.dirname(f.base), f.root);
+  const check = label => {
+    fs.rmSync(path.join(f.root, ".skeleton"), {recursive:true, force:true});
+    const extra = {CLAUDE_PROJECT_DIR:variant};
+    assert.equal(f.run("PreToolUse", edit("a.js"), variant, extra).decision, "deny", label);
+    assert.equal(f.run("ConfigChange", {source:"local_settings"}, variant, extra).decision, "block", label);
+  };
+  check("resolved witness survives stale caller root");
+  const stateModule = path.join(f.tool,"lib/state.mjs");
+  const stateSource = fs.readFileSync(stateModule);
+  fs.writeFileSync(stateModule,'throw new Error("injected import failure");');
+  check("faulted launchers honor the stale-index resolved witness");
+  fs.writeFileSync(stateModule,stateSource);
+  // Simulate an older writer: rewrite just the snapshot without touching the index.
+  const snapFile = path.join(f.env.XDG_STATE_HOME,"skel",projectKey(f.root)+".snapshot.json");
+  const current = JSON.parse(fs.readFileSync(snapFile));
+  current.root = link; fs.writeFileSync(snapFile, JSON.stringify(current));
+  check("old writer may change caller root without invalidating the witness");
+  // Keep the real approved bytes, and exercise the formerly cached-negative case.
+  fs.mkdirSync(path.join(f.root,".skeleton"));
+  fs.writeFileSync(path.join(f.root,".skeleton/state.json"),healthyState);
+  fs.writeFileSync(snapFile, JSON.stringify({...current,root:f.root}));
+  setup(true);
+  check("rootless repair is read from its head");
+  fs.writeFileSync(path.join(f.tool,"lib/state.mjs"),'throw new Error("injected import failure");');
+  check("faulted launchers read repaired uncached receipt");
+  fs.writeFileSync(stateModule, stateSource);
+  // A deleted direct root still supplies a hash preimage. Cache that positive
+  // witness, without opening its receipt on every unrelated project's hook.
+  fs.rmSync(f.root, { recursive: true });
+  const other = path.join(f.base, "other");
+  fs.mkdirSync(other);
+  const probe = `import fs from 'node:fs';
+    const s = await import(${JSON.stringify(pathToFileURL(path.join(f.tool, "lib/state.mjs")).href)});
+    const root = ${JSON.stringify(f.root)}, key = s.projectKey(root);
+    const index = s.storePath(root, '.snapshot').replace(/[^/]+$/, 'receipt-roots.json');
+    fs.rmSync(index); s.refreshReceiptIndex();
+    const entry = JSON.parse(fs.readFileSync(index)).records[key];
+    let opened = 0; const open = fs.openSync;
+    fs.openSync = function(p,...args) { if(String(p).endsWith('.snapshot.json')) opened++; return open.call(this,p,...args); };
+    const unrelated = s.approvalReceiptStatus(${JSON.stringify(other)});
+    process.stdout.write(JSON.stringify({entry, opened, unrelated}));`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", probe], { env: f.env, encoding: "utf8", timeout: 60000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { entry: { root: f.root, witness: f.root }, opened: 0, unrelated: "absent" });
+  fs.mkdirSync(f.root);
+  check("recreated path follows the existing stale-positive receipt policy");
+  fs.writeFileSync(stateModule, 'throw new Error("injected import failure");');
+  check("faulted launchers also protect a recreated path");
+  // A witness is not authority to enroll a different target after retargeting.
+  fs.rmSync(f.root, { recursive: true });
+  fs.symlinkSync(other, f.root);
+  for (const broken of [false, true]) {
+    fs.writeFileSync(stateModule, broken ? 'throw new Error("injected import failure");' : stateSource);
+    for (const [entry, input] of [["skel-hook.mjs", edit("a.js")], ["skel-config-hook.mjs", { source: "local_settings" }]]) {
+      const r = spawnSync(process.execPath, [path.join(f.tool, "bin", entry)], { cwd: variant, env: { ...f.env, CLAUDE_PROJECT_DIR: variant }, input: JSON.stringify({ cwd: variant, ...input }), encoding: "utf8", timeout: 15000 });
+      assert.equal(r.status, broken ? 1 : 0, r.stderr);
+      assert.equal(r.stdout, "", "retargeted B has no receipt: no global false enrollment");
+    }
+  }
 });
