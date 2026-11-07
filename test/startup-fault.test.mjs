@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { projectKey } from "../lib/state.mjs";
+import crypto from "node:crypto";
+import { drvfsMountOf, projectKey } from "../lib/state.mjs";
 const REPO = fileURLToPath(new URL("../", import.meta.url));
 const edit = file => ({ tool_name: "Edit", tool_input: { file_path: file, old_string: "const n = 1;", new_string: "const n = 2;" } });
 function fixture(t, fault = null) {
@@ -271,4 +272,66 @@ test("fallback never allows where the implementation's failure path protects", {
     }
   }));
   assert.deepEqual(failures.slice(0, 20), [], `${failures.length}/${scenarios.length} protected scenarios allowed by the fallback`);
+});
+
+// #55: the fallback's alias lookup, against the healthy launchers, on WSL's drvfs.
+const flipBelow = (base, p) => base + [...p.slice(base.length)].map(c => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase())).join("");
+const sha24 = s => crypto.createHash("sha256").update(s).digest("hex").slice(0, 24);
+const onDrvfs = (() => {
+  if (process.platform !== "linux") return false;
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "skel-fold-")));
+  try { return !!drvfsMountOf(d) && fs.statSync(flipBelow(path.dirname(d), d), { throwIfNoEntry: false })?.ino === fs.statSync(d).ino; }
+  finally { fs.rmSync(d, { recursive: true, force: true }); }
+})();
+const DRVFS = { skip: !onDrvfs && "needs WSL's drvfs (/mnt/c) as the temp dir: TMPDIR=/mnt/c/..." };
+/** A record as skel writes one from `dir`, optionally listed in the store's receipt index. */
+function aliasRecord(f, dir, { root = dir, key = sha24(fs.realpathSync.native(dir)), index = false } = {}) {
+  const store = path.join(f.env.XDG_STATE_HOME, "skel");
+  fs.mkdirSync(store, { recursive: true });
+  fs.writeFileSync(path.join(store, `${key}.snapshot.json`), JSON.stringify({ root, format: 3 }));
+  if (index) {
+    const file = path.join(store, "receipt-roots.json");
+    let records = {};
+    try { records = JSON.parse(fs.readFileSync(file, "utf8")).records; } catch {}
+    fs.writeFileSync(file, JSON.stringify({ format: 1, records: { ...records, [key]: root } }));
+  }
+}
+test("#55: state.mjs faulted, .skeleton missing, a case-variant cwd: the fallback still denies", DRVFS, t => {
+  for (const index of [false, true]) {
+    const f = fixture(t, "state.mjs");
+    aliasRecord(f, f.root, { index });
+    const variant = flipBelow(path.dirname(f.base), f.root);
+    const env = { CLAUDE_PROJECT_DIR: variant };
+    assert.equal(f.run("PreToolUse", edit("a.js"), variant, env).decision, "deny", `index ${index}`);
+    assert.equal(f.run("ConfigChange", { source: "local_settings" }, variant, env).decision, "block", `index ${index}`);
+    assert.equal(f.run("PreToolUse", edit("a.js")).decision, "deny", "the exact spelling, as before");
+  }
+});
+test("#55: fallback alias decisions match the healthy launchers (never less protective)", { ...DRVFS, timeout: 300000 }, t => {
+  const layouts = {
+    "case variant": (f) => { aliasRecord(f, f.root); return flipBelow(path.dirname(f.base), f.root); },
+    "third spelling": (f) => { const mixed = path.join(f.base, "MiXeD"); fs.mkdirSync(mixed); aliasRecord(f, mixed); return path.join(f.base, "mIxEd"); },
+    "8.3 name": (f) => { const long = path.join(f.base, "LongProjectName"); fs.mkdirSync(long); const short = path.join(f.base, "LONGPR~1"); if (!fs.existsSync(short)) return null; aliasRecord(f, short); return long; },
+    "retargeted": (f) => { aliasRecord(f, f.root, { root: flipBelow(path.dirname(f.base), f.root), key: sha24("elsewhere") }); return f.root; },
+    "unrelated": (f) => { aliasRecord(f, f.root, { root: path.join(f.base, "other"), key: sha24("other") }); return f.root; },
+    "8.3-looking wildcard": (f) => { aliasRecord(f, f.root, { root: path.join(f.base, "BACKUP~1"), key: sha24("b") }); return f.root; },
+  };
+  for (const [name, layout] of Object.entries(layouts)) {
+    for (const index of [false, true]) {
+      const decisions = {};
+      for (const fault of [null, "state.mjs"]) {
+        const f = fixture(t, fault);
+        const cwd = layout(f);
+        if (!cwd) { t.diagnostic(`${name}: not available on this volume`); break; }
+        if (index) { const store = path.join(f.env.XDG_STATE_HOME, "skel"); const records = {}; for (const n of fs.readdirSync(store)) if (n.endsWith(".snapshot.json")) records[n.slice(0, 24)] = JSON.parse(fs.readFileSync(path.join(store, n), "utf8")).root; fs.writeFileSync(path.join(store, "receipt-roots.json"), JSON.stringify({ format: 1, records })); }
+        fs.mkdirSync(cwd, { recursive: true });
+        const env = { CLAUDE_PROJECT_DIR: cwd };
+        decisions[fault ?? "healthy"] = [f.run("PreToolUse", edit("a.js"), cwd, env).decision, f.run("ConfigChange", { source: "local_settings" }, cwd, env).decision];
+      }
+      if (!decisions.healthy) continue;
+      const expected = ["retargeted", "unrelated", "8.3-looking wildcard"].includes(name) ? [null, null] : ["deny", "block"];
+      assert.deepEqual(decisions.healthy, expected, `healthy: ${name}, index ${index}`);
+      assert.deepEqual(decisions["state.mjs"], decisions.healthy, `${name}, index ${index}`);
+    }
+  }
 });

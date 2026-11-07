@@ -352,7 +352,7 @@ test("#55: a case-variant session path finds the record and denies with the stat
     }
     assert.equal(f.config(cwd), "block", `ConfigChange from ${cwd}`);
   }
-  assert.deepEqual(f.aliases(f.variant), { verified: [file], unverified: [] });
+  assert.deepEqual(f.aliases(f.variant), { verified: [file], unverified: [], unindexed: 1 });
   const notice = inEnv(f, `import { storeNotice } from ${JSON.stringify(new URL("../lib/store-notice.mjs", import.meta.url).href)}; process.stdout.write(JSON.stringify(await storeNotice(${JSON.stringify(f.variant)})))`);
   assert.match(notice, /written from another spelling of its path/, "skel status says the CLI needs the approved spelling");
   // A third spelling finds it too, and the record written from the variant is found from the original.
@@ -371,7 +371,7 @@ test("#55: a record written under any earlier spelling is found from any other, 
   fs.mkdirSync(path.join(mixed, "src"), { recursive: true });
   const file = f.approve(mixed); // keyed by that spelling, as skel before #55 wrote it
   const query = path.join(f.home, "lEgAcYmIxEd", "pRoJeCtMiXeD");
-  assert.deepEqual(f.aliases(query), { verified: [file], unverified: [] }, "neither the query spelling nor its lowercase is the written one");
+  assert.deepEqual(f.aliases(query), { verified: [file], unverified: [], unindexed: 1 }, "neither the query spelling nor its lowercase is the written one");
   assert.equal(f.hook(edit(path.join(query, "src", "a.js")), query).decision, "deny");
   assert.equal(f.config(query), "block");
 });
@@ -403,7 +403,7 @@ test("#55: a lookalike record that can't be proven is reported, not counted", DR
   const { verified, unverified } = f.aliases(f.project);
   assert.deepEqual(verified, []);
   assert.deepEqual(unverified.map(u => u.file).sort(), [moved].sort(), "the gone path isn't a lookalike of this one");
-  assert.match(unverified[0].why, /resolves to .* now, which isn't where the record was written/);
+  assert.match(unverified[0].why, /resolves to ".*" now, not to the path the record was written for/);
   for (const cwd of [f.project, f.variant]) assert.equal(f.hook(edit(path.join(cwd, "src", "a.js")), cwd).decision, null, `not enrolled from ${cwd}`);
   assert.equal(f.config(f.project), null);
   const notice = inEnv(f, `import { storeNotice } from ${JSON.stringify(new URL("../lib/store-notice.mjs", import.meta.url).href)}; process.stdout.write(JSON.stringify(await storeNotice(${JSON.stringify(f.project)})))`);
@@ -421,7 +421,7 @@ test("#55: a case-sensitive sibling isn't the project, and an 8.3 alias is", DRV
   if (/is enabled/.test(set?.stdout ?? "") && !fs.existsSync(path.join(cs, "SUB"))) {
     fs.mkdirSync(path.join(cs, "sub"));
     const file = f.approve(path.join(cs, "Sub"));
-    assert.deepEqual(f.aliases(path.join(cs, "sub")), { verified: [], unverified: [] }, "sub beside Sub is another dir");
+    assert.deepEqual(f.aliases(path.join(cs, "sub")), { verified: [], unverified: [], unindexed: 1 }, "sub beside Sub is another dir");
     assert.deepEqual(f.aliases(path.join(flipBelow(path.dirname(f.home), cs), "Sub")).verified, [file], "Sub through a variant of the dirs above it is Sub");
     fs.rmSync(file);
   } else t.diagnostic("couldn't enable per-directory case sensitivity here");
@@ -450,10 +450,66 @@ test("#55: off drvfs, the fallback does nothing and keys are unchanged", async (
   try {
     const real = fs.realpathSync.native(dir);
     assert.equal(projectKey(dir, "win32"), sha24(real.toLowerCase()), "Windows: the lowercased realpath");
-    assert.deepEqual(receiptAliases(dir, { platform: "win32" }), { verified: [], unverified: [] });
+    assert.deepEqual(receiptAliases(dir, { platform: "win32" }), { verified: [], unverified: [], unindexed: 0 });
     if (process.platform === "linux" && !drvfsMountOf(real)) {
       assert.equal(projectKey(dir), sha24(real), "ext4: the realpath as is");
-      assert.deepEqual(receiptAliases(dir), { verified: [], unverified: [] }, "ext4: case-sensitive, no fallback");
+      assert.deepEqual(receiptAliases(dir), { verified: [], unverified: [], unindexed: 0 }, "ext4: case-sensitive, no fallback");
     }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+const STOP = fileURLToPath(new URL("../bin/skel-stop.mjs", import.meta.url));
+test("#55: the receipt index stands in for record heads, and a record it doesn't list is still read", DRVFS, t => {
+  const f = caseFixture(t);
+  for (let i = 0; i < 20; i++) f.approve(f.project, { root: path.join(f.home, `other-${i}`), key: sha24(`other-${i}`) });
+  const file = f.approve(f.project);
+  const refresh = () => inEnv(f, `import { refreshReceiptIndex } from ${JSON.stringify(STATE)}; process.stdout.write(JSON.stringify(refreshReceiptIndex()))`);
+  assert.equal(refresh(), 1, "the state dir's index written");
+  assert.equal(refresh(), 0, "and current: nothing to do");
+  const index = JSON.parse(fs.readFileSync(path.join(f.store, "receipt-roots.json"), "utf8"));
+  assert.equal(index.records[path.basename(file).slice(0, 24)], f.project);
+  // How many record files a lookup opens, and what it finds.
+  const probe = (dir) => inEnv(f, `import fs from "node:fs"; let opened = 0; const o = fs.openSync; fs.openSync = function (p, ...a) { if (String(p).endsWith(".snapshot.json")) opened++; return o.call(this, p, ...a); }; const { approvalReceiptStatus } = await import(${JSON.stringify(STATE)}); process.stdout.write(JSON.stringify([approvalReceiptStatus(${JSON.stringify(dir)}), opened]))`);
+  assert.deepEqual(probe(f.variant), ["present", 0], "found through the index, no record opened");
+  // A record written without the index (an older skel): read from its own head.
+  fs.rmSync(file);
+  refresh();
+  f.approve(f.variant);
+  assert.deepEqual(probe(f.project), ["present", 1], "the unlisted record's head is read");
+  // An index that can't be read, or names the wrong root for a record: unreadable falls back; a wrong root is the store's own data.
+  fs.writeFileSync(path.join(f.store, "receipt-roots.json"), "{");
+  assert.deepEqual(probe(f.project), ["present", 21], "unreadable index: every head");
+  assert.equal(f.hook(edit(path.join(f.project, "src", "a.js"))).decision, "deny");
+});
+
+test("#55: an 8.3-looking name isn't a wildcard", DRVFS, t => {
+  const f = caseFixture(t);
+  for (let i = 0; i < 20; i++) f.approve(f.project, { root: path.join(f.home, `other-${i}`), key: sha24(`other-${i}`) });
+  f.approve(f.project, { root: path.join(f.home, "BACKUP~1"), key: sha24("b") });
+  const dir = path.join(f.home, "backup~1");
+  fs.mkdirSync(dir);
+  const { verified, unverified } = f.aliases(dir);
+  assert.deepEqual([verified, unverified.map(u => u.root)], [[], [path.join(f.home, "BACKUP~1")]], "only the record whose root is that name (case aside), not every sibling");
+  assert.deepEqual(f.aliases(path.join(f.home, "other-3")).unverified, [], "nor does `backup~1` look like other-3");
+});
+
+test("#55: a deleted .skeleton with an unprovable lookalike is reported by status and, once a session, Stop", DRVFS, t => {
+  const f = caseFixture(t);
+  const planted = flipBelow(path.dirname(f.home), f.project) + '"\n\u001b[31m';
+  f.approve(f.project, { root: f.variant, key: sha24("elsewhere") });
+  const status = spawnSync(process.execPath, [BIN, "status"], { cwd: f.project, env: { ...f.env, CLAUDE_PROJECT_DIR: f.project }, encoding: "utf8", timeout: 60_000 });
+  assert.notEqual(status.status, 0);
+  assert.match(status.stderr, /can't be proven to be it/);
+  assert.match(status.stderr, /no \.skeleton\/state\.json here or above/);
+  const stop = (session) => spawnSync(process.execPath, [STOP], { cwd: f.project, env: { ...f.env, CLAUDE_PROJECT_DIR: f.project }, input: JSON.stringify({ cwd: f.project, session_id: session, stop_hook_active: false }), encoding: "utf8", timeout: 60_000 });
+  const first = stop("s1");
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(JSON.parse(first.stdout).systemMessage, /can't be proven to be it/);
+  assert.equal(stop("s1").stdout, "", "once a session");
+  assert.match(JSON.parse(stop("s2").stdout).systemMessage, /can't be proven/, "and again in the next");
+  // A root is quoted, never shown raw.
+  fs.rmSync(f.store, { recursive: true }); fs.mkdirSync(f.store);
+  f.approve(f.project, { root: planted, key: sha24("elsewhere") });
+  const notice = inEnv(f, `import { aliasNotice } from ${JSON.stringify(new URL("../lib/store-notice.mjs", import.meta.url).href)}; process.stdout.write(JSON.stringify(aliasNotice(${JSON.stringify(f.project)}) ?? ""))`);
+  assert.ok(!notice.includes("\u001b") && !notice.includes("\n"), "control characters escaped");
 });
