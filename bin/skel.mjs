@@ -16,7 +16,7 @@ import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { PLUGIN_ID, claudeConfigDir, hasLegacyHooks, installStatus, isSkelConfigHook, isSkelHook, pluginEvidence, pluginStatus, registrationNotice, rulePath, skelStopHook } from "../lib/install-status.mjs";
 import { isLegacyCopy, renderLegacy } from "../lib/legacy-copy.mjs";
 import { enrollment } from "../lib/config-hook.mjs";
-import { SHELL_CSP, buildReviewData, clientScript, finalizedRecord, pagePayload, readDiagrams, renderShell, writeReview } from "../lib/review.mjs";
+import { SHELL_CSP, buildReviewData, clientScript, finalizedRecord, loadEscapeCheck, pagePayload, readDiagrams, renderShell, windowsReviewPath, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
@@ -912,11 +912,14 @@ const commands = {
     }
   },
 
-  review() {
+  async review() {
     const root = requireRoot();
-    const out = writeReview(root, requireState(root));
+    const out = writeReview(root, requireState(root), await loadEscapeCheck());
     console.log(out);
     console.log(`file://${out}`);
+    // On WSL a Windows browser can't open /tmp/... or file:///mnt/c/...
+    const win = windowsReviewPath(out);
+    if (win) console.log(`from Windows: ${win}`);
   },
 
   async serve(args) {
@@ -978,6 +981,7 @@ const commands = {
     // seconds). It runs every 30s while a page is polling, and on a page load
     // once the last one is >5s old.
     const cache = new Map();
+    const escapeCheck = await loadEscapeCheck();
     let known = scanRepo(root, cache).files.map((f) => path.join(root, f));
     let searching = false;
     let lastSearch = Date.now();
@@ -1014,7 +1018,7 @@ const commands = {
       // them (pollTracked); buildReviewData reads the others' text itself.
       // Keep watching files that have fences or malformed markers until the
       // next search.
-      const { record, ...data } = buildReviewData(root, state, cache, [...new Set([...known, ...pollTracked(state)])]);
+      const { record, ...data } = buildReviewData(root, state, cache, [...new Set([...known, ...pollTracked(state)])], escapeCheck);
       const watched = [...data.steps.flatMap((st) => st.locations.map((l) => l.file)), ...data.errored];
       known = [...new Set([...known, ...watched.map((f) => path.join(root, f))])];
       const { generatedAt, errored, ...stable } = data;

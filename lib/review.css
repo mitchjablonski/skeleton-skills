@@ -78,7 +78,7 @@ textarea { font: inherit; color: inherit; }
   background: var(--surface-2); color: var(--muted); border: 1px solid var(--border);
 }
 .pill.fill { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
-.pill.version { font-family: var(--mono); }
+.pill.version { font-family: var(--sans); }
 .pill.version.stale { background: var(--todo-soft); color: var(--todo-ink); border-color: var(--todo); }
 .progress { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; margin-left: auto; }
 .bar { width: 140px; height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
@@ -250,3 +250,21 @@ tbody.chunk { content-visibility: auto; contain-intrinsic-size: auto 3200px; }
 .finalized-text { margin: 0 0 4px; font-size: 14px; color: var(--text); }
 .from-skeleton { border: 1px dashed var(--border); border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 .from-skeleton .earlier { font-size: 13px; }
+
+/* #68 P7: the sticky header's alert row (expired link, server not answering). */
+.top-alert { flex-basis: 100%; font-size: 13px; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--todo); background: var(--todo-soft); color: var(--text); }
+.top-alert:empty { display: none; }
+/* #68 P15: wrap long lines (the toggle in the header). */
+.pill.toggle { cursor: pointer; font: 12px var(--sans); }
+.pill.toggle[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+body.wrap .src { white-space: pre-wrap; overflow-wrap: anywhere; }
+.generated { white-space: nowrap; }
+/* #68 P4, P11: a step's other fences, and a fill that may leave its block. */
+.splaces { display: block; margin-top: 2px; }
+.splace { display: block; font-size: 11px; color: var(--muted); font-family: var(--mono); overflow-wrap: anywhere; }
+.step-warn { margin: 2px 8px 6px 30px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--todo); background: var(--todo-soft); color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+.step-warn strong { color: var(--todo-ink); }
+/* #68 P6: what the last Send carried. */
+.last-sent { font-size: 12px; color: var(--muted); }
+.last-sent summary { cursor: pointer; color: var(--text); }
+.last-sent pre { margin: 6px 0 0; padding: 6px 8px; max-height: 240px; overflow: auto; white-space: pre-wrap; background: var(--surface-2); color: var(--text); border-radius: 6px; font: 11.5px/1.45 var(--mono); }
