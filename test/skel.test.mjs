@@ -1152,8 +1152,10 @@ test("#15: the page shows the skeleton version, and sent or copied feedback carr
   }
   // The page's Copy markdown and its Send payload name the version (browser code; checked at the source).
   const client = fs.readFileSync(path.join(path.dirname(BIN), "..", "lib", "review-client.js"), "utf-8");
-  assert.match(client, /`Reviewed skeleton version: \$\{data\.skeletonVersion\} \(approve with: skel approve --reviewed \$\{data\.skeletonVersion\}\)`/);
-  assert.match(client, /comments: outgoing\(\), version: data\.skeletonVersion/);
+  // The markdown and the payload themselves are lib/review-feedback.js's (test/review-feedback.test.mjs).
+  assert.match(client, /const toMarkdown = \(\) => skelFeedbackMarkdown\(data, outgoing\(\)\)/);
+  assert.match(client, /const outgoing = \(\) => skelOutgoing\(draft, data\.skeletonVersion\)/);
+  assert.match(client, /body: JSON\.stringify\(outgoing\(\)\)/);
   assert.match(client, /class: "pill version"/);
 });
 

@@ -1142,7 +1142,7 @@ const commands = {
     }
     if (taken.status === "ok") {
       const state = requireState(root);
-      console.log(feedbackMarkdown(state.title, mergeRecords(taken.records, state.reviewRound ?? null)));
+      console.log(feedbackMarkdown(state.title, mergeRecords(taken.records, state.reviewRound ?? null), state.phase));
     }
     else if (readonly) console.log("READ_ONLY: the review is read-only; the human's feedback arrives as a chat message. Wait for it; don't poll. Only if the human asks for direct Send: skel serve --send.");
     else if (noServer) console.log("NO_SERVER: no review server is running (a static review, or it stopped), so nothing can be sent; the human's feedback arrives as a chat message. Wait for it; don't poll.");
