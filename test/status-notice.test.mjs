@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -205,6 +206,7 @@ test("an approval record protects a skeleton link redirected to a regular file",
 
 // #44: the approval-record lookup once any project on the machine has a record.
 const HOOK = fileURLToPath(new URL("../bin/skel-hook.mjs", import.meta.url));
+const BIN = fileURLToPath(new URL("../bin/skel.mjs", import.meta.url));
 function receiptFixture(t) {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "skel-receipts-")));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -295,4 +297,163 @@ test("#44: a project reached through a symlink still finds its record", t => {
   assert.equal(status(path.join(f.home, "elsewhere"), f.home), "absent", "an unrelated path isn't enrolled");
   // And the hook, run from the link with .skeleton deleted, denies.
   assert.equal(f.hook(edit(path.join(link, "src", "a.js")), link).decision, "deny", "hook from the link");
+});
+
+// #55: on WSL's drvfs (/mnt/c) realpath keeps the caller's spelling, so a case
+// variant or 8.3 alias of a project's path hashes to another record name.
+const STATE = new URL("../lib/state.mjs", import.meta.url).href;
+const CONFIG_HOOK = fileURLToPath(new URL("../bin/skel-config-hook.mjs", import.meta.url));
+/** Run module code in the fixture's environment; it writes JSON. */
+function inEnv(f, code) {
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { env: f.env, encoding: "utf8", timeout: 60_000 });
+  assert.equal(r.status, 0, r.stderr);
+  return JSON.parse(r.stdout);
+}
+/** `p` with the case of every letter below `base` flipped. */
+const flipBelow = (base, p) => base + [...p.slice(base.length)].map(c => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase())).join("");
+const sha24 = (s) => crypto.createHash("sha256").update(s).digest("hex").slice(0, 24);
+/** Is the temp dir on WSL's drvfs, folding case? */
+const onDrvfs = await (async () => {
+  if (process.platform !== "linux") return false;
+  const { drvfsMountOf } = await import("../lib/state.mjs");
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "skel-fold-")));
+  try {
+    const v = flipBelow(path.dirname(d), d);
+    return !!drvfsMountOf(d) && fs.statSync(v, { throwIfNoEntry: false })?.ino === fs.statSync(d).ino;
+  } finally { fs.rmSync(d, { recursive: true, force: true }); }
+})();
+const DRVFS = { skip: !onDrvfs && "needs WSL's drvfs (/mnt/c) as the temp dir: TMPDIR=/mnt/c/..." };
+function caseFixture(t) {
+  const f = receiptFixture(t);
+  const variant = flipBelow(path.dirname(f.home), f.project);
+  /** An approval record as skel writes one from `dir`: keyed by its realpath as spelled, naming `dir`. */
+  const approve = (dir, { root = dir, key = sha24(fs.realpathSync.native(dir)) } = {}) => {
+    const file = path.join(f.store, `${key}.snapshot.json`);
+    fs.writeFileSync(file, JSON.stringify({ root, format: 3, approvedAt: 1 }));
+    return file;
+  };
+  const config = (cwd) => {
+    const r = spawnSync(process.execPath, [CONFIG_HOOK], { cwd, env: { ...f.env, CLAUDE_PROJECT_DIR: cwd }, input: JSON.stringify({ cwd, source: "user_settings" }), encoding: "utf8", timeout: 60_000 });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout ? JSON.parse(r.stdout).decision : null;
+  };
+  const aliases = (dir) => inEnv(f, `import { receiptAliases } from ${JSON.stringify(STATE)}; process.stdout.write(JSON.stringify(receiptAliases(${JSON.stringify(dir)})))`);
+  return { ...f, variant, approve, config, aliases };
+}
+
+test("#55: a case-variant session path finds the record and denies with the state deleted", DRVFS, t => {
+  const f = caseFixture(t);
+  const file = f.approve(f.project);
+  for (const cwd of [f.project, f.variant]) {
+    for (const input of [edit(path.join(cwd, "src", "a.js")), { tool_name: "Bash", tool_input: { command: "ls" } }]) {
+      const r = f.hook(input, cwd);
+      assert.equal(r.decision, "deny", `${input.tool_name} from ${cwd}`);
+      assert.match(r.stderr, /approval record exists but \.skeleton is missing/);
+    }
+    assert.equal(f.config(cwd), "block", `ConfigChange from ${cwd}`);
+  }
+  assert.deepEqual(f.aliases(f.variant), { verified: [file], unverified: [] });
+  const notice = inEnv(f, `import { storeNotice } from ${JSON.stringify(new URL("../lib/store-notice.mjs", import.meta.url).href)}; process.stdout.write(JSON.stringify(await storeNotice(${JSON.stringify(f.variant)})))`);
+  assert.match(notice, /written from another spelling of its path/, "skel status says the CLI needs the approved spelling");
+  // A third spelling finds it too, and the record written from the variant is found from the original.
+  assert.equal(f.hook(edit(path.join(f.project, "src", "a.js")), flipBelow(f.home, f.project)).decision, "deny", "a third spelling");
+  fs.rmSync(file);
+  f.approve(f.variant);
+  assert.equal(f.hook(edit(path.join(f.project, "src", "a.js"))).decision, "deny", "written from the variant, read from the original");
+  // Lookup only: what skel writes, and where, is unchanged.
+  const keys = inEnv(f, `import { projectKey } from ${JSON.stringify(STATE)}; process.stdout.write(JSON.stringify([projectKey(${JSON.stringify(f.project)}), projectKey(${JSON.stringify(f.variant)})]))`);
+  assert.deepEqual(keys, [sha24(f.project), sha24(f.variant)], "keys are still the realpath as spelled");
+});
+
+test("#55: a record written under any earlier spelling is found from any other, by its resolved root", DRVFS, t => {
+  const f = caseFixture(t);
+  const mixed = path.join(f.home, "LegacyMiXeD", "ProjectMiXeD");
+  fs.mkdirSync(path.join(mixed, "src"), { recursive: true });
+  const file = f.approve(mixed); // keyed by that spelling, as skel before #55 wrote it
+  const query = path.join(f.home, "lEgAcYmIxEd", "pRoJeCtMiXeD");
+  assert.deepEqual(f.aliases(query), { verified: [file], unverified: [] }, "neither the query spelling nor its lowercase is the written one");
+  assert.equal(f.hook(edit(path.join(query, "src", "a.js")), query).decision, "deny");
+  assert.equal(f.config(query), "block");
+});
+
+test("#55: a record written through a link since replaced doesn't carry over", DRVFS, t => {
+  const f = caseFixture(t);
+  const target = path.join(f.home, "target");
+  fs.mkdirSync(target);
+  const p = path.join(f.home, "Proj");
+  try { fs.symlinkSync(target, p); } catch (err) { return t.skip(`no symlinks here (${err.code})`); }
+  // Approved through the link (from a variant spelling of it): keyed by the target's realpath, naming the link.
+  const file = f.approve(p, { root: flipBelow(f.home, p) });
+  assert.equal(path.basename(file, ".snapshot.json"), sha24(fs.realpathSync.native(target)));
+  fs.rmSync(p);
+  fs.mkdirSync(path.join(p, "src"), { recursive: true }); // a real dir at the link's path now
+  const { verified, unverified } = f.aliases(p);
+  assert.deepEqual(verified, []);
+  assert.deepEqual(unverified.map(u => u.file), [file]);
+  assert.equal(f.hook(edit(path.join(p, "src", "a.js")), p).decision, null, "not enrolled: the record was the target's");
+});
+
+test("#55: a lookalike record that can't be proven is reported, not counted", DRVFS, t => {
+  const f = caseFixture(t);
+  // Its root, resolved now, doesn't hash to its name: written when that path led elsewhere (a link since retargeted, a dir replaced).
+  const moved = f.approve(f.project, { root: f.variant, key: sha24(path.join(f.home, "elsewhere")) });
+  // Another project, named like this one's but not a lookalike.
+  f.approve(f.project, { root: path.join(flipBelow(path.dirname(f.home), f.home), "PROJECT-gone"), key: sha24("x") });
+  fs.writeFileSync(path.join(f.store, `${sha24("y")}.snapshot.json`), "not json"); // no root: as good as another project's
+  const { verified, unverified } = f.aliases(f.project);
+  assert.deepEqual(verified, []);
+  assert.deepEqual(unverified.map(u => u.file).sort(), [moved].sort(), "the gone path isn't a lookalike of this one");
+  assert.match(unverified[0].why, /resolves to .* now, which isn't where the record was written/);
+  for (const cwd of [f.project, f.variant]) assert.equal(f.hook(edit(path.join(cwd, "src", "a.js")), cwd).decision, null, `not enrolled from ${cwd}`);
+  assert.equal(f.config(f.project), null);
+  const notice = inEnv(f, `import { storeNotice } from ${JSON.stringify(new URL("../lib/store-notice.mjs", import.meta.url).href)}; process.stdout.write(JSON.stringify(await storeNotice(${JSON.stringify(f.project)})))`);
+  assert.match(notice, /can't be proven to be it/, "skel status tells the human");
+});
+
+test("#55: a case-sensitive sibling isn't the project, and an 8.3 alias is", DRVFS, t => {
+  const f = caseFixture(t);
+  const cs = path.join(f.home, "cs");
+  fs.mkdirSync(cs);
+  const win = spawnSync("wslpath", ["-w", cs], { encoding: "utf8", timeout: 10_000 }).stdout?.trim();
+  // fsutil exits 0 on failure too: trust its words, and that a case variant is then a miss.
+  const set = win && spawnSync("fsutil.exe", ["file", "setCaseSensitiveInfo", win, "enable"], { cwd: "/mnt/c", encoding: "utf8", timeout: 20_000 });
+  fs.mkdirSync(path.join(cs, "Sub"));
+  if (/is enabled/.test(set?.stdout ?? "") && !fs.existsSync(path.join(cs, "SUB"))) {
+    fs.mkdirSync(path.join(cs, "sub"));
+    const file = f.approve(path.join(cs, "Sub"));
+    assert.deepEqual(f.aliases(path.join(cs, "sub")), { verified: [], unverified: [] }, "sub beside Sub is another dir");
+    assert.deepEqual(f.aliases(path.join(flipBelow(path.dirname(f.home), cs), "Sub")).verified, [file], "Sub through a variant of the dirs above it is Sub");
+    fs.rmSync(file);
+  } else t.diagnostic("couldn't enable per-directory case sensitivity here");
+  const long = path.join(f.home, "LongProjectName");
+  fs.mkdirSync(long);
+  const short = path.join(f.home, "LONGPR~1");
+  if (fs.existsSync(short)) {
+    const fromShort = f.approve(short);
+    assert.deepEqual(f.aliases(long).verified, [fromShort], "written from the 8.3 name, found from the long one");
+    fs.rmSync(fromShort);
+    const fromLong = f.approve(long);
+    assert.deepEqual(f.aliases(short).verified, [fromLong], "and the other way");
+  } else t.diagnostic("no 8.3 names on this volume");
+});
+
+test("#55: with no lookalike record, the fallback touches nothing but the store", DRVFS, t => {
+  const f = caseFixture(t);
+  for (let i = 0; i < 50; i++) f.approve(f.project, { root: path.join(f.home, `other-${i}`), key: sha24(`other-${i}`) });
+  const code = `import fs from "node:fs"; let n = 0; for (const k of ["statSync", "lstatSync", "realpathSync"]) { const o = fs[k]; fs[k] = function (p, ...a) { if (!String(p).startsWith(${JSON.stringify(f.store)})) n++; return o.call(this, p, ...a); }; } const rn = fs.realpathSync.native; fs.realpathSync.native = function (...a) { n++; return rn.apply(this, a); }; const { approvalReceiptStatus } = await import(${JSON.stringify(STATE)}); const r = approvalReceiptStatus(${JSON.stringify(f.variant)}); process.stdout.write(JSON.stringify([r, n]))`;
+  assert.deepEqual(inEnv(f, code), ["absent", 2], "two realpaths of the project (the exact key, then the fallback's), no stat");
+});
+
+test("#55: off drvfs, the fallback does nothing and keys are unchanged", async () => {
+  const { projectKey, receiptAliases, drvfsMountOf } = await import("../lib/state.mjs");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "skel-key-"));
+  try {
+    const real = fs.realpathSync.native(dir);
+    assert.equal(projectKey(dir, "win32"), sha24(real.toLowerCase()), "Windows: the lowercased realpath");
+    assert.deepEqual(receiptAliases(dir, { platform: "win32" }), { verified: [], unverified: [] });
+    if (process.platform === "linux" && !drvfsMountOf(real)) {
+      assert.equal(projectKey(dir), sha24(real), "ext4: the realpath as is");
+      assert.deepEqual(receiptAliases(dir), { verified: [], unverified: [] }, "ext4: case-sensitive, no fallback");
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
