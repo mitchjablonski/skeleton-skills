@@ -9,9 +9,11 @@ import crypto from "node:crypto";
 
 async function startupFailure(kind, cause) {
   let protectedContext = false;
+  let emitted = false;
   let reason = "the enrolled skeleton could not be checked";
   const diagnostic = message => process.stderr.write(`skel ${kind} startup: ${message}\n`);
   const emit = () => {
+    emitted = true;
     const text = `skel: hook startup failed; ${reason}. Repair the trusted skel checkout or named state from an external terminal, then retry.`;
     process.stdout.write(JSON.stringify(kind === "PreToolUse"
       ? { hookSpecificOutput: { hookEventName: kind, permissionDecision: "deny", permissionDecisionReason: text } }
@@ -111,6 +113,10 @@ async function startupFailure(kind, cause) {
   } catch (err) {
     diagnostic(`fallback lookup incomplete: ${err.message}`);
     if (protectedContext) emit();
+  } finally {
+    // No decision: keep the import fault visible as a failed hook (as without the
+    // fallback), so a broken checkout isn't silent and onFailure:"block" still applies.
+    if (!emitted) process.exitCode = 1;
   }
 }
 // END STARTUP FALLBACK
