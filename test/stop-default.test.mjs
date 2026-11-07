@@ -518,6 +518,37 @@ test("stale advisory locks recover dead owners and aged locks, and re-arm change
   assert.equal(f.stop().decision,"block");
 });
 
+test("#61: reclaiming a stale lock waits out a moment's Windows delete, never a live owner", t => {
+  const f = fixture(t);
+  const module = pathToFileURL(path.resolve("lib/stop-notice.mjs")).href;
+  const code = [
+    'import fs from "node:fs"; import path from "node:path"; import assert from "node:assert/strict";',
+    'Object.defineProperty(process, "platform", { value: "win32" });',
+    'const {claimStopNotice, stopNoticePath} = await import('+JSON.stringify(module)+');',
+    'const root='+JSON.stringify(f.root)+';',
+    'const file=stopNoticePath(root), lock=file+".lock";',
+    'fs.mkdirSync(path.dirname(file),{recursive:true});',
+    'const snap={approvedAt:1,files:{},fences:[]};',
+    'const aged=()=>fs.writeFileSync(lock,JSON.stringify({pid:process.pid,at:Date.now()-61000}));',
+    // A scanner holds the aged lock open (unlink: EACCES), then its delete settles (create: EPERM, then EEXIST with nothing readable).
+    'let unlinks=2, creates=2; const unlink=fs.unlinkSync, open=fs.openSync;',
+    'fs.unlinkSync=(p,...a)=>{if(p===lock&&unlinks>0){unlinks--;throw Object.assign(new Error("held"),{code:"EACCES"})}return unlink(p,...a)};',
+    'fs.openSync=(p,flags,...a)=>{if(p===lock&&flags==="wx"&&!fs.existsSync(lock)&&creates>0){creates--;throw Object.assign(new Error("pending"),{code:creates?"EPERM":"EEXIST"})}return open(p,flags,...a)};',
+    'aged();',
+    'assert.equal(claimStopNotice(root,snap,"a".repeat(64)),true,"reclaimed through the transient errors");',
+    'assert.deepEqual([unlinks,creates],[0,0]);',
+    'assert.equal(fs.existsSync(lock),false,"and released");',
+    // A live owner's fresh lock is still busy at once, and so is one that comes back readable after a reclaim.
+    'fs.writeFileSync(lock,JSON.stringify({pid:process.pid,at:Date.now()}));',
+    'let t0=Date.now(); assert.equal(claimStopNotice(root,snap,"b".repeat(64)),false); assert.ok(Date.now()-t0<150,"no wait for a live owner");',
+    'aged(); fs.unlinkSync=(p,...a)=>{const r=unlink(p,...a); if(p===lock) fs.writeFileSync(lock,JSON.stringify({pid:process.pid,at:Date.now(),nonce:"other"})); return r};',
+    't0=Date.now(); assert.equal(claimStopNotice(root,snap,"b".repeat(64)),false,"another caller won the reclaim"); assert.ok(Date.now()-t0<150,"no wait for it");',
+    'assert.equal(JSON.parse(fs.readFileSync(lock,"utf8")).nonce,"other");',
+  ].join("\n");
+  const result = spawnSync(process.execPath,["--input-type=module","-e",code],{cwd:f.root,env:f.env,encoding:"utf8",timeout:60_000});
+  assert.equal(result.status,0,result.stderr);
+});
+
 test("Stop advisory lock cleanup preserves a replacement owner and unknown live owners", t => {
   const f = fixture(t);
   const module = pathToFileURL(path.resolve("lib/stop-notice.mjs")).href;

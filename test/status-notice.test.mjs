@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { approvalReceiptStatus, storePath } from "../lib/state.mjs";
 import { configDecision } from "../lib/config-hook.mjs";
 import { spawnSync } from "node:child_process";
@@ -538,4 +538,66 @@ test("#55: the Stop hook indexes records the index doesn't list, from a project 
   const r = spawnSync(process.execPath, [STOP], { cwd: f.project, env: { ...f.env, CLAUDE_PROJECT_DIR: f.project }, input: JSON.stringify({ cwd: f.project, session_id: "s", stop_hook_active: false }), encoding: "utf8", timeout: 60_000 });
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.store, "receipt-roots.json"), "utf8")).records, { [sha24("other")]: path.join(f.home, "other") });
+});
+
+/** The Stop hook from a project with no skeleton, with `fault` (a file whose open fails) preloaded. */
+function noSkeletonStop(f, session, fault = null) {
+  const args = [STOP];
+  if (fault) {
+    const preload = path.join(f.home, "fault.mjs");
+    fs.writeFileSync(preload, `import fs from "node:fs"; const o = fs.openSync; fs.openSync = function (p, ...a) { if (String(p) === ${JSON.stringify(fault)}) throw Object.assign(new Error("busy"), { code: "EBUSY" }); return o.call(this, p, ...a); };`);
+    args.unshift("--import", pathToFileURL(preload).href);
+  }
+  const r = spawnSync(process.execPath, args, { cwd: f.project, env: { ...f.env, CLAUDE_PROJECT_DIR: f.project }, input: JSON.stringify({ cwd: f.project, session_id: session, stop_hook_active: false }), encoding: "utf8", timeout: 60_000 });
+  assert.equal(r.status, 0, r.stderr);
+}
+
+test("#61: the receipt index is rewritten only when its content changes, with an unreadable or a rootless record", DRVFS, t => {
+  const f = caseFixture(t);
+  const file = path.join(f.store, "receipt-roots.json");
+  f.approve(f.project, { root: path.join(f.home, "other"), key: sha24("other") });
+  fs.writeFileSync(path.join(f.store, `${sha24("rootless")}.snapshot.json`), JSON.stringify({ format: 3 }));
+  const busy = f.approve(f.project, { root: path.join(f.home, "busy"), key: sha24("busy") });
+  noSkeletonStop(f, "s1", busy);
+  const expected = { [sha24("other")]: path.join(f.home, "other"), [sha24("rootless")]: null };
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { format: 1, rootless: true, records: expected }, "the unreadable record left out, the rootless one indexed as null");
+  const stamp = () => { const st = fs.statSync(file, { bigint: true }); return [st.ino, st.mtimeNs]; };
+  const before = stamp();
+  for (const session of ["s1", "s1", "s2"]) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+    noSkeletonStop(f, session, busy);
+    assert.deepEqual(stamp(), before, `Stop (${session}) left the index as it was`);
+  }
+  // A refresh (status, approve) reads both again, and writes nothing either.
+  const refreshFailing = inEnv(f, `import fs from "node:fs"; const o = fs.openSync; fs.openSync = function (p, ...a) { if (String(p) === ${JSON.stringify(busy)}) throw Object.assign(new Error("busy"), { code: "EBUSY" }); return o.call(this, p, ...a); }; const { refreshReceiptIndex } = await import(${JSON.stringify(STATE)}); process.stdout.write(JSON.stringify(refreshReceiptIndex()))`);
+  assert.equal(refreshFailing, 0);
+  assert.deepEqual(stamp(), before);
+  // Readable again: the next Stop indexes it.
+  noSkeletonStop(f, "s2");
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).records, { ...expected, [sha24("busy")]: path.join(f.home, "busy") });
+});
+
+test("#61: a Stop from a project with no skeleton heals an entry an earlier head indexed as rootless", DRVFS, t => {
+  const f = caseFixture(t);
+  const file = path.join(f.store, "receipt-roots.json");
+  const record = f.approve(f.project, { root: path.join(f.home, "other"), key: sha24("other") });
+  const key = path.basename(record).slice(0, 24);
+  fs.writeFileSync(file, JSON.stringify({ format: 1, records: { [key]: null } }));
+  noSkeletonStop(f, "s");
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { format: 1, rootless: true, records: { [key]: path.join(f.home, "other") } }, "healed");
+  // A rootless record in such an index is marked so once, and then not read again by each Stop.
+  const rootless = path.join(f.store, `${sha24("rootless")}.snapshot.json`);
+  fs.writeFileSync(rootless, JSON.stringify({ format: 3 }));
+  fs.writeFileSync(file, JSON.stringify({ format: 1, records: { [key]: path.join(f.home, "other"), [sha24("rootless")]: null } }));
+  noSkeletonStop(f, "s");
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).rootless, true);
+  noSkeletonStop(f, "s", rootless);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).records[sha24("rootless")], null, "not read: an unreadable read would have left it out");
+  fs.rmSync(rootless);
+  // And a lookalike behind such an entry is found by that Stop (and after it, from the index).
+  fs.rmSync(record);
+  const mine = f.approve(f.project, { root: f.variant, key: sha24("elsewhere") });
+  fs.writeFileSync(file, JSON.stringify({ format: 1, records: { [sha24("elsewhere")]: null } }));
+  noSkeletonStop(f, "s2");
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).records[path.basename(mine).slice(0, 24)], f.variant);
 });
