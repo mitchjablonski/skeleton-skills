@@ -25,8 +25,8 @@ process.env.XDG_STATE_HOME = mkTemp("skel-state-");
 process.env.LOCALAPPDATA = mkTemp("skel-localappdata-");
 
 const { skelProgress } = new Function(read("review-progress.js") + "\nreturn { skelProgress };")();
-const { skelDraftForPhase, skelDraftForVersion, skelMergeVerdict, skelReanchor, skelOutgoing, skelFeedbackMarkdown, skelFromSkeleton } = new Function(
-  read("review-feedback.js") + "\nreturn { skelDraftForPhase, skelDraftForVersion, skelMergeVerdict, skelReanchor, skelOutgoing, skelFeedbackMarkdown, skelFromSkeleton };",
+const { skelDraftForPhase, skelDraftForVersion, skelMergeVerdict, skelSettle, skelReanchor, skelOutgoing, skelFeedbackMarkdown, skelFromSkeleton, skelVerdictClearedMessage } = new Function(
+  read("review-feedback.js") + "\nreturn { skelDraftForPhase, skelDraftForVersion, skelMergeVerdict, skelSettle, skelReanchor, skelOutgoing, skelFeedbackMarkdown, skelFromSkeleton, skelVerdictClearedMessage };",
 )();
 
 const V = "aaaaaaaaaaaa";
@@ -169,6 +169,54 @@ test("#69 (b): a stale tab's save keeps another tab's newer verdict", () => {
   // A draft with no verdictAt (an older page) never outranks a stamped verdict.
   assert.equal(skelMergeVerdict({ verdict: null }, stored).verdict, "approve");
   assert.equal(skelMergeVerdict({ verdict: "changes", verdictAt: 1 }, null).verdict, "changes", "nothing stored: mine");
+});
+
+// The client's draft handling (lib/review-client.js), on a localStorage stand-in.
+function tab(storage, version, phase) {
+  const load = (stored) => skelDraftForVersion(skelDraftForPhase({ verdict: null, verdictVersion: null, general: "", comments: [], ...stored }, phase).draft, version, phase).draft;
+  const stored = storage.value ?? {};
+  let draft = load(stored);
+  if (stored.verdict && !draft.verdict) draft.verdictSettled = skelSettle(stored);
+  const t = {
+    get draft() { return draft; },
+    save() { storage.value = skelMergeVerdict(draft, storage.value ?? null); },
+    choose(v, at) { draft = { ...draft, verdict: v, verdictVersion: version, verdictPhase: phase, verdictAt: at }; delete draft.verdictCleared; t.save(); },
+    storageEvent() { draft = load(skelMergeVerdict(storage.value, draft)); },
+    copy() { return skelFeedbackMarkdown({ title: "T", phase, skeletonVersion: version }, skelOutgoing(draft, version, phase)); },
+  };
+  t.save();
+  return t;
+}
+
+test("#70 review: a cleared approval stays cleared when the shape returns to the approved version", () => {
+  const storage = {};
+  tab(storage, V, "scaffold").choose("approve", 1000);
+  // An edit outside the fences: the page reloads onto W2 and clears the approval.
+  const changed = tab(storage, W2, "scaffold");
+  assert.equal(changed.draft.verdict, null);
+  assert.equal(storage.value.verdict, null, "the clear is saved, not only shown");
+  // The edit is reverted: back on V, nothing pressed, and Copy isn't an approval.
+  const back = tab(storage, V, "scaffold");
+  assert.equal(back.draft.verdict, null);
+  assert.doesNotMatch(back.copy(), /APPROVED|approve with/);
+  assert.match(skelVerdictClearedMessage(back.draft.verdictCleared, "scaffold"), /changed after you approved it, then changed back to aaaaaaaaaaaa\. Check it, then approve again\./);
+  // The same for the phase: a skeleton approval dropped in the fill doesn't return after a reshape.
+  const s2 = {};
+  tab(s2, V, "scaffold").choose("approve", 1000);
+  tab(s2, V, "fill");
+  assert.equal(tab(s2, V, "scaffold").draft.verdict, null);
+});
+
+test("#70 review: a newer approval in another tab still survives a stale tab, settled clear or not", () => {
+  const storage = {};
+  tab(storage, V, "scaffold").choose("approve", 1000);
+  const stale = tab(storage, W2, "scaffold"); // settled the clear of the V approval
+  const fresh = tab(storage, V, "scaffold");
+  fresh.choose("approve", 2000);
+  stale.storageEvent();
+  stale.save();
+  assert.deepEqual([storage.value.verdict, storage.value.verdictVersion, storage.value.verdictAt], ["approve", V, 2000]);
+  assert.equal(tab(storage, V, "scaffold").draft.verdict, "approve");
 });
 
 // ---- #69 review (c): re-anchoring stays in its step ----

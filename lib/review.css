@@ -184,6 +184,7 @@ tr.note td { padding: 6px 12px 8px 54px !important; background: var(--comment); 
 .diagram-src { text-align: left; font-family: var(--mono); font-size: 12px; color: var(--muted); margin: 0; white-space: pre-wrap; }
 .diagram-notes { width: 100%; border-collapse: collapse; }
 .dd-step { cursor: pointer; }
+.dd-step.dd-static { cursor: default; }
 .dd-step.dd-todo :is(rect, polygon, circle, ellipse, path) { fill: var(--todo-soft) !important; stroke: var(--todo) !important; }
 .dd-step.dd-filled :is(rect, polygon, circle, ellipse, path) { fill: var(--filled-soft) !important; stroke: var(--filled) !important; }
 .dd-step.dd-active :is(rect, polygon, circle, ellipse, path) { fill: var(--accent-soft) !important; stroke: var(--active) !important; stroke-width: 2px !important; }
