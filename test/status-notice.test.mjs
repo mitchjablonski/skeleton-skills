@@ -513,3 +513,29 @@ test("#55: a deleted .skeleton with an unprovable lookalike is reported by statu
   const notice = inEnv(f, `import { aliasNotice } from ${JSON.stringify(new URL("../lib/store-notice.mjs", import.meta.url).href)}; process.stdout.write(JSON.stringify(aliasNotice(${JSON.stringify(f.project)}) ?? ""))`);
   assert.ok(!notice.includes("\u001b") && !notice.includes("\n"), "control characters escaped");
 });
+
+test("#55: a record unreadable when the index is built still counts later", DRVFS, t => {
+  const f = caseFixture(t);
+  const file = f.approve(f.project);
+  const key = path.basename(file).slice(0, 24);
+  // Refresh while that record can't be opened (a lock on /mnt/c, a permission): it's left out, not indexed as rootless.
+  const refreshFailing = inEnv(f, `import fs from "node:fs"; const o = fs.openSync; fs.openSync = function (p, ...a) { if (String(p) === ${JSON.stringify(file)}) throw Object.assign(new Error("busy"), { code: "EBUSY" }); return o.call(this, p, ...a); }; const { refreshReceiptIndex } = await import(${JSON.stringify(STATE)}); process.stdout.write(JSON.stringify(refreshReceiptIndex()))`);
+  assert.equal(refreshFailing, 1);
+  const index = () => JSON.parse(fs.readFileSync(path.join(f.store, "receipt-roots.json"), "utf8")).records;
+  assert.ok(!Object.hasOwn(index(), key), "left out of the index");
+  assert.equal(f.hook(edit(path.join(f.variant, "src", "a.js")), f.variant).decision, "deny", "its head is read: still protected");
+  // An entry indexed as naming no root (as before this fix) is read again at the next refresh.
+  fs.writeFileSync(path.join(f.store, "receipt-roots.json"), JSON.stringify({ format: 1, records: { [key]: null } }));
+  inEnv(f, `import { refreshReceiptIndex } from ${JSON.stringify(STATE)}; process.stdout.write(JSON.stringify(refreshReceiptIndex()))`);
+  assert.equal(index()[key], f.project, "healed");
+  assert.equal(f.hook(edit(path.join(f.variant, "src", "a.js")), f.variant).decision, "deny");
+});
+
+test("#55: the Stop hook indexes records the index doesn't list, from a project with no skeleton", DRVFS, t => {
+  const f = caseFixture(t);
+  f.approve(f.project, { root: path.join(f.home, "other"), key: sha24("other") });
+  assert.ok(!fs.existsSync(path.join(f.store, "receipt-roots.json")));
+  const r = spawnSync(process.execPath, [STOP], { cwd: f.project, env: { ...f.env, CLAUDE_PROJECT_DIR: f.project }, input: JSON.stringify({ cwd: f.project, session_id: "s", stop_hook_active: false }), encoding: "utf8", timeout: 60_000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.store, "receipt-roots.json"), "utf8")).records, { [sha24("other")]: path.join(f.home, "other") });
+});

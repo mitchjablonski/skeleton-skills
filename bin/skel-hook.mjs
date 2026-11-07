@@ -81,10 +81,11 @@ async function startupFailure(kind, cause) {
       try {
         fd = fs.openSync(file, "r");
         const buf = Buffer.alloc(4096);
-        const m = /^\{\s*"root"\s*:\s*("(?:[^"\\]|\\.)*")/.exec(buf.toString("utf8", 0, fs.readSync(fd, buf, 0, buf.length, 0)));
-        const root = m && JSON.parse(m[1]);
+        const head = buf.toString("utf8", 0, fs.readSync(fd, buf, 0, buf.length, 0));
+        let root = null;
+        try { const m = /^\{\s*"root"\s*:\s*("(?:[^"\\]|\\.)*")/.exec(head); root = m && JSON.parse(m[1]); } catch {}
         return typeof root === "string" ? root : null;
-      } catch { return null; }
+      } catch { return undefined; } // unreadable now: unknown, not "no root"
       finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
     };
     const aliasPresent = real => {

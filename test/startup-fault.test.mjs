@@ -335,3 +335,18 @@ test("#55: fallback alias decisions match the healthy launchers (never less prot
     }
   }
 });
+
+test("#55: a record unreadable when the index was built still protects through the fallback", DRVFS, t => {
+  const f = fixture(t, "state.mjs");
+  aliasRecord(f, f.root);
+  const store = path.join(f.env.XDG_STATE_HOME, "skel");
+  const file = path.join(store, fs.readdirSync(store).find(n => n.endsWith(".snapshot.json")));
+  const code = `import fs from "node:fs"; const o = fs.openSync; fs.openSync = function (p, ...a) { if (String(p) === ${JSON.stringify(file)}) throw Object.assign(new Error("busy"), { code: "EBUSY" }); return o.call(this, p, ...a); }; const { refreshReceiptIndex } = await import(${JSON.stringify(new URL("../lib/state.mjs", import.meta.url).href)}); refreshReceiptIndex();`;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { env: f.env, encoding: "utf8", timeout: 60000 });
+  assert.equal(r.status, 0, r.stderr);
+  // The unreadable record is left out rather than indexed as rootless.
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(store, "receipt-roots.json"), "utf8")).records, {});
+  const variant = flipBelow(path.dirname(f.base), f.root);
+  assert.equal(f.run("PreToolUse", edit("a.js"), variant, { CLAUDE_PROJECT_DIR: variant }).decision, "deny");
+  assert.equal(f.run("ConfigChange", { source: "local_settings" }, variant, { CLAUDE_PROJECT_DIR: variant }).decision, "block");
+});
