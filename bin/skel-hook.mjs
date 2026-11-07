@@ -104,12 +104,13 @@ async function startupFailure(kind, cause) {
             const key = name.slice(0, 24);
             const entry = index && Object.hasOwn(index, key) ? index[key] : null;
             const listed = entry && typeof entry === "object" && !Array.isArray(entry)
-              && typeof entry.root === "string" && typeof entry.resolved === "string"
-              && path.posix.isAbsolute(entry.resolved) && hash(entry.resolved) === key;
+              && typeof entry.root === "string" && typeof entry.witness === "string"
+              && path.posix.isAbsolute(entry.witness) && hash(entry.witness) === key;
             const root = listed ? entry.root : headRoot(path.join(store.dir, name));
-            let witness = listed ? entry.resolved : null;
+            let witness = listed ? entry.witness : null;
             if (!listed && typeof root === "string" && path.posix.isAbsolute(root)) {
-              try { const resolved = fs.realpathSync.native(root); if (hash(resolved) === key) witness = resolved; } catch {}
+              if (hash(root) === key) witness = root;
+              else try { const resolved = fs.realpathSync.native(root); if (hash(resolved) === key) witness = resolved; } catch {}
             }
             aliasRecords.push({ key, root: witness ?? root });
           }

@@ -413,4 +413,38 @@ test("#63: same-key caller rewrites and rootless repairs remain protective after
   check("rootless repair is read from its head");
   fs.writeFileSync(path.join(f.tool,"lib/state.mjs"),'throw new Error("injected import failure");');
   check("faulted launchers read repaired uncached receipt");
+  fs.writeFileSync(stateModule, stateSource);
+  // A deleted direct root still supplies a hash preimage. Cache that positive
+  // witness, without opening its receipt on every unrelated project's hook.
+  fs.rmSync(f.root, { recursive: true });
+  const other = path.join(f.base, "other");
+  fs.mkdirSync(other);
+  const probe = `import fs from 'node:fs';
+    const s = await import(${JSON.stringify(pathToFileURL(path.join(f.tool, "lib/state.mjs")).href)});
+    const root = ${JSON.stringify(f.root)}, key = s.projectKey(root);
+    const index = s.storePath(root, '.snapshot').replace(/[^/]+$/, 'receipt-roots.json');
+    fs.rmSync(index); s.refreshReceiptIndex();
+    const entry = JSON.parse(fs.readFileSync(index)).records[key];
+    let opened = 0; const open = fs.openSync;
+    fs.openSync = function(p,...args) { if(String(p).endsWith('.snapshot.json')) opened++; return open.call(this,p,...args); };
+    const unrelated = s.approvalReceiptStatus(${JSON.stringify(other)});
+    process.stdout.write(JSON.stringify({entry, opened, unrelated}));`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", probe], { env: f.env, encoding: "utf8", timeout: 60000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { entry: { root: f.root, witness: f.root }, opened: 0, unrelated: "absent" });
+  fs.mkdirSync(f.root);
+  check("recreated path follows the existing stale-positive receipt policy");
+  fs.writeFileSync(stateModule, 'throw new Error("injected import failure");');
+  check("faulted launchers also protect a recreated path");
+  // A witness is not authority to enroll a different target after retargeting.
+  fs.rmSync(f.root, { recursive: true });
+  fs.symlinkSync(other, f.root);
+  for (const broken of [false, true]) {
+    fs.writeFileSync(stateModule, broken ? 'throw new Error("injected import failure");' : stateSource);
+    for (const [entry, input] of [["skel-hook.mjs", edit("a.js")], ["skel-config-hook.mjs", { source: "local_settings" }]]) {
+      const r = spawnSync(process.execPath, [path.join(f.tool, "bin", entry)], { cwd: variant, env: { ...f.env, CLAUDE_PROJECT_DIR: variant }, input: JSON.stringify({ cwd: variant, ...input }), encoding: "utf8", timeout: 15000 });
+      assert.equal(r.status, broken ? 1 : 0, r.stderr);
+      assert.equal(r.stdout, "", "retargeted B has no receipt: no global false enrollment");
+    }
+  }
 });

@@ -468,7 +468,7 @@ test("#55: the receipt index stands in for record heads, and a record it doesn't
   assert.equal(refresh(), 1, "the state dir's index written");
   assert.equal(refresh(), 0, "and current: nothing to do");
   const index = JSON.parse(fs.readFileSync(path.join(f.store, "receipt-roots.json"), "utf8"));
-  assert.deepEqual(index.records[path.basename(file).slice(0, 24)], { root: f.project, resolved: f.project });
+  assert.deepEqual(index.records[path.basename(file).slice(0, 24)], { root: f.project, witness: f.project });
   // How many record files a lookup opens, and what it finds.
   const probe = (dir) => inEnv(f, `import fs from "node:fs"; let opened = 0; const o = fs.openSync; fs.openSync = function (p, ...a) { if (String(p).endsWith(".snapshot.json")) opened++; return o.call(this, p, ...a); }; const { approvalReceiptStatus } = await import(${JSON.stringify(STATE)}); process.stdout.write(JSON.stringify([approvalReceiptStatus(${JSON.stringify(dir)}), opened]))`);
   assert.deepEqual(probe(f.variant), ["present", 0], "found through the index, no record opened");
@@ -528,7 +528,7 @@ test("#55: a record unreadable when the index is built still counts later", DRVF
   // Neither stale legacy strings nor malformed new witnesses may hide the head.
   for (const stale of [
     { format: 1, records: { [key]: path.join(f.home, "old-caller") } },
-    { format: 2, records: { [key]: { root: f.project, resolved: path.join(f.home, "wrong-witness") } } },
+    { format: 2, records: { [key]: { root: f.project, witness: path.join(f.home, "wrong-witness") } } },
   ]) {
     fs.writeFileSync(path.join(f.store, "receipt-roots.json"), JSON.stringify(stale));
     assert.equal(f.hook(edit(path.join(f.variant, "src", "a.js")), f.variant).decision, "deny");
@@ -536,7 +536,7 @@ test("#55: a record unreadable when the index is built still counts later", DRVF
   // An entry indexed as naming no root (as before this fix) is read again at the next refresh.
   fs.writeFileSync(path.join(f.store, "receipt-roots.json"), JSON.stringify({ format: 1, records: { [key]: null } }));
   inEnv(f, `import { refreshReceiptIndex } from ${JSON.stringify(STATE)}; process.stdout.write(JSON.stringify(refreshReceiptIndex()))`);
-  assert.deepEqual(index()[key], { root: f.project, resolved: f.project }, "healed");
+  assert.deepEqual(index()[key], { root: f.project, witness: f.project }, "healed");
   assert.equal(f.hook(edit(path.join(f.variant, "src", "a.js")), f.variant).decision, "deny");
 });
 
@@ -546,7 +546,7 @@ test("#55: the Stop hook indexes records the index doesn't list, from a project 
   assert.ok(!fs.existsSync(path.join(f.store, "receipt-roots.json")));
   const r = spawnSync(process.execPath, [STOP], { cwd: f.project, env: { ...f.env, CLAUDE_PROJECT_DIR: f.project }, input: JSON.stringify({ cwd: f.project, session_id: "s", stop_hook_active: false }), encoding: "utf8", timeout: 60_000 });
   assert.equal(r.status, 0, r.stderr);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.store, "receipt-roots.json"), "utf8")).records, { [sha24(other)]: { root: other, resolved: other } });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.store, "receipt-roots.json"), "utf8")).records, { [sha24(other)]: { root: other, witness: other } });
 });
 
 /** The Stop hook from a project with no skeleton, with `fault` (a file whose open fails) preloaded. */
@@ -568,7 +568,7 @@ test("#61: the receipt index is rewritten only when its content changes, with an
   fs.writeFileSync(path.join(f.store, `${sha24("rootless")}.snapshot.json`), JSON.stringify({ format: 3 }));
   const busyRoot = path.join(f.home, "busy"); fs.mkdirSync(busyRoot); const busy = f.approve(busyRoot);
   noSkeletonStop(f, "s1", busy);
-  const expected = { [sha24(other)]: { root: other, resolved: other } };
+  const expected = { [sha24(other)]: { root: other, witness: other } };
   assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { format: 2, records: expected }, "unreadable and rootless records left out");
   const stamp = () => { const st = fs.statSync(file, { bigint: true }); return [st.ino, st.mtimeNs]; };
   const before = stamp();
@@ -583,7 +583,7 @@ test("#61: the receipt index is rewritten only when its content changes, with an
   assert.deepEqual(stamp(), before);
   // Readable again: the next Stop indexes it.
   noSkeletonStop(f, "s2");
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).records, { ...expected, [sha24(busyRoot)]: { root: busyRoot, resolved: busyRoot } });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).records, { ...expected, [sha24(busyRoot)]: { root: busyRoot, witness: busyRoot } });
 });
 
 test("#61: a Stop from a project with no skeleton heals an entry an earlier head indexed as rootless", DRVFS, t => {
@@ -595,7 +595,7 @@ test("#61: a Stop from a project with no skeleton heals an entry an earlier head
   for (const rootless of [false, true]) {
     fs.writeFileSync(file, JSON.stringify({ format: 1, rootless, records: { [key]: null } }));
     noSkeletonStop(f, "s");
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { format: 2, records: { [key]: { root: other, resolved: other } } }, "legacy nulls heal, including marked ones");
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { format: 2, records: { [key]: { root: other, witness: other } } }, "legacy nulls heal, including marked ones");
   }
   // A rootless file may be replaced by an older writer: never cache a negative.
   const rootless = path.join(f.store, `${sha24(f.project)}.snapshot.json`);
@@ -605,7 +605,7 @@ test("#61: a Stop from a project with no skeleton heals an entry an earlier head
   f.approve(f.project);
   assert.equal(f.hook(edit(path.join(f.variant, "src", "a.js")), f.variant).decision, "deny");
   noSkeletonStop(f, "s2");
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).records[sha24(f.project)], { root: f.project, resolved: f.project });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).records[sha24(f.project)], { root: f.project, witness: f.project });
 });
 
 test("#63: a cached resolved witness cannot enroll the target of a retargeted path", DRVFS, t => {
