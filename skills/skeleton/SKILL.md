@@ -1,13 +1,13 @@
 ---
 name: skeleton
-description: Plan a feature as a code skeleton (real files, types, signatures, wiring, with fenced SKEL_TODO bodies) and have the human review it in a local page before any logic is written. Use when the user says /skeleton, "skeleton first", "plan it as stubs", or wants to see and shape the structure before code gets written.
+description: Plan a feature as a code skeleton (real files, types, signatures, wiring, with fenced SKEL_TODO bodies) and have the human review it in a local page before any logic is written. Use when the user says /skel:skeleton, "skeleton first", "plan it as stubs", or wants to see and shape the structure before code gets written.
 ---
 
 # Skeleton: the plan is the code's shape
 
 You are writing the plan as real code with no logic in it. The human approves the shape (which files exist, the names, the signatures, what calls what, what's pure and what has side effects) before any behavior is written. Later, filling the bodies happens only inside the fences you draw here, and a hook enforces that.
 
-CLI: `{{SKEL}}` (written below as `skel`).
+CLI: `node "${CLAUDE_PLUGIN_ROOT}/bin/skel.mjs"` (written below as `skel`).
 
 ## 1. Understand, briefly
 
@@ -103,7 +103,7 @@ In the terminal, give a short summary of the shape (files, the step list, and th
   - Every review is of one **skeleton version**: the page shows it, and copied feedback has a `Reviewed skeleton version: <v>` line. Run `skel approve --reviewed <v>` with the version from the feedback they pasted. It refuses, with a diff, if that isn't the current one. If they used Send instead, plain `skel approve` reads the version from their last send; with neither, it only checks against the version the page last *rendered* (any page load or `skel review` run counts), which is weaker: it catches edits made after that render, not whether the human saw it. So prefer `--reviewed` from their pasted feedback. For static review, re-run `skel review` after each revision so the file shows the current version.
   - Don't edit the skeleton between their approval and `skel approve`, and don't run `skel review` or fetch the page then either: a render you make counts as the version shown. If you did (or approve refuses with a diff), tell them what changed and ask them to look at the page again; it reloads by itself. Never pass a version they haven't seen, and never pass `--reviewed` with a version you computed yourself.
   - If it says they sent feedback you haven't read (Send mode), run `skel feedback` first.
-- Then tell them they can run `/skeleton-fill` to fill one step at a time, or `/skeleton-fill all` to fill every step without stopping (still fenced).
+- Then tell them they can run `/skel:skeleton-fill` to fill one step at a time, or `/skel:skeleton-fill all` to fill every step without stopping (still fenced).
 - `.skeleton/` is the tool's own state (phase, the human's feedback). Don't edit or write files there except `.skeleton/diagrams/`; the hook will ask the human if you try.
 
 Do not fill any step in this skill, even an obvious one.

@@ -92,19 +92,19 @@ test("install keeps notify-only across reinstalls and moved clones; conflicting 
   const write = settings => fs.writeFileSync(settingsFile, JSON.stringify(settings));
   const commands = settings => settings.hooks.Stop.flatMap(group => group.hooks.map(hook => hook.command));
   const ours = settings => commands(settings).filter(command => /skel-stop\.mjs/.test(command) && !command.includes("&&"));
-  cli(["install", root]);
+  cli(["install", "--legacy", root]);
   let settings = read();
   const stop = settings.hooks.Stop.flatMap(group => group.hooks).find(hook => /skel-stop\.mjs/.test(hook.command));
   stop.command += " --notify-only";
   write(settings);
-  cli(["install", root]);
+  cli(["install", "--legacy", root]);
   settings = read();
   assert.equal(ours(settings).length, 1);
   assert.match(ours(settings)[0], / --notify-only$/);
   const moved = settings.hooks.Stop.flatMap(group => group.hooks).find(hook => /skel-stop\.mjs/.test(hook.command));
   moved.command = 'node "/old/clone/bin/skel-stop.mjs" --notify-only';
   write(settings);
-  cli(["install", root]);
+  cli(["install", "--legacy", root]);
   settings = read();
   assert.equal(ours(settings).length, 1);
   assert.match(ours(settings)[0], / --notify-only$/);
@@ -117,7 +117,7 @@ test("install keeps notify-only across reinstalls and moved clones; conflicting 
     { type: "command", command: chainedCommand },
   ] });
   write(settings);
-  const installed = cli(["install", root]);
+  const installed = cli(["install", "--legacy", root]);
   const installedSkill = fs.readFileSync(path.join(root, ".claude", "skills", "skeleton-fill", "SKILL.md"), "utf8");
   assert.match(installedSkill, /default requests one corrective continuation/);
   assert.doesNotMatch(installedSkill, /By default its drift report is shown to the human only/);

@@ -4,6 +4,7 @@
 
 import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
+import { performance } from "node:perf_hooks";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -12,13 +13,14 @@ import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
-import { installStatus, isSkelHook, rulePath } from "../lib/install-status.mjs";
+import { PLUGIN_ID, claudeConfigDir, hasLegacyHooks, installStatus, isSkelConfigHook, isSkelHook, pluginEvidence, pluginStatus, registrationNotice, rulePath, skelStopHook } from "../lib/install-status.mjs";
+import { isLegacyCopy, renderLegacy } from "../lib/legacy-copy.mjs";
 import { enrollment } from "../lib/config-hook.mjs";
 import { SHELL_CSP, buildReviewData, clientScript, pagePayload, readDiagrams, renderShell, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
-  storeFeedback, takeFeedback,
+  storeFeedback, takeFeedback, withFeedbackLock, ensureReviewRound, feedbackLockNotice, feedbackOrderNotice, storeFeedbackForHttp, isFeedbackError,
 } from "../lib/feedback.mjs";
 import { discardUnusedStateDirFiles, migrateProject, migrationPlan } from "../lib/migrate.mjs";
 import { storeNotice } from "../lib/store-notice.mjs";
@@ -57,9 +59,13 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   stop-hook [--notify-only|--block]  Stop hook: one corrective continuation on drift, then notify
   migrate [--dry-run] [projectDir]   move this project's records from the old config dir to the state dir
                                      (run skel install and restart Claude Code first; refused during a fill)
-  install [projectDir]               install skills, filler subagent, hooks and deny rules (.skeleton/ state,
-                                     skel's state dir) into a project's .claude/
-  uninstall [projectDir]             remove what install added (leaves .skeleton/ and .gitignore alone)
+  install [--notify-only|--block] [projectDir]
+                                     protect a project for the skel plugin: deny rules for .skeleton/ state and
+                                     skel's state dir, the project's Stop mode, and (once the plugin is
+                                     enabled and outside a fill) removal of an older install's hooks and copies
+  install --legacy [projectDir]      the pre-plugin install: skills, filler subagent, hooks and deny rules
+                                     written into the project's .claude/ (kept for one release)
+  uninstall [projectDir]             remove what install added (leaves .skeleton/, .gitignore and the plugin alone)
 `;
 
 function die(msg) {
@@ -188,6 +194,7 @@ async function liveServer(root) {
       storeProtocol: v.storeProtocol ?? 1,
       token,
       readAuth: v.readAuth,
+      feedbackOrder: v.feedbackOrder,
       // The server accepted this token: a server that ignores the header
       // answers 200 as well, so this alone proves nothing (see readsProtected).
       tokenAccepted: !!token && res.status === 200,
@@ -396,9 +403,16 @@ function readOwned(target) {
   if (foreign.length) console.log(`warning: install's ownership record ${file} lists ${foreign.length} rule(s) install never writes, so they're left alone: ${foreign.join(", ")}`);
   return strings.filter(ours);
 }
-function writeOwned(target, owned) {
-  if (!owned.length) return fs.rmSync(ownedStorePath(target), { force: true });
-  writeFileAtomic(ownedStorePath(target), JSON.stringify({ root: realDir(target), ownedDeny: owned }, null, 2) + "\n", 0o600);
+function writeOwned(target, owned, stopMode = null) {
+  if (!owned.length && !stopMode) return fs.rmSync(ownedStorePath(target), { force: true });
+  writeFileAtomic(ownedStorePath(target), JSON.stringify({ root: realDir(target), ownedDeny: owned, ...(stopMode ? { stopMode } : {}) }, null, 2) + "\n", 0o600);
+}
+/** The Stop mode in install's ownership record ("notify-only" | "block"), or null. Read after readOwned vetted the file. */
+function readStopMode(target) {
+  try {
+    const m = JSON.parse(fs.readFileSync(ownedStorePath(target), "utf-8")).stopMode;
+    return m === "notify-only" || m === "block" ? m : null;
+  } catch { return null; }
 }
 
 /**
@@ -413,18 +427,6 @@ function legacyOwned(settings, owned) {
   const hooked = (settings.hooks?.PreToolUse ?? []).some((m) => m?.hooks?.some?.((hk) => isSkelHook(hk?.command)));
   return hooked && LEGACY_DENY_RULES.every((r) => deny.includes(r)) ? LEGACY_DENY_RULES : [];
 }
-
-/**
- * Our Stop hook (bin/skel-stop.mjs, or `skel.mjs stop-hook`) from any checkout,
- * recognised by its script whatever flags (`--x`) follow; block: one of them is
- * --block or --notify-only. Anything else after it (`&& notify-send done`) makes it the user's.
- */
-const skelStopHook = (cmd) => {
-  const m = typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/](?:skel-stop\.mjs"|skel\.mjs" stop-hook)((?:\s+--\w[\w-]*)*)\s*$/.exec(cmd);
-  return m ? { block: m[1].split(/\s+/).includes("--block"), notifyOnly: m[1].split(/\s+/).includes("--notify-only") } : null;
-};
-/** Exact standalone commands only: a chained command remains the user's. */
-const isSkelConfigHook = (cmd) => typeof cmd === "string" && /^node "[^"]*[\\/]bin[\\/]skel-config-hook\.mjs"$/.test(cmd);
 
 /**
  * A project's .claude/settings.local.json, parsed, for install/uninstall to
@@ -466,6 +468,321 @@ function openProjectSettings(dir, { forInstall = false } = {}) {
     : null;
   if (bad) die(`${settingsPath}: ${bad} isn't shaped the way Claude Code expects; fix it first (we won't overwrite it)`);
   return { target, claudeDir, settingsPath, settings };
+}
+
+/** This checkout's root with forward slashes, as legacy copies and hook commands spell it. */
+const PKG_ROOT_FWD = PKG_ROOT.split(path.sep).join("/");
+/** How a human runs this checkout's CLI from a terminal, fully quoted. */
+const TERMINAL_SKEL = `node "${SELF}"`;
+
+/**
+ * The deny rules install owns for `target`, merged into `settings` (not yet
+ * written): { rules, added, stateRules, why, stores, prevOwned }.
+ */
+function mergeRules(target, settings) {
+  const { rules: stateRules, why } = denyRules(target);
+  const stores = storeDenyRules();
+  const rules = [...new Set([...stateRules, ...stores.map((s) => s.rule).filter(Boolean)])];
+  const prevOwned = readOwned(target);
+  const stale = [...legacyOwned(settings, prevOwned), ...(prevOwned ?? []).filter((r) => !rules.includes(r))];
+  settings.permissions ??= {};
+  settings.permissions.deny = (settings.permissions.deny ?? []).filter((r) => !stale.includes(r));
+  const added = rules.filter((r) => !settings.permissions.deny.includes(r));
+  settings.permissions.deny.push(...added);
+  return { rules, added, stateRules, why, stores, prevOwned };
+}
+
+/** Write the settings (only when they changed, so a re-run leaves the file as it was), then the ownership record. */
+function writeRules(target, settingsPath, settings, { rules, added, prevOwned }, stopMode) {
+  const text = JSON.stringify(settings, null, 2) + "\n";
+  let old = null;
+  try { old = fs.readFileSync(settingsPath, "utf-8"); } catch {}
+  // Settings first: a failed write must never record rules that weren't added.
+  if (old !== text) writeFileAtomic(settingsPath, text);
+  // Ours: what we add now, plus what an earlier install added and still owns.
+  // A rule that was already there and isn't recorded stays the user's.
+  writeOwned(target, rules.filter((r) => added.includes(r) || prevOwned?.includes(r)), stopMode);
+  // .skeleton/ is per-run state (and holds the human's feedback): keep it
+  // out of commits, so a repo can't ship a verdict.
+  const gi = path.join(target, ".gitignore");
+  const giText = fs.existsSync(gi) ? fs.readFileSync(gi, "utf-8") : "";
+  if (!/^\/?\.skeleton\/?$/m.test(giText)) fs.appendFileSync(gi, `${giText && !giText.endsWith("\n") ? "\n" : ""}.skeleton/\n`);
+}
+
+function reportRules(target, settings, { rules, added, stateRules, why, stores }) {
+  const addedState = added.filter((r) => stateRules.includes(r));
+  if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
+  else console.log(addedState.length ? `added ${addedState.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
+  for (const { name, rule, why: noRule } of stores) {
+    if (noRule) console.log(`warning: no permission deny rule for skel's ${name}: ${noRule}. The hook still asks about edits there`);
+    else console.log(`${added.includes(rule) ? `added a permission deny rule for skel's ${name}` : `permission deny rule for skel's ${name} already present`}: ${rule} (it is resolved now: re-run install if you change XDG_STATE_HOME or XDG_CONFIG_HOME)`);
+  }
+  reportLeftInPlace(settings, rules);
+  launchWarning(target);
+}
+
+/**
+ * Take skel's hooks out of a parsed settings object, whatever checkout or form
+ * wrote them, keeping every other hook, shared matchers, group metadata and
+ * pre-existing empty groups: { removed, block, notifyOnly } where block and
+ * notifyOnly say which Stop flags the removed entries carried.
+ */
+function removeSkelHooks(settings) {
+  let removed = 0;
+  let block = false;
+  let notifyOnly = false;
+  const strip = (event, test) => {
+    const groups = settings.hooks?.[event];
+    if (!Array.isArray(groups)) return;
+    const emptied = new Set();
+    for (const group of groups) {
+      if (!Array.isArray(group?.hooks) || !group.hooks.length) continue;
+      const before = group.hooks.length;
+      group.hooks = group.hooks.filter((hk) => !test(hk?.command));
+      removed += before - group.hooks.length;
+      if (!group.hooks.length) emptied.add(group);
+    }
+    settings.hooks[event] = groups.filter((g) => !emptied.has(g));
+    if (!settings.hooks[event].length) delete settings.hooks[event];
+  };
+  strip("PreToolUse", isSkelHook);
+  strip("Stop", (cmd) => {
+    const found = skelStopHook(cmd);
+    if (found) { block ||= found.block; notifyOnly ||= found.notifyOnly; }
+    return !!found;
+  });
+  strip("ConfigChange", isSkelConfigHook);
+  if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
+  return { removed, block, notifyOnly };
+}
+
+/**
+ * A fill (or unreadable skeleton state) that removing the project's hooks would
+ * leave unguarded: one at or above `target` or CLAUDE_PROJECT_DIR, or any
+ * skeleton below `target`. The legacy gate guards a skeleton wherever an edited
+ * file sits (it walks up from the file), so this looks everywhere but `.git`
+ * and `node_modules`, including the scanner's skipped dirs (build/, target/…),
+ * and follows directory links (each real dir once). It fails closed: a dir it
+ * can't list or a tree deeper than it will walk counts as a possible fill.
+ * Returns enrollment's verdict (or one shaped like it), or null.
+ */
+const FILL_WALK_SKIP = new Set([".git", "node_modules"]);
+const FILL_WALK_DEPTH = 40;
+function fillAtOrBelow(target) {
+  const above = [target, process.env.CLAUDE_PROJECT_DIR].filter(Boolean).map((b) => enrollment(b)).find((s) => s.protected);
+  if (above) return above;
+  const unsure = (why) => ({ protected: true, reason: `skel can't rule out a fill below the project (${why})` });
+  const seen = new Set();
+  const stack = [[path.resolve(target), 0]];
+  while (stack.length) {
+    const [dir, depth] = stack.pop();
+    let real;
+    try { real = fs.realpathSync.native(dir); } catch (err) { if (err.code === "ENOENT") continue; return unsure(`can't resolve ${dir}: ${err.code ?? err.message}`); }
+    if (seen.has(real)) continue;
+    seen.add(real);
+    if (depth > FILL_WALK_DEPTH) return unsure(`${dir} is more than ${FILL_WALK_DEPTH} levels deep`);
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (err) {
+      if (err.code === "ENOENT" || err.code === "ENOTDIR") continue;
+      return unsure(`can't list ${dir}: ${err.code ?? err.message}`);
+    }
+    for (const e of entries) {
+      const child = path.join(dir, e.name);
+      if (e.name === STATE_DIR) {
+        const status = enrollment(dir, new Map(), { boundary: dir });
+        if (status.protected) return status;
+        continue;
+      }
+      if (FILL_WALK_SKIP.has(e.name)) continue;
+      let isDir = e.isDirectory();
+      if (e.isSymbolicLink()) { try { isDir = fs.statSync(child).isDirectory(); } catch { isDir = false; } }
+      if (isDir) stack.push([child, depth + 1]);
+    }
+  }
+  return null;
+}
+
+/** The Stop flags skel's Stop hook entries in these settings carry. */
+function legacyStopFlags(settings) {
+  let block = false;
+  let notifyOnly = false;
+  for (const g of settings.hooks?.Stop ?? []) {
+    for (const hk of Array.isArray(g?.hooks) ? g.hooks : []) {
+      const found = skelStopHook(hk?.command);
+      if (found) { block ||= found.block; notifyOnly ||= found.notifyOnly; }
+    }
+  }
+  return { block, notifyOnly };
+}
+
+/**
+ * Other settings files with skel's hooks that install doesn't edit (it only
+ * ever wrote .claude/settings.local.json): [file].
+ */
+function hooksElsewhere(target) {
+  return [path.join(target, ".claude", "settings.json"), path.join(claudeConfigDir(), "settings.json")].filter((file) => {
+    try { return hasLegacyHooks(JSON.parse(fs.readFileSync(file, "utf-8"))); } catch { return false; }
+  });
+}
+
+/**
+ * `skel install`: protect a project for the plugin. Writes the deny rules and
+ * the ownership record (with the project's Stop mode), and migrates an older
+ * install's hooks and skill/agent copies out of .claude/ once the plugin's
+ * hooks are positively in place, never during a fill.
+ */
+async function installForPlugin(dir, mode) {
+  const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
+  const rules = mergeRules(target, settings);
+  const legacyHooks = hasLegacyHooks(settings);
+  const copies = installedFiles(claudeDir).filter(([, dest]) => fs.existsSync(dest));
+  const flags = legacyStopFlags(settings);
+  let stopMode = mode ?? readStopMode(target);
+  const kept = [];
+  let removedHooks = 0;
+  let removedCopies = [];
+  const customized = [];
+  if (legacyHooks || copies.length) {
+    const fill = fillAtOrBelow(target);
+    const evidence = pluginEvidence(target);
+    if (fill) {
+      kept.push(`not removing the older install's hooks or skill copies: ${fill.reason}. Removing the gate mid-fill is what the settings guard holds, and the running session keeps its hooks anyway. Finish the skeleton or run \`skel reshape\`, then run \`skel install\` again.`);
+    } else if (!evidence.ok) {
+      kept.push(`keeping the older install's hooks and skill copies: there's no positive evidence the ${PLUGIN_ID} plugin's hooks would load for this project, so removing them could leave it with no gate:\n${evidence.problems.map((p) => `  - ${p}`).join("\n")}\n  Install or fix the plugin (see the README), then run \`skel install\` again; or run \`skel install --legacy\` to keep the old install up to date.`);
+    } else {
+      if (legacyHooks && flags.block && flags.notifyOnly && !mode) {
+        kept.push("keeping the older install's hooks: its Stop hook entries carry both --block and --notify-only, so skel can't tell which mode you meant. Remove one of them from .claude/settings.local.json, or re-run with `skel install --notify-only` or `skel install --block`.");
+      } else if (legacyHooks) {
+        if (!mode && flags.notifyOnly) stopMode = "notify-only";
+        else if (!mode && flags.block) stopMode = "block";
+        removedHooks = removeSkelHooks(settings).removed;
+      }
+      for (const [src, dest] of copies) {
+        const rel = path.relative(PKG_ROOT, src).split(path.sep).join("/");
+        let text = null;
+        try { text = fs.readFileSync(dest, "utf-8"); } catch {}
+        if (text !== null && isLegacyCopy(rel, text, fs.readFileSync(src, "utf-8"))) removedCopies.push(dest);
+        else customized.push(dest);
+      }
+    }
+  }
+  writeRules(target, settingsPath, settings, rules, stopMode);
+  for (const dest of removedCopies) {
+    fs.rmSync(dest, { force: true });
+    if (path.basename(dest) === "SKILL.md") { try { fs.rmdirSync(path.dirname(dest)); } catch {} } // only if we left it empty
+  }
+  reportRules(target, settings, rules);
+  console.log(`Stop mode for this project: ${stopMode === "notify-only" ? "notify only" : "one corrective continuation per unchanged drift report (the default)"}${stopMode ? ` (recorded in ${ownedStorePath(target)})` : ""}`);
+  for (const k of kept) console.log(`warning: ${k}`);
+  if (removedHooks) console.log(`removed ${removedHooks} hook(s) an older skel install added to ${settingsPath} (your other hooks are untouched)`);
+  for (const dest of removedCopies) console.log(`removed ${dest}: an unmodified copy an older skel install wrote (the plugin serves it now)`);
+  for (const dest of customized) console.log(`left in place: ${dest} isn't a copy skel shipped (you changed it, or it's yours). The plugin's /skel:* skills and skel:skeleton-filler agent are separate; remove this one by hand once you don't need it.`);
+  const plugin = pluginStatus(target);
+  if (!plugin.enabled) {
+    console.log(`note: the ${PLUGIN_ID} plugin isn't enabled for this project, so these rules have no hooks to go with them yet. Install it at local or project scope:\n  claude plugin marketplace add mitchjablonski/skeleton-skills --scope local\n  claude plugin install ${PLUGIN_ID} --scope local\nthen restart Claude Code.`);
+  } else if (removedHooks || removedCopies.length) {
+    console.log("note: settings on disk can't show what a running session loaded. Restart Claude Code (or run /reload-plugins), then check /hooks: skel's PreToolUse, Stop and ConfigChange hooks should each appear once, from the plugin.");
+  }
+  for (const file of hooksElsewhere(target)) console.log(`warning: ${file} also has skel's hooks${plugin.enabled ? ", so with the plugin they run twice" : ""}. install never edits that file; remove them by hand.`);
+  const reg = registrationNotice(target, "cli");
+  if (reg) console.log(`warning: ${reg}`);
+  if (enrollment(target).protected) console.log("note: a fill is active, so a running Claude Code session won't reload these settings: it keeps enforcing the rules it loaded until you restart it.");
+  const storesNote = await storeNotice(target);
+  if (storesNote) console.log(`note: ${storesNote}`);
+  if (/[\\/]plugins[\\/]cache[\\/]/.test(PKG_ROOT)) console.log(`note: this skel runs from Claude Code's plugin cache (${PKG_ROOT}), which moves with every update and is removed after one. For terminal recovery, keep a clone of skeleton-skills and run its bin/skel.mjs.`);
+  else console.log(`To run skel from a terminal (recovery, uninstall, migrate), use this checkout: ${TERMINAL_SKEL}`);
+}
+
+/** `skel install --legacy`: today's full install, kept for one release. */
+async function installLegacy(dir, mode) {
+  // The hook command runs through a shell: refuse an install path that a
+  // shell would interpret rather than quote it and hope. Windows paths are
+  // written with forward slashes (Node accepts them), so their backslashes
+  // never reach the shell.
+  if (/["'`$\n\r]/.test(PKG_ROOT) || (process.platform !== "win32" && PKG_ROOT.includes("\\"))) {
+    die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
+  }
+  const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
+  const rules = mergeRules(target, settings);
+  for (const [src, dest] of installedFiles(claudeDir)) {
+    writeFileAtomic(dest, renderLegacy(fs.readFileSync(src, "utf-8"), PKG_ROOT_FWD));
+  }
+  const command = `node "${HOOK}"`;
+  settings.hooks ??= {};
+  settings.hooks.PreToolUse ??= [];
+  const matcher = "Write|Edit|MultiEdit|NotebookEdit|Bash";
+  // Shared matchers and metadata belong to the user's remaining hooks.
+  let ours = false;
+  let firstHook = null;
+  settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter((group) => {
+    if (!Array.isArray(group?.hooks)) return true;
+    const before = group.hooks.length;
+    group.hooks = group.hooks.filter((hook) => {
+      if (!isSkelHook(hook?.command)) return true;
+      firstHook ??= hook;
+      return false;
+    });
+    const removed = group.hooks.length !== before;
+    ours ||= removed;
+    return !removed || group.hooks.length > 0;
+  });
+  settings.hooks.PreToolUse.push({ matcher, hooks: [{ ...(firstHook ?? { type: "command" }), command }] });
+  // The Stop hook checks for drift at the end of every turn during a fill.
+  // Found by its script, so a moved clone is updated in place, duplicates
+  // (two installs, a hand-added copy) collapse to the first, and a `--block`
+  // on any of them survives a reinstall.
+  const stopCommand = `node "${STOP_HOOK}"`;
+  settings.hooks.Stop ??= [];
+  let stopOurs = null;
+  let block = false;
+  let notifyOnly = false;
+  const emptied = new Set();
+  for (const m of settings.hooks.Stop) {
+    if (!Array.isArray(m?.hooks) || !m.hooks.length) continue;
+    m.hooks = m.hooks.filter((hk) => {
+      const found = skelStopHook(hk?.command);
+      if (!found) return true;
+      block ||= found.block;
+      notifyOnly ||= found.notifyOnly;
+      if (stopOurs) return false;
+      stopOurs = hk;
+      return true;
+    });
+    if (!m.hooks.length) emptied.add(m);
+  }
+  settings.hooks.Stop = settings.hooks.Stop.filter((m) => !emptied.has(m));
+  if (mode) { block = mode === "block"; notifyOnly = mode === "notify-only"; }
+  const stopFlags = block ? " --block" : notifyOnly ? " --notify-only" : "";
+  if (block && notifyOnly) console.log("warning: conflicting Stop hook modes; keeping --block. Remove the old --block entry to use --notify-only");
+  if (stopOurs) stopOurs.command = stopCommand + stopFlags;
+  else settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand + stopFlags }] });
+  // Freeze ordinary settings reloads during a fill. Keep other hooks and
+  // groups; remove only our exact standalone command, including moved clones.
+  settings.hooks.ConfigChange ??= [];
+  const configGroups = settings.hooks.ConfigChange;
+  const emptiedConfigs = new Set();
+  for (const group of configGroups) {
+    if (!Array.isArray(group?.hooks) || !group.hooks.length) continue;
+    group.hooks = group.hooks.filter((hk) => !isSkelConfigHook(hk?.command));
+    if (!group.hooks.length) emptiedConfigs.add(group);
+  }
+  settings.hooks.ConfigChange = configGroups.filter((g) => !emptiedConfigs.has(g));
+  settings.hooks.ConfigChange.push({
+    matcher: "user_settings|project_settings|local_settings",
+    hooks: [{ type: "command", command: `node "${CONFIG_HOOK}"` }],
+  });
+  writeRules(target, settingsPath, settings, rules, readStopMode(target));
+  console.log(`installed /skeleton and /skeleton-fill into ${claudeDir}/skills`);
+  console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
+  console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
+  console.log(stopOurs ? "drift check (Stop) hook updated" : `added drift check (Stop) hook to ${settingsPath}`);
+  console.log(`settings-reload guard (ConfigChange) configured; settings changes are held during a fill`);
+  reportRules(target, settings, rules);
+  if (pluginStatus(target).enabled) console.log(`warning: the ${PLUGIN_ID} plugin is enabled for this project too, so skel's hooks now run twice. Run \`skel install\` (without --legacy) to use the plugin's alone, or disable the plugin.`);
+  if (enrollment(target).protected) console.log("note: a fill is active, so a running Claude Code session won't reload these settings: it keeps enforcing the rules it loaded until you restart it.");
+  const storesNote = await storeNotice(target);
+  if (storesNote) console.log(`note: ${storesNote}`);
+  console.log(`optional: Claude Code's Bash sandbox can enforce those rules at the OS level; see "Security model" in the README (skel needs "excludedCommands": ["node \\"${SELF}\\" *"])`);
 }
 
 const commands = {
@@ -523,15 +840,17 @@ const commands = {
       if (configNotice) console.error(configNotice);
       die(`no ${STATE_DIR}/state.json here or above — run \`skel init "<title>"\` first`);
     }
+    const feedbackLock = [feedbackLockNotice(root), feedbackOrderNotice(root)].filter(Boolean).join("\n") || null;
     const state = readState(root);
     if (!validState(state)) {
       const error = `can't read ${path.join(root, STATE_DIR, "state.json")}; repair that file or run \`skel init --force "<title>"\` from ${root} (requires approval in Claude Code)`;
       if (args.includes("--json")) {
-        console.log(JSON.stringify({ error, configNotice }, null, 2));
+        console.log(JSON.stringify({ error, configNotice, ...(feedbackLock ? { feedbackLockNotice: feedbackLock } : {}) }, null, 2));
         process.exitCode = 1;
         return;
       }
       if (configNotice) console.error(configNotice);
+      if (feedbackLock) console.error(feedbackLock);
       die(error);
     }
     const { steps, errors, files } = snapshot(root);
@@ -542,8 +861,10 @@ const commands = {
     const coverage = record && !gap ? record.coverage : null;
     const sourceCheck = { ...(gap ? { coverageGap: gap } : {}), ...(coverage ? { coverage: { id: coverage.id, policy: coverage.policy, mode: coverage.discovery.mode, fullCheck: "done and finalize" } } : {}) };
     const stores = await storeNotice(root);
+    let registration = null;
+    try { registration = registrationNotice(root, "cli"); } catch {}
     if (args.includes("--json")) {
-      console.log(JSON.stringify({ ...state, errors, drift, ...sourceCheck, configNotice, ...(stores ? { storeNotice: stores } : {}), steps: steps.map(({ fences, ...s }) => ({
+      console.log(JSON.stringify({ ...state, errors, drift, ...sourceCheck, configNotice, ...(feedbackLock ? { feedbackLockNotice: feedbackLock } : {}), ...(stores ? { storeNotice: stores } : {}), ...(registration ? { registrationNotice: registration } : {}), steps: steps.map(({ fences, ...s }) => ({
         ...s, fences: fences.map(({ body, ...f }) => f),
       })) }, null, 2));
       return;
@@ -551,12 +872,14 @@ const commands = {
     const done = steps.filter((s) => s.status === "filled").length;
     console.log(`${state.title} — phase: ${state.phase}${state.activeStep ? `, active: ${state.activeStep}` : ""} — ${done}/${steps.length} filled`);
     if (configNotice) console.log(configNotice);
+    if (feedbackLock) console.log(`  ! ${feedbackLock}`);
     for (const s of steps) {
       const mark = s.id === state.activeStep ? "▶" : s.status === "filled" ? "✓" : "·";
       console.log(`  ${mark} ${s.id.padEnd(5)} ${s.title}  (${s.fences.map((f) => `${f.file}:${f.openLine}`).join(", ")})`);
     }
     for (const e of errors) console.log(`  ! ${e}`);
     if (stores) console.log(`  ! ${stores}`);
+    if (registration) console.log(`  ! ${registration.replace(/\n/g, "\n  ! ")}`);
     if (drift && !drift.ok) console.log(`  ! ${formatDrift(drift).replace(/\n/g, "\n    ")}\n    (skel done and skel finalize refuse until it's resolved)`);
     if (gap) console.log(`  ! ${gap}`);
     if (coverage) console.log(`  (this checked the skeleton's own files; the full check of source baseline ${coverage.id} runs at done/finalize)`);
@@ -591,7 +914,7 @@ const commands = {
     // A verified server is reused, and its token kept, only if its reads are
     // shown to need that token. Anything else from before #39 is replaced.
     const protectedReads = running ? await readsProtected(running) : false;
-    if (running && protectedReads && running.feedbackEnabled === feedbackEnabled && running.storeProtocol >= STORE_PROTOCOL) {
+    if (running && protectedReads && running.feedbackEnabled === feedbackEnabled && running.storeProtocol >= STORE_PROTOCOL && running.feedbackOrder === 1) {
       console.log(`skel review: ${running.url}#t=${running.token} (${mode}; already running; \`skel serve --stop\` stops it)`);
       return;
     }
@@ -721,9 +1044,9 @@ const commands = {
           res.end(JSON.stringify(pagePayload(data, { version, feedbackEnabled, serverId })));
         } else if (req.method === "GET" && req.url === "/api/version") {
           lastPoll = Date.now();
-          res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           const now = current();
-          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled, storeProtocol: STORE_PROTOCOL, readAuth: READ_AUTH }));
+          res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+          res.end(JSON.stringify({ version: now.version, skeletonVersion: now.data.skeletonVersion, serverId, pid: process.pid, feedbackEnabled, storeProtocol: STORE_PROTOCOL, readAuth: READ_AUTH, feedbackOrder: 1 }));
         } else if (req.method === "POST" && req.url === "/api/feedback") {
           if (!feedbackEnabled) { req.resume(); return void res.writeHead(405, { Allow: "GET", connection: "close" }).end("read-only review; reload and use Copy feedback for Claude"); }
           // Cross-site writes: same origin, a JSON content type (forces a CORS
@@ -737,18 +1060,18 @@ const commands = {
           if (!recorded) return void refuse(503, "skel serve couldn't record its session, so Claude wouldn't trust this feedback; copy it to Claude by hand");
           let body = "";
           req.on("data", (c) => { body += c; if (body.length > 2_000_000) req.destroy(); });
-          req.on("end", () => {
+          req.on("end", async () => {
             try {
               const fb = cleanFeedback(JSON.parse(body));
-              const now = current().data.skeletonVersion;
-              storeFeedback(root, session, fb, now);
+              let now;
+              await storeFeedbackForHttp(root, session, fb, () => (now = current().data.skeletonVersion));
               // A page that was already out of date is told so (the notes are
               // still delivered, marked stale).
               if (fb.version && fb.version !== now) {
                 res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ stale: true, reviewed: fb.version, current: now }));
               } else res.writeHead(204).end();
-            } catch {
-              res.writeHead(400).end("bad feedback payload");
+            } catch (err) {
+              res.writeHead(isFeedbackError(err) ? 503 : 400).end(isFeedbackError(err) ? err.message : "bad feedback payload");
             }
           });
         } else {
@@ -786,7 +1109,7 @@ const commands = {
     // The agent's Bash tool times out at 120s by default: keep each wait under
     // it and let the skill loop.
     const wait = Math.min(Number(flag(args, "wait", "0")) || 0, 110);
-    const deadline = Date.now() + wait * 1000;
+    const deadline = performance.now() + wait * 1000;
     let readonly = false;
     // No server (a static review, or it stopped): nothing can send, so don't
     // sit out the wait. Only once none has answered for NO_SERVER_GRACE in a
@@ -798,9 +1121,9 @@ const commands = {
     while (pendingCount(root) === 0) {
       const live = await liveServer(root);
       if (live?.feedbackEnabled === false) { readonly = true; break; }
-      missingSince = live ? null : missingSince ?? Date.now();
-      if (wait && missingSince !== null && Date.now() - missingSince >= NO_SERVER_GRACE) { noServer = true; break; }
-      if (Date.now() >= deadline) break;
+      missingSince = live ? null : missingSince ?? performance.now();
+      if (wait && missingSince !== null && performance.now() - missingSince >= NO_SERVER_GRACE) { noServer = true; break; }
+      if (performance.now() >= deadline) break;
       await new Promise((r) => setTimeout(r, 1000));
     }
     warnLegacyQueue(root);
@@ -811,7 +1134,10 @@ const commands = {
           "They are not the human's feedback; don't act on them.\n",
       );
     }
-    if (taken.status === "ok") console.log(feedbackMarkdown(requireState(root).title, mergeRecords(taken.records)));
+    if (taken.status === "ok") {
+      const state = requireState(root);
+      console.log(feedbackMarkdown(state.title, mergeRecords(taken.records, state.reviewRound ?? null)));
+    }
     else if (readonly) console.log("READ_ONLY: the review is read-only; the human's feedback arrives as a chat message. Wait for it; don't poll. Only if the human asks for direct Send: skel serve --send.");
     else if (noServer) console.log("NO_SERVER: no review server is running (a static review, or it stopped), so nothing can be sent; the human's feedback arrives as a chat message. Wait for it; don't poll.");
     else console.log(`NO_FEEDBACK${wait ? ` (waited ${wait}s)` : ""}`);
@@ -821,7 +1147,7 @@ const commands = {
     const given = flag(args, "reviewed", null);
     if (given !== null && !isVersion(given)) die('--reviewed takes the 12-character version the human reviewed (the "Reviewed skeleton version: …" line of their feedback)');
     const root = requireRoot();
-    const state = requireState(root);
+    let state = requireState(root);
     if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
     const { steps, errors, files } = snapshot(root);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
@@ -834,36 +1160,45 @@ const commands = {
     // a lock taken for the checks below (#50's feedback lock) isn't held through it.
     const sourceStart = Date.now();
     const { record, source } = await captureApproval(root, state, files);
-    const { record: last, unread } = lastReview(root, state.reviewEpoch);
-    if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
-    // What the human reviewed: the version named in the feedback the agent
-    // was given (copied markdown → --reviewed), else the page's latest send,
-    // else the version the review page (live or `skel review`) last rendered.
-    // Under the read-only default the last is the common case: approving what
-    // the page showed is fine, approving something it never showed is not.
-    let review = null;
-    if (given) review = { version: given, source: "reviewed-flag", at: null, how: "the human reviewed" };
-    else if (last?.version) review = { version: last.version, source: "review-page", at: last.at, how: "the human reviewed" };
-    let storeError = null;
-    if (!review) {
-      const store = readRenderedStore(root);
-      storeError = store.unreadable;
-      const shown = store.versions[0];
-      if (shown) review = { version: shown.version, source: "rendered", at: shown.at, how: "no --reviewed was given and nothing was sent; the review page last showed" };
-    }
-    if (review && review.version !== record.version) die(staleReview(root, state, files, review.version, review.how));
-    if (!review) console.log(`note: no reviewed version given (pass --reviewed <v> from the "Reviewed skeleton version" line of the feedback the human pasted), no send on record, and ${storeError ? `the rendered-versions store couldn't be read (${storeError}), so there's no rendered version to check against` : "no review page was ever rendered for this project"}. Approving on the human's word alone.`);
-    console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
-    for (const line of describeCoverage(source.coverage, Object.keys(record.files).length)) console.log(line);
-    const sourceTook = Date.now() - sourceStart;
-    if (sourceTook > 3000) console.log(`  note: reading the source set took ${(sourceTook / 1000).toFixed(1)}s. \`done\` and \`finalize\` re-read it.`);
-    const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
-    try {
-      writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at }, source.coverage);
-    } catch (err) {
-      die(`couldn't record the approved skeleton: ${err.message}`);
-    }
-    writeState(root, next);
+    const capturedState = state;
+    const review = withFeedbackLock(root, () => {
+      const checked = requireState(root);
+      if (checked.reviewEpoch !== capturedState.reviewEpoch || checked.reviewRound !== capturedState.reviewRound || JSON.stringify(checked.files) !== JSON.stringify(capturedState.files)) die("review state changed during source capture; retry approval");
+      if (checked.phase !== "scaffold") die("the skeleton is no longer open for approval; retry after the other operation");
+      state = ensureReviewRound(root);
+      const { record: last, unread, unknown } = lastReview(root, state.reviewRound);
+      if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
+      if (unknown && !last && !given) die("legacy feedback has no reliable review round/order. Review again and have the human explicitly provide --reviewed <version>, or resend their review. The last rendered page cannot replace that review.");
+      // What the human reviewed: the version named in the feedback the agent
+      // was given (copied markdown → --reviewed), else the page's latest send,
+      // else the version the review page (live or `skel review`) last rendered.
+      // Under the read-only default the last is the common case: approving what
+      // the page showed is fine, approving something it never showed is not.
+      let review = null;
+      if (given) review = { version: given, source: "reviewed-flag", at: null, how: "the human reviewed" };
+      else if (last?.version) review = { version: last.version, source: "review-page", at: last.at, how: "the human reviewed" };
+      let storeError = null;
+      if (!review) {
+        const store = readRenderedStore(root);
+        storeError = store.unreadable;
+        const shown = store.versions[0];
+        if (shown) review = { version: shown.version, source: "rendered", at: shown.at, how: "no --reviewed was given and nothing was sent; the review page last showed" };
+      }
+      if (review && review.version !== record.version) die(staleReview(root, state, files, review.version, review.how));
+      if (!review) console.log(`note: no reviewed version given (pass --reviewed <v> from the "Reviewed skeleton version" line of the feedback the human pasted), no send on record, and ${storeError ? `the rendered-versions store couldn't be read (${storeError}), so there's no rendered version to check against` : "no review page was ever rendered for this project"}. Approving on the human's word alone.`);
+      console.log(`skeleton version ${record.version}: ${Object.keys(record.files).length} file(s), ${record.fences.length} fence(s)`);
+      for (const line of describeCoverage(source.coverage, Object.keys(record.files).length)) console.log(line);
+      const sourceTook = Date.now() - sourceStart;
+      if (sourceTook > 3000) console.log(`  note: reading the source set took ${(sourceTook / 1000).toFixed(1)}s. \`done\` and \`finalize\` re-read it.`);
+      const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
+      try {
+        writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at }, source.coverage);
+      } catch (err) {
+        die(`couldn't record the approved skeleton: ${err.message}`);
+      }
+      writeState(root, next);
+      return review;
+    });
     // Successful approval re-arms delivery even if a frozen or reversed clock
     // repeats the old approval identity. Advisory cache faults never undo it.
     try {
@@ -872,7 +1207,8 @@ const commands = {
     } catch {}
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
-    if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`);
+    try { if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`); }
+    catch (err) { console.error(`note: approval succeeded; storage notice unavailable (${err.message})`); }
   },
 
   next() {
@@ -947,13 +1283,15 @@ const commands = {
 
   reshape(args) {
     const root = requireRoot();
-    const state = requireState(root);
-    if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
-    writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now() });
-    // The record is of the shape being reopened; approve writes the new one.
-    clearSnapshot(root);
-    clearConfigNotices(root);
-    console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
+    return withFeedbackLock(root, () => {
+      const state = requireState(root);
+      if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
+      writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now(), reviewRound: crypto.randomUUID() });
+      // The record is of the shape being reopened; approve writes the new one.
+      clearSnapshot(root);
+      clearConfigNotices(root);
+      console.log("back to skeleton review: edits are unfenced; get the human's approval again, then `skel approve`.");
+    });
   },
 
   async finalize() {
@@ -989,118 +1327,17 @@ const commands = {
     await runStopHook({ block });
   },
 
-  async install([dir = process.cwd()]) {
-    // The hook command runs through a shell: refuse an install path that a
-    // shell would interpret rather than quote it and hope. Windows paths are
-    // written with forward slashes (Node accepts them), so their backslashes
-    // never reach the shell.
-    if (/["'`$\n\r]/.test(PKG_ROOT) || (process.platform !== "win32" && PKG_ROOT.includes("\\"))) {
-      die(`can't install from a path containing quotes, $, backticks${process.platform === "win32" ? "" : " or backslashes"}: ${PKG_ROOT}`);
-    }
-    const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
-    const { rules: stateRules, why } = denyRules(target);
-    const stores = storeDenyRules();
-    const rules = [...new Set([...stateRules, ...stores.map((s) => s.rule).filter(Boolean)])];
-    const prevOwned = readOwned(target);
-    const stale = [...legacyOwned(settings, prevOwned), ...(prevOwned ?? []).filter((r) => !rules.includes(r))];
-    for (const [src, dest] of installedFiles(claudeDir)) {
-      writeFileAtomic(dest, fs.readFileSync(src, "utf-8").replaceAll("{{SKEL}}", `node "${SELF}"`));
-    }
-    const command = `node "${HOOK}"`;
-    settings.hooks ??= {};
-    settings.hooks.PreToolUse ??= [];
-    const matcher = "Write|Edit|MultiEdit|NotebookEdit|Bash";
-    // Shared matchers and metadata belong to the user's remaining hooks.
-    let ours = false;
-    let firstHook = null;
-    settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter((group) => {
-      if (!Array.isArray(group?.hooks)) return true;
-      const before = group.hooks.length;
-      group.hooks = group.hooks.filter((hook) => {
-        if (!isSkelHook(hook?.command)) return true;
-        firstHook ??= hook;
-        return false;
-      });
-      const removed = group.hooks.length !== before;
-      ours ||= removed;
-      return !removed || group.hooks.length > 0;
-    });
-    settings.hooks.PreToolUse.push({ matcher, hooks: [{ ...(firstHook ?? { type: "command" }), command }] });
-    // The Stop hook checks for drift at the end of every turn during a fill.
-    // Found by its script, so a moved clone is updated in place, duplicates
-    // (two installs, a hand-added copy) collapse to the first, and a `--block`
-    // on any of them survives a reinstall.
-    const stopCommand = `node "${STOP_HOOK}"`;
-    settings.hooks.Stop ??= [];
-    let stopOurs = null;
-    let block = false;
-    let notifyOnly = false;
-    const emptied = new Set();
-    for (const m of settings.hooks.Stop) {
-      if (!Array.isArray(m?.hooks) || !m.hooks.length) continue;
-      m.hooks = m.hooks.filter((hk) => {
-        const found = skelStopHook(hk?.command);
-        if (!found) return true;
-        block ||= found.block;
-        notifyOnly ||= found.notifyOnly;
-        if (stopOurs) return false;
-        stopOurs = hk;
-        return true;
-      });
-      if (!m.hooks.length) emptied.add(m);
-    }
-    settings.hooks.Stop = settings.hooks.Stop.filter((m) => !emptied.has(m));
-    const stopFlags = block ? " --block" : notifyOnly ? " --notify-only" : "";
-    if (block && notifyOnly) console.log("warning: conflicting Stop hook modes; keeping --block. Remove the old --block entry to use --notify-only");
-    if (stopOurs) stopOurs.command = stopCommand + stopFlags;
-    else settings.hooks.Stop.push({ hooks: [{ type: "command", command: stopCommand }] });
-    // Freeze ordinary settings reloads during a fill. Keep other hooks and
-    // groups; remove only our exact standalone command, including moved clones.
-    settings.hooks.ConfigChange ??= [];
-    const configGroups = settings.hooks.ConfigChange;
-    const emptiedConfigs = new Set();
-    for (const group of configGroups) {
-      if (!Array.isArray(group?.hooks) || !group.hooks.length) continue;
-      group.hooks = group.hooks.filter((hk) => !isSkelConfigHook(hk?.command));
-      if (!group.hooks.length) emptiedConfigs.add(group);
-    }
-    settings.hooks.ConfigChange = configGroups.filter((g) => !emptiedConfigs.has(g));
-    settings.hooks.ConfigChange.push({
-      matcher: "user_settings|project_settings|local_settings",
-      hooks: [{ type: "command", command: `node "${CONFIG_HOOK}"` }],
-    });
-    settings.permissions ??= {};
-    settings.permissions.deny = (settings.permissions.deny ?? []).filter((r) => !stale.includes(r));
-    const added = rules.filter((r) => !settings.permissions.deny.includes(r));
-    settings.permissions.deny.push(...added);
-    // Ours: what we add now, plus what an earlier install added and still owns.
-    // A rule that was already there and isn't recorded stays the user's.
-    // Settings first: a failed write must never record rules that weren't added.
-    writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-    writeOwned(target, rules.filter((r) => added.includes(r) || prevOwned?.includes(r)));
-    // .skeleton/ is per-run state (and holds the human's feedback): keep it
-    // out of commits, so a repo can't ship a verdict.
-    const gi = path.join(target, ".gitignore");
-    const giText = fs.existsSync(gi) ? fs.readFileSync(gi, "utf-8") : "";
-    if (!/^\/?\.skeleton\/?$/m.test(giText)) fs.appendFileSync(gi, `${giText && !giText.endsWith("\n") ? "\n" : ""}.skeleton/\n`);
-    console.log(`installed /skeleton and /skeleton-fill into ${claudeDir}/skills`);
-    console.log(`installed the skeleton-filler subagent into ${claudeDir}/agents (restart Claude Code if that folder is new)`);
-    console.log(ours ? "scope gate hook updated" : `added scope gate hook to ${settingsPath}`);
-    console.log(stopOurs ? "drift check (Stop) hook updated" : `added drift check (Stop) hook to ${settingsPath}`);
-    console.log(`settings-reload guard (ConfigChange) configured; settings changes are held during a fill`);
-    const addedState = added.filter((r) => stateRules.includes(r));
-    if (why) console.log(`warning: no permission deny rules for ${STATE_DIR}/ state: ${why}. The hook still guards it; to get the rules too, move the project to a plainer path and re-run install`);
-    else console.log(addedState.length ? `added ${addedState.length} permission deny rule(s) for ${STATE_DIR}/ state` : `permission deny rules for ${STATE_DIR}/ already present`);
-    for (const { name, rule, why: noRule } of stores) {
-      if (noRule) console.log(`warning: no permission deny rule for skel's ${name}: ${noRule}. The hook still asks about edits there`);
-      else console.log(`${added.includes(rule) ? `added a permission deny rule for skel's ${name}` : `permission deny rule for skel's ${name} already present`}: ${rule} (it is resolved now: re-run install if you change XDG_STATE_HOME or XDG_CONFIG_HOME)`);
-    }
-    reportLeftInPlace(settings, rules);
-    launchWarning(target);
-    if (enrollment(target).protected) console.log("note: a fill is active, so a running Claude Code session won't reload these settings: it keeps enforcing the rules it loaded until you restart it.");
-    const storesNote = await storeNotice(target);
-    if (storesNote) console.log(`note: ${storesNote}`);
-    console.log(`optional: Claude Code's Bash sandbox can enforce those rules at the OS level; see "Security model" in the README (skel needs "excludedCommands": ["node \\"${SELF}\\" *"])`);
+  async install(args) {
+    const usage = "usage: skel install [--legacy] [--notify-only|--block] [projectDir]";
+    const unknown = args.find((a) => a.startsWith("-") && !["--legacy", "--notify-only", "--block"].includes(a));
+    if (unknown) die(`unknown option ${unknown}\n${usage}`);
+    if (args.includes("--notify-only") && args.includes("--block")) die(`--notify-only and --block are mutually exclusive\n${usage}`);
+    const dirs = args.filter((a) => !a.startsWith("-"));
+    if (dirs.length > 1) die(usage);
+    const dir = dirs[0] ?? process.cwd();
+    const mode = args.includes("--notify-only") ? "notify-only" : args.includes("--block") ? "block" : null;
+    if (args.includes("--legacy")) return installLegacy(dir, mode);
+    return installForPlugin(dir, mode);
   },
 
   /**
@@ -1165,42 +1402,7 @@ const commands = {
     const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir);
     const prevOwned = readOwned(target);
     const owned = [...(prevOwned ?? []), ...legacyOwned(settings, prevOwned)];
-    const groups = settings.hooks?.PreToolUse ?? [];
-    const emptied = new Set();
-    for (const group of groups) {
-      if (!Array.isArray(group?.hooks)) continue;
-      const before = group.hooks.length;
-      group.hooks = group.hooks.filter((hook) => !isSkelHook(hook?.command));
-      if (before && !group.hooks.length) emptied.add(group);
-    }
-    if (settings.hooks?.PreToolUse) {
-      settings.hooks.PreToolUse = groups.filter((group) => !emptied.has(group));
-      if (!settings.hooks.PreToolUse.length) delete settings.hooks.PreToolUse;
-    }
-    // The drift check (Stop) hook, with or without --block.
-    const stops = settings.hooks?.Stop ?? [];
-    const emptiedStops = new Set();
-    for (const m of stops) {
-      if (!Array.isArray(m?.hooks) || !m.hooks.length) continue;
-      m.hooks = m.hooks.filter((hk) => !skelStopHook(hk?.command));
-      if (!m.hooks.length) emptiedStops.add(m);
-    }
-    if (settings.hooks?.Stop) {
-      settings.hooks.Stop = stops.filter((m) => !emptiedStops.has(m));
-      if (!settings.hooks.Stop.length) delete settings.hooks.Stop;
-    }
-    const configs = settings.hooks?.ConfigChange ?? [];
-    const emptiedConfigs = new Set();
-    for (const group of configs) {
-      if (!Array.isArray(group?.hooks) || !group.hooks.length) continue;
-      group.hooks = group.hooks.filter((hk) => !isSkelConfigHook(hk?.command));
-      if (!group.hooks.length) emptiedConfigs.add(group);
-    }
-    if (settings.hooks?.ConfigChange) {
-      settings.hooks.ConfigChange = configs.filter((g) => !emptiedConfigs.has(g));
-      if (!settings.hooks.ConfigChange.length) delete settings.hooks.ConfigChange;
-    }
-    if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
+    removeSkelHooks(settings);
     let removed = 0;
     let removedStores = 0;
     if (settings.permissions?.deny) {
@@ -1213,23 +1415,29 @@ const commands = {
     }
     if (fs.existsSync(settingsPath)) writeFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
     writeOwned(target, []);
-    for (const name of SKILLS) {
-      const skillDir = path.join(claudeDir, "skills", name);
-      fs.rmSync(path.join(skillDir, "SKILL.md"), { force: true });
-      try { fs.rmdirSync(skillDir); } catch {} // only if we left it empty
+    // Only copies a release of skel installed, byte for byte: a file you changed
+    // (which a migration to the plugin also keeps) stays, and is named.
+    const keptCopies = [];
+    for (const [src, dest] of installedFiles(claudeDir)) {
+      let text = null;
+      try { text = fs.readFileSync(dest, "utf-8"); } catch { continue; }
+      if (!isLegacyCopy(path.relative(PKG_ROOT, src).split(path.sep).join("/"), text, fs.readFileSync(src, "utf-8"))) { keptCopies.push(dest); continue; }
+      fs.rmSync(dest, { force: true });
+      // The agents folder may hold the user's own subagents: leave it. A skill dir goes only if we left it empty.
+      if (path.basename(dest) === "SKILL.md") { try { fs.rmdirSync(path.dirname(dest)); } catch {} }
     }
-    // The agents folder may hold the user's own subagents: leave it.
-    fs.rmSync(path.join(claudeDir, "agents", `${AGENT}.md`), { force: true });
-    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent, the scope gate hook, the drift check (Stop) hook and the settings-reload (ConfigChange) hook from ${claudeDir}`);
+    console.log(`removed /skeleton, /skeleton-fill, the ${AGENT} subagent (where unmodified), the scope gate hook, the drift check (Stop) hook and the settings-reload (ConfigChange) hook from ${claudeDir}`);
+    for (const dest of keptCopies) console.log(`left in place: ${dest} isn't a copy skel shipped (you changed it, or it's yours); delete it by hand if you don't want it`);
     console.log("restart Claude Code if these hooks are already loaded; an external uninstall may not trigger a settings-reload event");
     console.log(`removed ${removed} ${STATE_DIR}/ permission deny rule(s) install added`);
     if (removedStores) console.log(`removed ${removedStores} store-dir permission deny rule(s) install added`);
     reportLeftInPlace(settings, []);
     console.log(`left in place: ${STATE_DIR}/ (delete it once you're done with it) and the ${STATE_DIR}/ line in .gitignore`);
+    if (pluginStatus(target).enabled) console.log(`the ${PLUGIN_ID} plugin is still enabled for this project, so its hooks still run: \`claude plugin uninstall ${PLUGIN_ID} --scope local\` (or the scope you installed it at) removes it`);
   },
 };
 
 const [cmd = "help", ...rest] = process.argv.slice(2);
 const run = Object.hasOwn(commands, cmd) ? commands[cmd] : null;
 if (!run) die(`unknown command "${cmd}"\n\n${HELP}`);
-await run(rest);
+try { await run(rest); } catch (err) { if (isFeedbackError(err)) die(err.message); throw err; }

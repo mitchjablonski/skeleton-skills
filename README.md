@@ -4,8 +4,8 @@
 
 Two Claude Code skills and a small CLI that bring back the feeling of building with an AI pair one function at a time, with strong opinions about where code lives:
 
-1. **`/skeleton`**: Claude writes the feature as a *skeleton*: real files, real types and signatures, real wiring, plus an architecture diagram. Every body is an empty, fenced stub. You review the skeleton in a local page, comment on lines or on the diagram, and approve.
-2. **`/skeleton-fill`**: Claude fills one step at a time (or `all` of them), but **only inside the fences**. Each step's code is written by a restricted `skeleton-filler` subagent with no shell and no Write, a `PreToolUse` hook checks every edit, and each step is checked against a snapshot of the skeleton you approved, so a signature change or a new file can't slip in unasked: it comes back to you as a skeleton change.
+1. **`/skel:skeleton`**: Claude writes the feature as a *skeleton*: real files, real types and signatures, real wiring, plus an architecture diagram. Every body is an empty, fenced stub. You review the skeleton in a local page, comment on lines or on the diagram, and approve.
+2. **`/skel:skeleton-fill`**: Claude fills one step at a time (or `all` of them), but **only inside the fences**. Each step's code is written by a restricted `skel:skeleton-filler` subagent with no shell and no Write, a `PreToolUse` hook checks every edit, and each step is checked against a snapshot of the skeleton you approved, so a signature change or a new file can't slip in unasked: it comes back to you as a skeleton change.
 
 ![The review page: architecture diagram coloured by step status, steps sidebar, fenced code, line comments, and the feedback panel.](docs/review.png)
 
@@ -37,14 +37,66 @@ Mermaid files in `.skeleton/diagrams/*.mmd` render above the code. Nodes with th
 
 ## Install
 
+skel ships as a Claude Code plugin, `skel` from the `skeleton-skills` marketplace (this repository). The plugin brings the two skills (`/skel:skeleton`, `/skel:skeleton-fill`), the `skel:skeleton-filler` subagent and the three hooks. A plugin can't ship permission rules, so a small `skel install` step in each project adds the deny rules. You still run that step, and any recovery, from a clone of this repository: the plugin doesn't put a `skel` command in your terminal (an npm package may come later).
+
 ```bash
-git clone https://github.com/mitchjablonski/skeleton-skills
-node skeleton-skills/bin/skel.mjs install /path/to/your/project
+# 1. A clone for the terminal CLI. Keep it at a stable path, outside your projects.
+git clone https://github.com/mitchjablonski/skeleton-skills ~/tools/skeleton-skills
+
+# 2. The plugin, at local scope (only you, only this project) or project scope (shared via the
+#    committed .claude/settings.json; each collaborator still installs it). Run in the project.
+cd /path/to/your/project
+claude plugin marketplace add mitchjablonski/skeleton-skills --scope local
+claude plugin install skel@skeleton-skills --scope local
+
+# 3. The deny rules, then restart Claude Code.
+node ~/tools/skeleton-skills/bin/skel.mjs install
 ```
 
-This copies the two skills into `<project>/.claude/skills/` and the `skeleton-filler` subagent into `<project>/.claude/agents/`, and adds three things to `<project>/.claude/settings.local.json`: the `PreToolUse` scope-gate hook, a `Stop` hook that checks for drift at the end of each turn during a fill, and Claude Code permission **deny** rules for the tool's own state: the project's `.skeleton/` state and skel's state dir (`$XDG_STATE_HOME/skel`, else `~/.local/state/skel`, or `%LOCALAPPDATA%\skel` on native Windows), plus the old `~/.config/skel` location it migrates from (see [Security model](#security-model)). It merges into what's there: your settings and rules are kept, a re-run changes nothing, and it refuses a symlinked or unparseable settings file rather than write through it or overwrite it. If `.claude/agents/` didn't exist when your Claude Code session started, restart the session so it picks up the subagent.
+`claude plugin install` defaults to **user scope**, which runs skel's hooks in every project you open. skel recommends local or project scope. It doesn't refuse a user-scope install, but `skel install` and `skel status` warn about one.
 
-To remove it, run `node skeleton-skills/bin/skel.mjs uninstall /path/to/your/project`. That takes out the skills, the `skeleton-filler` agent file (your other subagents and the `.claude/agents/` folder stay), the scope, Stop and ConfigChange hooks and the deny rules install added, and nothing else: install records which rules it added in skel's state dir (outside the project), so a rule you already had, even an identical one, survives install and uninstall. It reports how many rules it removed, and lists any rule shaped like skel's that it left in place because this install didn't add it (yours, one from before a move, or one whose ownership record was lost). It leaves `.skeleton/` and its `.gitignore` line for you to delete.
+`skel install` adds Claude Code permission **deny** rules to `<project>/.claude/settings.local.json` for the tool's own state: the project's `.skeleton/` state and skel's state dir (`$XDG_STATE_HOME/skel`, else `~/.local/state/skel`, or `%LOCALAPPDATA%\skel` on native Windows), plus the old `~/.config/skel` location it migrates from (see [Security model](#security-model)). It records which rules it added, and the project's Stop mode, in skel's state dir, outside the project. It merges into what's there: your settings and rules are kept, a re-run changes nothing (the file isn't even rewritten), and it refuses a symlinked or unparseable settings file rather than write through it or overwrite it. It prints the exact, quoted `node ".../bin/skel.mjs"` path to use from a terminal.
+
+The Stop hook's mode is per project: `skel install --notify-only` makes drift a notice only; `skel install --block` (or no flag, the default) sends Claude back once per unchanged drift report.
+
+Plugin versions are pinned per release (`version` in `.claude-plugin/plugin.json`), so you stay on a release until you update it yourself (`claude plugin update skel@skeleton-skills`, then restart). Third-party marketplaces don't auto-update by default; leave it that way for now.
+
+To remove skel from a project: `node ~/tools/skeleton-skills/bin/skel.mjs uninstall` takes out the deny rules install added (and, for a legacy install, its hooks and copies) and nothing else: a rule you already had, even an identical one, survives install and uninstall. It lists any rule shaped like skel's that it left in place because this install didn't add it, and leaves `.skeleton/` and its `.gitignore` line for you. It doesn't touch the plugin: `claude plugin uninstall skel@skeleton-skills --scope local` (or the scope you used) does that.
+
+### Developing skel
+
+To run a working copy, add the clone as a local-path marketplace: `claude plugin marketplace add /path/to/skeleton-skills --scope local`, then install as above. A plugin from a local-path marketplace loads **in place** from the clone, so edits apply at the next session or `/reload-plugins`, with no version bump. `claude --plugin-dir /path/to/skeleton-skills` loads it for one session instead, and silently overrides an installed copy with the same name.
+
+### Upgrading from a pre-plugin install
+
+Earlier versions copied the skills and the filler into `.claude/skills/` and `.claude/agents/` and wrote the hooks into `.claude/settings.local.json`. Claude Code doesn't merge a settings hook with a plugin's copy of it, so with both, every hook runs twice (the stricter verdict wins, but it's slower, and each Stop runs twice). To move:
+
+1. Install the plugin (step 2 above).
+2. Outside a fill, run `skel install` from your clone (step 3). Once the plugin is positively in place for the project, it removes skel's hooks from `.claude/settings.local.json` (every form any version wrote, from any clone; your own hooks, shared matchers and their metadata stay) and the skill and agent copies that are byte-for-byte what a release of skel installed. A copy you changed stays, and install names it. A Stop hook's `--notify-only` carries over to the project's Stop mode.
+3. Restart Claude Code, then check `/hooks`: skel's PreToolUse, Stop and ConfigChange hooks should each appear once, from the plugin.
+
+In a linked git worktree, Claude Code keeps local settings in the main checkout: a `--scope local` install from the worktree writes `enabledPlugins` there and records the worktree as the install's project. Run `skel install` in the main checkout; it matches the worktree's install record to it (two worktrees' records for one checkout are ambiguous, and keep the old hooks).
+
+`skel install` keeps the old hooks and copies, with a warning naming why, when it can't see positive evidence that the plugin's hooks would load: the plugin isn't enabled for the project (an explicit `false` anywhere that outranks the `true` counts), a settings file doesn't parse as a JSON object, the install record or the marketplace's declared source for skel is missing, ambiguous or leaves the marketplace, the copy that would load (the declared folder for a local-path marketplace, and the installed copy) lacks the manifest or the hooks, managed policy (`allowManagedHooksOnly` without a managed enable, a blocked marketplace), `disableAllHooks`, another enabled plugin named `skel`, no install record for this project, or a plugin root whose manifest or `hooks/hooks.json` doesn't carry skel's three hooks. It never removes them during a fill, including a fill in a skeleton below the project. `skel uninstall` likewise removes only unmodified copies. It refuses to choose when the old Stop entries carry both `--block` and `--notify-only`; re-run with the flag you want. It only ever edits `.claude/settings.local.json`; skel hooks in `.claude/settings.json` or your user settings are reported, not removed. Even a clean check is only what's on disk: it can't show what a running session loaded, hence step 3. `skel status` and the Stop hook (once a session) warn while hooks are registered twice.
+
+`skel install --legacy` still does the old full install (copies, hooks and rules), for one more release, if you can't use the plugin (for example under a managed `strictKnownMarketplaces`). Existing settings that run `bin/skel-hook.mjs`, `bin/skel-stop.mjs` or `bin/skel-config-hook.mjs` from a clone keep working.
+
+### What a plugin changes about the guarantees
+
+Installing skel as a plugin changes how you get and update it, not what it guarantees. **Disabling or uninstalling the plugin, or reloading plugins after a change to `enabledPlugins`, removes the drift guard and the settings guard, even mid-fill.** Plainly:
+
+- **`/reload-plugins` after a disable unloads it.** `claude plugin disable` writes `enabledPlugins: false` and fires `ConfigChange`, which skel blocks during a fill, but an explicit `/reload-plugins` then reloads without the plugin (probed on Claude Code 2.1.318). The guard doesn't survive that.
+- **A restart loads whatever the settings say.** `ConfigChange` holds a change back from the *running* session; it doesn't stop the write to disk or the next start. The switch is one boolean in `settings.local.json` (local scope) or the committed `settings.json` (project scope).
+- **Off switches the guard doesn't see:** `claude plugin disable`/`uninstall` from another terminal (at the next start or reload), `disableAllHooks`, `--setting-sources`, a `--plugin-dir` copy with the same name, another enabled plugin named `skel`.
+- **Managed policy wins:** `allowManagedHooksOnly` blocks plugin hooks the policy doesn't enable, a managed `false` blocks the plugin, and marketplace restrictions can prevent the install. Policy changes can't be blocked.
+- **Updates mid-session:** hooks keep the old version's path until `/reload-plugins` or a restart.
+- **The plugin's files aren't protected.** The cache under `~/.claude/plugins` is yours to write, and a local-path install *is* your clone. A plugin is a way to get skel, not a security boundary.
+
+Recovery never depends on the plugin: run the clone's `node ".../bin/skel.mjs"` from a terminal (or Claude Code's `!` shell mode), whether the plugin is disabled, uninstalled or mid-update.
+
+### WSL: where the plugin runs from
+
+A plugin installed from GitHub is copied into `$CLAUDE_CONFIG_DIR/plugins/cache/...` (default `~/.claude/plugins`, or `CLAUDE_CODE_PLUGIN_CACHE_DIR`). Under WSL, `~` is the Linux home, so the code runs from the Linux filesystem even when your project is on `/mnt/c`. On one machine that cut a Stop check from about 235 ms to 138 ms (#40); loading code across `/mnt/c` is the slow part. A local-path marketplace runs **in place**, so a dev install from a `/mnt/c` clone gets no speedup; nor does a `CLAUDE_CONFIG_DIR` or cache dir pointed at `/mnt/c`. Native Windows isn't affected. The init line of `claude -p --output-format stream-json --verbose` shows each plugin's `path` if you want to check yours.
 
 ### Upgrading: skel's state moved
 
@@ -68,18 +120,20 @@ If a project's old records can't be moved, `skel migrate` moves none of them and
 
 Changing `XDG_CONFIG_HOME` or `XDG_STATE_HOME` later doesn't migrate anything: skel looks only where they point now, so re-run `skel install` after a change.
 
+**Feedback ordering lock recovery.** Send, feedback draining and approval share `.skeleton/feedback/.order-lock` so accepted notes cannot race approval. `skel status` reports a present lock (also as `feedbackLockNotice` in `--json`); presence does not mean it is stale. Retry after the active operation finishes. If a crash left the lock behind, stop all skel servers and commands, then remove only that empty lock directory from an external terminal and retry. Skel never expires or automatically deletes this authority lock. Do not remove the feedback queue or approval records to recover it.
+
 ## The loop
 
 ```
-/skeleton add stroke smoothing to the canvas
+/skel:skeleton add stroke smoothing to the canvas
    → skel init, writes stubs + diagram, `skel serve` → live read-only page
    → you comment / request changes / approve in the page
    → Copy feedback for Claude → paste into chat
    → skel approve --reviewed <v> (Claude Code asks you to allow it; <v> is the "Reviewed skeleton
                                   version" line you pasted, and approve refuses if the skeleton
                                   changed since the version you reviewed)
-/skeleton-fill            (one step, then stop)
-/skeleton-fill all        (every step, still fenced)
+/skel:skeleton-fill       (one step, then stop)
+/skel:skeleton-fill all   (every step, still fenced)
    → skel next → your opinion → skeleton-filler edits inside the fence → tests → skel done (page reloads)
    → a structural change? Claude stops and proposes it → you reopen it → skel reshape → re-review
    → skel finalize          (strips the markers)
@@ -108,15 +162,17 @@ For no HTTP listener, use `skel review` to generate a static HTML file, then reg
 | `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one. `done` refuses on drift from the approved skeleton or a change to the source baseline |
 | `skel finalize` | All filled and no drift: strip the markers |
 | `skel hook` | The `PreToolUse` scope gate |
-| `skel stop-hook [--notify-only|--block]` | The `Stop` drift check (installed as `bin/skel-stop.mjs`) |
+| `skel stop-hook [--notify-only|--block]` | The `Stop` drift check (the plugin runs `bin/skel-stop.mjs`; without a flag it uses the project's mode from `skel install`) |
 | `skel migrate [--dry-run] [dir]` | Move a project's records from the old config dir to the state dir, outside a fill ([Upgrading](#upgrading-skels-state-moved)) |
-| `skel install [dir]` / `skel uninstall [dir]` | Add or remove the skills, filler subagent, hooks and deny rules in a project's `.claude/` |
+| `skel install [--notify-only\|--block] [dir]` | Add the deny rules and the project's Stop mode; migrate an older install's hooks and copies once the plugin is in place ([Install](#install)) |
+| `skel install --legacy [dir]` | The pre-plugin install: skills, filler, hooks and rules written into the project's `.claude/` (one more release) |
+| `skel uninstall [dir]` | Remove what install added (not the plugin) |
 
 **Gate modes:** `ask` (default) sends an out-of-fence edit to you for a yes or no. Saying yes lets the edit land, not the step finish: it is drift from what you approved, so `skel done` and `skel finalize` refuse until you `skel reshape` and approve the new shape. `deny` refuses it outright, so Claude must propose a skeleton change.
 
 ## The filler subagent
 
-`/skeleton-fill` splits each step in two. The main conversation runs the loop: `skel serve`, `skel next`, your opinion on the approach, the tests, `skel done` and `skel feedback`. The code edit goes to `skeleton-filler`, a [Claude Code subagent](https://code.claude.com/docs/en/sub-agents) whose `tools` are only `Read, Grep, Glob, Edit, MultiEdit`, with `Bash`, `PowerShell`, `Monitor`, `Write`, `NotebookEdit` and `Agent` also denied. The main conversation hands it the fence bodies from `skel next`, the step's contract, the agreed approach and the test to satisfy. The filler edits inside the fence and returns a short report: `filled`, or `blocked` with the skeleton change it needs. It can't run the tests, so when they fail the main conversation sends the output back to it.
+`/skel:skeleton-fill` splits each step in two. The main conversation runs the loop: `skel serve`, `skel next`, your opinion on the approach, the tests, `skel done` and `skel feedback`. The code edit goes to `skel:skeleton-filler`, a [Claude Code subagent](https://code.claude.com/docs/en/sub-agents) whose `tools` are only `Read, Grep, Glob, Edit, MultiEdit`, with `Bash`, `PowerShell`, `Monitor`, `Write`, `NotebookEdit` and `Agent` also denied. The main conversation hands it the fence bodies from `skel next`, the step's contract, the agreed approach and the test to satisfy. The filler edits inside the fence and returns a short report: `filled`, or `blocked` with the skeleton change it needs. It can't run the tests, so when they fail the main conversation sends the output back to it.
 
 **Why:** the hook can only pattern-match shell commands, so arbitrary Bash is the hole in the fence. The agent that writes the step's code has no shell, so for that agent every change goes through Edit, where the hook judges the result exactly. It also can't create a file without you allowing it (Write is removed, and an Edit that would create a file goes to you), can't spawn agents, and starts without your conversation, only with the step's brief.
 
@@ -136,9 +192,9 @@ The fence is a **drift guard for a cooperative agent**: it keeps an agent that m
 |---|---|---|---|
 | **Claude Code permission deny rules** | `skel install` | The agent's Edit, Write, MultiEdit and NotebookEdit calls can't write `.skeleton/state.json`, `serve.json`, `review.html`, `feedback/` or `feedback-history/`, or anything in skel's state dir or the old config dir (`Edit(//<dir>/skel/**)`: the approved-skeleton records, rendered review versions, serve sessions and install's ownership records). Nor can Bash commands Claude Code recognises as file writes (`> file`, `tee`, `sed -i`, …). Claude Code checks deny rules itself, whatever a hook returns (a hook's `allow` can't lift them), in every permission mode including `bypassPermissions`, and offers no prompt. The settings file is a Claude Code protected path, so outside `auto` and `bypassPermissions` the agent can't quietly delete the rules either | A script or interpreter that opens files itself (`node -e …`, `python …`). Nested `.skeleton/` directories. A state dir other than the one install resolved (`XDG_STATE_HOME` changed since). A session started where Claude Code doesn't load the project's settings file ([below](#start-claude-code-at-the-project-root)) |
 | **Bash sandbox** (optional) | You (see below) | OS-level: the same deny rules become write denials for every sandboxed shell command and its child processes, scripts included | The fence: sandboxed commands can still edit your code. The built-in file tools (the deny rules cover those). Excluded commands, and unsandboxed retries you approve |
-| **`PreToolUse` hook** (`skel hook`) | `skel install` | The fence itself: an edit during a fill must leave everything outside the active fence unchanged. Asks before `approve`, `reshape`, `init --force`, `finalize`, `git clean -x` and `git stash -a`. Asks for edits to any `.skeleton/` at any depth and for Bash commands that name it, and likewise for edits into skel's state dir or the old config dir from any project and for Bash commands that name them (defence in depth behind the deny rules) | Arbitrary Bash that doesn't name its target (a config path built in a variable included), hook startup failures before the guard runs, and, like the deny rules, a session that doesn't load the project's settings file |
-| **`Stop` hook** (`bin/skel-stop.mjs`) | `skel install` | At the end of every Claude turn during a fill, `done` and `finalize`'s drift check on the skeleton's own files (fenced and tracked), reported to you as a `file:line` diff. On unchanged drift, Claude continues once per approval to fix it or propose a reshape, then later prompts and sessions only notify. `--notify-only` opts out ([below](#details)) | A file that newly gains fences, and the rest of the source baseline: both left to `done`, because rereading them every turn would cost seconds on a large project. It runs only when a turn ends, and fails open |
-| **`skeleton-filler` subagent** | `skel install` | The agent that writes each step's code has only `Read, Grep, Glob, Edit, MultiEdit`: no shell, no Write, no spawning agents, so every change it makes goes through Edit, where the hook judges the result exactly (see [The filler subagent](#the-filler-subagent)) | The main conversation still has a shell; the skill asks it not to write fence code itself, but nothing enforces that |
+| **`PreToolUse` hook** (`skel hook`) | The plugin (or `skel install --legacy`) | The fence itself: an edit during a fill must leave everything outside the active fence unchanged. Asks before `approve`, `reshape`, `init --force`, `finalize`, `git clean -x` and `git stash -a`. Asks for edits to any `.skeleton/` at any depth and for Bash commands that name it, and likewise for edits into skel's state dir or the old config dir from any project and for Bash commands that name them (defence in depth behind the deny rules) | Arbitrary Bash that doesn't name its target (a config path built in a variable included), hook startup failures before the guard runs, and, like the deny rules, a session that doesn't load the project's settings file |
+| **`Stop` hook** (`bin/skel-stop.mjs`) | The plugin (or `skel install --legacy`) | At the end of every Claude turn during a fill, `done` and `finalize`'s drift check on the skeleton's own files (fenced and tracked), reported to you as a `file:line` diff. On unchanged drift, Claude continues once per approval to fix it or propose a reshape, then later prompts and sessions only notify. `--notify-only` opts out ([below](#details)) | A file that newly gains fences, and the rest of the source baseline: both left to `done`, because rereading them every turn would cost seconds on a large project. It runs only when a turn ends, and fails open |
+| **`skel:skeleton-filler` subagent** | The plugin (or `skel install --legacy`) | The agent that writes each step's code has only `Read, Grep, Glob, Edit, MultiEdit`: no shell, no Write, no spawning agents, so every change it makes goes through Edit, where the hook judges the result exactly (see [The filler subagent](#the-filler-subagent)) | The main conversation still has a shell; the skill asks it not to write fence code itself, but nothing enforces that |
 | **Snapshot check at `done`/`finalize`** | Built: `skel approve` records it; `done`/`finalize` verify | Any drift outside the fences from the approved skeleton, and any edit, new file or deletion in the source baseline, however it was made (Edit, Bash, a script) ([below](#details)) | What the discovery policy leaves out (unless tracked), fence bodies, and a record in skel's state dir rewritten by a script or interpreter (the deny rule and the hook stop the file tools and the shell writes they recognise, not `node -e …`) |
 
 The deny rules are listed path by path, not as `.skeleton/**`, so that `.skeleton/diagrams/` (which the agent writes during `/skeleton`) stays writable: Claude Code's `!` carve-outs can't reopen a directory inside one a rule blocks as a whole. They use only `Edit(...)`, because Claude Code checks every file-writing tool against `Edit` rules and never matches a `Write(path)` rule, and they avoid wildcards other than a trailing `/**`, the only kind the sandbox honours on Linux and WSL2. They name the project by its absolute real path (`Edit(//home/you/proj/.skeleton/state.json)`; on Windows `C:\proj` is written `//c/proj`, the POSIX form Claude Code matches). A single leading `/` would anchor at the session's primary working directory, not the project, so a Claude session started in a subdirectory would guard `<subdir>/.skeleton` and miss the real state. Moving or renaming the project means re-running `skel install`, and install from the same side (Windows or WSL) you run Claude Code on, since the two spell paths differently. The rules for the old path stay in the settings file until you remove them by hand: install and uninstall list them as left in place but never delete a rule they didn't add. A rule is a gitignore pattern, so install backslash-escapes `[ ] * ?` in the path (`( ) { }` match as they are, so `Program Files (x86)` is fine). A path a rule can't spell at all (a newline, or a literal backslash on Linux and macOS) gets the hook and the skills but no deny rules, and install warns.
@@ -147,18 +203,20 @@ The deny rules are listed path by path, not as `.skeleton/**`, so that `.skeleto
 
 #### Start Claude Code at the project root
 
-The rules and the hook both live in `.claude/settings.local.json`, and Claude Code doesn't always load that file from the project. On Linux, macOS and WSL, in a git repository, it loads it from the repository root (in a worktree, the main checkout's root), whichever subdirectory you start in. It loads it from the directory you start in instead outside a git repository, on native Windows, when the repository root is your home directory, or when the root (or its `.git` or `.claude`) isn't owned by your user (see Claude Code's [settings docs](https://code.claude.com/docs/en/settings#where-claude-code-keeps-the-local-file-in-a-git-repository)). So a session started in a subdirectory is covered only when the project is its git repository's root; otherwise neither the rules nor the hook load. `skel install` warns when the project isn't the root of its git repository (or isn't in one, or is a worktree, or the repository is rooted at your home directory), and on native Windows. Root ownership it doesn't check.
+The rules live in `.claude/settings.local.json`, and so does what loads the hooks: the plugin's `enabledPlugins` entry at local scope (at project scope it's in `.claude/settings.json`, loaded from the same place), or the hooks themselves for a legacy install. Claude Code doesn't always load those files from the project. On Linux, macOS and WSL, in a git repository, it loads it from the repository root (in a worktree, the main checkout's root), whichever subdirectory you start in. It loads it from the directory you start in instead outside a git repository, on native Windows, when the repository root is your home directory, or when the root (or its `.git` or `.claude`) isn't owned by your user (see Claude Code's [settings docs](https://code.claude.com/docs/en/settings#where-claude-code-keeps-the-local-file-in-a-git-repository)). So a session started in a subdirectory is covered only when the project is its git repository's root; otherwise neither the rules nor the hook load. `skel install` warns when the project isn't the root of its git repository (or isn't in one, or is a worktree, or the repository is rooted at your home directory), and on native Windows. Root ownership it doesn't check.
 
-**Turning on the sandbox (recommended, manual).** `install` doesn't switch it on, because it changes how every shell command in the project runs (network goes through a proxy with an empty allowlist, writes are limited to the working directory and temp). To enable it, add this to `.claude/settings.local.json` (or `~/.claude/settings.json`), with the path `install` prints:
+**Turning on the sandbox (recommended, manual).** `install` doesn't switch it on, because it changes how every shell command in the project runs (network goes through a proxy with an empty allowlist, writes are limited to the working directory and temp). To enable it, add this to `.claude/settings.local.json` (or `~/.claude/settings.json`). The excluded command must be the exact path the skills run, so use a stable clone: install the plugin from a local-path marketplace pointing at that clone (it then loads in place, see [Developing skel](#developing-skel)), and name the clone's path here:
 
 ```json
 {
   "sandbox": {
     "enabled": true,
-    "excludedCommands": ["node \"/path/to/skeleton-skills/bin/skel.mjs\" *"]
+    "excludedCommands": ["node \"/home/you/tools/skeleton-skills/bin/skel.mjs\" *"]
   }
 }
 ```
+
+A plugin installed from GitHub runs from a versioned cache path that changes on every update, so don't exclude that path, and don't widen the pattern to a wildcard that would let other commands out of the sandbox.
 
 `skel` itself has to run outside the sandbox. It writes the very state the deny rules protect, plus its stores in skel's state dir. And on Linux and WSL2 a sandboxed command's `localhost` is private, so your browser couldn't reach `skel serve`. Keep the skeleton-skills checkout outside the project, so the agent can't edit the excluded script. On Linux and WSL2 the sandbox needs `bubblewrap` and `socat`. Without them Claude Code runs commands unsandboxed, unless you also set `"failIfUnavailable": true`. To stop Claude from retrying a blocked command outside the sandbox, set `"allowUnsandboxedCommands": false`. See Claude Code's [sandboxing](https://code.claude.com/docs/en/sandboxing) and [permissions](https://code.claude.com/docs/en/permissions#read-and-edit) docs.
 
@@ -197,7 +255,7 @@ Not covered: arbitrary Bash in the main conversation (the filler subagent that w
 
 ### Hook faults and settings reloads
 
-Re-run `skel install` to install the settings-reload guard. During a detected fill, `ConfigChange` blocks reloads from user, project and local settings, including unrelated settings changes. It does not scan descendant projects: a session at a repository root does not discover a fill in a child package until that package is the session/cwd context. It does not guard the `skills` change source or edits to `.claude/agents/skeleton-filler.md`. Managed policy cannot be blocked, and some managed updates never fire this hook. A missing or unloaded hook offers no protection.
+The plugin brings the settings-reload guard (with `skel install --legacy`, re-run it to get the guard). During a detected fill, `ConfigChange` blocks reloads from user, project and local settings, including unrelated settings changes. It does not scan descendant projects: a session at a repository root does not discover a fill in a child package until that package is the session/cwd context. It does not guard the `skills` change source or edits to `.claude/agents/skeleton-filler.md`. Managed policy cannot be blocked, and some managed updates never fire this hook. A missing or unloaded hook offers no protection.
 
 Claude Code does not display a blocked `ConfigChange` reason to you or Claude; it records only a debug-log entry. skel also saves a metadata-only historical notice outside the project and displays it through `skel status` and the Stop hook. A storage error is logged and does not permit the blocked reload. Notices name the settings source/path and time, never the settings contents. Stop shows each notice once per session; status can still show it on request. A new blocked change resets delivery. An allowed settings change, or successful init/reshape/finalize, clears the notice. `done` preserves it while the fill remains active. See the [ConfigChange reference](https://code.claude.com/docs/en/hooks#configchange).
 
@@ -216,7 +274,15 @@ The Stop continuation protocol was tested on Claude Code CLI 2.1.318: `systemMes
 ## Development
 
 ```bash
-npm test     # node --test, no dependencies
+npm test                           # node --test, no dependencies
+claude plugin validate .           # the manifest, marketplace and hooks.json
+node test/live/plugin-probe.mjs    # live: installs the plugin from this clone into a throwaway
+                                   # Claude Code config and drives a session against a local mock
+                                   # of the Messages API (no model calls, nothing leaves the machine)
 ```
 
+After changing a skill or the filler agent, regenerate the list of shipped copies that `skel install` recognizes when it migrates an old install: `node scripts/dev/legacy-copy-hashes.mjs > lib/legacy-copy-hashes.mjs` (a test fails until you do).
+
 MIT
+
+Feedback ordering uses logical positions and review-round IDs, not wall-clock timestamps. Legacy notes remain readable, but if no current-round review is available, approval requires a fresh review or an explicit human-provided `--reviewed` version; a later page render cannot replace it. Send retries brief ordering contention, then reports busy and keeps the draft. Duplicate logical positions are refused with both file paths in `skel status`; inspect and resolve those records externally without discarding the notes.

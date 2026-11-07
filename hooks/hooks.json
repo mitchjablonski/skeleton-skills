@@ -1,0 +1,22 @@
+{
+  "description": "skel: the scope gate (PreToolUse), the drift check (Stop) and the settings-reload guard (ConfigChange). Run `skel install` in each project for the deny rules a plugin can't ship.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/skel-hook.mjs"] }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/skel-stop.mjs"] }]
+      }
+    ],
+    "ConfigChange": [
+      {
+        "matcher": "user_settings|project_settings|local_settings",
+        "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/skel-config-hook.mjs"] }]
+      }
+    ]
+  }
+}
