@@ -137,6 +137,7 @@ test("#69 (a): skeleton-phase comments and Overall notes are marked in the fill 
   // A note written during the fill isn't marked.
   draft.comments.push({ file: "a.ts", line: 5, step: "2", text: "fill note", version: V, phase: "fill" });
   draft.general = "looks fine";
+  draft.generalVersion = V; // as the page stamps it on input (#68 P2)
   const out = skelOutgoing(draft, V, "fill");
   assert.equal(out.general, "[from the skeleton review] rename take\n\nlooks fine");
   assert.deepEqual(out.comments.map((c) => c.text), ["[from the skeleton review] nit", "fill note"]);

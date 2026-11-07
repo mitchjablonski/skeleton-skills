@@ -139,7 +139,7 @@ Changing `XDG_CONFIG_HOME` or `XDG_STATE_HOME` later doesn't migrate anything: s
    → skel finalize          (strips the markers)
 ```
 
-The default is a **live read-only page**: code and step status update automatically, and you can add line comments, diagram comments and overall notes. Use **Copy feedback for Claude** and paste it into chat. Claude waits for your chat reply. The server accepts no feedback POSTs in this mode.
+The default is a **live read-only page** (the page calls it **Copy mode**: you still comment, then copy): code and step status update automatically, and you can add line comments, diagram comments and overall notes. Use **Copy feedback for Claude** and paste it into chat. Claude waits for your chat reply. The server accepts no feedback POSTs in this mode.
 
 For one-click Send, explicitly opt in with `skel serve --send`. Claude then reads `skel feedback --wait 110` during review and `skel feedback` after fills. This enables the feedback POST endpoint, protected by Host/Origin checks and the review token. Switching between `skel serve` and `skel serve --send` restarts the verified server in the requested mode; open tabs follow the switch and reload by themselves. Stop it with `skel serve --stop` when finished.
 

@@ -16,9 +16,9 @@ import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { PLUGIN_ID, claudeConfigDir, hasLegacyHooks, installStatus, isSkelConfigHook, isSkelHook, pluginEvidence, pluginStatus, registrationNotice, rulePath, skelStopHook } from "../lib/install-status.mjs";
 import { isLegacyCopy, renderLegacy } from "../lib/legacy-copy.mjs";
 import { enrollment } from "../lib/config-hook.mjs";
-import { SHELL_CSP, buildReviewData, clientScript, finalizedRecord, pagePayload, readDiagrams, renderShell, writeReview } from "../lib/review.mjs";
+import { SHELL_CSP, buildReviewData, clientScript, finalizedRecord, loadEscapeCheck, pagePayload, readDiagrams, renderShell, windowsReviewPath, writeReview } from "../lib/review.mjs";
 import {
-  cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
+  approvalState, cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession, sendRecord,
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
   storeFeedback, takeFeedback, withFeedbackLock, ensureReviewRound, feedbackLockNotice, feedbackOrderNotice, storeFeedbackForHttp, isFeedbackError,
 } from "../lib/feedback.mjs";
@@ -912,11 +912,14 @@ const commands = {
     }
   },
 
-  review() {
+  async review() {
     const root = requireRoot();
-    const out = writeReview(root, requireState(root));
+    const out = writeReview(root, requireState(root), await loadEscapeCheck());
     console.log(out);
     console.log(`file://${out}`);
+    // On WSL a Windows browser can't open /tmp/... or file:///mnt/c/...
+    const win = windowsReviewPath(out);
+    if (win) console.log(`from Windows: ${win}`);
   },
 
   async serve(args) {
@@ -978,6 +981,7 @@ const commands = {
     // seconds). It runs every 30s while a page is polling, and on a page load
     // once the last one is >5s old.
     const cache = new Map();
+    const escapeCheck = await loadEscapeCheck();
     let known = scanRepo(root, cache).files.map((f) => path.join(root, f));
     let searching = false;
     let lastSearch = Date.now();
@@ -1014,7 +1018,7 @@ const commands = {
       // them (pollTracked); buildReviewData reads the others' text itself.
       // Keep watching files that have fences or malformed markers until the
       // next search.
-      const { record, ...data } = buildReviewData(root, state, cache, [...new Set([...known, ...pollTracked(state)])]);
+      const { record, ...data } = buildReviewData(root, state, cache, [...new Set([...known, ...pollTracked(state)])], escapeCheck);
       const watched = [...data.steps.flatMap((st) => st.locations.map((l) => l.file)), ...data.errored];
       known = [...new Set([...known, ...watched.map((f) => path.join(root, f))])];
       const { generatedAt, errored, ...stable } = data;
@@ -1082,7 +1086,7 @@ const commands = {
           req.on("data", (c) => { body += c; if (body.length > 2_000_000) req.destroy(); });
           req.on("end", async () => {
             try {
-              const fb = cleanFeedback(JSON.parse(body));
+              const fb = sendRecord(cleanFeedback(JSON.parse(body)));
               let now;
               await storeFeedbackForHttp(root, session, fb, () => (now = current().data.skeletonVersion));
               // A page that was already out of date is told so (the notes are
@@ -1188,6 +1192,10 @@ const commands = {
       state = ensureReviewRound(root);
       const { record: last, unread, unknown } = lastReview(root, state.reviewRound);
       if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
+      // #68 P2: their latest verdict sent for this version (verdict-less sends
+      // after it add their notes) is APPROVED WITH COMMENTS: an approval of
+      // the version after the comments are applied, not of this one.
+      if (!given && approvalState(root, state.reviewRound, record.version).withComments) die("the human's last verdict sent for this version was APPROVED WITH COMMENTS: they asked for changes first. Apply them, then have the human approve again: a new plain APPROVED, sent from the page or pasted (pass its --reviewed version).");
       if (unknown && !last && !given) die("legacy feedback has no reliable review round/order. Review again and have the human explicitly provide --reviewed <version>, or resend their review. The last rendered page cannot replace that review.");
       // What the human reviewed: the version named in the feedback the agent
       // was given (copied markdown → --reviewed), else the page's latest send,

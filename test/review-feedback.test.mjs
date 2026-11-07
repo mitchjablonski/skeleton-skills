@@ -89,7 +89,7 @@ test("#66: the reviewed version a Send records is the verdict's", () => {
   const out = skelOutgoing({ verdict: "approve", verdictVersion: B, general: " g ", comments: [{ file: "a.ts", line: 2, step: null, text: "t", version: A, anchor: { text: "x" } }] }, B);
   assert.equal(out.version, B);
   assert.equal(out.verdict, "approve");
-  assert.deepEqual(out.comments, [{ file: "a.ts", line: 2, step: null, version: A, text: "t" }], "no anchor/outdated internals leave the page");
+  assert.deepEqual(out.comments, [{ file: "a.ts", line: 2, step: null, version: A, quote: "x", text: "t" }], "no anchor/outdated internals leave the page (only the quoted line, #68 P3)");
   // What the server keeps of it.
   const fb = cleanFeedback(out);
   assert.equal(fb.version, B);
@@ -132,7 +132,9 @@ test("#66: the server's Send markdown matches: fill-phase words, and comments fr
   assert.equal(fb.comments[2].version, undefined, "a malformed version is dropped");
   const scaffold = feedbackMarkdown("T", fb);
   assert.match(scaffold, /^# Skeleton review: T\n/);
-  assert.match(scaffold, /Verdict: APPROVED\n/);
+  // #68 P2: an approval that comes with comments says so.
+  assert.match(scaffold, /Verdict: APPROVED WITH COMMENTS \(apply these, then ask me to approve the new version\)\n/);
+  assert.match(feedbackMarkdown("T", { ...fb, comments: [] }), /Verdict: APPROVED\n/);
   assert.match(scaffold, new RegExp(`Note: 1 of these 3 comments was written on another skeleton version \\(${A}\\) than the reviewed one \\(${B}\\)`));
   assert.match(scaffold, new RegExp(`- a\\.ts:1 \\[written on version ${A}\\]: old`));
   assert.match(scaffold, /- b\.ts:1: new/);

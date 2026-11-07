@@ -32,6 +32,8 @@ test("#51: delayed poll refusal ignores a replaced token and keeps polling", asy
       const auth = () => ({'x-skeleton-token':token});
       const tryPendingToken = () => false;
       const lockOut = () => events.push('locked');
+      let missed = 0, outage = false; // #68 P7: the outage notice
+      const answered = () => {}, setTopAlert = () => {};
       const setTimeout = () => events.push('scheduled');
       ${poll}
       return {poll, change:()=>token='new', polling:()=>polling};`)(async (_url, options) => {

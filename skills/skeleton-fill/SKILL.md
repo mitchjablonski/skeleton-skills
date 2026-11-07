@@ -12,14 +12,16 @@ You run the loop; a restricted subagent writes the code. The **`skel:skeleton-fi
 CLI: `node "${CLAUDE_PLUGIN_ROOT}/bin/skel.mjs"` (written below as `skel`).
 
 Arguments:
-- none → fill the next pending step, then stop.
-- a step id (e.g. `3`) → fill that step, then stop.
-- `all` → fill steps in order without stopping between them. Still stop for any skeleton change, and for anything you'd normally ask about.
+- none → fill the next pending step, then stop (step-by-step mode).
+- a step id (e.g. `3`) → fill that step, then stop (step-by-step mode).
+- `all` → fill steps in order without stopping between them, and without waiting after each opinion. Still stop for any skeleton change, and for anything you'd normally ask about.
 
 ## For each step
 
 1. **Start it.** Run `skel serve` in the background and share its whole URL, including `#t=…`, or `skel serve --send` instead if the human explicitly opted in to direct Send. Keep that mode when reusing a server. The default live review is read-only: comments are copied into chat. If using static review instead, retain that choice. Then run `skel next` (or `skel start <id>`); it prints each fence's file, line range and body.
-2. **State your opinion first, in 2–4 lines:** how the step should be done and the one non-obvious choice in it (e.g. "Keep this pure and do the dedupe in one pass. Mutating the input would be faster, but the signature promises a new array."). Read the code around the fences first so the opinion is grounded. In step-by-step mode this is the human's moment to redirect, so keep it short and concrete.
+2. **State your opinion first, in 2–4 lines:** how the step should be done and the one non-obvious choice in it (e.g. "Keep this pure and do the dedupe in one pass. Mutating the input would be faster, but the signature promises a new array."). Read the code around the fences first so the opinion is grounded. Keep it short and concrete.
+   - **In step-by-step mode, stop here** and end your turn with the opinion: it is the human's moment to redirect, and they can't once the filler is running. Delegate (step 3) only after they reply: a go-ahead, or a redirect you fold into the brief's `Approach`. If the human has said "go" (or otherwise told you not to wait) for the rest of this fill, state the opinion and carry on in the same turn for later steps.
+   - In `all` mode, state the opinion and carry on.
 3. **Delegate the edit.** First, in a git repo, run `git status --porcelain` and keep its output: it is the "before" for step 4's check (a skeleton nobody has committed is all untracked files, and earlier fills or unrelated work show up as already changed). Then call the Agent tool with `subagent_type: "skel:skeleton-filler"` and wait for its report. It starts with none of this conversation, so the brief must carry everything it needs:
 
    ```
