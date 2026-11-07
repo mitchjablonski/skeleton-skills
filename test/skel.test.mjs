@@ -2860,7 +2860,8 @@ const legacyProjectAt = (dir) => {
   };
   return { dir, cfgHome, stateHome, oldDir, newDir, env, oldFile, newFile, records, setPhase, skel, spawnIt, key, stop };
 };
-const onlyFiles = (d) => (fs.existsSync(d) ? fs.readdirSync(d).sort() : []);
+// The #55 receipt index is derived, kept beside the records on WSL's drvfs: not a record.
+const onlyFiles = (d) => (fs.existsSync(d) ? fs.readdirSync(d).filter((f) => f !== "receipt-roots.json").sort() : []);
 const inOld = (m, before) => {
   for (const s of Object.keys(before)) assert.deepEqual(fs.readFileSync(m.oldFile(s)), before[s], `${s} stays under the rule that guards it`);
   assert.deepEqual(onlyFiles(m.newDir).filter((f) => f.startsWith(m.key)), []);
@@ -3120,7 +3121,7 @@ test("#18: planMigration reports each file's outcome and touches nothing", () =>
   m.records();
   fs.writeFileSync(m.oldFile(".rendered"), "{broken");
   fs.writeFileSync(m.oldFile(".config-notice"), "{broken");
-  const listing = () => fs.readdirSync(m.oldDir).map((f) => [f, fs.statSync(path.join(m.oldDir, f)).mtimeMs]).sort();
+  const listing = () => fs.readdirSync(m.oldDir).filter((f) => f !== "receipt-roots.json").map((f) => [f, fs.statSync(path.join(m.oldDir, f)).mtimeMs]).sort();
   const was = listing();
   const { outcomes } = planMigration({ key: m.key, from: m.oldDir, to: m.newDir, keyOf: projectKey });
   assert.deepEqual(Object.fromEntries(outcomes.map((o) => [o.suffix, o.outcome])), { "": "move", ".snapshot": "move", ".rendered": "refuse", "-install": "move", ".config-notice": "drop" });

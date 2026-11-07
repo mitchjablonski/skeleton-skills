@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
-import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
+import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, refreshReceiptIndex, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { PLUGIN_ID, claudeConfigDir, hasLegacyHooks, installStatus, isSkelConfigHook, isSkelHook, pluginEvidence, pluginStatus, registrationNotice, rulePath, skelStopHook } from "../lib/install-status.mjs";
 import { isLegacyCopy, renderLegacy } from "../lib/legacy-copy.mjs";
@@ -23,7 +23,7 @@ import {
   storeFeedback, takeFeedback, withFeedbackLock, ensureReviewRound, feedbackLockNotice, feedbackOrderNotice, storeFeedbackForHttp, isFeedbackError,
 } from "../lib/feedback.mjs";
 import { discardUnusedStateDirFiles, migrateProject, migrationPlan } from "../lib/migrate.mjs";
-import { storeNotice } from "../lib/store-notice.mjs";
+import { aliasNotice, storeNotice } from "../lib/store-notice.mjs";
 import {
   clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, readSnapshot, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
 } from "../lib/snapshot.mjs";
@@ -834,10 +834,16 @@ const commands = {
   },
 
   async status(args) {
+    refreshReceiptIndex(); // #55: the hooks' index of record roots, if a record came or went without one
     const root = findRoot(process.cwd());
     const configNotice = readConfigNotice(process.env.CLAUDE_PROJECT_DIR || process.cwd()) || (root && readConfigNotice(root));
     if (!root) {
       if (configNotice) console.error(configNotice);
+      // #55: a deleted .skeleton with a record the hooks can't prove is this project's.
+      for (const dir of new Set([process.cwd(), process.env.CLAUDE_PROJECT_DIR].filter(Boolean))) {
+        const note = aliasNotice(dir, { deleted: true });
+        if (note) console.error(`skel: ${note}`);
+      }
       die(`no ${STATE_DIR}/state.json here or above — run \`skel init "<title>"\` first`);
     }
     const feedbackLock = [feedbackLockNotice(root), feedbackOrderNotice(root)].filter(Boolean).join("\n") || null;
