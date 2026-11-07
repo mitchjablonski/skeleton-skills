@@ -18,7 +18,7 @@ import { isLegacyCopy, renderLegacy } from "../lib/legacy-copy.mjs";
 import { enrollment } from "../lib/config-hook.mjs";
 import { SHELL_CSP, buildReviewData, clientScript, finalizedRecord, loadEscapeCheck, pagePayload, readDiagrams, renderShell, windowsReviewPath, writeReview } from "../lib/review.mjs";
 import {
-  cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession, sendRecord,
+  approvalState, cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession, sendRecord,
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
   storeFeedback, takeFeedback, withFeedbackLock, ensureReviewRound, feedbackLockNotice, feedbackOrderNotice, storeFeedbackForHttp, isFeedbackError,
 } from "../lib/feedback.mjs";
@@ -1192,9 +1192,10 @@ const commands = {
       state = ensureReviewRound(root);
       const { record: last, unread, unknown } = lastReview(root, state.reviewRound);
       if (unread) die(`the human sent feedback you haven't read yet (${unread} send${unread > 1 ? "s" : ""}). Run \`skel feedback\` first; approve only if they still agree.`);
-      // #68 P2: their last send approved WITH COMMENTS: an approval of the
-      // version after the comments are applied, not of this one.
-      if (!given && last?.withComments === true && last.version === record.version) die("the human's last send for this version was APPROVED WITH COMMENTS: they asked for changes first. Apply them, then have the human approve again: a new plain APPROVED, sent from the page or pasted (pass its --reviewed version).");
+      // #68 P2: their latest verdict sent for this version (verdict-less sends
+      // after it add their notes) is APPROVED WITH COMMENTS: an approval of
+      // the version after the comments are applied, not of this one.
+      if (!given && approvalState(root, state.reviewRound, record.version).withComments) die("the human's last verdict sent for this version was APPROVED WITH COMMENTS: they asked for changes first. Apply them, then have the human approve again: a new plain APPROVED, sent from the page or pasted (pass its --reviewed version).");
       if (unknown && !last && !given) die("legacy feedback has no reliable review round/order. Review again and have the human explicitly provide --reviewed <version>, or resend their review. The last rendered page cannot replace that review.");
       // What the human reviewed: the version named in the feedback the agent
       // was given (copied markdown → --reviewed), else the page's latest send,

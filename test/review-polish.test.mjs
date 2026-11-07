@@ -102,10 +102,12 @@ test("#68 P2 (#71 review): the server words a send the same way", () => {
   assert.deepEqual([sendRecord(fb).notes, sendRecord(fb).withComments], [false, false]);
   const withC = sendRecord(cleanFeedback({ ...out, comments: [...out.comments, { file: "a.ts", line: 1, text: "new", version: B }] }));
   assert.deepEqual([withC.notes, withC.withComments], [true, true]);
-  // Merged sends: comments on the approved version sent before the approval still count.
+  // Merged sends: the latest send with a verdict decides (#71 final check), so
+  // comments sent before a later plain approval are listed but don't count.
   const r = (order, x) => ({ ...x, round: "00000000-0000-0000-0000-000000000000", order: String(order), at: order, session: "s" });
   const merged = mergeRecords([r(1, sendRecord(cleanFeedback({ verdict: null, version: B, general: "", comments: [{ file: "a.ts", line: 1, text: "c", version: B }] }))), r(2, sendRecord(cleanFeedback({ verdict: "approve", version: B, general: "", comments: [] })))], "00000000-0000-0000-0000-000000000000");
-  assert.match(feedbackMarkdown("T", merged), /Verdict: APPROVED WITH COMMENTS/);
+  assert.match(feedbackMarkdown("T", merged), /Verdict: APPROVED\n/);
+  assert.match(feedbackMarkdown("T", merged), /- a\.ts:1: c/);
   const older = mergeRecords([r(1, sendRecord(cleanFeedback({ verdict: null, version: A, general: "g", generalVersion: A, comments: [{ file: "a.ts", line: 1, text: "c", version: A }] }))), r(2, sendRecord(cleanFeedback({ verdict: "approve", version: B, general: "", comments: [] })))], "00000000-0000-0000-0000-000000000000");
   assert.match(feedbackMarkdown("T", older), /Verdict: APPROVED\n/);
 });
@@ -123,13 +125,76 @@ test("#68 P2 (#71 review): plain skel approve won't take a send that approved WI
   const approve = (...a) => { try { return { ok: true, out: run("approve", ...a) }; } catch (e) { return { ok: false, out: String(e.stderr) }; } };
   const refused = approve();
   assert.equal(refused.ok, false);
-  assert.match(refused.out, /last send for this version was APPROVED WITH COMMENTS: they asked for changes first/);
+  assert.match(refused.out, /last verdict sent for this version was APPROVED WITH COMMENTS: they asked for changes first/);
   // A later plain approval of the same version is taken.
   sendIt({ verdict: "approve", general: "", comments: [] });
   run("feedback");
   const ok = approve();
   assert.equal(ok.ok, true, ok.out);
   assert.match(ok.out, /skeleton approved/);
+});
+
+// #71 final check: skel feedback and skel approve decide from the same send,
+// the latest with a verdict for this version.
+function sendProject() {
+  const { dir, run } = project();
+  run("init", "T");
+  run("review");
+  const html = fs.readFileSync(path.join(dir, ".skeleton", "review.html"), "utf8");
+  const v = JSON.parse(/<script id="skeleton-data" type="application\/json">(.*?)<\/script>/s.exec(html)[1]).skeletonVersion;
+  addSession(dir, "test-session");
+  const sendIt = (raw) => storeFeedback(dir, "test-session", sendRecord(cleanFeedback({ version: v, general: "", comments: [], ...raw })));
+  const approve = () => { try { return { ok: true, out: run("approve") }; } catch (e) { return { ok: false, out: String(e.stderr) }; } };
+  return { dir, run, v, sendIt, approve };
+}
+
+test("#68 P2 (#71 final): WITH COMMENTS, then a comments-only send: feedback says so and approve refuses", () => {
+  const { run, v, sendIt, approve } = sendProject();
+  sendIt({ verdict: "approve", comments: [{ file: "src/a.ts", line: 1, text: "rename", version: v }] });
+  sendIt({ verdict: null, comments: [{ file: "src/a.ts", line: 2, text: "and this", version: v }] });
+  const fb = run("feedback");
+  assert.match(fb, /Verdict: APPROVED WITH COMMENTS/);
+  assert.match(fb, /rename/);
+  assert.match(fb, /and this/);
+  const res = approve();
+  assert.equal(res.ok, false);
+  assert.match(res.out, /APPROVED WITH COMMENTS: they asked for changes first/);
+});
+
+test("#68 P2 (#71 final): WITH COMMENTS, then a plain APPROVED: feedback says APPROVED, notes still listed, approve passes", () => {
+  const { run, v, sendIt, approve } = sendProject();
+  sendIt({ verdict: "approve", comments: [{ file: "src/a.ts", line: 1, text: "rename", version: v }] });
+  sendIt({ verdict: "approve" });
+  const fb = run("feedback");
+  assert.match(fb, /\nVerdict: APPROVED\n/);
+  assert.match(fb, /- src\/a\.ts:1: rename/, "the earlier send's notes are still listed");
+  const res = approve();
+  assert.equal(res.ok, true, res.out);
+  assert.match(res.out, /skeleton approved/);
+});
+
+test("#68 P2 (#71 final): a plain APPROVED, then a comments-only send on that version, counts as WITH COMMENTS for both", () => {
+  const { run, v, sendIt, approve } = sendProject();
+  sendIt({ verdict: "approve" });
+  sendIt({ verdict: null, comments: [{ file: "src/a.ts", line: 2, text: "one more", version: v }] });
+  assert.match(run("feedback"), /Verdict: APPROVED WITH COMMENTS/);
+  assert.equal(approve().ok, false);
+});
+
+test("#68 P2 (#71 final): an Overall note from a pre-upgrade draft is tagged as from an unknown earlier version", () => {
+  const out = F.skelOutgoing({ verdict: "approve", verdictVersion: B, general: "old note", comments: [] }, B, "scaffold");
+  assert.equal(out.generalUnversioned, true);
+  const md = F.skelFeedbackMarkdown(page("scaffold"), out);
+  assert.match(md, /\nVerdict: APPROVED\n/);
+  assert.match(md, /\n## Overall \[written on an unknown earlier version\]\nold note\n/);
+  const fb = cleanFeedback(out);
+  assert.equal(fb.generalUnversioned, true);
+  assert.match(feedbackMarkdown("T", fb), /\n## Overall \[written on an unknown earlier version\]\nold note\n/);
+  const r = (order, x) => ({ ...x, round: "00000000-0000-0000-0000-000000000000", order: String(order), at: order, session: "s" });
+  assert.match(mergeRecords([r(1, sendRecord(fb))], "00000000-0000-0000-0000-000000000000").general, /^\[written on an unknown earlier version\] old note$/);
+  // Not when it carries a version, and "Delete notes from earlier versions" takes it too.
+  assert.equal(F.skelOutgoing({ general: "n", generalVersion: B, comments: [] }, B, "scaffold").generalUnversioned, undefined);
+  assert.match(client, /const olderGeneral = \(\) => !!\(draft\.general \?\? ""\)\.trim\(\) && draft\.generalVersion !== data\.skeletonVersion;/);
 });
 
 test("#68 P2 (#71 review): a pasted plain approval's --reviewed still works after a send with comments", () => {
