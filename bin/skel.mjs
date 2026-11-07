@@ -16,7 +16,7 @@ import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { PLUGIN_ID, claudeConfigDir, hasLegacyHooks, installStatus, isSkelConfigHook, isSkelHook, pluginEvidence, pluginStatus, registrationNotice, rulePath, skelStopHook } from "../lib/install-status.mjs";
 import { isLegacyCopy, renderLegacy } from "../lib/legacy-copy.mjs";
 import { enrollment } from "../lib/config-hook.mjs";
-import { SHELL_CSP, buildReviewData, clientScript, pagePayload, readDiagrams, renderShell, writeReview } from "../lib/review.mjs";
+import { SHELL_CSP, buildReviewData, clientScript, finalizedRecord, pagePayload, readDiagrams, renderShell, writeReview } from "../lib/review.mjs";
 import {
   cleanFeedback, feedbackMarkdown, isVersion, lastReview, mergeRecords, newServeSession,
   addSession, clearSessions, historyDir, legacyQueued, pendingCount, queueDir, readServe, servePath,
@@ -875,8 +875,19 @@ const commands = {
       })) }, null, 2));
       return;
     }
-    const done = steps.filter((s) => s.status === "filled").length;
-    console.log(`${state.title} — phase: ${state.phase}${state.activeStep ? `, active: ${state.activeStep}` : ""} — ${done}/${steps.length} filled`);
+    // The same words as the review page's progress line (lib/review-progress.js).
+    if (state.phase === "done") {
+      const fin = finalizedRecord(state);
+      console.log(`${state.title} — phase: done — finalized: ${fin ? `all ${fin.steps.length} step${fin.steps.length === 1 ? "" : "s"} filled and markers removed` : "markers removed"}`);
+      if (configNotice) console.log(configNotice);
+      if (feedbackLock) console.log(`  ! ${feedbackLock}`);
+      if (stores) console.log(`  ! ${stores}`);
+      if (registration) console.log(`  ! ${registration.replace(/\n/g, "\n  ! ")}`);
+      return;
+    }
+    const active = state.activeStep && steps.some((s) => s.id === state.activeStep) ? state.activeStep : null;
+    const done = steps.filter((s) => s.status === "filled" && s.id !== active).length;
+    console.log(`${state.title} — phase: ${state.phase}${state.activeStep ? `, active: ${state.activeStep}` : ""} — ${done}/${steps.length} done${active ? ` · step ${active} filling` : ""}`);
     if (configNotice) console.log(configNotice);
     if (feedbackLock) console.log(`  ! ${feedbackLock}`);
     for (const s of steps) {
@@ -888,7 +899,10 @@ const commands = {
     if (registration) console.log(`  ! ${registration.replace(/\n/g, "\n  ! ")}`);
     if (drift && !drift.ok) console.log(`  ! ${formatDrift(drift).replace(/\n/g, "\n    ")}\n    (skel done and skel finalize refuse until it's resolved)`);
     if (gap) console.log(`  ! ${gap}`);
-    if (coverage) console.log(`  (this checked the skeleton's own files; the full check of source baseline ${coverage.id} runs at done/finalize)`);
+    // Rediscovering the source set takes from a quarter of a second to several
+    // seconds on a Windows drive under WSL, too slow for a command agents run
+    // constantly: say plainly what this didn't check (#67 B6).
+    if (coverage) console.log(`  (this checked only the skeleton's own files: new, deleted or changed files elsewhere are checked against source baseline ${coverage.id} at skel done and skel finalize)`);
     // Diagram nodes named step_<id> that match no step are silently uncolored
     // on the page; say so here.
     for (const d of readDiagrams(root)) {
@@ -1315,7 +1329,10 @@ const commands = {
       const abs = path.join(root, rel);
       writeFileAtomic(abs, stripMarkers(fs.readFileSync(abs, "utf-8")), fs.statSync(abs).mode & 0o777);
     }
-    writeState(root, { ...readState(root), phase: "done", activeStep: null });
+    // The markers are gone after this, so record what they described: the
+    // review page and `skel status` say "all N steps filled" from it.
+    const finalized = { steps: toSteps(fences).map(({ id, title }) => ({ id, title })), files, at: new Date().toISOString() };
+    writeState(root, { ...readState(root), phase: "done", activeStep: null, finalized });
     clearSnapshot(root);
     clearConfigNotices(root);
     console.log(`finalized: stripped markers from ${files.length} file(s)`);

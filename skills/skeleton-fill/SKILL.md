@@ -75,3 +75,5 @@ When you re-approve, `skel approve` checks that the human reviewed the reshaped 
 ```
 skel finalize    # strips the SKEL marker lines; Claude Code asks them to allow it
 ```
+
+Then stop the review server with `skel serve --stop`. The open page already says the skeleton is finalized, and the server has nothing left to show.
