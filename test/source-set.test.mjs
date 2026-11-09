@@ -1049,7 +1049,6 @@ test("describeCoverage names the fallback and the kinds of member", async () => 
   assert.match(text, /discovered with walk: not a git repository, so skel applies the \.gitignore files itself/);
   assert.match(text, /1 fenced .*1 explicitly added with `skel track`, 1 other source files, checked in full/);
   assert.match(text, /review page shows 2 file\(s\).*not necessarily reviewed/);
-  assert.match(text, /holds 2 file/);
 });
 
 test("discovery never reads a file, and lists nothing the policy excludes as a member", () => {

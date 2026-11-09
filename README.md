@@ -86,6 +86,8 @@ node ~/tools/skeleton-skills/bin/skel.mjs uninstall
 claude plugin uninstall skel@skeleton-skills --scope local
 ```
 
+In native PowerShell, use `node "$HOME\tools\skeleton-skills\bin\skel.mjs" uninstall` for the first command; the plugin command is the same.
+
 Then restart Claude Code so the running session unloads the plugin and hooks. `skel uninstall` takes out the deny rules it added (and, for a legacy install, its hooks and copies) and nothing else: a rule you already had, even an identical one, survives install and uninstall. It lists any rule shaped like skel's that it left in place because this install didn't add it, and leaves `.skeleton/` and its `.gitignore` line for you.
 
 ### Developing skel
