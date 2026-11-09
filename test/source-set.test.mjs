@@ -1047,7 +1047,8 @@ test("describeCoverage names the fallback and the kinds of member", async () => 
   const { coverage } = await captureSourceSet(p.dir, readState(p.dir), ["src/a.ts"]);
   const text = describeCoverage(coverage, 2).join("\n");
   assert.match(text, /discovered with walk: not a git repository, so skel applies the \.gitignore files itself/);
-  assert.match(text, /1 fenced .*1 tracked, 1 other source/);
+  assert.match(text, /1 fenced .*1 explicitly added with `skel track`, 1 other source files, checked in full/);
+  assert.match(text, /review page shows 2 file\(s\).*not necessarily reviewed/);
   assert.match(text, /holds 2 file/);
 });
 
