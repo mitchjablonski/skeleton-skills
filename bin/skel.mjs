@@ -672,7 +672,7 @@ async function installForPlugin(dir, mode) {
     if (path.basename(dest) === "SKILL.md") { try { fs.rmdirSync(path.dirname(dest)); } catch {} } // only if we left it empty
   }
   reportRules(target, settings, rules);
-  console.log(`Stop mode for this project: ${stopMode === "notify-only" ? "notify only" : "one corrective continuation per unchanged drift report (the default)"}${stopMode ? ` (recorded in ${ownedStorePath(target)})` : ""}`);
+  console.log(`Stop mode for this project: ${stopMode === "notify-only" ? "notify only: warn and let Claude stop if drift remains" : "ask Claude to correct each unchanged drift report once; if the same drift remains, warn and let it stop (default)"}${stopMode ? ` (recorded in ${ownedStorePath(target)})` : ""}`);
   for (const k of kept) console.log(`warning: ${k}`);
   if (removedHooks) console.log(`removed ${removedHooks} hook(s) an older skel install added to ${settingsPath} (your other hooks are untouched)`);
   for (const dest of removedCopies) console.log(`removed ${dest}: an unmodified copy an older skel install wrote (the plugin serves it now)`);
@@ -934,11 +934,15 @@ const commands = {
     requireState(root);
     const feedbackEnabled = args.includes("--send");
     const mode = feedbackEnabled ? "feedback enabled" : "read-only";
+    const explainMode = () => console.log(feedbackEnabled
+      ? "Send mode: send feedback from the page; Claude reads it with `skel feedback`."
+      : "Copy mode: comment on the page, then copy feedback and paste it into chat.");
     // A verified server is reused, and its token kept, only if its reads are
     // shown to need that token. Anything else from before #39 is replaced.
     const protectedReads = running ? await readsProtected(running) : false;
     if (running && protectedReads && running.feedbackEnabled === feedbackEnabled && running.storeProtocol >= STORE_PROTOCOL && running.feedbackOrder === 1) {
       console.log(`skel review: ${running.url}#t=${running.token} (${mode}; already running; \`skel serve --stop\` stops it)`);
+      explainMode();
       return;
     }
     if (running) {
@@ -1114,6 +1118,8 @@ const commands = {
       origin = `http://127.0.0.1:${p}`;
       writeFileAtomic(servePath(root), JSON.stringify({ url: `${origin}/`, port: p, pid: process.pid, serverId, feedbackEnabled, token }), 0o600);
       console.log(`skel review: ${origin}/#t=${token} (${mode})`);
+      explainMode();
+      console.log("Keep this process running while reviewing. Stop with Ctrl+C or `skel serve --stop` from another terminal.");
     };
     server.once("error", (err) => {
       if (err.code !== "EADDRINUSE") throw err;

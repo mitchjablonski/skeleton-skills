@@ -127,8 +127,8 @@ test("approve shows counts, policy, exclusions, and says a baseline isn't proof 
   assert.match(out, /lockfile 1 \(package-lock\.json\)/);
   assert.match(out, /generated 1 \(a\.min\.js\)/);
   assert.match(out, /unknown-extension \d+ \(.*LICENSE/);
-  assert.match(out, /`skel track` adds any of them/);
-  assert.match(out, /isn't proof that every file was shown: the skeleton, which is what the review page shows, holds 1 file\(s\)/);
+  assert.match(out, /`skel track <file>` for omitted project code or review context; do not add skel's own state or tool internals/);
+  assert.match(out, /review page shows 1 file\(s\).*other source files.*not necessarily reviewed/);
 });
 
 // ---- unfenced edit, add, delete, rename ----
@@ -1047,8 +1047,8 @@ test("describeCoverage names the fallback and the kinds of member", async () => 
   const { coverage } = await captureSourceSet(p.dir, readState(p.dir), ["src/a.ts"]);
   const text = describeCoverage(coverage, 2).join("\n");
   assert.match(text, /discovered with walk: not a git repository, so skel applies the \.gitignore files itself/);
-  assert.match(text, /1 fenced .*1 tracked, 1 other source/);
-  assert.match(text, /holds 2 file/);
+  assert.match(text, /1 fenced .*1 explicitly added with `skel track`, 1 other source files, checked in full/);
+  assert.match(text, /review page shows 2 file\(s\).*not necessarily reviewed/);
 });
 
 test("discovery never reads a file, and lists nothing the policy excludes as a member", () => {

@@ -39,6 +39,8 @@ Mermaid files in `.skeleton/diagrams/*.mmd` render above the code. Nodes with th
 
 skel ships as a Claude Code plugin, `skel` from the `skeleton-skills` marketplace (this repository). The plugin brings the two skills (`/skel:skeleton`, `/skel:skeleton-fill`), the `skel:skeleton-filler` subagent and the three hooks. A plugin can't ship permission rules, so a small `skel install` step in each project adds the deny rules. You still run that step, and any recovery, from a clone of this repository: the plugin doesn't put a `skel` command in your terminal (an npm package may come later).
 
+**Bash (macOS, Linux, or WSL):**
+
 ```bash
 # 1. A clone for the terminal CLI. Keep it at a stable path, outside your projects.
 git clone https://github.com/mitchjablonski/skeleton-skills ~/tools/skeleton-skills
@@ -53,6 +55,22 @@ claude plugin install skel@skeleton-skills --scope local
 node ~/tools/skeleton-skills/bin/skel.mjs install
 ```
 
+**PowerShell (native Windows):**
+
+```powershell
+# 1. A clone for the terminal CLI. Keep it at a stable path, outside your projects.
+git clone https://github.com/mitchjablonski/skeleton-skills "$HOME\tools\skeleton-skills"
+
+# 2. Run in your project. Use --scope project instead to share the plugin via
+#    committed .claude/settings.json; each collaborator still installs it.
+Set-Location "C:\path\to\your\project"
+claude plugin marketplace add mitchjablonski/skeleton-skills --scope local
+claude plugin install skel@skeleton-skills --scope local
+
+# 3. Add the deny rules, then restart Claude Code.
+node "$HOME\tools\skeleton-skills\bin\skel.mjs" install
+```
+
 `claude plugin install` defaults to **user scope**, which runs skel's hooks in every project you open. skel recommends local or project scope. It doesn't refuse a user-scope install, but `skel install` and `skel status` warn about one.
 
 `skel install` adds Claude Code permission **deny** rules to `<project>/.claude/settings.local.json` for the tool's own state: the project's `.skeleton/` state and skel's state dir (`$XDG_STATE_HOME/skel`, else `~/.local/state/skel`, or `%LOCALAPPDATA%\skel` on native Windows), plus the old `~/.config/skel` location it migrates from (see [Security model](#security-model)). It records which rules it added, and the project's Stop mode, in skel's state dir, outside the project. It merges into what's there: your settings and rules are kept, a re-run changes nothing (the file isn't even rewritten), and it refuses a symlinked or unparseable settings file rather than write through it or overwrite it. It prints the exact, quoted `node ".../bin/skel.mjs"` path to use from a terminal.
@@ -61,7 +79,16 @@ The Stop hook's mode is per project: `skel install --notify-only` makes drift a 
 
 Plugin versions are pinned per release (`version` in `.claude-plugin/plugin.json`), so you stay on a release until you update it yourself (`claude plugin update skel@skeleton-skills`, then restart). Third-party marketplaces don't auto-update by default; leave it that way for now.
 
-To remove skel from a project: `node ~/tools/skeleton-skills/bin/skel.mjs uninstall` takes out the deny rules install added (and, for a legacy install, its hooks and copies) and nothing else: a rule you already had, even an identical one, survives install and uninstall. It lists any rule shaped like skel's that it left in place because this install didn't add it, and leaves `.skeleton/` and its `.gitignore` line for you. It doesn't touch the plugin: `claude plugin uninstall skel@skeleton-skills --scope local` (or the scope you used) does that.
+To remove skel from a project, run these commands from the project, using the scope you installed the plugin with:
+
+```bash
+node ~/tools/skeleton-skills/bin/skel.mjs uninstall
+claude plugin uninstall skel@skeleton-skills --scope local
+```
+
+In native PowerShell, use `node "$HOME\tools\skeleton-skills\bin\skel.mjs" uninstall` for the first command; the plugin command is the same.
+
+Then restart Claude Code so the running session unloads the plugin and hooks. `skel uninstall` takes out the deny rules it added (and, for a legacy install, its hooks and copies) and nothing else: a rule you already had, even an identical one, survives install and uninstall. It lists any rule shaped like skel's that it left in place because this install didn't add it, and leaves `.skeleton/` and its `.gitignore` line for you.
 
 ### Developing skel
 
