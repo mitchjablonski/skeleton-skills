@@ -70,6 +70,7 @@ The contract is `lib/strict-protocol.mjs` (#82). `test/fixtures/strict-results.m
 - Same requestId with the same intent returns the original Result; a different intent is `request-reused`.
 - `unavailable` can be a lost committed reply; retry uses the same requestId.
 - Approve names the current `reviewVersion`; reshape and finalize name the approved version.
+- A committed reshape rotates the review round (`lib/strict-authority.mjs` in #83 sets it to the host's `nextReviewRoundId`). So the UI confirms a reshape on a re-read in the same project and session with a **different** round, phase `skeleton`, no approved version, at the committed revision or later. Approve still confirms only in the intent's own round. The mock authority rotates the round the same way.
 
 **Assumed by this PR, beyond the schema:** the page maps its phase names to AuthorityState's (scaffold to skeleton, fill to fill, done to finalized), and the UI treats a re-read at a revision below the committed one as unconfirmed.
 
