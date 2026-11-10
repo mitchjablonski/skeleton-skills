@@ -276,6 +276,42 @@ test("in-boundary transitions: a missing or malformed status is refused, never a
   }
 });
 
+test("in-boundary transitions: a forged requested:false is refused (respread, inherited, accessor, Proxy)", () => {
+  const strictActive = classifyEvidence(ACTIVE, { ...CONTEXT, requested: true });
+  const notRequested = classifyEvidence({ kind: "unsupported" }, { ...CONTEXT, requested: false });
+  assert.equal(refuseInBoundaryTransition(notRequested, "approve"), null, "the genuine status is allowed");
+  let reads = 0;
+  const forged = {
+    "respread": { ...strictActive, requested: false },
+    "respread of an allowed status": { ...notRequested },
+    "bare literal": { state: "active", requested: false },
+    "inherited from a status": Object.create(notRequested),
+    "inherited requested": Object.assign(Object.create({ requested: false }), { state: "active" }),
+    "accessor answering differently on each read": Object.defineProperties({}, {
+      state: { enumerable: true, value: "active" },
+      requested: { enumerable: true, get: () => (reads++ === 0 ? true : false) },
+    }),
+    "Proxy over a strict status": new Proxy(strictActive, { get: (t, k) => (k === "requested" ? false : t[k]), getOwnPropertyDescriptor: (t, k) => (k === "requested" ? { value: false, writable: false, enumerable: true, configurable: false } : Reflect.getOwnPropertyDescriptor(t, k)) }),
+    "Proxy over an allowed status": new Proxy(notRequested, {}),
+  };
+  for (const [label, status] of Object.entries(forged)) {
+    const msg = refuseInBoundaryTransition(status, "approve");
+    assert.ok(msg, label);
+    assert.match(msg, /^refused: approve .*strict status couldn't be read/, label);
+  }
+  assert.equal(reads, 0, "an accessor is never called");
+});
+
+test("in-boundary transitions: the action name is sanitized before it reaches the message", () => {
+  const strictActive = classifyEvidence(ACTIVE, CONTEXT);
+  for (const action of ["approve\nok: approved", "<b>x</b>", "", 42, null, undefined, "x".repeat(40)]) {
+    const msg = refuseInBoundaryTransition(strictActive, action);
+    assert.match(msg, /^refused: this transition can't run from inside the session/, String(action));
+    assert.doesNotMatch(msg, /\n|<b>/);
+  }
+  assert.match(refuseInBoundaryTransition(strictActive, "finalize"), /^refused: finalize /);
+});
+
 test("in-boundary transitions: the helper isn't wired into the CLI", () => {
   const bin = fs.readFileSync(BIN, "utf-8");
   assert.doesNotMatch(bin, /refuseInBoundaryTransition|refusePrivileged/);
