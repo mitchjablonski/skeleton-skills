@@ -8,8 +8,8 @@
 // nothing about where it came from. The review page's decision UI
 // (lib/review-decision.js) is tested against these; production never loads it.
 //
-// RuntimeEvidence fixtures (#78) live in test/fixtures/strict-evidence.mjs,
-// not here.
+// RuntimeEvidence fixtures (#78) aren't here: see PR #80, which adds its own
+// fixtures file for them.
 //
 // If Sol changes the contract, change this file first: the validators below
 // are what the tests hold the UI and the mock authority to.

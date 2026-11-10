@@ -49,6 +49,7 @@ function fakeDoc() {
 const all = (n, pred, out = []) => { if (pred(n)) out.push(n); for (const c of n.children ?? []) all(c, pred, out); return out; };
 const byAttr = (root, k, v) => all(root, (n) => n.attrs && k in n.attrs && (v === undefined || n.attrs[k] === v));
 
+const tick = () => new Promise((r) => setImmediate(r));
 const ids = () => { let i = 0; return () => `req-${++i}`; };
 const SHOWN = { phase: "scaffold", reviewVersion: VERSION_A, approvedVersion: null, pendingNotes: false };
 async function setup({ state = AUTHORITY_STATES.skeleton, shown = SHOWN, current = VERSION_A } = {}) {
@@ -163,7 +164,9 @@ for (const code of REJECTION_CODES) {
     assert.equal(v.approved, null);
     assert.equal(v.message.code, code);
     assert.match(v.message.text, COPY[code]);
-    assert.doesNotMatch(v.message.text + v.message.title, /^Approved/);
+    assert.notEqual(v.message.title, "Approved");
+    assert.doesNotMatch(v.message.title, /^Approved\b/, "the title never claims approval");
+    assert.doesNotMatch(v.message.text, /was approved \(revision/, "the text never claims approval");
     const approve = action(v, "approve");
     if (code === "unavailable") {
       assert.equal(approve.enabled, true);
@@ -272,7 +275,7 @@ test("#77 #66: the page moving to another version drops the retry and never show
   const real = two.auth.submit;
   two.auth.submit = (i) => new Promise((r) => { release = () => r(real(i)); });
   const p = two.ctl.decide("approve");
-  await new Promise((r) => setImmediate(r));
+  await tick();
   const moved = two.ctl.setShown({ ...SHOWN, reviewVersion: VERSION_B });
   release();
   await p;
@@ -280,6 +283,155 @@ test("#77 #66: the page moving to another version drops the retry and never show
   v = two.ctl.view();
   assert.equal(v.approved, null);
   assert.doesNotMatch(JSON.stringify(v), /Approved bbbbbbbbbbbb/);
+  assert.equal(v.status, "stale", "the move survives the answer");
+  assert.ok(v.actions.every((a) => !a.enabled), "nothing enabled until Re-read");
+  assert.equal(two.ctl.requestRetained, null);
+  assert.equal(v.canReread, true);
+  assert.match(v.message.text, /moved to bbbbbbbbbbbb while the decision on aaaaaaaaaaaa was being sent\. The service recorded it \(revision 5\)\./);
+});
+
+// ---- races found in review (rvscripts/race.mjs, inv.mjs) ----
+
+/** A channel whose submit waits for release(answer); answer is a Result or "throw". */
+function held(auth) {
+  const real = auth.submit;
+  const h = { release: null };
+  auth.submit = (i) => new Promise((res, rej) => {
+    h.release = async (answer) => {
+      if (answer === "throw") { await real(i); rej(new Error("reset")); } else res(answer ?? real(i));
+    };
+  });
+  h.restore = () => { auth.submit = real; };
+  return h;
+}
+
+test("#77 race 1 (blocking): the page moving during the pre-send read sends nothing, even when B is reviewable", async () => {
+  const { auth, ctl } = await setup();
+  const p = ctl.decide("approve"); // the human clicked while seeing A
+  auth.setCurrent(VERSION_B); // the agent made B reviewable
+  const s = ctl.setShown({ ...SHOWN, reviewVersion: VERSION_B });
+  assert.deepEqual(await p, { kind: "stale" });
+  await s;
+  assert.deepEqual(auth.calls.submit, [], "no intent for B, or for A");
+  const v = ctl.view();
+  assert.equal(v.approved, null);
+  assert.equal(v.status, "stale");
+  assert.ok(v.actions.every((a) => !a.enabled));
+  // After Re-read the human may approve B, which they now see.
+  await ctl.load();
+  await ctl.decide("approve");
+  assert.equal(auth.calls.submit[0].reviewVersion, VERSION_B);
+});
+
+test("#77 race 1: the version is captured at the click, not after the read", async () => {
+  // The read itself is slow; the page moves while it is pending.
+  const auth = createMockAuthority();
+  const ctl = skelDecisionController({ channel: auth, shown: SHOWN, newRequestId: ids() });
+  await ctl.load();
+  const realGet = auth.getState;
+  const pending = [];
+  auth.getState = () => new Promise((r) => { pending.push(() => r(realGet())); });
+  const p = ctl.decide("approve");
+  const s = ctl.setShown({ ...SHOWN, reviewVersion: VERSION_B });
+  assert.equal(pending.length, 2, "the pre-send read and the move's re-read");
+  pending[0](); // the pre-send read answers only after the page moved
+  pending[1]();
+  await p;
+  await s;
+  assert.deepEqual(auth.calls.submit, []);
+});
+
+for (const [name, answer] of [["unavailable", { kind: "rejected", requestId: "req-1", code: "unavailable" }], ["a lost answer", "throw"], ["revision-conflict", { kind: "rejected", requestId: "req-1", code: "revision-conflict" }]]) {
+  test(`#77 race 2: ${name} arriving after a page move keeps actions held and retains nothing`, async () => {
+    const { auth, ctl } = await setup();
+    const h = held(auth);
+    const p = ctl.decide("approve");
+    await tick();
+    assert.equal(ctl.view().canReread, false, "no Re-read while a decision is in flight");
+    await ctl.setShown({ ...SHOWN, reviewVersion: VERSION_B });
+    assert.equal(ctl.view().status, "stale");
+    assert.equal(ctl.view().canReread, false, "still in flight");
+    await ctl.load();
+    assert.equal(ctl.view().status, "stale", "Re-read does nothing mid-flight");
+    await h.release(answer);
+    await p;
+    h.restore();
+    const v = ctl.view();
+    assert.equal(v.status, "stale");
+    assert.equal(ctl.requestRetained, null, "never a retry for the old version");
+    assert.ok(v.actions.every((a) => !a.enabled && !a.retry));
+    assert.equal(v.canReread, true);
+    assert.equal(v.approved, null);
+    assert.deepEqual(await ctl.decide("approve"), { kind: "refused-locally" });
+    assert.ok(auth.calls.submit.length <= 1, "nothing more sent without Re-read");
+  });
+}
+
+test("#77 race 3: a committed answer is shown as approved only when the re-read state confirms it", async () => {
+  const { auth, ctl } = await setup();
+  const real = auth.submit;
+  auth.submit = async (i) => { await real(i); throw new Error("reset"); };
+  await ctl.decide("approve");
+  auth.submit = real;
+  auth.setState(AUTHORITY_STATES.newRound); // reshaped elsewhere meanwhile
+  assert.deepEqual(await ctl.decide("approve"), { kind: "committed", revision: 5 }, "the original answer");
+  const v = ctl.view();
+  assert.equal(v.approved, null);
+  assert.equal(v.status, "stale");
+  assert.equal(v.message.title, "Recorded, but the state differs");
+  assert.match(v.message.text, /recorded the request \(revision 5\), but the current review state doesn't show it in effect: phase skeleton, review round example-round-2, revision 7, approved version none\./);
+  assert.equal(v.identity.reviewRoundId, "example-round-2", "the current state is shown");
+  assert.ok(v.actions.every((a) => !a.enabled));
+  // The same with a committed answer and a state that never moved.
+  const two = await setup();
+  two.auth.force({ ...RESULTS.committed, requestId: "req-1" });
+  await two.ctl.decide("approve");
+  assert.equal(two.ctl.view().approved, null);
+  assert.equal(two.ctl.view().message.title, "Recorded, but the state differs");
+});
+
+test("#77 race 4: after a lost answer the state is re-read, and only the retained request is offered", async () => {
+  const { auth, ctl } = await setup();
+  const real = auth.submit;
+  auth.submit = async (i) => { await real(i); throw new Error("reset"); };
+  await ctl.decide("approve");
+  const v = ctl.view();
+  assert.equal(v.identity.revision, 5, "re-read after the thrown submit");
+  assert.deepEqual(v.actions.map((a) => [a.action, a.enabled, a.retry]), [["approve", true, true]]);
+  assert.equal(v.approved, null);
+});
+
+test("#77 inv: an inconsistent AuthorityState fails closed", async () => {
+  const bad = [
+    { projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "fill", approvedVersion: null, revision: 3 },
+    { projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "finalized", approvedVersion: null, revision: 3 },
+    { projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "skeleton", approvedVersion: "x", revision: 3 },
+  ];
+  for (const st of bad) {
+    assert.notDeepEqual(validateAuthorityState(st), [], "the fixtures refuse it too");
+    const sent = [];
+    const ch = { getState: async () => ({ ...st }), submit: async (i) => { sent.push(i); return { kind: "rejected", code: "unavailable" }; } };
+    const page = { phase: st.phase === "skeleton" ? "scaffold" : "fill", reviewVersion: "x", approvedVersion: null, pendingNotes: false };
+    const ctl = skelDecisionController({ channel: ch, shown: page, newRequestId: () => "id1" });
+    await ctl.load();
+    const v = ctl.view();
+    assert.deepEqual(v.actions, [], JSON.stringify(st));
+    assert.equal(v.identity, null);
+    await ctl.decide("reshape");
+    await ctl.decide("approve");
+    assert.deepEqual(sent, []);
+  }
+});
+
+test("#77: mounting twice in one container gives one UI and one controller", async () => {
+  const doc = fakeDoc();
+  const container = doc.createElement("div");
+  const auth = createMockAuthority();
+  const opts = { doc, container, channel: auth, shown: SHOWN, newRequestId: ids() };
+  const [a, b] = await Promise.all([skelMountDecision(opts), skelMountDecision(opts)]);
+  assert.equal(a, b);
+  assert.equal(container.children.length, 1);
+  assert.equal(await skelMountDecision(opts), a);
 });
 
 test("#77: reshape names the approved version and needs the page to agree", async () => {
@@ -371,9 +523,18 @@ test("#77: the default page is unchanged — the decision module isn't loaded, s
     assert.ok(!renderHtml({ title: "T", diagrams: [], phase: "scaffold" }).includes(name));
   }
   // No approval or decision endpoint on the agent-reachable review server.
+  // A source-text check of bin/skel.mjs: every use of req.url, and every
+  // "/api/..." or "/assets/..." literal, is one of today's routes. Its limit:
+  // a route added in another file, or through a router that never names
+  // req.url, wouldn't be seen here.
   const server = fs.readFileSync(path.join(HERE, "..", "bin", "skel.mjs"), "utf-8");
-  const routes = [...server.matchAll(/req\.url === "([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual([...new Set(routes)].sort(), ["/", "/api/data", "/api/feedback", "/api/version", "/assets/review.js"]);
+  const uses = [...server.matchAll(/req\.url\b(\s*===\s*"[^"]*"|\.startsWith\("[^"]*"\))?/g)].map((m) => m[0].replace(/\s+/g, " "));
+  assert.deepEqual([...new Set(uses)].sort(), [
+    'req.url === "/"', 'req.url === "/api/data"', 'req.url === "/api/feedback"', 'req.url === "/api/version"', 'req.url === "/assets/review.js"', 'req.url.startsWith("/?")',
+  ], "every req.url use is a known route comparison");
+  const literals = new Set([...server.matchAll(/["'`](\/(?:api|assets)\/[^"'`]*)["'`]/g)].map((m) => m[1]));
+  assert.deepEqual([...literals].sort(), ["/api/data", "/api/feedback", "/api/version", "/assets/review.js"]);
+  assert.doesNotMatch(server, /switch\s*\(\s*req\.|new URL\(\s*req\.url|req\.path\b|\/api\/(approve|reshape|decision|intent|sign)/);
   assert.doesNotMatch(server, /review-decision/);
   assert.doesNotMatch(read("review.mjs"), /review-decision/);
 });
