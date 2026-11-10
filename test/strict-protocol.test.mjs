@@ -86,4 +86,12 @@ test("strict result echoes committed identity and handles unknown transport outc
     "session-ended", "unavailable", "request-reused"]) assert.ok(parseStrictResult({ kind: "rejected", code }));
   assert.equal(parseStrictResult({ kind: "rejected", code: "unknown" }), null);
   assert.equal(parseStrictResult(null), null);
+  for (const original of [committed, { kind: "rejected", code: "unavailable" }]) {
+    let reads = 0;
+    const changing = new Proxy(original, { getOwnPropertyDescriptor(target, key) {
+      const d = Reflect.getOwnPropertyDescriptor(target, key);
+      return key === "kind" && ++reads > 1 ? { ...d, value: "unexpected" } : d;
+    } });
+    assert.equal(parseStrictResult(changing), null, "discriminator must remain valid in the copied record");
+  }
 });
