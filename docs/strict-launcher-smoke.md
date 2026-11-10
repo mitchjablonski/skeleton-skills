@@ -15,10 +15,11 @@ python3 scripts/dev/strict-client-smoke.py \
   --sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
-The supplied path must be absolute, executable and a regular file. A missing
+The supplied path must be absolute, executable and a regular file, not a symlink.
+The canonical resolved path is reported. A missing
 client, malformed digest, digest mismatch, unsupported platform, missing
 Bubblewrap or required runtime directories, sandbox failure, timeout, or
-nonzero client exit is reported as JSON with a nonzero exit status. The caller
+nonzero client exit or missing version-like stdout is reported as JSON with a nonzero exit status. The caller
 must obtain the digest from a trusted source; this script does not download or
 install anything.
 
@@ -30,6 +31,8 @@ network, IPC and UTS namespaces. The CLI executable is mounted read-only at
 mounted read-only as runtime roots. No persistent project or host HOME is
 mounted writable. `/proc`, `/dev`, `/tmp`, and `/run` are private sandbox instances.
 The version output and diagnostics are capped before they are printed.
+`requestedIsolation` describes the arguments/environment constructed by the
+harness, not measurements of effective mounts, credentials or network access.
 
 ## Scope and limits
 

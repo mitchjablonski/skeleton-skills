@@ -8,7 +8,8 @@ The outside host will authenticate the human channel and load its private
 record before calling `planAuthorityTransaction(record, intent, facts)`.
 The returned `{record, result, persist, replayed}` is a plan, not a receipt.
 When `persist` is true, the host must atomically and durably commit the entire
-record before returning the result. Concurrent host transactions must serialize
+record before returning the result, fsyncing both the file and its directory.
+If persistence fails, reply `unavailable`, never the planned result. Concurrent host transactions must serialize
 and re-read under the same authority lock; pure planning supplies no CAS or lock.
 
 ## Record and replay rules
@@ -29,8 +30,13 @@ and re-read under the same authority lock; pure planning supplies no CAS or lock
 - Journal order differs from authority revision: terminal rejection appends a
   result without advancing the phase revision. Commits advance revision once.
 
-Consistency checking cannot detect a coherently rewritten history. OS isolation
-and integrity of private storage are still required. JSON serialization/reload
+Consistency checking cannot detect a coherently rewritten history, rollback or
+truncation to an earlier valid record. A stale backup restore can forget request
+IDs and permit their reuse. OS isolation and private-storage integrity are still
+required; rollback-capable storage/recovery additionally needs a monotonic
+generation outside this record or an equivalent anti-rollback mechanism.
+File/directory fsync before reply prevents acknowledging unflushed commits; it
+does not authenticate an operator-restored old backup. JSON serialization/reload
 tests simulate restart inputs; they do not establish durable filesystem commits.
 
 ## Host facts and transitions
@@ -48,6 +54,11 @@ caller must not manufacture completion by passing `true` from an agent report.
 Refreshing a changed draft's reviewable version, initial registration, strict
 migration/reset, session end and snapshot publication remain separate host-side
 operations to specify and test; this core does not silently implement them.
+
+Malformed requests and wrong project/session are refused before request-ID lookup;
+`request-reused` applies to otherwise valid requests for this authority. At the
+journal cap, `unavailable` requires explicit host/operator recovery, not an endless
+automatic retry loop. No compaction or recovery procedure is implemented yet.
 
 ## Next implementation gates
 

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import signal
 import stat
@@ -57,6 +58,9 @@ def main() -> int:
         return emit({"ok": False, "code": "invalid-sha256-format"}, 2)
 
     try:
+        if client.is_symlink():
+            return emit({"ok": False, "code": "client-symlink-refused"}, 2)
+        client = client.resolve(strict=True)
         client_stat = client.stat()
         if not stat.S_ISREG(client_stat.st_mode):
             return emit({"ok": False, "code": "client-not-regular-file"}, 2)
@@ -138,18 +142,18 @@ def main() -> int:
                     pass
                 stdout, stderr = process.communicate()
 
+            version_output = re.search(rb"\b\d+\.\d+(?:\.\d+)?\b", stdout) is not None
             result = {
-                "ok": not timed_out and process.returncode == 0,
-                "code": "timeout" if timed_out else ("completed" if process.returncode == 0 else "client-failed"),
+                "ok": not timed_out and process.returncode == 0 and version_output,
+                "code": "timeout" if timed_out else ("client-failed" if process.returncode != 0 else ("completed" if version_output else "version-output-missing")),
                 "client": str(client),
                 "sha256": actual_sha256,
                 "command": [mounted_client, "--version"],
                 "bubblewrapFoundOnPath": True,
                 "bubblewrapPath": bwrap,
                 "environment": {"HOME": "/home/agent", "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
-                "privateHomeMounted": False,
-                "hostCredentialsPassed": False,
-                "egressAvailable": False,
+                "requestedIsolation": {"freshHomeMounted": True, "hostHomeMounted": False,
+                                       "inheritedCredentialsPassed": False, "networkNamespace": "private"},
                 "elapsedSeconds": round(time.monotonic() - started_at, 3),
                 "stdout": output_text(stdout),
                 "stderr": output_text(stderr),
