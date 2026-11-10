@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fork } from "node:child_process";
-import { createAuthorityStore, openAuthorityStore } from "../lib/strict-authority-store.mjs";
+import { createAuthorityStore, openAuthorityStore, inspectAuthorityStore } from "../lib/strict-authority-store.mjs";
 
 const storeTest = (name, options, fn) => typeof options === "function"
   ? test(name, { skip: process.platform !== "linux" }, options)
@@ -101,7 +101,11 @@ storeTest("after-rename failure is ambiguous unavailable and same-ID recovery re
 storeTest("file fsync failure prevents rename; duplicate retry must also complete fsync", t => {
   const { dir, record } = fixture(t); createAuthorityStore(dir, initial());
   let renamed = false;
-  const store = openAuthorityStore(dir, { fsyncSync() { throw Error("injected fsync"); },
+  const store = openAuthorityStore(dir, { fsyncSync(fd) {
+    const name = fs.readlinkSync(`/proc/self/fd/${fd}`);
+    if (name.endsWith(".tmp") || name.endsWith("/authority.json")) throw Error("injected fsync");
+    fs.fsyncSync(fd);
+  },
     renameSync(from, to) { renamed = true; fs.renameSync(from, to); } });
   assert.equal(store.submit(request(), facts()).code, "unavailable"); assert.equal(renamed, false);
   assert.equal(record().state.revision, 0);
@@ -112,10 +116,11 @@ storeTest("file fsync failure prevents rename; duplicate retry must also complet
 
 storeTest("Linux parent fsync failure after rename never reports committed", t => {
   const { dir, record } = fixture(t); createAuthorityStore(dir, initial());
+  let renamed = false;
   const store = openAuthorityStore(dir, { fsyncSync(fd) {
-    if (fs.fstatSync(fd).isDirectory()) throw Error("injected directory fsync");
+    if (renamed && fs.fstatSync(fd).isDirectory()) throw Error("injected directory fsync");
     fs.fsyncSync(fd);
-  } });
+  }, renameSync(from, to) { fs.renameSync(from, to); renamed = true; } });
   assert.equal(store.submit(request(), facts()).code, "unavailable"); assert.equal(record().state.revision, 1);
   assert.equal(store.submit(request(), null).code, "unavailable");
   assert.equal(openAuthorityStore(dir).submit(request(), null).kind, "committed");
@@ -170,6 +175,58 @@ process.on('message', ({request,facts}) => { process.send(store.submit(request,f
   assert.ok(results.filter(r => r.kind === "rejected").every(r => ["unavailable", "revision-conflict"].includes(r.code)));
   assert.equal(record().state.revision, 1);
   assert.equal(record().journal.filter(e => e.result.kind === "committed").length, 1);
+});
+
+storeTest("trusted path permissions and replaced ancestors refuse", t => {
+  const { root, dir } = fixture(t); const store = createAuthorityStore(dir, initial());
+  for (const target of [dir, path.join(dir, "authority.json"), root]) {
+    const mode = fs.statSync(target).mode & 0o777;
+    fs.chmodSync(target, mode | 0o020);
+    assert.throws(() => openAuthorityStore(dir));
+    assert.equal(store.submit(request(), facts()).code, "unavailable");
+    fs.chmodSync(target, mode);
+  }
+  const moved = root + "-moved";
+  fs.renameSync(root, moved); fs.symlinkSync(moved, root);
+  try { assert.throws(() => openAuthorityStore(dir)); }
+  finally { fs.unlinkSync(root); fs.renameSync(moved, root); }
+});
+
+storeTest("inspection distinguishes held, PID reuse, old boot and unknown without mutation", t => {
+  const { dir } = fixture(t); const store = createAuthorityStore(dir, initial());
+  assert.equal(inspectAuthorityStore(dir).lock, "absent");
+  const lock = path.join(dir, ".authority-lock"); fs.mkdirSync(lock, { mode: 0o700 });
+  assert.equal(inspectAuthorityStore(dir).lock, "unknown");
+  const file = path.join(lock, "holder.json");
+  const startTime = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8").split(") ").at(-1).split(" ")[19];
+  const live = { pid: process.pid, bootId: fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), startTime };
+  const write = v => fs.writeFileSync(file, JSON.stringify(v), { mode: 0o600 });
+  write(live); assert.equal(inspectAuthorityStore(dir).lock, "held");
+  write({ ...live, startTime: "0" }); assert.equal(inspectAuthorityStore(dir).lock, "abandoned");
+  write({ ...live, bootId: "00000000-0000-0000-0000-000000000000" }); assert.equal(inspectAuthorityStore(dir).lock, "abandoned");
+  write({}); assert.equal(inspectAuthorityStore(dir).lock, "unknown");
+  const before = fs.readFileSync(file, "utf8");
+  assert.equal(store.submit(request(), facts()).code, "unavailable");
+  assert.equal(fs.readFileSync(file, "utf8"), before);
+  fs.unlinkSync(file); fs.rmdirSync(lock); fs.symlinkSync(path.join(dir, "missing"), lock);
+  assert.equal(inspectAuthorityStore(dir).lock, "unknown", "dangling lock isn't absent");
+});
+
+storeTest("process crash after temporary fsync preserves inspectable lock and owned temp", { timeout: 10000 }, async t => {
+  const { root, dir, record } = fixture(t); createAuthorityStore(dir, initial());
+  const worker = path.join(root, "crash.mjs");
+  fs.writeFileSync(worker, `import fs from 'node:fs';
+import {openAuthorityStore} from ${JSON.stringify(new URL("../lib/strict-authority-store.mjs", import.meta.url).href)};
+const store=openAuthorityStore(process.argv[2], {fsyncSync(fd) { fs.fsyncSync(fd); const name=fs.readlinkSync('/proc/self/fd/'+fd); if(name.endsWith('.tmp')) process.exit(71); }});
+store.submit(${JSON.stringify(request())}, ${JSON.stringify(facts())});`);
+  const child = fork(worker, [dir], { stdio: "ignore" });
+  await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", code => { assert.equal(code, 71); resolve(); }); });
+  const inspection = inspectAuthorityStore(dir);
+  assert.equal(inspection.lock, "abandoned"); assert.equal(inspection.orphanTemps.length, 1);
+  const temp = path.join(dir, inspection.orphanTemps[0]); fs.chmodSync(temp, 0o666);
+  assert.deepEqual(inspectAuthorityStore(dir).orphanTemps, []);
+  assert.equal(openAuthorityStore(dir).submit(request(), facts()).code, "unavailable");
+  assert.equal(record().state.revision, 0); assert.ok(fs.existsSync(path.join(dir, ".authority-lock", "holder.json")));
 });
 
 test("unsupported platforms refuse before touching supplied paths or initial state", { skip: process.platform === "linux" }, () => {
