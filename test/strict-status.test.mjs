@@ -276,7 +276,7 @@ test("in-boundary transitions: a missing or malformed status is refused, never a
   }
 });
 
-test("in-boundary transitions: a forged requested:false is refused (respread, inherited, accessor, Proxy)", () => {
+test("in-boundary transitions: copies of a status are refused (respread, inherited, accessor, Proxy)", () => {
   const strictActive = classifyEvidence(ACTIVE, { ...CONTEXT, requested: true });
   const notRequested = classifyEvidence({ kind: "unsupported" }, { ...CONTEXT, requested: false });
   assert.equal(refuseInBoundaryTransition(notRequested, "approve"), null, "the genuine status is allowed");

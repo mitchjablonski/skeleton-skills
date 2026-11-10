@@ -634,6 +634,8 @@ const R6_OVERCLAIMS = [
   /\bcheck whether (it|the request|the decision)\b/i,
 ];
 // After an unknown outcome, a refused Retry can't say the request made no change.
+// Codes whose answer to a Retry leaves the earlier send's outcome unknown.
+const RESEND_UNKNOWN = ["session-ended", "unauthorized-channel", "unavailable", "request-reused"];
 const RESEND_OVERCLAIMS = [/made no change/i, /recorded nothing/i, /nothing (new )?(was )?recorded/i];
 const r6Check = (text, extra = []) => { for (const bad of [...R6_OVERCLAIMS, ...extra]) assert.doesNotMatch(text, bad, `overclaims a historical outcome: ${text}`); };
 
@@ -651,7 +653,7 @@ test("#77 R6: no decision string or rendered rejection claims a Re-read, reload 
     for (const w of [{ label: "Approve skeleton", done: "approved" }, { label: "Reshape", done: "reshaped" }]) {
       for (const resent of [false, true]) {
         const m = SKEL_DECISION_REJECTION[code]({ ...w, version: "v1.2.3", phase: "skeleton", resent });
-        r6Check(`${m.title} ${m.text}`, resent && ["session-ended", "unauthorized-channel", "unavailable"].includes(code) ? RESEND_OVERCLAIMS : []);
+        r6Check(`${m.title} ${m.text}`, resent && RESEND_UNKNOWN.includes(code) ? RESEND_OVERCLAIMS : []);
       }
     }
   }
@@ -681,7 +683,7 @@ test("#77 R6: rendered messages on every controller path make no historical clai
       note(ctl, `reread after ${first}`, RESEND_OVERCLAIMS);
       auth.force({ kind: "rejected", requestId: "req-1", code });
       await ctl.decide("approve");
-      note(ctl, `retry ${code} after ${first}`, ["session-ended", "unauthorized-channel", "unavailable"].includes(code) ? RESEND_OVERCLAIMS : []);
+      note(ctl, `retry ${code} after ${first}`, RESEND_UNKNOWN.includes(code) ? RESEND_OVERCLAIMS : []);
     }
   }
   // Malformed answer.
@@ -712,7 +714,7 @@ test("#77 R6: rendered messages on every controller path make no historical clai
   assert.ok(seen.length >= REJECTION_CODES.length * 7 + 5, `paths covered: ${seen.length}`);
 });
 
-for (const code of ["unauthorized-channel", "session-ended"]) {
+for (const code of ["unauthorized-channel", "session-ended", "request-reused"]) {
   test(`#77 R6: a Retry answered ${code} leaves the first send's outcome unknown`, async () => {
     const { auth, ctl } = await setup();
     auth.force({ kind: "rejected", requestId: "req-1", code: "unavailable" });
@@ -723,18 +725,18 @@ for (const code of ["unauthorized-channel", "session-ended"]) {
     assert.equal(auth.calls.submit.length, 2);
     assert.equal(auth.calls.submit[1].requestId, "req-1", "it was a resend of the kept intent");
     const v = ctl.view();
-    assert.equal(v.status, code === "session-ended" ? "ended" : "refused");
+    assert.equal(v.status, { "session-ended": "ended", "unauthorized-channel": "refused", "request-reused": "stale" }[code]);
     assert.equal(v.approved, null);
     assert.equal(v.message.code, code);
     assert.match(v.message.text, /this (retry|send) was refused\. Whether the earlier send of this request for aaaaaaaaaaaa was recorded is unknown, and it is not shown as approved/);
     assert.doesNotMatch(v.message.text, /made no change|recorded nothing|doesn't show whether an earlier request committed/);
-    assert.ok(v.actions.every((a) => !a.enabled && !a.retry), "decisions stay off, and the kept request is gone");
+    assert.ok(v.actions.every((a) => !a.enabled && !a.retry), "decisions are held, and the kept request is gone");
     assert.equal(ctl.requestRetained, null);
-    // A fresh request answered the same way is still "refused and made no change".
+    // A fresh request answered the same way still says this request changed nothing.
     const fresh = await setup();
     fresh.auth.force({ kind: "rejected", requestId: "req-1", code });
     await fresh.ctl.decide("approve");
-    assert.match(fresh.ctl.view().message.text, /this request was refused and made no change/);
+    assert.match(fresh.ctl.view().message.text, code === "request-reused" ? /this request was refused and recorded nothing/ : /this request was refused and made no change/);
   });
 }
 
