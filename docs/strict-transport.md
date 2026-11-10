@@ -75,6 +75,8 @@ The contract is `lib/strict-protocol.mjs` (#82). `test/fixtures/strict-results.m
 
 ## 6. Open questions for Sol
 
+Proposed answers, plus status and recovery integration (#78), are in [docs/strict-decision-page.md](strict-decision-page.md): (a) is question 1, (b) is question 2, (c) is question 3 and (d) is question 4. They are proposals for Sol's review and decide nothing.
+
 1. **How does the browser reach the human listener's origin?** For example a launcher-bound loopback port in the host namespace, or something native. How does the human learn its address, given strict-boundary.md says the address need not be secret but its inaccessibility from the agent must be proved?
 2. **How are origin and CSRF bound** on the listener, without any secret the page carries?
 3. **How does the listener-served page know what the human is looking at?** The decision UI compares the shown version with `AuthorityState.reviewVersion`. If the source is still read on the agent-reachable review page, how does the listener page learn the shown version and pending notes without trusting that page?
