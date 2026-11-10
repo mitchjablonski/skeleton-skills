@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_VERIFIER, EVIDENCE_REASONS, LOCAL_REASONS, STRICT_STATES, classifyEvidence, refusePrivileged, strictLine, strictStatus } from "../lib/strict-status.mjs";
+import { DEFAULT_VERIFIER, EVIDENCE_REASONS, LOCAL_REASONS, MAX_EVIDENCE_AGE_MS, MAX_EVIDENCE_LIFETIME_MS, STRICT_STATES, classifyEvidence, refusePrivileged, strictLine, strictStatus } from "../lib/strict-status.mjs";
 import { ACTIVE, CONTEXT, MALFORMED, NEGATIVE, NOW, POSITIVE, PROFILE, PROJECT, SESSION, UNVERIFIED_REASONS, fixtureVerifier, throwingVerifier } from "./fixtures/strict-evidence.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -45,8 +45,8 @@ test("each positive fixture maps to its state, and only active allows privileged
 });
 
 test("expired, wrong-project, wrong-session and other near-active evidence is never active", async () => {
-  for (const [name, { evidence, expect }] of Object.entries(NEGATIVE)) {
-    const status = await strictStatus({ verifier: fixtureVerifier(evidence), ...CONTEXT });
+  for (const [name, { evidence, expect, context }] of Object.entries(NEGATIVE)) {
+    const status = await strictStatus({ verifier: fixtureVerifier(evidence), ...CONTEXT, ...context });
     assert.equal(status.state, expect.state, name);
     assert.equal(status.reason, expect.reason, name);
     notActive(status, name);
@@ -104,7 +104,7 @@ test("the status module reads no files, settings or environment", () => {
 test("every state and reason has plain copy with a next step, and says drift is detected, not prevented", async () => {
   const statuses = [
     ...await Promise.all(Object.values(POSITIVE).map(({ evidence }) => strictStatus({ verifier: fixtureVerifier(evidence), ...CONTEXT }))),
-    ...Object.values(NEGATIVE).map(({ evidence }) => classifyEvidence(evidence, CONTEXT)),
+    ...Object.values(NEGATIVE).map(({ evidence, context }) => classifyEvidence(evidence, { ...CONTEXT, ...context })),
   ];
   const seen = new Set(statuses.map((s) => s.reason ? `${s.state}:${s.reason}` : s.state));
   for (const reason of [...EVIDENCE_REASONS, ...LOCAL_REASONS]) assert.ok(seen.has(`unverified:${reason}`), reason);
@@ -115,11 +115,50 @@ test("every state and reason has plain copy with a next step, and says drift is 
     assert.match(s.drift, /detect.*refuse/);
     assert.match(s.drift, /does not stop files in the workspace from being written/);
     assert.doesNotMatch(`${s.summary} ${s.next}`, /contain|prevent|sandbox/i, "no containment claim");
-    if (s.state !== "active") assert.match(s.next, /refused|unchanged/, `${s.state}:${s.reason}`);
+    if (s.state !== "active") assert.match(s.next, /refused/, `${s.state}:${s.reason}`);
+    else assert.match(`${s.summary} ${s.next}`, /Enforcement reports.*Enforcement reports/s, "active copy is conditional, not a capability claim");
   }
   // Each reason has its own words, not one generic message.
   const unverified = statuses.filter((s) => s.state === "unverified");
   assert.equal(new Set(unverified.map((s) => s.summary)).size, new Set(unverified.map((s) => s.reason)).size);
+});
+
+test("freshness is capped on top of the producer's expiresAt (provisional caps for Sol)", () => {
+  assert.equal(MAX_EVIDENCE_LIFETIME_MS, 10 * 60_000);
+  assert.equal(MAX_EVIDENCE_AGE_MS, 10 * 60_000);
+  const at = (observed, expires) => ({ ...ACTIVE, observedAt: new Date(observed).toISOString(), expiresAt: new Date(expires).toISOString() });
+  assert.equal(classifyEvidence(at(NOW - 1000, NOW - 1000 + MAX_EVIDENCE_LIFETIME_MS), CONTEXT).state, "active", "exactly the lifetime cap");
+  assert.equal(classifyEvidence(at(NOW - 1000, NOW - 999 + MAX_EVIDENCE_LIFETIME_MS), CONTEXT).reason, "evidence-unreadable", "1ms over the lifetime cap");
+  const lifted = { ...CONTEXT, maxLifetimeMs: 3_600_000 };
+  assert.equal(classifyEvidence(at(NOW - MAX_EVIDENCE_AGE_MS, NOW + 60_000), lifted).state, "active", "exactly the age cap");
+  assert.equal(classifyEvidence(at(NOW - MAX_EVIDENCE_AGE_MS - 1, NOW + 60_000), lifted).reason, "evidence-stale", "1ms over the age cap");
+});
+
+test("options and evidence are read from own properties only", async () => {
+  const inherited = Object.assign(Object.create({ supportedProfiles: [PROFILE], now: NOW, maxLifetimeMs: Infinity }), { projectId: PROJECT, sessionId: SESSION });
+  notActive(classifyEvidence(ACTIVE, inherited), "inherited options");
+  assert.equal(classifyEvidence(Object.create(ACTIVE), CONTEXT).reason, "evidence-unreadable");
+  const viaProto = Object.assign(Object.create({ verifier: fixtureVerifier(ACTIVE) }), CONTEXT);
+  assert.equal((await strictStatus(viaProto)).state, "unsupported", "an inherited verifier is ignored");
+});
+
+test("requested and unrequested strict differ: only a request refuses privileged actions", async () => {
+  const unrequested = await strictStatus({ ...CONTEXT, requested: false });
+  assert.equal(unrequested.state, "unsupported");
+  assert.equal(unrequested.requested, false);
+  assert.equal(unrequested.privilegedActions, undefined);
+  assert.match(unrequested.next, /default mode is unchanged/);
+  const requested = await strictStatus({ ...CONTEXT, requested: true });
+  assert.equal(requested.state, "unsupported");
+  assert.equal(requested.requested, true);
+  assert.equal(requested.privilegedActions, "refused");
+  assert.match(requested.summary, /Strict was requested for this project/);
+  assert.match(requested.next, /refused in strict mode, and skel doesn't fall back to default mode on its own/);
+  assert.doesNotMatch(requested.next, /Nothing to do|unchanged/);
+  assert.match(refusePrivileged(requested, "finalize"), /^refused: finalize .*unsupported\. Approve, reshape and finalize are refused/);
+  notActive(classifyEvidence({ kind: "unverified", reason: "evidence-stale" }, { ...CONTEXT, requested: true }), "requested stale");
+  // A strict helper refuses even active evidence when strict wasn't requested.
+  assert.ok(refusePrivileged(classifyEvidence(ACTIVE, { ...CONTEXT, requested: false }), "approve"));
 });
 
 test("the refusal names the action, the state and the next step", () => {
@@ -135,7 +174,7 @@ test("the human strict line is one line with the state, reason and next step", (
   const line = strictLine(classifyEvidence({ kind: "unverified", reason: "launcher-absent" }, CONTEXT));
   assert.match(line, /^strict: unverified \(launcher-absent\) — This session wasn't started by the strict launcher.* Next: End this session/);
   assert.doesNotMatch(line, /\n/);
-  assert.match(strictLine(classifyEvidence({ kind: "unsupported" }, CONTEXT)), /^strict: unsupported — This release has no strict enforcement/);
+  assert.match(strictLine(classifyEvidence({ kind: "unsupported" }, CONTEXT)), /^strict: unsupported — Strict was requested for this project, but this release has no strict enforcement\. Next: Approve, reshape and finalize are refused/);
 });
 
 // ---- the CLI ----
@@ -148,7 +187,7 @@ function project() {
 }
 const fenced = 'export function value() {\n// SKEL[1] value\nthrow new Error("SKEL_TODO");\n// /SKEL[1]\n}\n';
 
-test("skel status --json carries strict: unsupported, not requested, privileged actions refused", () => {
+test("skel status --json carries strict: unsupported, not requested, and no refusal in default mode", () => {
   const { root, run } = project();
   assert.equal(run("init", "strict json").status, 0);
   fs.writeFileSync(path.join(root, "code.js"), fenced);
@@ -160,7 +199,8 @@ test("skel status --json carries strict: unsupported, not requested, privileged 
     assert.equal(json.phase, phase);
     assert.equal(json.strict.state, "unsupported");
     assert.equal(json.strict.requested, false);
-    assert.equal(json.strict.privilegedActions, "refused");
+    assert.equal(json.strict.privilegedActions, undefined, "default mode refuses nothing");
+    assert.doesNotMatch(JSON.stringify(json.strict), /refused/, "default JSON never says refused");
     assert.match(json.strict.summary, /not available/);
     assert.match(json.strict.drift, /does not stop files/);
   }
@@ -183,6 +223,7 @@ test("planted evidence files and settings can't make skel status active", () => 
   assert.equal(json.strict.state, "unsupported");
   assert.equal(json.strict.requested, false);
   assert.equal(json.strict.evidence, undefined);
+  assert.equal(json.strict.privilegedActions, undefined);
 });
 
 test("skel status --json on unreadable state still carries strict", () => {
@@ -194,7 +235,7 @@ test("skel status --json on unreadable state still carries strict", () => {
   const json = JSON.parse(res.stdout);
   assert.match(json.error, /init --force/);
   assert.equal(json.strict.state, "unsupported");
-  assert.equal(json.strict.privilegedActions, "refused");
+  assert.equal(json.strict.privilegedActions, undefined);
 });
 
 test("regression: default-mode skel status output is unchanged, with no strict line", () => {

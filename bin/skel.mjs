@@ -851,7 +851,7 @@ const commands = {
     // #78: strict-tier status from the default verifier, which is never active
     // in this release. There is no way to request strict yet, so the human
     // output has no strict line; the JSON always carries the field.
-    const strict = { requested: false, ...(await strictStatus({ projectId: root, sessionId: null })) };
+    const strict = await strictStatus({ projectId: root, sessionId: null, requested: false });
     const state = readState(root);
     if (!validState(state)) {
       const error = `can't read ${path.join(root, STATE_DIR, "state.json")}; repair that file or run \`skel init --force "<title>"\` from ${root} (requires approval in Claude Code)`;
