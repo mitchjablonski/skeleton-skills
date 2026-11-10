@@ -296,6 +296,15 @@ An unreadable store dir by itself does not enroll a project with no skeleton. A 
 
 The Stop continuation protocol was tested on Claude Code CLI 2.1.318: `systemMessage` alone stops; both `decision: "block"` and `additionalContext` continue. The default uses `decision: "block"` only for file drift on an explicitly identified first Stop (`stop_hook_active === false`) and neither continuation field on the next, or on later prompts with the same exterior drift. Unknown flag values and approval-record faults only notify. IDE/Desktop behavior has not been probed separately; the documented hook protocol is the compatibility basis for those clients.
 
+## Strict tier (in development)
+
+**Strict is not available yet, and nothing in this release enforces it.** Everything above is the default tier: a drift guard for a cooperative agent. The strict tier is being designed and built in [#19](https://github.com/mitchjablonski/skeleton-skills/issues/19).
+
+- **Candidate scope:** the Claude Code CLI on explicitly verified Linux/WSL configurations only. Other clients and platforms (native Windows, macOS, IDE extensions, Desktop) are not candidates until tests say otherwise.
+- **Status today:** `skel status --json` has a `strict` field. In this release it always says `unsupported`, with `requested: false` and no `privilegedActions` field, because default mode refuses nothing (`skel approve`, `reshape` and `finalize` are unchanged); there is no way to request strict yet, so the plain `skel status` output doesn't mention it. A file in the project, a settings or dependency check, or a review-page result can never make it `active`.
+- **Planned states:** `active` (fresh enforcement evidence for this project and session), `unverified` (with a reason: `launcher-absent`, `profile-unsupported`, `evidence-stale`, `evidence-unreadable`, `dependency-missing`, or `evidence-mismatch` for another project or session), `unsupported`, and `ended`. For a project that requested strict, anything but `active` refuses approve, reshape and finalize and names the next step, usually restarting through the strict launcher. Recovery never quietly falls back to default mode.
+- **Drift:** in either tier, `skel done` and `skel finalize` detect changes outside the fences and refuse. That is detection and refusal, not prevention: neither tier promises that every workspace write stays inside a fence.
+
 ## Prior art
 
 [pi-topdown-kit](https://github.com/yinloo-ola/pi-topdown-kit) does scaffold-first stepwise refinement for the pi harness: a compilable skeleton of `stub()` calls, with progress read by grep. skeleton-skills brings the idea to Claude Code and adds fences enforced by a hook, a review page with comments that go back to Claude, and diagrams that track step status.
