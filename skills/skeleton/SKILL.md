@@ -108,3 +108,5 @@ In the terminal, give a short summary of the shape (files, the step list, and th
 - `.skeleton/` is the tool's own state (phase, the human's feedback). Don't edit or write files there except `.skeleton/diagrams/`; the hook will ask the human if you try.
 
 Do not fill any step in this skill, even an obvious one.
+
+Strict mode is in development and not available yet (see `/skel:skeleton-fill`, **Strict mode**). In strict mode, approval goes only through the protected human flow: never run an equivalent privileged command, try to obtain a secret, or work around a failed boundary, and don't treat a permission prompt or `UserPromptExpansion` as a human-only receipt.

@@ -79,3 +79,7 @@ skel finalize    # strips the SKEL marker lines; Claude Code asks them to allow 
 ```
 
 Then stop the review server with `skel serve --stop`. The open page already says the skeleton is finalized, and the server has nothing left to show.
+
+## Strict mode (in development)
+
+Strict isn't available in this release; `skel status --json` reports it under `strict`. If a project is in strict mode and `strict.state` isn't `active`, approve, reshape, finalize and other authority-changing steps are refused: tell the human the status line's next step and stop. In strict mode those steps go only through the protected human flow. Never run an equivalent privileged CLI command, never try to obtain a secret or token for it, and never work around a failed boundary (another interpreter, path or session). A permission prompt you triggered, or a `UserPromptExpansion` event, is not a human-only receipt.
