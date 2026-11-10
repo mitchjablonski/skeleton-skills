@@ -67,12 +67,14 @@ export const RESULTS = Object.freeze({
  *   - same requestId + same intent -> the original Result;
  *   - same requestId + different intent -> request-reused.
  * Approve and reshape are modelled; a committed reshape rotates the review
- * round to `nextReviewRoundId(state)`, as lib/strict-authority.mjs (#83) does
- * with its host's nextReviewRoundId. Finalize is refused (invalid-transition),
+ * round to `nextReviewRoundId(state)` and sets the version under review to
+ * `nextReviewVersion(state)`, as lib/strict-authority.mjs (#83) does with its
+ * host's nextReviewRoundId and contentVersion. nextReviewVersion is optional:
+ * by default the version under review stays as it was. Finalize is refused (invalid-transition),
  * because its completion and drift checks aren't. `force` returns a fixed
  * result for the next submit, for codes the checks can't produce here.
  */
-export function createMockAuthority({ state = AUTHORITY_STATES.skeleton, nextReviewRoundId = (st) => `${st.reviewRoundId}-after-r${st.revision + 1}` } = {}) {
+export function createMockAuthority({ state = AUTHORITY_STATES.skeleton, nextReviewRoundId = (st) => `${st.reviewRoundId}-after-r${st.revision + 1}`, nextReviewVersion = (st) => st.reviewVersion } = {}) {
   let s = { ...state };
   const forced = [];
   const seen = new Map();
@@ -81,7 +83,7 @@ export function createMockAuthority({ state = AUTHORITY_STATES.skeleton, nextRev
     const conflict = strictIntentConflict(s, i);
     if (conflict) return { kind: "rejected", requestId: i.requestId, code: conflict };
     if (i.action === "approve") s = { ...s, phase: "fill", approvedVersion: i.reviewVersion, revision: s.revision + 1 };
-    else if (i.action === "reshape") s = { ...s, phase: "skeleton", approvedVersion: null, reviewRoundId: nextReviewRoundId(s), revision: s.revision + 1 };
+    else if (i.action === "reshape") s = { ...s, phase: "skeleton", approvedVersion: null, reviewRoundId: nextReviewRoundId(s), reviewVersion: nextReviewVersion(s), revision: s.revision + 1 };
     else return { kind: "rejected", requestId: i.requestId, code: "invalid-transition" };
     return { kind: "committed", requestId: i.requestId, action: i.action, reviewVersion: i.reviewVersion, revision: s.revision };
   };
