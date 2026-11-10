@@ -1,8 +1,7 @@
-// #77: the strict decision UI (lib/review-decision.js) against a MOCK of
-// contract v1 (test/fixtures/strict-results.mjs), and the guarantee that the
-// default review page doesn't carry it. Like test/review-page.test.mjs, the
-// page script is run here as the page runs it (plain script, new Function),
-// with a minimal DOM stand-in for the drawing.
+// #77: the strict decision UI logic (lib/review-decision.mjs) against a MOCK
+// of contract v1 (test/fixtures/strict-results.mjs, checked with Sol's
+// lib/strict-protocol.mjs), and the guarantee that the default review page
+// doesn't carry it. A minimal DOM stand-in covers the drawing.
 //
 // Not tested, because they can't be yet: origin/CSRF binding and real browser
 // reachability of the human-channel listener. Both need Sol's listener (#75,
@@ -14,17 +13,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { clientScript, renderHtml, renderShell } from "../lib/review.mjs";
 import {
-  ACTIONS, AUTHORITY_STATES, INTENTS, REJECTION_CODES, RESULTS, VERSION_A, VERSION_B,
-  committedFor, createMockAuthority, intentFor, validateAuthorityState, validateIntent, validateResult,
+  AUTHORITY_STATES, INTENTS, RESULTS, STRICT_ACTIONS, STRICT_REJECTIONS, VERSION_A, VERSION_B,
+  committedFor, createMockAuthority, intentFor, parseAuthorityState, parseStrictIntent, parseStrictResult,
 } from "./fixtures/strict-results.mjs";
+import { skelDecisionConfirms, skelDecisionController, skelDecisionOutcome, skelDecisionRender, skelMountDecision } from "../lib/review-decision.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LIB = path.join(HERE, "..", "lib");
 const read = (f) => fs.readFileSync(path.join(LIB, f), "utf-8");
-const DECISION = read("review-decision.js");
-const { skelDecisionController, skelDecisionRender, skelMountDecision, skelDecisionOutcome } = new Function(
-  DECISION + "\nreturn { skelDecisionController, skelDecisionRender, skelMountDecision, skelDecisionOutcome };",
-)();
+const DECISION = read("review-decision.mjs");
+const REJECTION_CODES = STRICT_REJECTIONS;
 
 // ---- a minimal DOM stand-in: enough for createElement/append/replaceWith/click ----
 function fakeDoc() {
@@ -52,8 +50,8 @@ const byAttr = (root, k, v) => all(root, (n) => n.attrs && k in n.attrs && (v ==
 const tick = () => new Promise((r) => setImmediate(r));
 const ids = () => { let i = 0; return () => `req-${++i}`; };
 const SHOWN = { phase: "scaffold", reviewVersion: VERSION_A, approvedVersion: null, pendingNotes: false };
-async function setup({ state = AUTHORITY_STATES.skeleton, shown = SHOWN, current = VERSION_A } = {}) {
-  const auth = createMockAuthority({ state, current });
+async function setup({ state = AUTHORITY_STATES.skeleton, shown = SHOWN } = {}) {
+  const auth = createMockAuthority({ state });
   const ctl = skelDecisionController({ channel: auth, shown, newRequestId: ids() });
   await ctl.load();
   return { auth, ctl };
@@ -62,28 +60,32 @@ const action = (v, a) => v.actions.find((x) => x.action === a);
 
 // ---- fixtures validate against each other ----
 
-test("#77 fixtures: every AuthorityState, Intent and Result is valid, and each Result answers its Intent", () => {
-  for (const [k, s] of Object.entries(AUTHORITY_STATES)) assert.deepEqual(validateAuthorityState(s), [], k);
-  for (const [k, i] of Object.entries(INTENTS)) assert.deepEqual(validateIntent(i), [], k);
-  assert.deepEqual(validateResult(RESULTS.committed, INTENTS.approve), []);
-  assert.deepEqual(validateResult(committedFor(INTENTS.reshape), INTENTS.reshape), []);
+test("#77 fixtures: every AuthorityState, Intent and Result passes lib/strict-protocol.mjs, and each Result answers its Intent", () => {
+  for (const [k, st] of Object.entries(AUTHORITY_STATES)) assert.ok(parseAuthorityState(st), k);
+  for (const [k, i] of Object.entries(INTENTS)) assert.ok(parseStrictIntent(i), k);
+  for (const [k, r] of Object.entries(RESULTS)) assert.ok(parseStrictResult(r), k);
+  assert.ok(parseStrictResult(committedFor(INTENTS.reshape)));
   assert.deepEqual(Object.keys(RESULTS).sort(), ["committed", ...REJECTION_CODES].sort(), "one fixture per Result state");
-  for (const code of REJECTION_CODES) assert.deepEqual(validateResult(RESULTS[code], INTENTS.approve), [], code);
-  // An Intent is the ReviewRef of an AuthorityState: the revision it expects is the state's.
+  assert.deepEqual(skelDecisionOutcome(RESULTS.committed, INTENTS.approve), { kind: "committed", revision: 5 });
+  for (const code of REJECTION_CODES) assert.deepEqual(skelDecisionOutcome(RESULTS[code], INTENTS.approve), { kind: "rejected", code });
+  // An Intent is the ReviewRef of an AuthorityState.
   assert.equal(INTENTS.approve.expectedRevision, AUTHORITY_STATES.skeleton.revision);
+  assert.equal(INTENTS.approve.reviewVersion, AUTHORITY_STATES.skeleton.reviewVersion, "approve names the current reviewable version");
   assert.equal(INTENTS.reshape.reviewVersion, AUTHORITY_STATES.fill.approvedVersion, "reshape names the approved version, not a draft");
-  assert.deepEqual([...ACTIONS], ["approve", "reshape", "replace", "finalize"]);
+  assert.deepEqual([...STRICT_ACTIONS], ["approve", "reshape", "finalize"]);
 });
 
-test("#77 fixtures: the validators refuse what they should", () => {
-  assert.notDeepEqual(validateResult({ ...RESULTS.committed, reviewVersion: VERSION_B }, INTENTS.approve), [], "a commit for another version");
-  assert.notDeepEqual(validateResult({ ...RESULTS.committed, revision: 4 }, INTENTS.approve), [], "a commit that doesn't advance");
-  assert.notDeepEqual(validateResult({ ...RESULTS.committed, approved: true }), [], "extra fields");
-  assert.notDeepEqual(validateResult({ kind: "rejected", code: "nope" }), []);
-  assert.notDeepEqual(validateResult({ kind: "ok" }), []);
-  assert.notDeepEqual(validateIntent({ ...INTENTS.approve, token: "x" }), [], "an Intent carries no secret");
-  assert.notDeepEqual(validateIntent({ ...INTENTS.approve, action: "migrate" }), []);
-  assert.notDeepEqual(validateAuthorityState({ ...AUTHORITY_STATES.skeleton, approvedVersion: VERSION_A }), []);
+test("#77 fixtures: the shared schema refuses what it should, and the UI fails closed on it", () => {
+  for (const bad of [{ ...RESULTS.committed, reviewVersion: VERSION_B }, { ...RESULTS.committed, revision: 4 }, { ...RESULTS.committed, requestId: "other" }]) {
+    assert.deepEqual(skelDecisionOutcome(bad, INTENTS.approve), { kind: "malformed" }, JSON.stringify(bad));
+  }
+  assert.equal(parseStrictResult({ ...RESULTS.committed, approved: true }), null, "extra fields");
+  assert.equal(parseStrictResult({ kind: "rejected", code: "nope" }), null);
+  assert.equal(parseStrictResult({ kind: "ok" }), null);
+  assert.equal(parseStrictIntent({ ...INTENTS.approve, token: "x" }), null, "an Intent carries no secret");
+  for (const action of ["replace", "migrate"]) assert.equal(parseStrictIntent({ ...INTENTS.approve, action }), null);
+  assert.equal(parseAuthorityState({ ...AUTHORITY_STATES.skeleton, approvedVersion: VERSION_A }), null);
+  assert.equal(parseAuthorityState({ ...AUTHORITY_STATES.skeleton, projectId: "/home/me/project" }), null, "opaque ids, never paths");
 });
 
 test("#77 fixtures: the reference mock authority is idempotent and refuses a reused request id", async () => {
@@ -101,7 +103,7 @@ test("#77 fixtures: the reference mock authority is idempotent and refuses a reu
 test("#77: the UI shows the exact identity and version, and offers approve only with no pending notes", async () => {
   const { ctl } = await setup();
   const v = ctl.view();
-  assert.deepEqual(v.identity, { projectId: "example-project", sessionId: "example-session", reviewRoundId: "example-round", phase: "skeleton", revision: 4, approvedVersion: null, shownVersion: VERSION_A });
+  assert.deepEqual(v.identity, { projectId: "example-project", sessionId: "example-session", reviewRoundId: "example-round", phase: "skeleton", revision: 4, approvedVersion: null, reviewVersion: VERSION_A, shownVersion: VERSION_A });
   assert.equal(action(v, "approve").enabled, true);
   assert.equal(action(v, "reshape"), undefined, "reshape isn't offered before approval");
   const notes = await setup({ shown: { ...SHOWN, pendingNotes: true } });
@@ -151,7 +153,7 @@ const COPY = {
   "invalid-transition": /Approve skeleton isn't allowed while the skeleton is in the skeleton phase\. Nothing changed\./,
   "unauthorized-channel": /didn't arrive through the protected human channel.*Copy\/Send feedback still work/,
   "session-ended": /session this review belongs to has ended, so nothing changed\. Decisions from this page are off/,
-  unavailable: /nothing was approved\. You can retry: a retry sends the same request/,
+  unavailable: /answered "unavailable", so whether the request for aaaaaaaaaaaa was recorded is unknown, and it is not shown as approved\. Retry sends the same request/,
   "request-reused": /already used for a different decision, so nothing new was recorded/,
 };
 
@@ -171,6 +173,8 @@ for (const code of REJECTION_CODES) {
     if (code === "unavailable") {
       assert.equal(approve.enabled, true);
       assert.equal(approve.retry, true);
+      assert.equal(v.canReread, true, "Re-read beside Retry");
+      assert.doesNotMatch(v.message.text, /nothing (was|changed)/i, "unavailable is an unknown outcome, never proof nothing happened");
     } else {
       assert.equal(approve.enabled, false, "actions held after a definitive rejection");
     }
@@ -191,11 +195,38 @@ for (const code of REJECTION_CODES) {
   });
 }
 
-test("#77: the mock authority's own checks reach the UI as typed rejections", async () => {
-  // The page shows B while the authority would recompute A.
+test("#77: approve is decided only when the page shows the authority's reviewVersion", async () => {
+  // The page shows B while the authority's version under review is A: held locally, nothing sent.
   const stale = await setup({ shown: { ...SHOWN, reviewVersion: VERSION_B } });
-  assert.deepEqual(await stale.ctl.decide("approve"), { kind: "rejected", code: "stale-review" });
+  const a = action(stale.ctl.view(), "approve");
+  assert.equal(a.enabled, false);
+  assert.equal(a.reason, "The page shows bbbbbbbbbbbb, but the version under review is aaaaaaaaaaaa: reload the review.");
+  assert.deepEqual(await stale.ctl.decide("approve"), { kind: "refused-locally" });
+  assert.equal(stale.auth.calls.submit.length, 0);
+  // The authority's own check (strictIntentConflict) still answers stale-review to a direct request.
+  assert.deepEqual(await stale.auth.submit({ ...INTENTS.approve, requestId: "direct-1", reviewVersion: VERSION_B }), { kind: "rejected", requestId: "direct-1", code: "stale-review" });
   assert.equal(stale.auth.commits(), 0);
+});
+
+test("#77 Sol P2: a re-read state older than the commit never confirms it", async () => {
+  // Preflight at rev 4, committed at rev 5, then a re-read of fill/A at rev 0.
+  const { auth, ctl } = await setup();
+  const real = auth.submit;
+  auth.submit = async (i) => {
+    const r = await real(i);
+    auth.setState({ ...AUTHORITY_STATES.fill, revision: 0 });
+    return r;
+  };
+  assert.deepEqual(await ctl.decide("approve"), { kind: "committed", revision: 5 });
+  const v = ctl.view();
+  assert.equal(v.approved, null, "never 'Approved at revision 5' from a state that predates the request");
+  assert.equal(v.message.title, "Recorded, but the state differs");
+  assert.match(v.message.text, /revision 0,/);
+  assert.equal(v.status, "stale");
+  const intent = intentFor(AUTHORITY_STATES.skeleton, "approve", "x");
+  assert.equal(skelDecisionConfirms({ ...AUTHORITY_STATES.fill, revision: 4 }, intent, 5), false);
+  assert.equal(skelDecisionConfirms({ ...AUTHORITY_STATES.fill, revision: 5 }, intent, 5), true);
+  assert.equal(skelDecisionConfirms({ ...AUTHORITY_STATES.fill, revision: 8 }, intent, 5), true, "later revisions still show it in effect");
 });
 
 // ---- duplicate submit ----
@@ -379,7 +410,7 @@ test("#77 race 3: a committed answer is shown as approved only when the re-read 
   assert.equal(v.approved, null);
   assert.equal(v.status, "stale");
   assert.equal(v.message.title, "Recorded, but the state differs");
-  assert.match(v.message.text, /recorded the request \(revision 5\), but the current review state doesn't show it in effect: phase skeleton, review round example-round-2, revision 7, approved version none\./);
+  assert.match(v.message.text, /recorded the request \(revision 5\), but the current review state doesn't show it in effect: phase skeleton, review round example-round-2, revision 7, version under review aaaaaaaaaaaa, approved version none\./);
   assert.equal(v.identity.reviewRoundId, "example-round-2", "the current state is shown");
   assert.ok(v.actions.every((a) => !a.enabled));
   // The same with a committed answer and a state that never moved.
@@ -403,12 +434,13 @@ test("#77 race 4: after a lost answer the state is re-read, and only the retaine
 
 test("#77 inv: an inconsistent AuthorityState fails closed", async () => {
   const bad = [
-    { projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "fill", approvedVersion: null, revision: 3 },
-    { projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "finalized", approvedVersion: null, revision: 3 },
-    { projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "skeleton", approvedVersion: "x", revision: 3 },
+    { projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "fill", reviewVersion: "x", approvedVersion: null, revision: 3 },
+    { projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "finalized", reviewVersion: "x", approvedVersion: null, revision: 3 },
+    { projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "skeleton", reviewVersion: "x", approvedVersion: "x", revision: 3 },
+    { projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "skeleton", approvedVersion: null, revision: 3 }, // no reviewVersion
   ];
   for (const st of bad) {
-    assert.notDeepEqual(validateAuthorityState(st), [], "the fixtures refuse it too");
+    assert.equal(parseAuthorityState(st), null, "the shared schema refuses it too");
     const sent = [];
     const ch = { getState: async () => ({ ...st }), submit: async (i) => { sent.push(i); return { kind: "rejected", code: "unavailable" }; } };
     const page = { phase: st.phase === "skeleton" ? "scaffold" : "fill", reviewVersion: "x", approvedVersion: null, pendingNotes: false };
@@ -423,52 +455,54 @@ test("#77 inv: an inconsistent AuthorityState fails closed", async () => {
   }
 });
 
-test("#77 notes: notes after an unavailable approve drop it; nothing is resent", async () => {
+for (const [name, lose] of [["unavailable", "unavailable"], ["a lost answer", "throw"]]) {
+  test(`#77 notes: after ${name}, notes hold Retry with Re-read beside it, and the outcome stays unconfirmed`, async () => {
+    const { auth, ctl } = await setup();
+    const real = auth.submit;
+    // The authority actually commits; the page only sees an unknown outcome.
+    auth.submit = async (i) => { await real(i); if (lose === "throw") throw new Error("reset"); return { kind: "rejected", requestId: i.requestId, code: "unavailable" }; };
+    await ctl.decide("approve");
+    auth.submit = real;
+    let v = ctl.view();
+    assert.equal(v.approved, null);
+    assert.equal(v.canReread, true);
+    assert.deepEqual(v.actions.map((x) => [x.action, x.enabled, x.retry]), [["approve", true, true]]);
+    assert.doesNotMatch(v.message.text, /nothing (was|changed)/i);
+    await ctl.setShown({ ...SHOWN, pendingNotes: true }); // the human starts notes on A
+    v = ctl.view();
+    assert.equal(ctl.requestRetained, "req-1", "kept: its outcome is unknown, so it is never dropped");
+    const retry = action(v, "approve");
+    assert.deepEqual([retry.enabled, retry.retry], [false, true]);
+    assert.match(retry.reason, /notes on this version: send or copy them first/);
+    assert.equal(v.canReread, true);
+    assert.deepEqual(await ctl.decide("approve"), { kind: "refused-locally" });
+    assert.equal(auth.calls.submit.length, 1, "held: nothing resent");
+    await ctl.load();
+    v = ctl.view();
+    assert.equal(v.message.title, "Still unconfirmed");
+    assert.match(v.message.text, /phase fill, review round example-round, revision 5, version under review aaaaaaaaaaaa, approved version aaaaaaaaaaaa\. Whether the request for aaaaaaaaaaaa landed is still unconfirmed/);
+    assert.equal(v.approved, null, "a re-read alone never shows approval");
+    await ctl.setShown({ ...SHOWN, pendingNotes: false });
+    assert.deepEqual(await ctl.decide("approve"), { kind: "committed", revision: 5 }, "same id: the original answer");
+    assert.deepEqual(auth.calls.submit.map((i) => i.requestId), ["req-1", "req-1"]);
+    assert.equal(auth.commits(), 1);
+    assert.deepEqual(ctl.view().approved, { reviewVersion: VERSION_A, revision: 5 });
+  });
+}
+
+test("#77 notes: notes during the flight, then unavailable, hold the kept request", async () => {
   const { auth, ctl } = await setup();
-  auth.force({ kind: "rejected", code: "unavailable" });
-  await ctl.decide("approve");
+  let release;
+  auth.submit = (i) => { auth.calls.submit.push(i); return new Promise((r) => { release = () => r({ kind: "rejected", requestId: i.requestId, code: "unavailable" }); }); };
+  const p = ctl.decide("approve");
+  await tick();
+  await ctl.setShown({ ...SHOWN, pendingNotes: true });
+  release();
+  await p;
   assert.equal(ctl.requestRetained, "req-1");
-  await ctl.setShown({ ...SHOWN, pendingNotes: true }); // the human starts notes on A
-  const v = ctl.view();
-  assert.equal(ctl.requestRetained, null, "never processed, so dropped");
-  assert.equal(v.message.title, "Approval dropped");
-  assert.match(v.message.text, /You started notes on aaaaaaaaaaaa, so the approval the service couldn't take was dropped; nothing was approved\./);
-  assert.deepEqual(v.actions.map((a) => [a.action, a.enabled, a.retry]), [["approve", false, false]]);
-  assert.match(action(v, "approve").reason, /notes on this version/);
+  assert.deepEqual(action(ctl.view(), "approve").enabled, false);
   assert.deepEqual(await ctl.decide("approve"), { kind: "refused-locally" });
   assert.equal(auth.calls.submit.length, 1);
-  assert.equal(ctl.view().approved, null);
-});
-
-test("#77 notes: notes after a lost answer hold Retry, with Re-read beside it", async () => {
-  const { auth, ctl } = await setup();
-  const real = auth.submit;
-  auth.submit = async (i) => { auth.calls.submit.push({ ...i }); throw new Error("reset"); }; // never reached the authority
-  await ctl.decide("approve");
-  auth.submit = real;
-  let v = ctl.view();
-  assert.equal(v.canReread, true, "Re-read beside Retry after a lost answer");
-  assert.deepEqual(v.actions.map((a) => [a.action, a.enabled, a.retry]), [["approve", true, true]]);
-  await ctl.setShown({ ...SHOWN, pendingNotes: true });
-  v = ctl.view();
-  assert.equal(ctl.requestRetained, "req-1", "it may have landed, so it is kept to ask for its answer");
-  const retry = action(v, "approve");
-  assert.deepEqual([retry.enabled, retry.retry], [false, true]);
-  assert.match(retry.reason, /notes on this version: send or copy them first/);
-  assert.deepEqual(await ctl.decide("approve"), { kind: "refused-locally" });
-  assert.equal(auth.calls.submit.length, 1, "Retry held: nothing resent");
-  assert.equal(ctl.view().approved, null);
-  // Re-read shows the state and keeps the request unconfirmed.
-  await ctl.load();
-  v = ctl.view();
-  assert.equal(v.message.title, "Still unconfirmed");
-  assert.match(v.message.text, /Current review state: phase skeleton, review round example-round, revision 4, approved version none\. Whether the request for aaaaaaaaaaaa landed is still unconfirmed/);
-  assert.equal(action(v, "approve").enabled, false, "still held by the notes");
-  // Notes sent or cleared: Retry is available again and gets the authoritative answer.
-  await ctl.setShown({ ...SHOWN, pendingNotes: false });
-  assert.equal(action(ctl.view(), "approve").enabled, true);
-  assert.deepEqual(await ctl.decide("approve"), { kind: "committed", revision: 5 });
-  assert.deepEqual(auth.calls.submit.map((i) => i.requestId), ["req-1", "req-1"]);
 });
 
 test("#77 notes: the drawn Retry is disabled while notes are pending", async () => {
@@ -488,15 +522,20 @@ test("#77 notes: the drawn Retry is disabled while notes are pending", async () 
   assert.equal(byAttr(container, "data-decision-reread").length, 1);
 });
 
-test("#77: a second mount with a different channel or page throws", async () => {
+test("#77: a second mount applies a new page via setShown; a different channel throws", async () => {
   const doc = fakeDoc();
   const container = doc.createElement("div");
   const make = ids();
   const a1 = createMockAuthority();
   const m1 = await skelMountDecision({ doc, container, channel: a1, shown: SHOWN, newRequestId: make });
   await assert.rejects(skelMountDecision({ doc, container, channel: createMockAuthority(), shown: SHOWN, newRequestId: make }), /already mounted/);
-  await assert.rejects(skelMountDecision({ doc, container, channel: a1, shown: { ...SHOWN, reviewVersion: "other" }, newRequestId: make }), /already mounted/);
-  assert.equal(await skelMountDecision({ doc, container, channel: a1, shown: SHOWN, newRequestId: make }), m1);
+  await assert.rejects(skelMountDecision({ doc, container, channel: a1, shown: SHOWN, newRequestId: ids() }), /already mounted/);
+  assert.equal(await skelMountDecision({ doc, container, channel: a1, shown: SHOWN, newRequestId: make }), m1, "the page's current shown: same mount");
+  assert.equal(m1.controller.view().status, "ready");
+  const m2 = await skelMountDecision({ doc, container, channel: a1, shown: { ...SHOWN, reviewVersion: VERSION_B }, newRequestId: make });
+  assert.equal(m2, m1);
+  assert.equal(m1.controller.view().identity.shownVersion, VERSION_B, "applied with setShown");
+  assert.equal(m1.controller.view().status, "stale", "a page move holds actions as usual");
   assert.equal(container.children.length, 1);
 });
 
@@ -540,15 +579,21 @@ test("#77: an unreadable or malformed state turns decisions off", async () => {
 test("#77: drawn with a mock channel — identity as text, approve only after committed, duplicate clicks safe", async () => {
   const doc = fakeDoc();
   const container = doc.createElement("div");
+  // Markup in an id never reaches the page: the shared schema refuses it, so no identity or action is drawn.
+  const hostile = createMockAuthority();
+  hostile.setState({ ...AUTHORITY_STATES.skeleton, projectId: "<img src=x onerror=alert(1)>" });
+  const hc = doc.createElement("div");
+  await skelMountDecision({ doc, container: hc, channel: hostile, shown: SHOWN, newRequestId: ids() });
+  assert.equal(byAttr(hc, "data-decision-identity")[0].children.length, 0);
+  assert.equal(byAttr(hc, "data-decision-action").length, 0);
+  assert.doesNotMatch(hc.children[0].textContent, /<img/);
   const auth = createMockAuthority();
-  const evil = "<img src=x onerror=alert(1)>";
-  auth.setState({ ...AUTHORITY_STATES.skeleton, projectId: evil });
   const m = await skelMountDecision({ doc, container, channel: auth, shown: SHOWN, newRequestId: ids() });
   const panel = () => container.children[0];
   assert.equal(container.children.length, 1);
-  const identity = byAttr(panel(), "data-decision-identity")[0].textContent;
-  assert.ok(identity.includes(evil), "shown as text");
-  assert.ok(identity.includes(VERSION_A) && identity.includes("4"));
+  const identity = byAttr(panel(), "data-decision-identity")[0];
+  assert.ok(all(identity, (n) => n.tag === "#text").some((t) => t.text === "example-project"), "drawn as a text node");
+  assert.ok(identity.textContent.includes(VERSION_A) && identity.textContent.includes("4"));
   assert.equal(byAttr(panel(), "data-decision-approved").length, 0);
   const btn = byAttr(panel(), "data-decision-action", "approve")[0];
   btn.click();
@@ -613,13 +658,18 @@ test("#77: the default page is unchanged — the decision module isn't loaded, s
   assert.deepEqual([...literals].sort(), ["/api/data", "/api/feedback", "/api/version", "/assets/review.js"]);
   assert.doesNotMatch(server, /switch\s*\(\s*req\.|new URL\(\s*req\.url|req\.path\b|\/api\/(approve|reshape|decision|intent|sign)/);
   assert.doesNotMatch(server, /review-decision/);
-  assert.doesNotMatch(read("review.mjs"), /review-decision/);
+  for (const dir of ["lib", "bin"]) {
+    for (const f of fs.readdirSync(path.join(HERE, "..", dir))) {
+      if (f === "review-decision.mjs") continue;
+      assert.doesNotMatch(fs.readFileSync(path.join(HERE, "..", dir, f), "utf-8"), /review-decision/, `${dir}/${f} loads the decision module`);
+    }
+  }
 });
 
 test("#77: an Intent built by the UI carries no token or secret, only the contract fields", async () => {
   const { auth, ctl } = await setup();
   await ctl.decide("approve");
-  assert.deepEqual(validateIntent(auth.calls.submit[0]), []);
-  assert.deepEqual(auth.calls.submit[0], intentFor(AUTHORITY_STATES.skeleton, VERSION_A, "approve", "req-1"));
+  assert.ok(parseStrictIntent(auth.calls.submit[0]));
+  assert.deepEqual(auth.calls.submit[0], intentFor(AUTHORITY_STATES.skeleton, "approve", "req-1"));
   assert.doesNotMatch(DECISION, /x-skeleton-token|sessionStorage|localStorage|fetch\(/, "the module uses no review token, storage or network of its own");
 });
