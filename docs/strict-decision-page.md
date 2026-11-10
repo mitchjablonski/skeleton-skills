@@ -179,6 +179,7 @@ The controller's `shown` value (version and pending notes) has no trustworthy so
 - The capture is stored privately, content-addressed. Approved captures are referenced from the authority journal by version and retained under the record's integrity and anti-rollback protection. Losing or corrupting the capture store is an unreadable record (R3).
 - `reviewVersion` is a full SHA-256 over a **canonical, length-prefixed serialization of exactly the exteriors and fence set served to the page**: each path, its **raw exterior bytes** and its fence ids and titles, in sorted order. Fence bodies are excluded, matching #83's `contentVersion`, so a fill doesn't change the approved version and drift compares exteriors only. That replaces the default `skeletonVersion`, which keeps 12 hex characters (48 bits, lib/snapshot.mjs). An agent can find two colliding skeletons in about 2^24 tries, show one and swap in the other. Strict doesn't extend the short hash; it hashes the served capture.
 - The approved record **is** the capture, not a later re-read. A torn or racing workspace read at commit time affects only drift detection, never what was approved.
+- **Open gates.** Capture/commit atomicity (binding the capture, its version and the commit in one durable transaction) and anti-rollback for the record and capture store are still open. Sol's #86 durable store implements neither. Until both exist, nothing here is more than a proposal.
 
 **C3. The page shows what it was given, in a form a human can perceive.**
 
@@ -198,7 +199,7 @@ The controller's `shown` value (version and pending notes) has no trustworthy so
 - **Recapture** is new. It asks the authority to capture the workspace again, which can change `reviewVersion`. It's a POST behind the same Origin, Fetch Metadata and binding checks, and the host operation #83 leaves unspecified ("refreshing a changed draft's reviewable version").
   - **Unchanged content** writes no journal entry.
   - **Changed content** moves `AuthorityState.reviewVersion`, so it is a journaled state change. Otherwise #83's replay of the journal wouldn't reproduce the current state. It shouldn't consume the 1024-entry transaction cap, so we ask Sol for a separate allowance for recapture entries, or an equivalent.
-  - On the page, a changed capture moves the page (`setShown`), which discards any kept intent. If a Retry is pending with an unknown outcome, the page says "Recapture ends the pending Retry; Re-read first to see whether it landed" and asks for confirmation.
+  - On the page, a changed capture moves the page (`setShown`), which discards any kept intent. If a Retry is pending with an unknown outcome, the page says "Recapture ends the pending Retry. After that, this page can no longer ask the service for the original answer. Retry first if you want it." and asks for confirmation. Re-read alone can't tell whether the earlier request committed.
 - **When capture happens.** The first capture is made when a review round opens: at registration, or after reshape rotates the round (#83). Later captures happen only when the human presses Recapture, never at the agent's request. Registration comes before the agent scaffolds, so that first capture is usually empty or partial. The page says so: "This capture was taken before the skeleton was written. Press Recapture when the agent says the skeleton is ready." The first real review is therefore a human Recapture.
 - **In fill**, the approved version is fixed. Recapture there is a drift view only: it shows the current exteriors against the approved capture, writes nothing, and moves neither `reviewVersion` nor `approvedVersion`. Reshape names the approved version and opens a new round, which gets its own first capture.
 - After a Recapture, the page shows a **diff against the previously rendered capture and against the approved capture**, including files removed since then, so a change or an omission is visible.
@@ -259,9 +260,9 @@ These requirements follow #83 (`docs/strict-authority.md`) and strict-boundary.m
   - A new session refuses too, until a reviewed outside-host recovery runs.
   - State is never re-derived from `.skeleton/` or any public file, and a missing record never means "no skeleton" or "bootstrap".
 - **R4. Journal full.** At #83's 1024-entry cap, new transactions refuse without pruning, and existing retries still resolve. The page should tell a full journal, an unreadable record and a transient `unavailable` apart. **Interim:** #83 currently answers `unavailable` for both a full journal and a missing record, so until Sol adds codes the page can only show the unknown-outcome copy.
-- **R5. Session end.** If the record persists across sessions, the new session's AuthorityState answers whether an old decision landed (`approvedVersion` at or after the revision), and the page says so. Only when no state is readable does it say the outcome is unknown.
-- **R6. Kept intents live only in tab memory.** A new or reloaded tab never offers Retry for an old intent; it reads AuthorityState, which settles approve.
-- **R7. Listener restart.** The port is per-launch, so an old tab's request fails as a network error. The page treats that as an unknown outcome, tells the human to reopen from the control channel, and holds actions.
+- **R5. Session end.** No new action is accepted for the ended session. The page doesn't say whether an earlier request committed.
+- **R6. Kept intents live only in tab memory.** A new or reloaded tab shows the current authoritative state. Without the retained request identity, it can't determine whether an earlier request committed. It offers no retry of that lost request. Current state never settles a historical outcome: another decision may have changed the state since. Historical certainty needs the retained request ID and an authoritative journal lookup.
+- **R7. Connection failure.** An old tab's request can fail as a network error, for example because the listener stopped and the next one uses a new port. The page doesn't diagnose a restart from a network error. It treats the outcome as unknown, tells the human to reopen through the launcher's control window, and holds actions.
 
 Recovery copy, per state:
 
@@ -270,12 +271,12 @@ Recovery copy, per state:
 | Retry still unknown | "Still unconfirmed. Retry asks for the original answer; Re-read shows the current state." |
 | Record missing or corrupt (R3) | "The strict record for this project can't be read, so every decision is refused, in this session and new ones, until the record is recovered outside this session. Don't edit or delete `.skeleton/` to work around it." |
 | Journal full (R4) | "The strict record is full, so new decisions are refused. Earlier decisions still resolve. It needs recovery outside this session." |
-| Listener gone (R7) | "This page's decision service has stopped. Reopen the page from the launcher's control window (not the agent's terminal); the new page shows whether the decision landed." |
-| Session ended (R5) | "The strict session ended. Open the new session's decision page: its state shows whether the last decision landed." |
+| Connection failed (R7) | "Connection failed; the old request outcome may be unknown. Reopen through the launcher to inspect current state." (The launcher means its control window, not the agent's terminal.) |
+| Session ended (R5) | "No new action is accepted for this session. This does not establish whether an earlier request committed." |
 
 **Needs from Sol.** R1 to R5 as journal behaviour, consistent with #83. A rejection code or evidence reason that distinguishes "record unreadable" and "journal full" from transient `unavailable`, because their copy differs: neither is fixed by retrying.
 
-**Unproven.** All of it until durable storage exists. #83's JSON reload tests aren't durable commits.
+**Unproven.** All of it until durable storage exists. #83's JSON reload tests aren't durable commits. Anti-rollback and capture/commit atomicity remain open gates, and Sol's #86 durable store doesn't implement either.
 
 **#79 tests.**
 
@@ -283,7 +284,8 @@ Recovery copy, per state:
 - **Changed intent:** the same ID with a changed intent gets `request-reused`.
 - **Corrupt or delete the record:** every request refuses, a new session also refuses, and deleting `.skeleton/` doesn't change that.
 - **Full journal:** fill to 1024 entries; new requests refuse and old retries resolve.
-- **Listener restart mid-request:** the old tab shows the R7 copy and the new tab shows the true outcome.
+- **Listener stopped mid-request:** the old tab shows the R7 copy without claiming a restart. The new tab shows current state and makes no claim about the old request.
+- **Lost historical outcome:** an approve commits and its response is lost, then another reshape changes the round, then the tab reloads. The UI shows current state and doesn't claim to resolve the lost approve's outcome.
 - **Reload after `unavailable`:** no Retry is offered.
 
 ## (e) Status and skills integration (#78)
