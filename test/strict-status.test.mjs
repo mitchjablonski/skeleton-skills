@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_VERIFIER, EVIDENCE_REASONS, LOCAL_REASONS, MAX_EVIDENCE_AGE_MS, MAX_EVIDENCE_LIFETIME_MS, STRICT_STATES, classifyEvidence, refusePrivileged, strictLine, strictStatus } from "../lib/strict-status.mjs";
+import { DEFAULT_VERIFIER, EVIDENCE_REASONS, IN_BOUNDARY_TRANSITIONS, LOCAL_REASONS, MAX_EVIDENCE_AGE_MS, MAX_EVIDENCE_LIFETIME_MS, STRICT_STATES, classifyEvidence, refuseInBoundaryTransition, refusePrivileged, strictLine, strictStatus } from "../lib/strict-status.mjs";
 import { ACTIVE, CONTEXT, MALFORMED, NEGATIVE, NOW, POSITIVE, PROFILE, PROJECT, SESSION, UNVERIFIED_REASONS, fixtureVerifier, throwingVerifier } from "./fixtures/strict-evidence.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -211,6 +211,74 @@ test("the refusal names the action, the state and the next step", () => {
   assert.match(refusePrivileged(null, "finalize"), /^refused: finalize .*couldn't be read/);
   assert.match(refusePrivileged({ state: "active" }, "reshape"), /^refused/, "a hand-built active object without allowed is refused");
   assert.match(refusePrivileged({ state: "on", privilegedActions: "allowed" }, "reshape"), /couldn't be read/);
+});
+
+// ---- in-boundary CLI transitions (#84 (e)) ----
+
+// Every state and reason the classifier can give, as { name, evidence }.
+const EVERY_STATUS = [
+  ...Object.entries(POSITIVE).map(([name, { evidence }]) => ({ name, evidence })),
+  { name: "unverified:evidence-mismatch", evidence: NEGATIVE["wrong-project"].evidence },
+];
+
+test("in-boundary transitions: the cases cover every state and reason", () => {
+  const seen = new Set(EVERY_STATUS.map(({ evidence }) => { const st = classifyEvidence(evidence, CONTEXT); return st.reason ? `${st.state}:${st.reason}` : st.state; }));
+  const expected = ["active", "unsupported", "ended", ...[...EVIDENCE_REASONS, ...LOCAL_REASONS].map((r) => `unverified:${r}`)];
+  assert.deepEqual([...seen].sort(), expected.sort());
+  assert.deepEqual([...STRICT_STATES].sort(), [...new Set(expected.map((k) => k.split(":")[0]))].sort());
+  assert.deepEqual([...IN_BOUNDARY_TRANSITIONS], ["approve", "reshape", "finalize"]);
+});
+
+test("in-boundary transitions: a strict-requested project ALWAYS refuses approve, reshape and finalize, even when active", () => {
+  for (const { name, evidence } of EVERY_STATUS) {
+    const status = classifyEvidence(evidence, { ...CONTEXT, requested: true });
+    assert.equal(status.requested, true, name);
+    for (const action of IN_BOUNDARY_TRANSITIONS) {
+      const msg = refuseInBoundaryTransition(status, action);
+      assert.ok(msg, `${name} ${action}`);
+      assert.match(msg, new RegExp(`^refused: ${action} can't run from inside the session in a strict project, even when strict status is active \\(strict status is ${status.state}`), `${name} ${action}`);
+      assert.match(msg, /go only through the protected human decision page/, `${name} ${action}`);
+      assert.doesNotMatch(msg, /until status shows active/, "never suggests active would let the CLI through");
+    }
+  }
+  // The difference from refusePrivileged, which is a copy helper and allows when active.
+  const active = classifyEvidence(ACTIVE, CONTEXT);
+  assert.equal(active.state, "active");
+  assert.equal(active.privilegedActions, "allowed");
+  assert.equal(refusePrivileged(active, "approve"), null);
+  assert.ok(refuseInBoundaryTransition(active, "approve"));
+  assert.ok(refuseInBoundaryTransition(active, "Approve"), "any action name is refused in a strict project");
+});
+
+test("in-boundary transitions: null only when strict wasn't requested, in every state", () => {
+  for (const { name, evidence } of EVERY_STATUS) {
+    const status = classifyEvidence(evidence, { ...CONTEXT, requested: false });
+    assert.equal(status.requested, false, name);
+    for (const action of IN_BOUNDARY_TRANSITIONS) assert.equal(refuseInBoundaryTransition(status, action), null, `${name} ${action}`);
+  }
+  // The CLI's own default status, which is what a default-mode project sees.
+  assert.equal(refuseInBoundaryTransition(classifyEvidence(DEFAULT_VERIFIER.verify(), {}), "approve"), null);
+});
+
+test("in-boundary transitions: a missing or malformed status is refused, never allowed", () => {
+  const active = classifyEvidence(ACTIVE, CONTEXT);
+  for (const [label, status] of [
+    ["null", null], ["undefined", undefined], ["string", "active"], ["empty object", {}],
+    ["unknown state", { state: "on", requested: false }],
+    ["requested missing", { state: "unsupported" }],
+    ["requested 'no'", { state: "unsupported", requested: "no" }],
+    ["requested 0", { state: "unsupported", requested: 0 }],
+    ["requested 'yes' on active", { ...active, requested: "yes" }],
+  ]) {
+    const msg = refuseInBoundaryTransition(status, "finalize");
+    assert.ok(msg, label);
+    assert.match(msg, /^refused: finalize .*strict status couldn't be read/, label);
+  }
+});
+
+test("in-boundary transitions: the helper isn't wired into the CLI", () => {
+  const bin = fs.readFileSync(BIN, "utf-8");
+  assert.doesNotMatch(bin, /refuseInBoundaryTransition|refusePrivileged/);
 });
 
 test("the human strict line is one line with the state, reason and next step", () => {
