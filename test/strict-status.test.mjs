@@ -19,7 +19,7 @@ const mkTemp = (prefix) => { const d = fs.realpathSync(fs.mkdtempSync(path.join(
 
 const notActive = (status, label) => {
   assert.notEqual(status.state, "active", label);
-  assert.equal(status.privilegedActions, "refused", label);
+  assert.equal(status.privilegedActions, status.requested === true ? "refused" : undefined, label);
   assert.equal(status.evidence, undefined, label);
   assert.ok(refusePrivileged(status, "approve"), label);
 };
@@ -159,6 +159,49 @@ test("requested and unrequested strict differ: only a request refuses privileged
   notActive(classifyEvidence({ kind: "unverified", reason: "evidence-stale" }, { ...CONTEXT, requested: true }), "requested stale");
   // A strict helper refuses even active evidence when strict wasn't requested.
   assert.ok(refusePrivileged(classifyEvidence(ACTIVE, { ...CONTEXT, requested: false }), "approve"));
+});
+
+test("an unverified reason is read once, and a throwing getter or proxy is unreadable", async () => {
+  let reads = 0;
+  const flipping = { kind: "unverified", get reason() { reads += 1; return reads === 1 ? "evidence-stale" : "not-a-reason"; } };
+  const status = classifyEvidence(flipping, CONTEXT);
+  assert.equal(reads, 1);
+  assert.equal(status.reason, "evidence-stale");
+  assert.match(status.next, /^Restart the session/);
+  const throwing = { kind: "unverified", get reason() { throw new Error("boom"); } };
+  assert.equal(classifyEvidence(throwing, CONTEXT).reason, "evidence-unreadable");
+  const proxy = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error("trap"); } });
+  assert.equal(classifyEvidence(proxy, CONTEXT).reason, "evidence-unreadable");
+  assert.equal((await strictStatus({ verifier: fixtureVerifier(throwing), ...CONTEXT })).reason, "evidence-unreadable");
+  const badOptions = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error("trap"); } });
+  assert.equal(classifyEvidence(ACTIVE, badOptions).reason, "evidence-unreadable");
+});
+
+test("requested must be exactly true: anything else shows as not requested and still refuses", () => {
+  for (const requested of [undefined, null, false, "true", "yes", 1, {}, [true]]) {
+    const label = JSON.stringify(requested) ?? "undefined";
+    const active = classifyEvidence(ACTIVE, { ...CONTEXT, requested });
+    assert.equal(active.requested, false, label);
+    assert.equal(active.privilegedActions, undefined, label);
+    assert.ok(refusePrivileged(active, "approve"), label);
+    const stale = classifyEvidence({ kind: "unverified", reason: "evidence-stale" }, { ...CONTEXT, requested });
+    assert.equal(stale.privilegedActions, undefined, label);
+  }
+  const { requested, ...absent } = CONTEXT;
+  assert.equal(classifyEvidence(ACTIVE, absent).requested, false, "absent is not requested");
+  assert.ok(refusePrivileged({ ...classifyEvidence(ACTIVE, CONTEXT), requested: "yes" }, "approve"), "a status without requested: true is refused");
+});
+
+test("unverified and ended copy says refused only when strict was requested", () => {
+  const evidence = [{ kind: "ended" }, ...EVIDENCE_REASONS.map((reason) => ({ kind: "unverified", reason })), NEGATIVE["wrong-project"].evidence];
+  for (const e of evidence) {
+    const on = classifyEvidence(e, CONTEXT), off = classifyEvidence(e, { ...CONTEXT, requested: false });
+    const label = `${on.state}:${on.reason}`;
+    assert.match(on.next, /Approve, reshape and finalize are refused until status shows active\.$/, label);
+    assert.doesNotMatch(off.next, /refused/, label);
+    assert.match(off.next, /Strict wasn't requested for this project, so default mode applies unchanged\.$/, label);
+    assert.equal(on.summary, off.summary, label);
+  }
 });
 
 test("the refusal names the action, the state and the next step", () => {

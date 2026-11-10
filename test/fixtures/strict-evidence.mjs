@@ -29,7 +29,8 @@ export const NOW = Date.parse("2026-11-09T12:00:00.000Z");
 export const PROJECT = "example-project";
 export const SESSION = "example-session";
 export const PROFILE = "linux-wsl-cli-candidate";
-export const CONTEXT = { projectId: PROJECT, sessionId: SESSION, now: NOW, supportedProfiles: [PROFILE] };
+// requested must be exactly true for a project that requested strict.
+export const CONTEXT = { projectId: PROJECT, sessionId: SESSION, now: NOW, supportedProfiles: [PROFILE], requested: true };
 
 const iso = (ms) => new Date(ms).toISOString();
 
