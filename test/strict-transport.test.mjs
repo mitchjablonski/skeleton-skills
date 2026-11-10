@@ -423,6 +423,83 @@ test("#77 inv: an inconsistent AuthorityState fails closed", async () => {
   }
 });
 
+test("#77 notes: notes after an unavailable approve drop it; nothing is resent", async () => {
+  const { auth, ctl } = await setup();
+  auth.force({ kind: "rejected", code: "unavailable" });
+  await ctl.decide("approve");
+  assert.equal(ctl.requestRetained, "req-1");
+  await ctl.setShown({ ...SHOWN, pendingNotes: true }); // the human starts notes on A
+  const v = ctl.view();
+  assert.equal(ctl.requestRetained, null, "never processed, so dropped");
+  assert.equal(v.message.title, "Approval dropped");
+  assert.match(v.message.text, /You started notes on aaaaaaaaaaaa, so the approval the service couldn't take was dropped; nothing was approved\./);
+  assert.deepEqual(v.actions.map((a) => [a.action, a.enabled, a.retry]), [["approve", false, false]]);
+  assert.match(action(v, "approve").reason, /notes on this version/);
+  assert.deepEqual(await ctl.decide("approve"), { kind: "refused-locally" });
+  assert.equal(auth.calls.submit.length, 1);
+  assert.equal(ctl.view().approved, null);
+});
+
+test("#77 notes: notes after a lost answer hold Retry, with Re-read beside it", async () => {
+  const { auth, ctl } = await setup();
+  const real = auth.submit;
+  auth.submit = async (i) => { auth.calls.submit.push({ ...i }); throw new Error("reset"); }; // never reached the authority
+  await ctl.decide("approve");
+  auth.submit = real;
+  let v = ctl.view();
+  assert.equal(v.canReread, true, "Re-read beside Retry after a lost answer");
+  assert.deepEqual(v.actions.map((a) => [a.action, a.enabled, a.retry]), [["approve", true, true]]);
+  await ctl.setShown({ ...SHOWN, pendingNotes: true });
+  v = ctl.view();
+  assert.equal(ctl.requestRetained, "req-1", "it may have landed, so it is kept to ask for its answer");
+  const retry = action(v, "approve");
+  assert.deepEqual([retry.enabled, retry.retry], [false, true]);
+  assert.match(retry.reason, /notes on this version: send or copy them first/);
+  assert.deepEqual(await ctl.decide("approve"), { kind: "refused-locally" });
+  assert.equal(auth.calls.submit.length, 1, "Retry held: nothing resent");
+  assert.equal(ctl.view().approved, null);
+  // Re-read shows the state and keeps the request unconfirmed.
+  await ctl.load();
+  v = ctl.view();
+  assert.equal(v.message.title, "Still unconfirmed");
+  assert.match(v.message.text, /Current review state: phase skeleton, review round example-round, revision 4, approved version none\. Whether the request for aaaaaaaaaaaa landed is still unconfirmed/);
+  assert.equal(action(v, "approve").enabled, false, "still held by the notes");
+  // Notes sent or cleared: Retry is available again and gets the authoritative answer.
+  await ctl.setShown({ ...SHOWN, pendingNotes: false });
+  assert.equal(action(ctl.view(), "approve").enabled, true);
+  assert.deepEqual(await ctl.decide("approve"), { kind: "committed", revision: 5 });
+  assert.deepEqual(auth.calls.submit.map((i) => i.requestId), ["req-1", "req-1"]);
+});
+
+test("#77 notes: the drawn Retry is disabled while notes are pending", async () => {
+  const doc = fakeDoc();
+  const container = doc.createElement("div");
+  const auth = createMockAuthority();
+  const real = auth.submit;
+  const m = await skelMountDecision({ doc, container, channel: auth, shown: SHOWN, newRequestId: ids() });
+  auth.submit = async () => { throw new Error("reset"); };
+  await m.controller.decide("approve");
+  auth.submit = real;
+  await m.controller.setShown({ ...SHOWN, pendingNotes: true });
+  m.redraw();
+  const btn = byAttr(container, "data-decision-action", "approve")[0];
+  assert.ok("disabled" in btn.attrs);
+  assert.match(btn.textContent, /^Retry/);
+  assert.equal(byAttr(container, "data-decision-reread").length, 1);
+});
+
+test("#77: a second mount with a different channel or page throws", async () => {
+  const doc = fakeDoc();
+  const container = doc.createElement("div");
+  const make = ids();
+  const a1 = createMockAuthority();
+  const m1 = await skelMountDecision({ doc, container, channel: a1, shown: SHOWN, newRequestId: make });
+  await assert.rejects(skelMountDecision({ doc, container, channel: createMockAuthority(), shown: SHOWN, newRequestId: make }), /already mounted/);
+  await assert.rejects(skelMountDecision({ doc, container, channel: a1, shown: { ...SHOWN, reviewVersion: "other" }, newRequestId: make }), /already mounted/);
+  assert.equal(await skelMountDecision({ doc, container, channel: a1, shown: SHOWN, newRequestId: make }), m1);
+  assert.equal(container.children.length, 1);
+});
+
 test("#77: mounting twice in one container gives one UI and one controller", async () => {
   const doc = fakeDoc();
   const container = doc.createElement("div");
