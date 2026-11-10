@@ -22,7 +22,7 @@ The same evidence carries a limit: the spike sandboxed **Bash only**. Built-in R
 |---|---|---|---|
 | **Agent tools** (inside #75's boundary) | **Yes.** Reads source, and in Send mode posts feedback. Holds the token. | **No.** The listener is in the launcher's namespace. *Unproven until #75 shows it for every tool path.* | **No.** It can read only the public verifier snapshot, which may expose only non-capability AuthorityState. |
 | **Browser** (the human's) | **Yes**, with the token from the link. The review page there has no decision UI. | **Yes**: it loads the decision UI from the listener's own origin, reads AuthorityState there and submits an Intent there. How it gets there is open question 1. | **No**, not directly. The listener's answer is the only thing it gets back. |
-| **Outside launcher** (#75) | Starts nothing here today. The agent runs `skel serve`. | **Starts it** and owns its lifetime and binding. | Starts it or connects to it, and passes no capability to the agent. |
+| **Outside launcher** (#75) | Starts nothing here today. The agent runs `skel serve`. A browser outside the agent netns can't reach it without an inward-only forward, which is a new boundary crossing ([strict-decision-page.md](strict-decision-page.md) (a)). | **Starts it** and owns its lifetime and binding. | Starts it or connects to it, and passes no capability to the agent. |
 | **Private authority** (#76) | No. It doesn't trust the review server or feedback. | Doesn't call it. The listener calls the authority, which is the listener's only downstream. | Itself. Per #76 it authenticates the channel *and* independently recomputes and verifies the reviewed content, checks the revision and phase transition, and commits atomically. |
 
 Code, diagrams and comments shown on either page stay untrusted data, wherever they're shown.
@@ -75,7 +75,7 @@ The contract is `lib/strict-protocol.mjs` (#82). `test/fixtures/strict-results.m
 
 ## 6. Open questions for Sol
 
-Proposed answers, plus status and recovery integration (#78), are in [docs/strict-decision-page.md](strict-decision-page.md): (a) is question 1, (b) is question 2, (c) is question 3 and (d) is question 4. They are proposals for Sol's review and decide nothing.
+Proposed answers, plus status and recovery integration (#78), are in [docs/strict-decision-page.md](strict-decision-page.md): (a) is question 1, (b) is question 2, (c) is question 3 and (d) is question 4. They are proposals for Sol's review and decide nothing. In particular, the launcher's own terminal is shared with the agent and is not a trusted channel, and the review origin is treated as hostile script in the human's browser.
 
 1. **How does the browser reach the human listener's origin?** For example a launcher-bound loopback port in the host namespace, or something native. How does the human learn its address, given strict-boundary.md says the address need not be secret but its inaccessibility from the agent must be proved?
 2. **How are origin and CSRF bound** on the listener, without any secret the page carries?

@@ -1,149 +1,319 @@
 # Strict tier: protected-origin decision page and status integration (#77 / #78)
 
-Status: **design proposal only.** No production code, no listener, no launcher and no evidence producer exist. This answers the open questions in [docs/strict-transport.md](strict-transport.md) section 6 and proposes how `skel status` and the skills consume evidence (#78). [docs/strict-boundary.md](strict-boundary.md) is authoritative; where this document differs, that plan wins. **Nothing here claims containment.** Every "the agent can't reach X" below is conditional on #75 proving it for every agent path, including the model-egress path.
+Status: **design proposal only.** No production code, no listener, no launcher and no evidence producer exist. This answers the open questions in [docs/strict-transport.md](strict-transport.md) section 6 and proposes how `skel status` and the skills consume evidence (#78). [docs/strict-boundary.md](strict-boundary.md) is authoritative, and so is #83's `docs/strict-authority.md` once it merges; where this document differs, they win. **Nothing here claims containment.** Every "the agent can't reach X" below is conditional on #75 proving it for every agent path, including the model-egress path.
 
-Owners: the launcher (#75) and the private authority, journal and evidence producer (#76) belong to Sol. The page, transport proposal (#77), status, skills and recovery copy (#78) are ours. Each section ends with what it needs from Sol, what stays unproven, and the tests it adds to #79.
+Owners: the launcher (#75) and the private authority, journal, capture and evidence producer (#76, #83) belong to Sol. The page, the transport proposal (#77), status, skills and recovery copy (#78) are ours. Each section ends with what it needs from Sol, what stays unproven, and the tests it adds to #79.
 
-The adversary assumed throughout: **the agent controls everything inside the boundary, including whatever answers on the review server's port.** `skel serve` runs inside the boundary, so the agent can replace it with any server. Treat the review origin as fully hostile script running in the human's browser.
+Adversaries assumed throughout:
+
+- **The agent controls everything inside the boundary.** That includes the workspace, its `.git/` directory, and whatever answers on the review server's port. `skel serve` runs inside the boundary, so the agent can replace it with any server.
+- **The review origin is hostile script in the human's browser.** It has whatever network reach the browser has: the internet and every host loopback port.
+- **The agent shares the launcher's terminal.** A whole-process launcher runs the agent on the same PTY, so the agent can overwrite anything printed there with ANSI escapes, print fake status lines, and read what the human types.
+
+## The trusted human channel
+
+The human trusts exactly two things:
+
+- **The launcher control channel.** This is a surface the agent can't write to or read from. Either the launcher opens a separate terminal or window it alone owns, or the controls live only on the decision page and the launcher's own terminal carries nothing to trust.
+- **The decision page at the origin that channel names.**
+
+Everything on the agent's terminal is untrusted, including anything the launcher printed there before or after the agent started. That covers origins, status and "reopen" prompts. The control channel shows:
+
+- the decision page's origin;
+- a reopen control;
+- strict status;
+- **an echo of every committed transition**: action, version, revision and time. A transition the human didn't make is visible there even when the agent's terminal says otherwise.
 
 ## (a) How the browser reaches the listener
 
-| Option | Browser reaches it by | Agent can reach | Agent can't reach (if #75 holds) | Cost |
-|---|---|---|---|---|
-| **A1. Launcher opens the browser** to a host-netns loopback listener | URL the launcher passes to `xdg-open` / `wslview` | Nothing new. It may learn the address; the address isn't a secret. | The listener socket: no route from the agent netns to host loopback | One process the launcher runs on the host; per-profile browser opener |
-| **A2. Loopback port in the host netns, address printed** on the launcher's own terminal | The human opens or types it | Same as A1 | Same as A1 | The human copies a URL; the agent's transcript never needs it |
-| **A3. Unix socket plus host-side proxy** | A small proxy exposes a loopback TCP port to the browser | Same as A1 | The socket file, if its directory is launcher-private and never mounted in | Adds a forwarder. The browser-facing port has A2's reachability, so this changes nothing for the browser and only helps if listener and authority are separate processes |
-| **A4. Native window** (webview the launcher starts) | No browser origin at all | Same as A1 | Same as A1 | New dependency, WSLg on WSL, out of scope for v1 |
+| Option | Browser reaches it by | Agent can reach (if #75 holds) | Cost |
+|---|---|---|---|
+| **A1. Launcher opens the browser** to a host-netns loopback listener | The launcher hands the URL to the browser | Nothing new. The address isn't a secret; the socket has no route from the agent netns | Per-profile browser opener |
+| **A2. Loopback port in the host netns, address shown on the control channel** | The human opens it from the control channel | Same as A1 | One manual step |
+| **A3. Unix socket plus host-side proxy** | A forwarder exposes a loopback TCP port | Same as A1 for the browser-facing port | Adds a hop and changes nothing for the browser |
+| **A4. Native window** started by the launcher | No browser origin | Same as A1 | New dependency (WSLg on WSL); out of scope for v1 |
 
-**Recommendation: A1 with A2 as the fallback.** The listener binds `127.0.0.1` (never `0.0.0.0`, never inside the agent netns) on a per-launch random port. The launcher opens the browser once with a one-time navigation nonce (see b). It also prints the bare origin, without the nonce, on its own terminal so the human can reopen it. Reopening goes through a fresh nonce: the bare origin shows "open from the launcher" and the launcher has a "reopen" command. A3 is acceptable as an implementation detail of Sol's process layout, not as a security layer.
+**Recommendation: A1, with A2 as the fallback.** Parts:
 
-Two things A1 depends on that aren't the listener's own:
+- **The listener** binds `127.0.0.1` in the host netns, never `0.0.0.0` and never inside the agent netns, on a per-launch random port.
+- **Opening the page.** The launcher opens the browser with a one-time navigation nonce (b). Reopening goes through the control channel and always mints a fresh nonce. It can't be triggered from the agent's terminal, the review page or anything else the agent can write.
+- **Only the listener is TCP.** The hostile review origin can reach every host loopback port, so every other launcher-owned link uses Unix sockets in a launcher-private directory that is never mounted into the boundary. That covers listener to authority, evidence refresh and reopen. A3 is acceptable only as that internal layout.
 
-- **The review server needs a forward too.** `skel serve` inside the agent netns is unreachable from the browser (that's the direction the #19 spike measured). In strict, the launcher has to forward one host loopback port inward to the review server's port. The forward carries connections host to agent only; the agent must not be able to open connections outward through it. Without it, strict has no review page, and the decision page (c) must carry the whole review.
-- **Model egress must refuse host addresses.** If the model transport is a proxy the agent can address, it must refuse `127.0.0.0/8`, `::1`, the host's own interfaces and the WSL host/gateway addresses. Otherwise it's a path to the listener.
+**New boundary crossings this adds**, each to be recorded in strict-boundary.md's trust map:
 
-WSL: the browser is usually a Windows process. It reaches WSL loopback through localhost forwarding (NAT mode) or the shared loopback (mirrored mode). Either way, **any Windows-side process can reach the listener too.** That's in the same class as same-user host malware (b, residual), but it needs to be recorded per profile.
+- **The review server forward.** `skel serve` inside the agent netns is unreachable from the browser. That is the direction the #19 spike measured. Strict needs a launcher forward from one host loopback port inward to the review server's port. The forward carries connections host to agent only and gives the agent no outbound path. It is a new crossing, missing from the current trust map. Without it, strict has no review page, and the decision page (c) carries the whole review.
+- **Agent script in the browser.** The review origin runs agent-supplied script in a browser that has internet and loopback egress. That bypasses the model-egress limits for **exfiltration**: anything the agent can put on the review page, it can send anywhere. The page's CSP limits the review server's own pages, but the agent controls those headers. Strict makes no confidentiality claim for content the agent can read, and the trust map has to say so.
 
-**Needs from Sol.** The listener's bind address and port in the host netns. A launcher command that opens and reopens the page with a fresh nonce. The inward-only review-server forward. An egress design that refuses loopback and host addresses.
-**Unproven.** That agent-netns code can't reach host loopback (the spike measured the other direction). That built-in tools, MCP and hooks are inside the same netns. Browser reachability on each WSL networking mode.
-**#79 tests.** From every agent path (Bash, built-in tools, subagent, MCP, hook, model-egress proxy), connect to the listener's port, the host's other loopback ports and the WSL host address: all fail. A real browser on the supported profile loads the launcher-opened page. The review-server forward accepts host-to-agent connections and gives the agent no outbound path.
+**Model egress must refuse host and local addresses.** If the model transport is a proxy the agent can address, it refuses:
+
+- all of `127.0.0.0/8`, `0.0.0.0/8`, `::1`, `::` and `::ffff:127.0.0.0/104`;
+- the host's own interfaces;
+- the WSL host and gateway addresses, and in mirrored mode the Windows host addresses.
+
+It checks the **resolved address it actually connects to**, not the requested name, so DNS rebinding and names resolving to any of these are refused.
+
+**Agent-driven browser paths are a launcher requirement, not residual risk.** The agent must not be able to start or steer the human's browser. If any of these is visible inside the boundary, the launcher refuses to start:
+
+- WSL interop (`cmd.exe`, `powershell.exe`, binfmt `WSLInterop`);
+- write access to `/mnt/*`;
+- a session D-Bus or XDG portal (OpenURI);
+- `xdg-open`, or any browser binary that reaches the host display;
+- the host's browser profile directories.
+
+A specific attack: the agent pre-launches the default-profile browser with remote debugging enabled. The launcher's later URL then lands in that instance, and the agent clicks Approve over CDP. Mitigations:
+
+- The launcher opens the page in a **fresh, launcher-owned browser profile** with remote debugging off.
+- Alternatively, the launcher refuses if a debugging port or pipe is already open for the target browser.
+
+WSL: the browser is usually a Windows process. It reaches WSL loopback through localhost forwarding (NAT mode) or the shared loopback (mirrored mode). **Any Windows-side process can reach the listener too.** Record that per profile, and treat the human's Windows session as trusted host.
+
+**Needs from Sol.**
+
+- The listener's host-netns bind and port.
+- The control channel (separate terminal or window, or page-only controls) and reopen through it.
+- Unix sockets for every internal link.
+- The inward-only review forward, and the trust-map entries for it and for browser exfiltration.
+- The egress refusal list, checked on connected addresses.
+- The launch refusals for interop, `/mnt/*`, a session bus, browser openers and debugging ports.
+- A fresh browser profile.
+
+**Unproven.**
+
+- That agent-netns code can't reach host loopback. The spike measured the other direction.
+- That built-in tools, MCP and hooks share that netns.
+- Browser reachability on each WSL networking mode.
+- That a fresh profile can be opened from WSL on Windows without exposing the URL to other processes.
+
+**#79 tests.**
+
+- **Agent reach.** From every agent path (Bash, built-in tools, subagent, MCP, hook, model-egress proxy), connect to the listener, the internal Unix sockets, other host loopback ports and the WSL host address. Include `0.0.0.0:L`, `[::]:L`, `[::ffff:127.0.0.1]:L`, `127.1.2.3:L` and a hostname that rebinds to 127.0.0.1. All fail.
+- **Launch refusals.** Launch with interop enabled, with `/mnt/c` writable, with a session bus visible, and with a browser already running with remote debugging. Each is refused.
+- **Terminal.** The agent writes ANSI that rewrites the screen and prints a fake origin and "strict: active". None of it reaches the control channel, and reopen can't be triggered from the agent's terminal.
+- **Browser.** A real browser on the supported profile loads the launcher-opened page.
+- **Review forward.** It accepts host-to-agent connections and gives the agent no outbound path.
 
 ## (b) Origin and CSRF without a page-carried authority secret
 
-The hostile page is the review origin `http://127.0.0.1:R`. **It's same-site with the listener `http://127.0.0.1:L`**: a site ignores the port. Cookies ignore the port too. So "same-site" defenses (SameSite cookies, `Sec-Fetch-Site: same-site`) don't separate the two. Only exact origin does.
+The hostile page is the review origin `http://127.0.0.1:R`. **It's same-site with the listener `http://127.0.0.1:L`**: a site ignores the port. Cookies ignore the port too. So same-site defenses (SameSite cookies, `Sec-Fetch-Site: same-site`) don't separate the two. Only exact origin does.
 
 | Control | Defends against | Doesn't defend against |
 |---|---|---|
-| **Exact `Origin` check**: every non-GET request must carry `Origin: http://127.0.0.1:L`, and a missing Origin is refused | Cross-origin fetches and form posts from the review page or any web page | A same-user host process making raw HTTP requests (it can forge any header) |
-| **Exact `Host` check**: `Host` must be `127.0.0.1:L` | DNS rebinding (an attacker hostname resolving to 127.0.0.1) | Same as above |
-| **`Sec-Fetch-Site`**: API calls must be `same-origin`; the page document only `none` (opened by the launcher or typed) | `same-site` requests from the review origin, including top-level navigations that steer the human onto the page | Older browsers without Fetch Metadata. The `Origin` check stays the primary control, and the supported-profile matrix pins browser versions |
-| **JSON only**: `Content-Type: application/json`, no CORS headers ever, preflight refused | Simple-request CSRF (form POST, `no-cors` fetch). A cross-origin read of AuthorityState comes back opaque | Nothing the Origin check doesn't already cover. This is defense in depth |
-| **No framing**: `frame-ancestors 'none'` and `X-Frame-Options: DENY` | Clickjacking: the review page framing the decision page under a decoy | Social engineering in a separate tab ("go click Approve") |
-| **No cookies, no storage** on the listener origin | Cookie tossing from the review origin (it can set cookies for `127.0.0.1` that the listener would receive) | n/a |
-| **Per-launch random port** | Stale tabs from an earlier launch reaching a new listener; collisions | Discovery. A page can scan loopback ports. **Not a security control.** |
-| **One-time navigation nonce** in the launcher-opened URL, exchanged once for an in-memory tab binding sent as a request header | A second tab or a stale tab acting as the decision page; a URL replayed from history (the nonce is dead after first use) | A same-user host process that drives the browser itself |
+| **Exact `Origin`**: every non-GET request carries `Origin: http://127.0.0.1:L`; a missing Origin is refused | Cross-origin fetches and form posts from the review page or any web page | A host process sending raw HTTP (it can forge headers) |
+| **Exact `Host`**: `127.0.0.1:L` only; `localhost:L`, `0.0.0.0:L`, `[::1]:L` and anything else are refused | DNS rebinding | Same as above |
+| **`Sec-Fetch-Site` required**: API calls must be `same-origin`, the document must be `none`, and a request without the header is refused (no fallback to Origin) | `same-site` requests from the review origin, including navigations that steer the human onto the page; old browsers | Same as above. Pinned browser versions belong in the profile matrix |
+| **JSON only**, no CORS headers ever, preflight refused, HTTP/1.1 only | Simple-request CSRF (form POST, `no-cors` fetch); a cross-origin read comes back opaque | Defense in depth only |
+| **No framing**: `frame-ancestors 'none'`, `X-Frame-Options: DENY` | Classic clickjacking | Double-clickjacking and focus stealing (next row) |
+| **Approve arms late and confirms**: Approve stays disabled until about one second after the page last gained focus or visibility, and then needs a separate confirm step | Double-clickjacking, focus steal, a click carried over from another window | The human choosing to approve without reading |
+| **No cookies, no storage**: the listener ignores `Cookie` headers of any size | Cookie tossing from the review origin; cookie-bomb denial of service | n/a |
+| **Response headers**: `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, `Cross-Origin-Resource-Policy: same-origin` | Cached captures, the nonce leaking in a referrer, cross-origin embedding of responses | n/a |
+| **Per-launch random port** | Stale tabs from an earlier launch; collisions | Discovery: a page can scan loopback ports. **Not a security control.** |
+| **One-time navigation nonce** in the **URL fragment**. Page script consumes it with a POST (so prefetch or a speculative GET can't burn it), strips it with `history.replaceState`, and gets back an in-memory tab binding sent as a request header | A second or stale tab acting as the decision page; replay from history | A process that can drive the browser (mitigated in a) |
 
-Reads (AuthorityState and the content capture) are GETs, which browsers send without `Origin` when same-origin. They require `Sec-Fetch-Site: same-origin` plus the binding header; a cross-origin request carrying that custom header triggers a preflight, which fails. Nothing they return is secret, since the agent wrote the content, so this only keeps stale tabs and other origins from driving the page.
+**Reads.** AuthorityState and capture pages are GETs, which browsers send without `Origin` when same-origin. They require `Sec-Fetch-Site: same-origin` and the binding header. A cross-origin request carrying that custom header triggers a preflight, which fails. Re-read is not a read (c).
 
-**The nonce is not an authority secret.** It only picks which listener-origin tab is the live decision page. Alone it authorizes nothing: the listener still requires the exact Origin and Fetch Metadata, and the authority still checks the Intent and verifies content. A leaked binding is useless from any other origin, and from the agent, which can't reach the listener. It never appears on the review page and never enters Copy/Send. It lives only in the tab's JavaScript memory, so closing the tab drops it.
+**The nonce is not an authority secret.** It only picks which listener-origin tab is the live decision page:
 
-**Agent-controlled content never runs on the listener origin.** Strict CSP: `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'`. No inline script. The listener serves only its own fixed assets, with no project-derived paths. All project text goes in through `textContent` (lib/review-decision.mjs already does this), with `require-trusted-types-for 'script'` as a backstop. **No diagrams on the listener origin in v1:** a diagram renderer runs a library over agent-controlled input. Diagrams stay on the review page as untrusted presentation. The approved version doesn't cover them (see c).
+- Alone, it authorizes nothing. The listener still requires the exact Origin and Fetch Metadata, and the authority still checks the Intent.
+- It's useless from any other origin, and the agent can't reach the listener.
+- It never appears on the review page or in Copy/Send, and it lives only in the tab's memory.
 
-**Residual risk, stated plainly.** Everything above proves only that a request came from a page on the listener origin, in a browser tab the launcher opened, holding a fresh binding. **It doesn't prove a human clicked**, and it doesn't stop:
+**Agent-controlled content never runs on the listener origin.**
 
-- same-user host malware or browser extensions (they can drive the browser);
-- Windows-side processes on WSL;
+- Strict CSP: `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'`, plus `require-trusted-types-for 'script'`.
+- The listener serves only its own fixed assets, with no project-derived paths.
+- All project text goes in through `textContent`, which lib/review-decision.mjs already uses.
+- **No diagrams on the listener origin in v1.** Diagrams stay on the review page as untrusted presentation.
+
+**Residual risk.** This proves only that a request came from a page on the listener origin, in a tab opened through the control channel, holding a fresh binding. It doesn't prove a human clicked, and it doesn't stop:
+
+- host malware or browser extensions in the human's own session;
 - browser bugs;
 - the human approving without reading;
 - the review page persuading the human in another tab.
 
-"Human origin" in strict means human-channel origin under these assumptions, not proof of a person.
+**Needs from Sol.** Listener enforcement of every row above. The nonce exchange as a POST. A ruling that the tab binding is checked by the listener alone; we suggest that, since the authority's checks don't depend on it.
 
-**Needs from Sol.** The listener enforces Origin, Host and Fetch Metadata; serves no CORS headers and no cookies; serves only fixed assets under that CSP; does the nonce exchange; and refuses everything else. Also whether the tab binding is checked by the listener alone or forwarded to the authority (we suggest listener-only, since the authority's checks don't depend on it).
-**Unproven.** Fetch Metadata and `Origin` behaviour on each pinned browser on the supported profile; whether `wslview` hands the URL to the browser without exposing it to other processes.
-**#79 tests.** These run in a real browser. From the review origin `127.0.0.1:R`: a form POST, `fetch` with and without `no-cors`, a JSON fetch with preflight, a top-level navigation, an iframe embed, and setting a `127.0.0.1` cookie. All of them are refused, or have no effect. The same requests from a `localhost:L` origin and from a rebinding hostname are refused. A reused nonce, a stale tab from the previous launch and a second listener-origin tab without the binding are all refused. A malicious skeleton (HTML, script, `javascript:` URLs, CSP-bypass strings, oversized lines) renders as inert text, and the listener origin's CSP report shows no violations.
+**Unproven.** Fetch Metadata and `Origin` behaviour on each pinned browser.
+
+**#79 tests**, in a real browser:
+
+- **From the review origin:** a form POST, `fetch` with and without `no-cors`, a JSON fetch with preflight, a top-level navigation, an iframe embed, setting a `127.0.0.1` cookie, and an oversized cookie. All are refused or have no effect.
+- **Wrong origins and hosts:** the same requests from `localhost:L`, a rebinding hostname, and `Host` values of `0.0.0.0:L` and `[::1]:L` are refused.
+- **Missing Fetch Metadata:** a document request without `Sec-Fetch-Site` is refused.
+- **Nonce and tabs:** a reused nonce, a prefetch of the nonce URL, a stale tab from the previous launch, and a second tab without the binding are all refused. The nonce isn't in history after load.
+- **Clicks:** a double-click lure and a focus-steal attempt from the review origin don't approve. Approve isn't armed within the delay after focus changes.
+- **Leaked token:** the review/feedback token from `.skeleton/serve.json` is presented to the listener in every header and body position. It's refused and grants nothing.
+- **Malicious skeleton:** a skeleton containing HTML, script, `javascript:` URLs, CSP-bypass strings and oversized lines renders inert, with no CSP violations.
 
 ## (c) What the human sees versus what gets approved
 
-The problem: the controller's `shown` (version and pending notes) currently has no trustworthy source. The review page is agent-controlled, so it can show content A while claiming version A' for content B. **A version hash cross-checked against the review page doesn't satisfy #66:** the hostile page can display harmless text beside the real hash of the malicious version.
+The controller's `shown` value (version and pending notes) has no trustworthy source today. The review page is agent-controlled, so it can show content A beside the real hash of malicious content B. A hash cross-check therefore doesn't satisfy #66. **The decision page renders the reviewed content itself, from a capture the authority makes.**
 
-**Proposal: the decision page renders the reviewed content itself, from the authority's own read.**
+**C1. Capture runs nothing and follows nothing.** Capture is the first host code to touch agent-controlled bytes, so:
 
-1. **The authority captures content.** When a review round opens (or on Re-read), the authority reads the workspace, computes the record the way `lib/snapshot.mjs` does (exteriors and the fence set), stores the bytes privately and content-addressed, and sets `reviewVersion` to their hash.
-2. **The page renders that capture**, served by the listener as data and drawn as text: every exterior line, every fence id and title. The tab's `shown.reviewVersion` is the version **it rendered**, never one it was told. The page never live-reloads: new content appears only when the human presses Re-read, which maps to `setShown`.
-3. **At commit, the writer verifies.** The workspace still produces exactly the captured bytes, otherwise `stale-review`. The approved record is the captured one.
-4. **Strict versions are full-length.** The default `skeletonVersion` is 12 hex characters, which is 48 bits. An agent that controls content can find two colliding skeletons in about 2^24 tries: show one, swap in the other. Strict `reviewVersion` must be the full SHA-256 (64 hex fits the protocol's ID rule), or the writer must compare captured bytes, never the short version.
-5. **The human states pending notes on the decision page.** The listener can't see drafts on the review origin, and must not trust that page's word for it. Approve on the decision page is two explicit choices: **"Approve: I have no unsent notes on this version"**, or **"I have notes"**, which sends the human to Copy/Send on the review page and offers nothing to approve. The declaration sets `shown.pendingNotes`. Approve-with-comments stays feedback (#71). The listener doesn't take notes, because that would open a listener-to-agent write path.
+- **No subprocesses and no git.** The default scan runs `git grep` and `git ls-files` in the agent's repository (lib/markers.mjs). Git executes code named in the agent-writable `.git/config` (`core.fsmonitor`, hooks, filters), so reusing that scan host-side hands the agent code execution as the authority.
+- **No symlinks.** lib/snapshot.mjs `readText` follows a symlink after its inside-root check, so a swap to `~/.ssh/...` would copy host secrets into the approved record and the public snapshot.
+- **The rules:**
+  - Every open resolves beneath the workspace without following any symlink (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, or per-component `O_NOFOLLOW`).
+  - It takes regular files only (refusing FIFOs, devices and sockets), and refuses hard links (`st_nlink > 1`) unless Sol can bound them another way.
+  - It reads with `fstat` on the open descriptor and caps per-file size, file count and total bytes.
+  - It runs with least privilege: a capture process that can read only the workspace, never the private store or the user's home.
+- **Choosing the files.** The proposed split: the agent-side scan (inside the boundary) names the files and fences, and the host capture only opens, reads and hashes those named files under the rules above. The list is untrusted. A wrong list only changes what the human sees and approves, and the human sees exactly that.
 
-**Why this answers #66.** APPROVED can only name the bytes that tab drew on the protected origin, and the writer refuses unless the workspace still matches them. It still can't prove the human read them.
+**C2. The capture is the approved record.**
 
-**Tradeoff.** The decision page duplicates the review as text. Diagrams, rich layout and feedback stay on the review page, which is labelled untrusted. Large skeletons need paging. Approve stays available, because paging changes nothing about what is bound, but the page shows "you've viewed n of m files" next to Approve. A smaller alternative, a diff against the previous approved version, is fine for reshape later but not for a first approval.
+- The capture is stored privately, content-addressed.
+- `reviewVersion` is a full SHA-256 over a **canonical, length-prefixed serialization of exactly the bytes served to the page**: each path, file content and fence id and title, in sorted order. That replaces the default `skeletonVersion`, which keeps 12 hex characters (48 bits, lib/snapshot.mjs). An agent can find two colliding skeletons in about 2^24 tries, show one and swap in the other. Strict doesn't extend the short hash; it hashes the served capture.
+- The approved record **is** the capture, not a later re-read. A torn or racing workspace read at commit time affects only drift detection, never what was approved.
 
-**Needs from Sol.** A content capture bound to `reviewRoundId` and `reviewVersion`. A read-only listener route that returns the capture as data (bounded size, UTF-8 text, paths as opaque display strings). A full-length `reviewVersion`. Commit-time verification against the captured bytes. A ruling on whether coverage beyond the record (the baselined source set) is in what the human approves; it isn't today.
-**Unproven.** That rendering the full capture is usable for real skeletons. That the authority's workspace read can't be raced: the writer's commit-time check must be atomic with its read (#76).
-**#79 tests.** The agent edits the exterior between capture and click, and between click and commit: no approval, and the shown version is unchanged until Re-read. The review page shows content A and version A' while the workspace holds B: the decision page shows B, and approving names B. A 48-bit collision pair (two exteriors with equal 12-hex `skeletonVersion`) gets distinct strict versions. With "I have notes", nothing can be sent. A malicious exterior renders inert (shared with b).
+**C3. The page shows what it was given, in a form a human can perceive.**
+
+- Capture pages are fetched by capture version, so one view never mixes two captures.
+- Drawn text isn't necessarily what the human perceives, so the page:
+  - shows bidi controls, zero-width and other invisible characters as visible escapes;
+  - wraps long lines (nothing hides past the right edge);
+  - flags non-ASCII and confusable characters in paths and identifiers.
+- Paging shows "you've viewed n of m files" next to Approve.
+
+**C4. Re-read is a mutation.**
+
+- Re-read asks the authority to recapture, which can change `reviewVersion`. It's a journaled host operation, a POST behind the same Origin, Fetch Metadata and binding checks, never a GET. #83 lists "refreshing a changed draft's reviewable version" as an unspecified host operation; this is that operation.
+- After a Re-read, the page shows a **diff against the capture it previously rendered**, so a change is visible rather than buried in a full re-render.
+- The page never live-reloads, and the tab's `shown.reviewVersion` is always the capture it rendered (`setShown` on Re-read).
+
+**C5. Pending notes are declared on the decision page.** The listener can't see drafts on the review origin and must not trust that page's word. Approve is two explicit choices:
+
+- **"Approve: I have no unsent notes on this version"**;
+- **"I have notes"**, which sends the human to Copy/Send on the review page and offers nothing to approve.
+
+The declaration sets `shown.pendingNotes`. The listener takes no notes, because that would open a listener-to-agent write path.
+
+**Why this answers #66.** APPROVED can name only bytes that the tab drew on the protected origin. It still can't prove the human read them.
+
+**Needs from Sol.**
+
+- Capture under C1, with the scan split or an alternative.
+- Content-addressed private storage and the canonical serialization.
+- Re-read/recapture as a journaled host operation.
+- A read-only, version-addressed capture route.
+- A ruling on whether the baselined coverage set is part of what the human approves (today it isn't).
+
+**Unproven.**
+
+- That openat2 or `O_NOFOLLOW` capture is available and correct on each profile's filesystem, including 9p/drvfs on WSL.
+- That full-text review is usable for real skeletons.
+
+**#79 tests.**
+
+- **Hostile `.git/config` and hooks:** `core.fsmonitor`, filters and hooks never execute during capture.
+- **Links:** a symlink to a host file, a symlink swapped in during capture (TOCTOU), a symlinked parent directory and a hard link to a host file are all refused, and no host bytes enter the capture or the public snapshot.
+- **Special and oversized files:** a FIFO, a device node, a huge file and too many files are refused without hanging.
+- **Edits between steps:** edit the workspace between capture and click, and between click and commit. The approved record equals the capture shown, and nothing approves a version the tab didn't render.
+- **Hostile review page:** the review page shows A and the hash of A while the workspace holds B. The decision page shows B, and approving names B.
+- **Collisions:** a pair with equal 12-hex `skeletonVersion` gets distinct strict versions.
+- **Perception:** bidi, zero-width and confusable fixtures render visibly flagged.
+- **Re-read:** a cross-origin or bindingless Re-read is refused; a valid Re-read shows the diff.
+- **Notes:** with "I have notes" selected, nothing can be sent.
 
 ## (d) requestId retention and recovery (UX requirements for Sol's journal)
 
-These are requirements on behaviour. Storage is Sol's choice.
+These requirements follow #83 (`docs/strict-authority.md`) and strict-boundary.md. Storage is Sol's choice.
 
-- **R1. Retention.** A requestId and its original Result can be found at least until its session ends, across listener and authority restarts within the session.
-- **R2. Unknown ID with an intact journal** is processed as a new request. The first attempt never committed, and the intent's `expectedRevision` still guards against anything that has happened since. The page treats the answer like any other.
-- **R3. A journal that can't be trusted** (missing, corrupt or discontinuous) means the authority answers `unavailable` to everything until recovery finishes. If recovery can't reconstruct it, the session ends (`session-ended`). It never answers "not found, so process it as new" from a damaged journal.
-- **R4. After the session ends**, any requestId gets `session-ended`. The page then says the decision may or may not have landed and shows the last state it read.
-- **R5. Kept intents live only in tab memory.** A new or reloaded tab never offers Retry for an old intent; it re-reads AuthorityState, which settles approve (`approvedVersion` at or after the revision) and offers a fresh decision. The UI needs no lookup by ID.
-- **R6. Listener restart.** The port is per-launch, so an old tab's request fails as a network error. The page treats that as an unknown outcome (as today), then says "the decision service restarted: reopen the page from the launcher", and holds actions. The new tab's first read settles it.
+- **R1. Retention.** Committed results and terminal rejections stay findable, as #83 retains them, across listener and authority restarts. Invalid requests, wrong-channel attempts and `unavailable` host facts don't reserve an ID (#83), so a Retry after those is processed normally.
+- **R2. Unknown ID with a readable record** is processed as a new request. `expectedRevision` still guards against anything that happened since.
+- **R3. A missing or corrupt enrolled record is a refusal.**
+  - Every request refuses.
+  - A new session refuses too, until a reviewed outside-host recovery runs.
+  - State is never re-derived from `.skeleton/` or any public file, and a missing record never means "no skeleton" or "bootstrap".
+- **R4. Journal full.** At #83's 1024-entry cap, new transactions refuse without pruning, and existing retries still resolve. The page tells the two apart.
+- **R5. Session end.** If the record persists across sessions, the new session's AuthorityState answers whether an old decision landed (`approvedVersion` at or after the revision), and the page says so. Only when no state is readable does it say the outcome is unknown.
+- **R6. Kept intents live only in tab memory.** A new or reloaded tab never offers Retry for an old intent; it reads AuthorityState, which settles approve.
+- **R7. Listener restart.** The port is per-launch, so an old tab's request fails as a network error. The page treats that as an unknown outcome, tells the human to reopen from the control channel, and holds actions.
 
 Recovery copy, per state:
 
-| State | Copy (next step) |
+| State | Copy |
 |---|---|
 | Retry still unknown | "Still unconfirmed. Retry asks for the original answer; Re-read shows the current state." |
-| Authority recovering (R3) | "The decision service is recovering its records. Nothing is shown as approved. Wait, then Re-read." |
-| Listener gone (R6) | "This page's decision service has stopped. Reopen the page from the launcher; the new page shows whether the decision landed." |
-| Session ended (R4) | "The strict session ended. This page can't tell whether the last decision landed; start a new session through the launcher and check its state." |
+| Record missing or corrupt (R3) | "The strict record for this project can't be read, so every decision is refused, in this session and new ones, until the record is recovered outside this session. Don't edit or delete `.skeleton/` to work around it." |
+| Journal full (R4) | "The strict record is full, so new decisions are refused. Earlier decisions still resolve. It needs recovery outside this session." |
+| Listener gone (R7) | "This page's decision service has stopped. Reopen the page from the launcher's control window; the new page shows whether the decision landed." |
+| Session ended (R5) | "The strict session ended. Open the new session's decision page: its state shows whether the last decision landed." |
 
-**Needs from Sol.** R1 to R4 as journal behaviour. A ruling on whether R3 needs its own rejection code (`recovering`) or `unavailable` is enough. We think `unavailable` is enough, because the page's handling is the same.
-**Unproven.** All of it until the journal exists.
-**#79 tests.** Commit, then kill the authority before the reply, restart, retry the same ID: the original Result comes back. Same ID with a changed intent: `request-reused`. Corrupt the journal: every request is refused, nothing new commits, and a fresh session is required. Restart the listener mid-request: the old tab shows the R6 copy, and the new tab's state shows the true outcome. Reload the tab after `unavailable`: no Retry is offered, and the state settles it.
+**Needs from Sol.** R1 to R5 as journal behaviour, consistent with #83. A rejection code or evidence reason that distinguishes "record unreadable" and "journal full" from transient `unavailable`, because their copy differs: neither is fixed by retrying.
+
+**Unproven.** All of it until durable storage exists. #83's JSON reload tests aren't durable commits.
+
+**#79 tests.**
+
+- **Crash recovery:** commit, kill the authority before the reply, restart, retry the same ID; the original Result comes back.
+- **Changed intent:** the same ID with a changed intent gets `request-reused`.
+- **Corrupt or delete the record:** every request refuses, a new session also refuses, and deleting `.skeleton/` doesn't change that.
+- **Full journal:** fill to 1024 entries; new requests refuse and old retries resolve.
+- **Listener restart mid-request:** the old tab shows the R7 copy and the new tab shows the true outcome.
+- **Reload after `unavailable`:** no Retry is offered.
 
 ## (e) Status and skills integration (#78)
 
-**Status inside the boundary is advice, not a gate.** `skel status` and the skills run inside the agent's boundary. The agent can run any program, including a copy of skel that prints `active`, and can point any verifier at a file it wrote. So agent-side status can never be made unforgeable *to the agent*. It doesn't need to be: the writer refuses regardless of what status says. Two consequences:
+**Status inside the boundary is advice, not a gate.**
 
-- **The status the human trusts is shown outside:** on the decision page (from the listener) and on the launcher's terminal. Copy never tells the human to trust `skel status` in the agent transcript for strict.
-- **Inside, status routes:** it refuses early with the right recovery copy, and it keeps the skills from pretending to approve.
+- `skel status` and the skills run inside the boundary. The agent can run a copy of skel that prints `active`, or point a verifier at a file it wrote. So agent-side status can't be made unforgeable *to the agent*.
+- The human-trusted status is shown on the **control channel and the decision page**, never in the agent's terminal or transcript.
+- Inside, status routes: it refuses early, gives recovery copy, and keeps the skills from pretending to approve.
 
-**Who produces evidence.** Sol's authority signs RuntimeEvidence. The launcher puts it, and the context it binds to, in a **read-only** mount it supplies, refreshed by the authority. A production verifier, `launcherVerifier`, implements the existing interface `verify({projectId, sessionId}) → RuntimeEvidence`. It reads that mount, checks the signature with a public key pinned in the read-only install, and returns the evidence. `classifyEvidence` stays as it is: freshness caps, binding and profile.
+**In-boundary privileged CLI transitions always refuse in strict, even when active.** `skel approve`, `skel reshape` and `skel finalize` inside the boundary are never a strict writer, so in a strict project they refuse whatever status says. The only strict transition path is the decision page.
 
-**Identity.** Today `skel status` passes the project root as `projectId` and `null` as `sessionId`. In strict, both come from the launcher's read-only context, as the opaque authority-assigned IDs (strict-protocol IDs are not paths).
+- **Required code change for integration:** `refusePrivileged` in lib/strict-status.mjs returns `null` (allow) when status is active. Production wiring must not use it as the gate for in-boundary CLI transitions. Those need an unconditional strict refusal, and `refusePrivileged` stays a copy helper for status display.
+- The current copy ("refused until status shows active") must change to point at the decision page.
+
+**Who produces evidence.**
+
+- Sol's authority signs RuntimeEvidence and refreshes it into a **read-only** mount the launcher supplies, over a launcher-private Unix socket.
+- A production `launcherVerifier` implements the existing `verify({projectId, sessionId}) → RuntimeEvidence`. It reads the mount, checks the signature against a public key pinned in the read-only install, and returns the evidence.
+- `classifyEvidence` keeps the freshness caps, binding and profile checks.
+- Project and session IDs come from the launcher's read-only context, as opaque authority IDs. They are not the project root, which is what `skel status` passes today.
 
 **How `requested` is set.** Never from a project file, settings or environment.
 
-- **Under the launcher:** `requested: true` comes from the launcher's read-only context.
-- **Outside the launcher:** a host-level enrollment registry outside the workspace, written only by the launcher at enrollment, names enrolled projects. Plain skel reads it. A match gives `requested: true` and `unverified:launcher-absent`, so privileged actions refuse and nothing falls back silently. This registry can only make skel *more* restrictive: it can never produce `active`.
-- **Residual:** outside the launcher, the agent has full user access and can delete the registry entry. Then plain skel shows default mode. Private authority is unaffected (strict-boundary.md), and the next strict launch reports the divergence (below).
+- **Under the launcher:** from the launcher's read-only context.
+- **Outside the launcher:** from a host enrollment registry outside the workspace, written only by the launcher at enrollment. A match gives `requested: true` and `unverified:launcher-absent`, so privileged actions refuse and nothing falls back silently. The registry can only make status stricter, never `active`.
+- **Residual:** outside the launcher, the agent has full user access and can delete the registry entry. Private authority is unaffected (R3), and the next strict launch reports the divergence.
 
-**Recovery copy.** The existing reasons and copy in `lib/strict-status.mjs` stay. Proposed additions:
+**Recovery copy.** The existing reasons in lib/strict-status.mjs stay. Proposed additions:
 
 | Condition | Who detects | Proposed state / reason | Next step |
 |---|---|---|---|
-| Public `.skeleton/` disagrees with the authority (an approval made outside strict, or erased public state) | Authority, at launch or Re-read | `unverified:state-diverged` (new) | "This project's public review state doesn't match the strict record. Approve, reshape and finalize are refused. Review again from the decision page; don't edit `.skeleton/` to match." |
-| Authority recovering its journal | Authority | `unverified:evidence-stale` (existing) until fresh evidence returns | Existing copy |
-| Listener not running while evidence is fresh | Launcher | Not a status state. The launcher reports it on its terminal and its reopen command restarts the listener | "Reopen the decision page from the launcher." |
-| Skill asked to approve in strict | Skill | n/a | The skill tells the human to decide on the decision page the launcher opened and stops. It never runs `skel approve`, never asks for a token (current SKILL.md text already says this) |
+| Public `.skeleton/` disagrees with the authority | Authority, at launch or Re-read | `unverified:state-diverged` (new) | "This project's public review state doesn't match the strict record. Decisions go only through the decision page; don't edit `.skeleton/` to match." |
+| Record missing, corrupt or full | Authority | `unverified:authority-refusing` (new) | R3 or R4 copy |
+| Listener not running while evidence is fresh | Launcher | Not a status state; shown on the control channel | "Reopen the decision page from the control window." |
+| Skill asked to approve in strict | Skill | n/a | Tell the human to decide on the decision page, then stop. Never run `skel approve`, never ask for a token (SKILL.md already says this) |
 
-**Needs from Sol.** The evidence signature and pinned key. The read-only mount and its refresh, liveness, revocation and clock-rollback rules (the caps in `strict-status.mjs` stay provisional until then). Opaque IDs in the launcher context. The host enrollment registry: its location, who writes it, and that the launcher writes it. Whether `state-diverged` is evidence the authority emits or a local reason.
-**Unproven.** Liveness. A signed record proves origin, not that the authority is alive now. The proposal relies on short lifetimes plus refresh, and both need Sol's revocation design.
-**#79 tests.** Outside the launcher, with the project in the registry: `requested: true`, `unverified:launcher-absent`, privileged refused. An agent-written evidence file, an env var pointing the verifier at it, a replayed genuine record from an earlier session, and a record signed with another key: none reaches `active`. Delete public `.skeleton/` and relaunch: `state-diverged`, not "no skeleton". The skills, driven in a real session, never run a privileged command in strict and give the decision-page instruction. The default-mode status output and approve path are unchanged.
+**Needs from Sol.**
+
+- The evidence signature, the pinned key, and the read-only mount with its refresh.
+- Liveness, revocation and clock-rollback rules. The caps in strict-status.mjs stay provisional until then.
+- Opaque IDs in the launcher context.
+- The enrollment registry: its location, and that the launcher alone writes it.
+- Whether `state-diverged` and `authority-refusing` are emitted by the authority or derived locally.
+
+**Unproven.** Liveness: a signed record proves origin, not that the authority is alive now.
+
+**#79 tests.**
+
+- **Outside the launcher:** with a registry match, status shows `requested: true` and `unverified:launcher-absent`, and privileged actions refuse.
+- **Forged evidence:** an agent-written evidence file, an env var pointing the verifier at it, a replayed record from an earlier session, and a record signed with another key never reach `active`.
+- **CLI under active:** with status `active`, `skel approve`, `reshape` and `finalize` inside the boundary still refuse.
+- **Deleted public state:** delete `.skeleton/` and relaunch; the result is `state-diverged`, not "no skeleton".
+- **Skills:** in a real session, the skills never run a privileged command in strict.
+- **Default mode:** status and approve behave as before.
 
 ## Questions for Sol
 
-1. (a) Do you accept a host-netns loopback listener on a per-launch port, opened by the launcher with a nonce? And an inward-only forward for `skel serve`?
-2. (a) Will the egress design refuse loopback, host and WSL-gateway addresses?
-3. (b) Should the listener alone check the tab binding, with the authority never seeing it?
-4. (c) Will the authority capture content per round, serve it read-only to the listener page, and verify the captured bytes at commit? And use a full-length strict `reviewVersion` (the 12-hex version is collision-prone against an adversarial agent)?
-5. (c) Is the baselined coverage set part of what the human approves in strict?
-6. (d) Do you accept journal requirements R1 to R4? Is `unavailable` enough while recovering, or do you want a separate code?
-7. (e) How is evidence signed and refreshed, and what are its lifetime and revocation rules? Who writes the host enrollment registry, and where does it live?
-8. (e) Should `state-diverged` be emitted by the authority or derived locally?
+1. (a) Which control channel: a separate launcher-owned terminal or window, or page-only controls? Will it echo every committed transition?
+2. (a) Is the listener the only TCP endpoint, with everything internal on launcher-private Unix sockets? Will the launcher add trust-map entries for the inward `skel serve` forward and for browser-side exfiltration?
+3. (a) Will egress refuse the full address list, checked on the connected address? Will the launcher refuse to start when interop, a writable `/mnt/*`, a session bus, a browser opener or a debugging port is visible? Will it open the page in a fresh browser profile?
+4. (b) Does the listener alone check the tab binding? Is the nonce exchange a POST from page script?
+5. (c) Do you accept capture rules C1 (no subprocess or git, no symlinks, regular files only, caps, least privilege) and the scan split? Do you accept a full SHA-256 over the canonical served capture, with the capture as the approved record?
+6. (c) Is Re-read/recapture the "refresh reviewable version" host operation #83 leaves open? Is the coverage set part of what the human approves?
+7. (d) Do you accept R1 to R5, consistent with #83? Which codes or reasons distinguish an unreadable record and a full journal from `unavailable`?
+8. (e) How is evidence signed and refreshed, and what are its lifetime and revocation rules? Who writes the enrollment registry? Are `state-diverged` and `authority-refusing` authority-emitted or local?
