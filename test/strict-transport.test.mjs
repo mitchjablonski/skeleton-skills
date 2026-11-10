@@ -563,6 +563,35 @@ test("#77: reshape names the approved version and needs the page to agree", asyn
   assert.match(action(off.ctl.view(), "reshape").reason, /doesn't match/);
 });
 
+test("#77 #83: a committed reshape confirms on the rotated review round", async () => {
+  const shown = { phase: "fill", reviewVersion: VERSION_A, approvedVersion: VERSION_A, pendingNotes: false };
+  const { auth, ctl } = await setup({ state: AUTHORITY_STATES.fill, shown });
+  assert.deepEqual(await ctl.decide("reshape"), { kind: "committed", revision: 6 });
+  assert.equal(auth.state.reviewRoundId, "example-round-after-r6", "the mock rotates the round, as #83 does");
+  const v = ctl.view();
+  assert.equal(v.message.title, "Reshape recorded", "not 'Recorded, but the state differs'");
+  assert.equal(v.status, "ready");
+  assert.equal(v.identity.reviewRoundId, "example-round-after-r6");
+  assert.equal(v.approved, null, "a reshape is never shown as an approval");
+});
+
+test("#77 #83: reshape and approve confirmation rules around the round", () => {
+  const reshape = intentFor(AUTHORITY_STATES.fill, "reshape", "rs-1"); // round example-round, expects rev 5
+  const rotated = { ...AUTHORITY_STATES.fill, reviewRoundId: "example-round-2", phase: "skeleton", approvedVersion: null, revision: 6 };
+  assert.equal(skelDecisionConfirms(rotated, reshape, 6), true, "rotated round, skeleton, no approval, at the commit");
+  assert.equal(skelDecisionConfirms({ ...rotated, revision: 9 }, reshape, 6), true, "later revisions too");
+  assert.equal(skelDecisionConfirms({ ...rotated, revision: 5 }, reshape, 6), false, "older than the commit");
+  assert.equal(skelDecisionConfirms({ ...rotated, reviewRoundId: "example-round", revision: 5 }, reshape, 6), false, "old round, lower revision");
+  assert.equal(skelDecisionConfirms({ ...rotated, reviewRoundId: "example-round" }, reshape, 6), false, "a reshape that didn't rotate isn't the one #83 commits");
+  assert.equal(skelDecisionConfirms({ ...rotated, phase: "fill", approvedVersion: VERSION_A }, reshape, 6), false);
+  assert.equal(skelDecisionConfirms({ ...rotated, sessionId: "other-session" }, reshape, 6), false);
+  assert.equal(skelDecisionConfirms({ ...rotated, projectId: "other-project" }, reshape, 6), false);
+  const approve = intentFor(AUTHORITY_STATES.skeleton, "approve", "ap-1");
+  const filled = { ...AUTHORITY_STATES.skeleton, phase: "fill", approvedVersion: VERSION_A, revision: 5 };
+  assert.equal(skelDecisionConfirms(filled, approve, 5), true);
+  assert.equal(skelDecisionConfirms({ ...filled, reviewRoundId: "example-round-2" }, approve, 5), false, "approve keeps the same-round rule");
+});
+
 test("#77: an unreadable or malformed state turns decisions off", async () => {
   for (const getState of [async () => { throw new Error("down"); }, async () => ({ ...AUTHORITY_STATES.skeleton, revision: "4" }), async () => null]) {
     const ctl = skelDecisionController({ channel: { getState, submit: async () => assert.fail("no submit") }, shown: SHOWN, newRequestId: ids() });
