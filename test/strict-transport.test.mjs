@@ -16,7 +16,7 @@ import {
   AUTHORITY_STATES, INTENTS, RESULTS, STRICT_ACTIONS, STRICT_REJECTIONS, VERSION_A, VERSION_B,
   committedFor, createMockAuthority, intentFor, parseAuthorityState, parseStrictIntent, parseStrictResult,
 } from "./fixtures/strict-results.mjs";
-import { skelDecisionConfirms, skelDecisionController, skelDecisionOutcome, skelDecisionRender, skelMountDecision } from "../lib/review-decision.mjs";
+import { SKEL_DECISION_REJECTION, skelDecisionConfirms, skelDecisionController, skelDecisionOutcome, skelDecisionRender, skelMountDecision } from "../lib/review-decision.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LIB = path.join(HERE, "..", "lib");
@@ -148,13 +148,13 @@ test("#77: a committed answer that doesn't match the intent is never shown as ap
 });
 
 const COPY = {
-  "stale-review": /aaaaaaaaaaaa is no longer the version under review, so nothing was approved\. .*Reload the review/,
-  "revision-conflict": /nothing was approved from this tab\. The current state has been re-read/,
-  "invalid-transition": /Approve skeleton isn't allowed while the skeleton is in the skeleton phase\. Nothing changed\./,
+  "stale-review": /aaaaaaaaaaaa is no longer the version under review, so this request was refused and made no change\. .*Reload the review/,
+  "revision-conflict": /after this page read it, so this request was refused and made no change\. The current state has been re-read/,
+  "invalid-transition": /Approve skeleton isn't allowed while the skeleton is in the skeleton phase, so this request was refused and made no change\./,
   "unauthorized-channel": /didn't arrive through the protected human channel.*Copy\/Send feedback still work/,
-  "session-ended": /session this review belongs to has ended, so nothing changed\. Decisions from this page are off/,
-  unavailable: /answered "unavailable", so whether the request for aaaaaaaaaaaa was recorded is unknown, and it is not shown as approved\. Retry sends the same request/,
-  "request-reused": /already used for a different decision, so nothing new was recorded/,
+  "session-ended": /session this review belongs to has ended, so this request was refused and made no change\. That doesn't show whether an earlier request committed\. Decisions from this page are off/,
+  unavailable: /answered "unavailable", so whether the request for aaaaaaaaaaaa was recorded is unknown, and it is not shown as approved\. Retry sends the same request.*Re-read shows the current state, which can't show whether this request was recorded/,
+  "request-reused": /already used for a different decision, so this request was refused and recorded nothing/,
 };
 
 for (const code of REJECTION_CODES) {
@@ -480,7 +480,7 @@ for (const [name, lose] of [["unavailable", "unavailable"], ["a lost answer", "t
     await ctl.load();
     v = ctl.view();
     assert.equal(v.message.title, "Still unconfirmed");
-    assert.match(v.message.text, /phase fill, review round example-round, revision 5, version under review aaaaaaaaaaaa, approved version aaaaaaaaaaaa\. Whether the request for aaaaaaaaaaaa landed is still unconfirmed/);
+    assert.match(v.message.text, /phase fill, review round example-round, revision 5, version under review aaaaaaaaaaaa, approved version aaaaaaaaaaaa\. The current state can't show whether the request for aaaaaaaaaaaa was recorded, so it is still unconfirmed/);
     assert.equal(v.approved, null, "a re-read alone never shows approval");
     await ctl.setShown({ ...SHOWN, pendingNotes: false });
     assert.deepEqual(await ctl.decide("approve"), { kind: "committed", revision: 5 }, "same id: the original answer");
@@ -575,6 +575,24 @@ test("#77 #83: a committed reshape confirms on the rotated review round", async 
   assert.equal(v.approved, null, "a reshape is never shown as an approval");
 });
 
+test("#77 #83: the mock's reshape can also set the new version under review, as #83's host contentVersion does", async () => {
+  const shown = { phase: "fill", reviewVersion: VERSION_A, approvedVersion: VERSION_A, pendingNotes: false };
+  const auth = createMockAuthority({ state: AUTHORITY_STATES.fill, nextReviewVersion: () => VERSION_B });
+  const ctl = skelDecisionController({ channel: auth, shown, newRequestId: ids() });
+  await ctl.load();
+  assert.deepEqual(await ctl.decide("reshape"), { kind: "committed", revision: 6 });
+  assert.deepEqual(auth.state, { ...AUTHORITY_STATES.fill, phase: "skeleton", approvedVersion: null, reviewRoundId: "example-round-after-r6", reviewVersion: VERSION_B, revision: 6 });
+  assert.ok(parseAuthorityState(auth.state));
+  assert.equal(auth.calls.submit[0].reviewVersion, VERSION_A, "the intent still names the approved version");
+  const v = ctl.view();
+  assert.equal(v.message.title, "Reshape recorded");
+  assert.equal(v.identity.reviewVersion, VERSION_B);
+  // Without the option, the version under review is unchanged (the existing behaviour).
+  const plain = createMockAuthority({ state: AUTHORITY_STATES.fill });
+  await plain.submit(INTENTS.reshape);
+  assert.equal(plain.state.reviewVersion, VERSION_A);
+});
+
 test("#77 #83: reshape and approve confirmation rules around the round", () => {
   const reshape = intentFor(AUTHORITY_STATES.fill, "reshape", "rs-1"); // round example-round, expects rev 5
   const rotated = { ...AUTHORITY_STATES.fill, reviewRoundId: "example-round-2", phase: "skeleton", approvedVersion: null, revision: 6 };
@@ -599,7 +617,39 @@ test("#77: an unreadable or malformed state turns decisions off", async () => {
     const v = ctl.view();
     assert.equal(v.identity, null);
     assert.deepEqual(v.actions, []);
-    assert.match(v.message.text, /decisions are off\. Nothing changed/);
+    assert.match(v.message.text, /decisions are off\. Reading the state never changes it/);
+  }
+});
+
+// R6 (docs/strict-decision-page.md): no copy may imply that a Re-read, a
+// reload or the current state settles whether an earlier request committed.
+// Only the same-id Retry answer, or an authoritative journal lookup, can.
+const R6_OVERCLAIMS = [
+  /\blanded\b/i,
+  /\btook effect\b|\btakes effect\b/i,
+  /\bnothing (new )?(was |has been |is )?(approved|reshaped|finali[sz]ed|recorded|changed|\$\{)/i,
+  /\b(re-?read(ing)?|reload(ing)?|the current state)\b[^.]*\b(shows|confirms|settles|tells you|will show) whether/i,
+  /\bcheck whether (it|the request|the decision)\b/i,
+];
+
+test("#77 R6: no decision message claims a Re-read, reload or current state settles an earlier outcome", () => {
+  // Every string and template literal in the module (message copy, titles, reasons) ...
+  const literals = DECISION.match(/"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`/g);
+  assert.ok(literals.length > 40, "the scan found the module's strings");
+  for (const known of ["Couldn't confirm whether the decision was recorded", "The current state can't show whether", "has ended, so this request was refused"]) {
+    assert.ok(literals.some((l) => l.includes(known)), `the scan covers: ${known}`);
+  }
+  // ... and every rejection's rendered copy, for both offered actions.
+  const rendered = Object.keys(SKEL_DECISION_REJECTION).flatMap((code) => [
+    { label: "Approve skeleton", done: "approved" }, { label: "Reshape", done: "reshaped" },
+  ].map((w) => { const m = SKEL_DECISION_REJECTION[code]({ ...w, version: VERSION_A, phase: "skeleton" }); return `${m.title} ${m.text}`; }));
+  assert.deepEqual(Object.keys(SKEL_DECISION_REJECTION).sort(), [...REJECTION_CODES].sort());
+  for (const text of [...literals, ...rendered]) {
+    for (const bad of R6_OVERCLAIMS) assert.doesNotMatch(text, bad, `overclaims a historical outcome: ${text}`);
+  }
+  // The scan itself catches the phrasings it is for.
+  for (const old of ["Whether the request landed is unconfirmed.", "Re-read to see whether it took effect.", "so nothing was approved.", "so nothing was ${c.done}.", "Nothing changed.", "Re-read shows whether it was recorded."]) {
+    assert.ok(R6_OVERCLAIMS.some((re) => re.test(old)), old);
   }
 });
 
