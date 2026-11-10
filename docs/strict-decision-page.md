@@ -162,36 +162,43 @@ The controller's `shown` value (version and pending notes) has no trustworthy so
   - Before any open, whatever the API, every path is refused if it is absolute or contains `..`, an empty component or NUL.
   - Every open resolves beneath the workspace without following any symlink (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, or a component-by-component walk with `O_NOFOLLOW`).
   - It takes regular files only (refusing FIFOs, devices and sockets), and refuses hard links (`st_nlink > 1`) unless Sol can bound them another way.
-  - It reads with `fstat` on the open descriptor and caps per-file size, file count and total bytes.
+  - It reads with `fstat` on the open descriptor and caps per-file size, file count, total bytes, directory depth and entries per directory.
+  - A file that is renamed, replaced or changes type between the walk and its open fails the capture.
   - It runs with least privilege: a capture process that can read only the workspace, never the private store or the user's home.
 - **The host parses, the agent only suggests.** Fences must never come from the agent: an agent could report a fence range covering malicious exterior lines that carry no SKEL markers, and the host would drop them as body, so they'd never be drawn, approved or drift-checked.
   - The host parses SKEL markers in pure JS from the bytes it read and derives the exteriors and the fence set itself.
   - An agent-supplied list contributes **candidate paths only**. Per #83, host facts never come from request JSON.
-  - The host runs its own no-follow, pure-JS walk of the workspace for files containing `SKEL[`, under a fixed ignore policy the host owns (not the project's `.gitignore` alone, which the agent writes). A file the candidate list omits is added and flagged on the page. If the walk can't complete within its caps, capture refuses.
-  - Drift checks and finalize use this host enumeration, never the agent's list.
+  - The host runs its own no-follow, pure-JS walk of the workspace for files containing `SKEL[`. A file the candidate list omits is added and flagged on the page. If the walk can't complete within its caps, capture refuses.
+  - **The walk's ignore policy is fixed in the host.** No project-controlled file can exclude anything from it: not `.gitignore`, `.git/info/exclude`, a `.skelignore`, or any setting in the workspace. The proposed policy skips only `.git/`, `.hg/`, `.svn/` and `node_modules/` directories, matched by exact name. It is narrower than the default `SKIP_DIRS` in lib/markers.mjs (which also skips `build`, `dist`, `target` and others) and doesn't depend on it. The policy only limits where *new* files are found. It can never remove a file that is already in an approved capture (next bullet).
+  - **No silent drops within a capture.** A file the walk or candidate list names that then fails a capture rule (over a cap, a link, special, non-UTF-8, a BOM, a malformed or unmatched marker) fails the whole capture, with the file and reason shown. It is never dropped. The one alternative, for malformed markers only, is to show that file whole as exterior with no fences; this proposal refuses instead, since a whole file the human doesn't expect is easy to miss.
+- **Drift and finalize check the approved list, not a new enumeration.** After approval the agent could thin out a fresh enumeration: grow a file past a cap, add a hard link, swap in a symlink, move it under a skipped directory, add a NUL or a binary extension, add an unmatched marker, or delete it. So drift and finalize check **every file in the approved capture's list**, under the same capture rules. Any approved file that is missing, over a cap, linked, special, non-UTF-8, malformed or newly skipped counts as drift and fails. The host walk is used on top of that only to find new marker files.
 
 **C2. The capture is the approved record.**
 
-- The capture is stored privately, content-addressed.
-- `reviewVersion` is a full SHA-256 over a **canonical, length-prefixed serialization of exactly the exteriors and fence set served to the page**: each path, its exterior lines and its fence ids and titles, in sorted order. Fence bodies are excluded, matching #83's `contentVersion`, so a fill doesn't change the approved version and drift compares exteriors only. That replaces the default `skeletonVersion`, which keeps 12 hex characters (48 bits, lib/snapshot.mjs). An agent can find two colliding skeletons in about 2^24 tries, show one and swap in the other. Strict doesn't extend the short hash; it hashes the served capture.
+- The capture is stored privately, content-addressed. Approved captures are referenced from the authority journal by version and retained under the record's integrity and anti-rollback protection. Losing or corrupting the capture store is an unreadable record (R3).
+- `reviewVersion` is a full SHA-256 over a **canonical, length-prefixed serialization of exactly the exteriors and fence set served to the page**: each path, its **raw exterior bytes** and its fence ids and titles, in sorted order. Fence bodies are excluded, matching #83's `contentVersion`, so a fill doesn't change the approved version and drift compares exteriors only. That replaces the default `skeletonVersion`, which keeps 12 hex characters (48 bits, lib/snapshot.mjs). An agent can find two colliding skeletons in about 2^24 tries, show one and swap in the other. Strict doesn't extend the short hash; it hashes the served capture.
 - The approved record **is** the capture, not a later re-read. A torn or racing workspace read at commit time affects only drift detection, never what was approved.
 
 **C3. The page shows what it was given, in a form a human can perceive.**
 
 - Capture pages are fetched by capture version, so one view never mixes two captures.
+- **Encoding.** Capture refuses files that aren't valid UTF-8 and files with a BOM (C1, no silent drops). So the bytes hashed and the text drawn match one to one, and a U+FFFD replacement character can't hide a byte swap.
+- **Line breaks.** The page splits lines the way a human reads them, not only on `\n`. Today's `exterior()` splits on `\n` alone, so `// note\rrunEvil();` draws as one comment line but runs the second statement in languages that treat a lone CR as a line end. The page shows lone CR, U+2028, U+2029, vertical tab, form feed and NEL (U+0085) as visible escapes, and starts a new displayed line at each.
 - Drawn text isn't necessarily what the human perceives, so the page:
   - shows bidi controls, zero-width and other invisible characters as visible escapes;
   - wraps long lines (nothing hides past the right edge);
   - flags non-ASCII and confusable characters in paths and identifiers.
+- **Fences are lexical.** The parser finds SKEL markers as text, so markers inside a multi-line string literal or comment can put "body" at what is really exterior level. The page shows each fence with its surrounding exterior lines, so the human can judge where the fence actually sits.
 - Paging shows "you've viewed n of m files" next to Approve.
 
 **C4. Re-read and Recapture are separate actions.**
 
 - **Re-read (refresh state)** keeps the meaning it has in strict-transport.md section 4 and lib/review-decision.mjs. It's a GET of AuthorityState that changes nothing, keeps a kept intent and its Retry, and is the recovery action after an unknown outcome.
 - **Recapture** is new. It asks the authority to capture the workspace again, which can change `reviewVersion`. It's a POST behind the same Origin, Fetch Metadata and binding checks, and the host operation #83 leaves unspecified ("refreshing a changed draft's reviewable version").
-  - **Unchanged content** writes no journal entry. Recapture never counts toward #83's 1024-entry transaction cap; captures are kept apart from the transaction journal.
-  - **Changed content** moves the page (`setShown`), which discards any kept intent. If a Retry is pending with an unknown outcome, the page says "Recapture ends the pending Retry; Re-read first to see whether it landed" and asks for confirmation.
-- **When capture happens.** The first capture is made when a review round opens: at registration, or after reshape rotates the round (#83). Later captures happen only when the human presses Recapture, never at the agent's request.
+  - **Unchanged content** writes no journal entry.
+  - **Changed content** moves `AuthorityState.reviewVersion`, so it is a journaled state change. Otherwise #83's replay of the journal wouldn't reproduce the current state. It shouldn't consume the 1024-entry transaction cap, so we ask Sol for a separate allowance for recapture entries, or an equivalent.
+  - On the page, a changed capture moves the page (`setShown`), which discards any kept intent. If a Retry is pending with an unknown outcome, the page says "Recapture ends the pending Retry; Re-read first to see whether it landed" and asks for confirmation.
+- **When capture happens.** The first capture is made when a review round opens: at registration, or after reshape rotates the round (#83). Later captures happen only when the human presses Recapture, never at the agent's request. Registration comes before the agent scaffolds, so that first capture is usually empty or partial. The page says so: "This capture was taken before the skeleton was written. Press Recapture when the agent says the skeleton is ready." The first real review is therefore a human Recapture.
 - **In fill**, the approved version is fixed. Recapture there is a drift view only: it shows the current exteriors against the approved capture, writes nothing, and moves neither `reviewVersion` nor `approvedVersion`. Reshape names the approved version and opens a new round, which gets its own first capture.
 - After a Recapture, the page shows a **diff against the previously rendered capture and against the approved capture**, including files removed since then, so a change or an omission is visible.
 - The page never live-reloads, and the tab's `shown.reviewVersion` is always the capture it rendered.
@@ -207,9 +214,11 @@ The declaration sets `shown.pendingNotes`. The listener takes no notes, because 
 
 **Needs from Sol.**
 
-- Capture under C1: path validation, no-follow reads, a pure-JS marker parse and host enumeration.
+- Capture under C1: path validation, no-follow reads, a pure-JS marker parse, host enumeration under a fixed ignore policy, and no silent drops.
+- Drift and finalize checking every approved file.
 - Content-addressed private storage and the canonical exterior/fence-set serialization.
-- Recapture as a host operation outside the transaction cap, and a definition of when first capture happens.
+- Recapture as a journaled host operation with its own allowance outside the transaction cap, and a definition of when first capture happens.
+- Approved captures referenced from the journal and covered by its integrity and anti-rollback protection.
 - A read-only, version-addressed capture route.
 - A ruling on whether the baselined coverage set is part of what the human approves (today it isn't).
 
@@ -223,7 +232,11 @@ The declaration sets `shown.pendingNotes`. The listener takes no notes, because 
 - **Hostile `.git/config` and hooks:** `core.fsmonitor`, filters and hooks never execute during capture.
 - **Paths:** candidate entries `../x`, `a/../../x`, `/etc/passwd`, `a//b` and a NUL-containing path are refused before any open.
 - **Links:** a symlink to a host file, a symlink swapped in during capture (TOCTOU), a symlinked parent directory and a hard link to a host file are all refused, and no host bytes enter the capture or the public snapshot.
-- **Special and oversized files:** a FIFO, a device node, a huge file and too many files are refused without hanging.
+- **Special and oversized files:** a FIFO, a device node, a huge file, too many files, a too-deep tree and a directory with too many entries all fail the capture without hanging. No file is silently dropped. A file renamed between walk and open fails the capture.
+- **Thinning after approval:** after approval, take an approved file and separately grow it past the size cap, hard-link it, replace it with a symlink, move it under `build/` and under `node_modules/`, add a NUL, give it a binary extension, add an unmatched marker, and delete it. Each one fails drift and finalize.
+- **Project ignore files:** a `.gitignore`, `.git/info/exclude` or `.skelignore` naming a marker file has no effect on the host walk.
+- **Encoding and line breaks:** a non-UTF-8 file and a BOM file fail the capture. `// note\rrunEvil();`, and the same with U+2028, U+2029, VT, FF and NEL, draw as visibly separate lines with escapes.
+- **Lexical fences:** markers inside a multi-line string literal show with their surrounding exterior lines.
 - **Edits between steps:** edit the workspace between capture and click, and between click and commit. The approved record equals the capture shown, and nothing approves a version the tab didn't render.
 - **Hostile review page:** the review page shows A and the hash of A while the workspace holds B. The decision page shows B, and approving names B.
 - **Fences:** a candidate list claiming a fence range over unmarked malicious exterior lines; the host's own parse draws and versions those lines as exterior.
@@ -231,7 +244,7 @@ The declaration sets `shown.pendingNotes`. The listener takes no notes, because 
 - **Fill:** fill a step after approval; the strict version of the exteriors is unchanged and drift passes.
 - **Collisions:** a pair with equal 12-hex `skeletonVersion` gets distinct strict versions.
 - **Perception:** bidi, zero-width and confusable fixtures render visibly flagged.
-- **Re-read and Recapture:** Re-read changes nothing and keeps a pending Retry. A cross-origin or bindingless Recapture is refused. An unchanged Recapture writes no journal entry, and 2000 unchanged Recaptures don't reach the transaction cap. A changed Recapture shows the diff and warns before ending a pending Retry.
+- **Re-read and Recapture:** Re-read changes nothing and keeps a pending Retry. A cross-origin or bindingless Recapture is refused. An unchanged Recapture writes no journal entry, and 2000 unchanged Recaptures don't reach the transaction cap. A changed Recapture is journaled, and replaying the journal reproduces the current `reviewVersion`. Deleting the capture store gives the R3 refusal. A changed Recapture shows the diff and warns before ending a pending Retry.
 - **Notes:** with "I have notes" selected, nothing can be sent.
 
 ## (d) requestId retention and recovery (UX requirements for Sol's journal)
@@ -240,7 +253,7 @@ These requirements follow #83 (`docs/strict-authority.md`) and strict-boundary.m
 
 - **R1. Retention.** Committed results and terminal rejections stay findable, as #83 retains them, across listener and authority restarts. Invalid requests, wrong-channel attempts and `unavailable` host facts don't reserve an ID (#83), so a Retry after those is processed normally. **Limit:** a restored older backup forgets request IDs and permits their reuse (#83 strict-authority.md); preventing that needs Sol's anti-rollback mechanism.
 - **R2. Unknown ID with a readable record** is processed as a new request. `expectedRevision` still guards against anything that happened since.
-- **R3. A missing or corrupt enrolled record is a refusal.**
+- **R3. A missing or corrupt enrolled record is a refusal.** That includes the capture store: a missing or corrupt approved capture counts as an unreadable record.
   - Every request refuses.
   - A new session refuses too, until a reviewed outside-host recovery runs.
   - State is never re-derived from `.skeleton/` or any public file, and a missing record never means "no skeleton" or "bootstrap".
@@ -332,7 +345,7 @@ Recovery copy, per state:
 2. (a) Is the listener the only TCP endpoint, with everything internal on launcher-private Unix sockets? Will the launcher add trust-map entries for the inward `skel serve` forward and for browser-side exfiltration?
 3. (a) Will egress refuse the full address list, checked on the connected address? Will the launcher refuse to start when interop, a non-workspace `/mnt/*` mount, a session bus or a browser opener is visible? Will it open the page in a fresh, launcher-private profile created on every launch? Can #75 keep `.git/config`, `.git/hooks` and `.git/info` read-only inside the boundary, or is host git a recorded residual?
 4. (b) Does the listener alone check the tab binding? Is the nonce exchange a POST from page script?
-5. (c) Do you accept capture rules C1: path validation before open, no subprocess or git, no symlinks, regular files only, caps, least privilege, a host-side pure-JS marker parse, and host enumeration with agent paths as candidates only? Do you accept a full SHA-256 over the served exteriors and fence set, with the capture as the approved record?
-6. (c) Is Recapture the "refresh reviewable version" host operation #83 leaves open, kept off the transaction cap and writing nothing when unchanged? Is first capture at round open right? Is the coverage set part of what the human approves?
+5. (c) Do you accept capture rules C1: path validation before open, no subprocess or git, no symlinks, regular files only, caps, least privilege, a host-side pure-JS marker parse, and host enumeration with agent paths as candidates only, under a fixed ignore policy no project file can change, with no silent drops? Will drift and finalize check every approved file? Do you accept a full SHA-256 over the served exteriors and fence set, with the capture as the approved record?
+6. (c) Is Recapture the "refresh reviewable version" host operation #83 leaves open? When content changes, is it journaled with its own allowance outside the transaction cap, and does it write nothing when unchanged? Are approved captures retained under the record's integrity and anti-rollback protection? Is first capture at round open right? Is the coverage set part of what the human approves?
 7. (d) Do you accept R1 to R5, consistent with #83? Which codes or reasons will distinguish an unreadable record and a full journal from `unavailable` (today both are `unavailable`)? Is there an anti-rollback plan for restored backups?
 8. (e) How is evidence signed and refreshed, and what are its lifetime and revocation rules? Who writes the enrollment registry? Are `state-diverged` and `authority-refusing` authority-emitted or local?
