@@ -237,3 +237,20 @@ test("unsupported platforms refuse before touching supplied paths or initial sta
   assert.throws(() => openAuthorityStore(hostile), /requires Linux/);
   assert.equal(touched, false);
 });
+
+storeTest('v2 exact-capture commits and terminal refusals survive stored reopen without downgrade',t=>{
+  const {dir,record}=fixture(t);const shape='a'.repeat(64),raw='b'.repeat(64),other='c'.repeat(64);
+  const state={...initial(),protocolVersion:2,reviewVersion:shape,captureVersion:raw,approvedCaptureVersion:null};
+  const req={...request(),protocolVersion:2,reviewVersion:shape,captureVersion:raw};
+  const host={...facts(),contentVersion:shape,captureVersion:raw};
+  createAuthorityStore(dir,state);
+  const refused=openAuthorityStore(dir).submit(req,{...host,captureVersion:other});assert.equal(refused.code,'stale-review');
+  assert.deepEqual(openAuthorityStore(dir).submit(req,null),refused);
+  const accepted={...req,requestId:'accepted'};const result=openAuthorityStore(dir).submit(accepted,host);
+  assert.equal(result.kind,'committed');assert.equal(result.protocolVersion,2);assert.equal(result.captureVersion,raw);
+  assert.deepEqual(openAuthorityStore(dir).submit(accepted,null),result);
+  assert.equal(openAuthorityStore(dir).submit({...accepted,captureVersion:other},null).code,'request-reused');
+  assert.equal(record().protocolVersion,2);assert.equal(record().state.approvedCaptureVersion,raw);
+  const corrupt=record();delete corrupt.journal[1].result.captureVersion;
+  fs.writeFileSync(path.join(dir,'authority.json'),JSON.stringify(corrupt));assert.throws(()=>openAuthorityStore(dir));
+});

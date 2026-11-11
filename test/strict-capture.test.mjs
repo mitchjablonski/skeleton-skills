@@ -206,3 +206,20 @@ linuxTest('line caps bound whole visual display before allocation and reconstruc
  write('one','a\n');write('two','b\n');assert.throws(()=>capture([entry('one'),entry('two')],{maxTotalLines:3}),e=>e.code==='CAPTURE_LINE_LIMIT');
  assert.equal(capture([entry('one'),entry('two')],{maxTotalLines:4}).files.length,2);
 });
+
+linuxTest('native errno mapping ignores keyword filenames and failure messages', t => {
+ const {write,capture,root}=fixture(t);
+ for(const name of ['account','SKEL_x','BOM_notes']) {
+  assert.throws(()=>capture([entry(name)]),e=>e.code==='CAPTURE_MISSING'&&e.path===name);
+  write(name,'text');
+  const original=fs.openSync;
+  fs.openSync=function(file,...args){if(typeof file==='string'&&file.endsWith('/'+name))throw Object.assign(Error('/proc/private SKEL BOM changed limit'),{code:'EACCES'});return original(file,...args);};
+  try {assert.throws(()=>capture([entry(name)]),e=>e.code==='CAPTURE_IO'&&e.reason==='EACCES'&&e.path===name&&!e.message.includes('/proc/'));} finally {fs.openSync=original;}
+ }
+ write('limit',fenced('body'));assert.throws(()=>capture([entry('limit','fenced')],{maxFileLines:2}),e=>e.code==='CAPTURE_LINE_LIMIT');
+ assert.throws(()=>capture([entry('limit')],{maxFileBytes:1}),e=>e.code==='CAPTURE_LIMIT');
+ write('text',Buffer.from([255]));assert.throws(()=>capture([entry('text')]),e=>e.code==='CAPTURE_TEXT'&&e.path==='text');
+ write('changed','before');const read=fs.readSync;let changed=false;
+ fs.readSync=function(...args){const n=read(...args);if(!changed&&n){changed=true;fs.appendFileSync(path.join(root,'changed'),'after');}return n;};
+ try{assert.throws(()=>capture([entry('changed')]),e=>e.code==='CAPTURE_CHANGED'&&e.path==='changed');}finally{fs.readSync=read;}
+});

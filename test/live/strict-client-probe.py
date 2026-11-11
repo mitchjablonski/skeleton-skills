@@ -19,6 +19,18 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 INNER = ROOT / "test" / "live" / "strict-tools-inner.mjs"
 TIMEOUT_SECONDS = 120
 MAX_OUTPUT = 16 * 1024
+EXPECTED_INNER_CHECKS = frozenset({
+    "clientExitZero",
+    "exactlyFiveToolResults",
+    "workspaceReadReturnedFixture",
+    "workspaceEditApplied",
+    "absolutePublicControlReadable",
+    "privateReadReportsMissingPath",
+    "bashRanWithWorkspaceControlAndPrivatePathUnavailable",
+    "noOutputOverflow",
+    "noMalformedApiRequests",
+    "apiOfferedOnlyFixedTools",
+})
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -77,6 +89,24 @@ def decode_capture(data: bytes) -> str:
     if len(text) > MAX_OUTPUT:
         return text[:MAX_OUTPUT] + "...[truncated]"
     return text
+
+
+def validate_inner_checks(raw_checks: object) -> dict:
+    """Require the exact known check set, with every item a literal True."""
+    checks = raw_checks if isinstance(raw_checks, dict) else {}
+    observed = set(checks)
+    missing = sorted(EXPECTED_INNER_CHECKS - observed)
+    unexpected = sorted(observed - EXPECTED_INNER_CHECKS)
+    non_boolean = sorted(name for name in observed & EXPECTED_INNER_CHECKS if type(checks[name]) is not bool)
+    false = sorted(name for name in observed & EXPECTED_INNER_CHECKS if type(checks[name]) is bool and checks[name] is False)
+    return {
+        "valid": not (missing or unexpected or non_boolean or false),
+        "expectedNames": sorted(EXPECTED_INNER_CHECKS),
+        "missingNames": missing,
+        "unexpectedNames": unexpected,
+        "nonBooleanNames": non_boolean,
+        "falseNames": false,
+    }
 
 
 def main() -> int:
@@ -210,7 +240,10 @@ def main() -> int:
                     "stderr": decode_capture(stderr),
                 }, 1)
 
-            checks = dict(inner.get("checks", {}))
+            raw_inner_checks = inner.get("checks")
+            check_validation = validate_inner_checks(raw_inner_checks)
+            checks = dict(raw_inner_checks) if isinstance(raw_inner_checks, dict) else {}
+            checks["innerCheckSetValid"] = check_validation["valid"]
             checks["outerProcessExitZero"] = process.returncode == 0
             checks["privateHostReceiptUnchanged"] = private_unchanged
             inside_namespaces = inner.get("insideNamespaces") or {}
@@ -223,7 +256,14 @@ def main() -> int:
                 and inside_namespaces["pid"] != outer_namespaces["pid"]
             )
             inner["checks"] = checks
-            inner["ok"] = inner.get("ok") is True and all(checks.values())
+            inner["innerCheckValidation"] = check_validation
+            outer_checks_valid = (
+                process.returncode == 0
+                and private_unchanged
+                and checks["networkNamespaceDiffers"] is True
+                and checks["pidNamespaceDiffers"] is True
+            )
+            inner["ok"] = inner.get("ok") is True and check_validation["valid"] and outer_checks_valid
             inner["code"] = "probe-passed" if inner["ok"] else "probe-acceptance-failed"
             inner["clientSha256"] = client_hash
             inner["nodeSha256"] = node_hash

@@ -55,6 +55,14 @@ Failures are `StrictCaptureError` objects with stable `code`, safe relative
 and `/proc` paths are not exposed. Rendering code should map these fields to
 typed recovery copy rather than parse free-form error messages.
 
+The stable codes are `CAPTURE_ROOT` (unsupported/invalid root descriptor),
+`CAPTURE_VALIDATION`, `CAPTURE_DUPLICATE`, `CAPTURE_LIMIT` (file/byte/options),
+`CAPTURE_LINE_LIMIT`, `CAPTURE_LINK` (symlink/hardlink/nonregular member),
+`CAPTURE_MISSING`, `CAPTURE_IO`, `CAPTURE_CHANGED`, `CAPTURE_TEXT` (UTF8/NUL),
+`CAPTURE_BOM`, `CAPTURE_SEPARATOR`, and `CAPTURE_MARKERS`. Policy errors assign
+codes where detected; filesystem errors map by errno, never by filename/message
+keywords. This distinction matters for typed recovery instructions.
+
 ## Remaining gates
 
 Before/after descriptor metadata checks detect observable read-time changes, and
@@ -69,6 +77,7 @@ anti-rollback and actual supported launcher profile before strict activation.
 Neither hash is human authentication or a transition capability.
 The descriptor traversal assumes genuine host-controlled procfs and does not
 enforce a no-mount-crossing policy; supported-root filesystem/profile validation
-is still a launcher gate. Prototype v1 intents do not carry `captureVersion`;
-the protected decision path must remain disabled until exact-capture binding
-is implemented in the authority protocol and journal.
+is still a launcher gate. Prototype v1 intents do not carry `captureVersion`.
+[Protocol v2](strict-protocol-v2.md) adds the pair to parsers, authority and
+journal replay, but the protected decision path stays disabled until its host
+and UI explicitly require V2 and complete the remaining integration gates.
