@@ -624,34 +624,134 @@ test("#77: an unreadable or malformed state turns decisions off", async () => {
 // R6 (docs/strict-decision-page.md): no copy may imply that a Re-read, a
 // reload or the current state settles whether an earlier request committed.
 // Only the same-id Retry answer, or an authoritative journal lookup, can.
+// Messages are single sentences joined on one line, so `.*` spans periods
+// inside version strings.
 const R6_OVERCLAIMS = [
   /\blanded\b/i,
   /\btook effect\b|\btakes effect\b/i,
   /\bnothing (new )?(was |has been |is )?(approved|reshaped|finali[sz]ed|recorded|changed|\$\{)/i,
-  /\b(re-?read(ing)?|reload(ing)?|the current state)\b[^.]*\b(shows|confirms|settles|tells you|will show) whether/i,
+  /\b(re-?read(ing)?|reload(ing)?|the current state)\b.*\b(shows|confirms|settles|tells you|will show) whether/i,
   /\bcheck whether (it|the request|the decision)\b/i,
 ];
+// After an unknown outcome, a refused Retry can't say the request made no change.
+// Codes whose answer to a Retry leaves the earlier send's outcome unknown.
+const RESEND_UNKNOWN = ["session-ended", "unauthorized-channel", "unavailable", "request-reused"];
+const RESEND_OVERCLAIMS = [/made no change/i, /recorded nothing/i, /nothing (new )?(was )?recorded/i];
+const r6Check = (text, extra = []) => { for (const bad of [...R6_OVERCLAIMS, ...extra]) assert.doesNotMatch(text, bad, `overclaims a historical outcome: ${text}`); };
 
-test("#77 R6: no decision message claims a Re-read, reload or current state settles an earlier outcome", () => {
-  // Every string and template literal in the module (message copy, titles, reasons) ...
-  const literals = DECISION.match(/"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`/g);
+test("#77 R6: no decision string or rendered rejection claims a Re-read, reload or current state settles an earlier outcome", () => {
+  // Every string literal in the module, single-quoted included, with comments stripped first ...
+  const code = DECISION.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "").replace(/([;,{}()\]])\s*\/\/.*$/gm, "$1");
+  const literals = code.match(/"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`/g);
   assert.ok(literals.length > 40, "the scan found the module's strings");
-  for (const known of ["Couldn't confirm whether the decision was recorded", "The current state can't show whether", "has ended, so this request was refused"]) {
+  for (const known of ["Couldn't confirm whether the decision was recorded", "The current state can't show whether", "has ended, so this request was refused", "this retry was refused"]) {
     assert.ok(literals.some((l) => l.includes(known)), `the scan covers: ${known}`);
   }
-  // ... and every rejection's rendered copy, for both offered actions.
-  const rendered = Object.keys(SKEL_DECISION_REJECTION).flatMap((code) => [
-    { label: "Approve skeleton", done: "approved" }, { label: "Reshape", done: "reshaped" },
-  ].map((w) => { const m = SKEL_DECISION_REJECTION[code]({ ...w, version: VERSION_A, phase: "skeleton" }); return `${m.title} ${m.text}`; }));
+  // ... and every rejection's rendered copy, for both offered actions, fresh and resent.
   assert.deepEqual(Object.keys(SKEL_DECISION_REJECTION).sort(), [...REJECTION_CODES].sort());
-  for (const text of [...literals, ...rendered]) {
-    for (const bad of R6_OVERCLAIMS) assert.doesNotMatch(text, bad, `overclaims a historical outcome: ${text}`);
+  for (const code of REJECTION_CODES) {
+    for (const w of [{ label: "Approve skeleton", done: "approved" }, { label: "Reshape", done: "reshaped" }]) {
+      for (const resent of [false, true]) {
+        const m = SKEL_DECISION_REJECTION[code]({ ...w, version: "v1.2.3", phase: "skeleton", resent });
+        r6Check(`${m.title} ${m.text}`, resent && RESEND_UNKNOWN.includes(code) ? RESEND_OVERCLAIMS : []);
+      }
+    }
   }
-  // The scan itself catches the phrasings it is for.
-  for (const old of ["Whether the request landed is unconfirmed.", "Re-read to see whether it took effect.", "so nothing was approved.", "so nothing was ${c.done}.", "Nothing changed.", "Re-read shows whether it was recorded."]) {
+  for (const text of literals) r6Check(text);
+  // The scan itself catches the phrasings it is for, across periods in a version.
+  for (const old of ["Whether the request landed is unconfirmed.", "Re-read to see whether it took effect.", "so nothing was approved.", "so nothing was ${c.done}.", "Nothing changed.", "Re-read shows whether it was recorded.", "Re-read for v1.2.3 shows whether it was recorded."]) {
     assert.ok(R6_OVERCLAIMS.some((re) => re.test(old)), old);
   }
 });
+
+test("#77 R6: rendered messages on every controller path make no historical claim", async () => {
+  const seen = [];
+  const note = (ctl, label, extra = []) => { const m = ctl.view().message; if (m) { seen.push(label); r6Check(`${m.title} ${m.text}`, extra); } };
+  // Fresh rejections, and the same codes on a Retry after an unknown outcome.
+  for (const code of REJECTION_CODES) {
+    const fresh = await setup();
+    fresh.auth.force({ kind: "rejected", requestId: "req-1", code });
+    await fresh.ctl.decide("approve");
+    note(fresh.ctl, `fresh ${code}`);
+    for (const first of ["unavailable", "throw"]) {
+      const { auth, ctl } = await setup();
+      if (first === "throw") { const real = auth.submit; let n = 0; auth.submit = async (i) => { if (n++ === 0) { auth.calls.submit.push(i); throw new Error("reset"); } return real(i); }; }
+      else auth.force({ kind: "rejected", requestId: "req-1", code: "unavailable" });
+      await ctl.decide("approve");
+      note(ctl, `unknown ${first}`, RESEND_OVERCLAIMS);
+      await ctl.load(); // Re-read keeps it unconfirmed
+      note(ctl, `reread after ${first}`, RESEND_OVERCLAIMS);
+      auth.force({ kind: "rejected", requestId: "req-1", code });
+      await ctl.decide("approve");
+      note(ctl, `retry ${code} after ${first}`, RESEND_UNKNOWN.includes(code) ? RESEND_OVERCLAIMS : []);
+    }
+  }
+  // Malformed answer.
+  const mal = await setup();
+  mal.auth.force({ kind: "committed", requestId: "other", action: "approve", reviewVersion: VERSION_A, revision: 5 });
+  await mal.ctl.decide("approve");
+  note(mal.ctl, "malformed");
+  // Committed, but the re-read state doesn't show it.
+  const differs = await setup();
+  differs.auth.force(committedFor({ ...INTENTS.approve, requestId: "req-1" }));
+  await differs.ctl.decide("approve");
+  note(differs.ctl, "recorded but differs");
+  // The page moved while sending.
+  const moved = await setup();
+  let release;
+  moved.auth.submit = (i) => new Promise((r) => { release = () => r({ kind: "rejected", requestId: i.requestId, code: "unavailable" }); });
+  const p = moved.ctl.decide("approve");
+  await tick(); await tick();
+  await moved.ctl.setShown({ ...SHOWN, reviewVersion: VERSION_B });
+  note(moved.ctl, "page moved");
+  release();
+  await p;
+  note(moved.ctl, "moved answer", RESEND_OVERCLAIMS);
+  // An unreadable state.
+  const unreadable = skelDecisionController({ channel: { getState: async () => null, submit: async () => assert.fail("no submit") }, shown: SHOWN, newRequestId: ids() });
+  await unreadable.load();
+  note(unreadable, "unreadable");
+  assert.ok(seen.length >= REJECTION_CODES.length * 7 + 5, `paths covered: ${seen.length}`);
+});
+
+for (const code of ["unauthorized-channel", "session-ended", "request-reused"]) {
+  test(`#77 R6: a Retry answered ${code} leaves the first send's outcome unknown`, async () => {
+    const { auth, ctl } = await setup();
+    auth.force({ kind: "rejected", requestId: "req-1", code: "unavailable" });
+    await ctl.decide("approve");
+    assert.equal(ctl.requestRetained, "req-1");
+    auth.force({ kind: "rejected", requestId: "req-1", code });
+    assert.deepEqual(await ctl.decide("approve"), { kind: "rejected", code });
+    assert.equal(auth.calls.submit.length, 2);
+    assert.equal(auth.calls.submit[1].requestId, "req-1", "it was a resend of the kept intent");
+    const v = ctl.view();
+    assert.equal(v.status, { "session-ended": "ended", "unauthorized-channel": "refused", "request-reused": "stale" }[code]);
+    assert.equal(v.approved, null);
+    assert.equal(v.message.code, code);
+    assert.match(v.message.text, /this (retry|send) was refused\. Whether the earlier send of this request for aaaaaaaaaaaa was recorded is unknown, and it is not shown as approved/);
+    assert.doesNotMatch(v.message.text, /made no change|recorded nothing|doesn't show whether an earlier request committed/);
+    assert.ok(v.actions.every((a) => !a.enabled && !a.retry), "decisions are held, and the kept request is gone");
+    assert.equal(ctl.requestRetained, null);
+    // A fresh request answered the same way still says this request changed nothing.
+    const fresh = await setup();
+    fresh.auth.force({ kind: "rejected", requestId: "req-1", code });
+    await fresh.ctl.decide("approve");
+    assert.match(fresh.ctl.view().message.text, code === "request-reused" ? /this request was refused and recorded nothing/ : /this request was refused and made no change/);
+  });
+}
+
+for (const code of ["stale-review", "revision-conflict", "invalid-transition"]) {
+  test(`#77 R6: a Retry answered ${code} still means nothing was recorded (exact retries replay first)`, async () => {
+    const { auth, ctl } = await setup();
+    auth.force({ kind: "rejected", requestId: "req-1", code: "unavailable" });
+    await ctl.decide("approve");
+    auth.force({ kind: "rejected", requestId: "req-1", code });
+    await ctl.decide("approve");
+    assert.equal(auth.calls.submit[1].requestId, "req-1");
+    assert.match(ctl.view().message.text, /this request was refused and made no change/);
+    assert.equal(ctl.requestRetained, null);
+  });
+}
 
 // ---- drawing ----
 
