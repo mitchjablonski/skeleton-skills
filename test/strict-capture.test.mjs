@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { captureStrictManifest } from "../lib/strict-capture.mjs";
+import { StrictCaptureError, captureStrictManifest } from "../lib/strict-capture.mjs";
 
 const linuxTest = (name, fn) => test(name, { skip: process.platform !== "linux" }, fn);
 const entry = (name, mode = "whole") => ({ path: name, mode });
@@ -21,7 +21,7 @@ function fixture(t) {
 
 linuxTest("canonical order, full hashes and immutable exact rendered captures", t => {
   const { write, capture } = fixture(t);
-  const text = "\uFEFFhello\r\nworld\r\n";
+  const text = "hello\r\nworld\r\n";
   write("b.txt", text); write("a.js", fenced("throw Error('SKEL_TODO');"));
   const first = capture([entry("b.txt"), entry("a.js", "fenced")]);
   const second = capture([entry("a.js", "fenced"), entry("b.txt")]);
@@ -42,11 +42,11 @@ linuxTest("filled body and CRLF changes preserve shape while exact byte capture 
   const filled = capture([entry("code.js", "fenced")]);
   assert.equal(before.shapeVersion, filled.shapeVersion); assert.notEqual(before.captureVersion, filled.captureVersion);
   assert.notEqual(before.files[0].rawSha256, filled.files[0].rawSha256);
-  assert.deepEqual(before.files[0].fences, [{ id: "1", title: "value" }]);
-  assert.deepEqual(before.files[0].exterior, ["export function value() {", "// SKEL[1] value", "// /SKEL[1]", "}", ""]);
+  assert.deepEqual(before.files[0].fences, [{ id: "1", title: "value", openLine: 2, closeLine: 4 }]);
+  assert.deepEqual(before.files[0].exterior, ["export function value() {\n", "// SKEL[1] value\n", "// /SKEL[1]\n", "}\n", ""]);
   write("code.js", fenced("return 1;\n// additional filled body line").replace(/\n/g, "\r\n"));
   const crlf = capture([entry("code.js", "fenced")]);
-  assert.equal(crlf.shapeVersion, filled.shapeVersion); assert.notEqual(crlf.captureVersion, filled.captureVersion);
+  assert.notEqual(crlf.shapeVersion, filled.shapeVersion); assert.notEqual(crlf.captureVersion, filled.captureVersion);
   const whole = capture([entry("code.js", "whole")]);
   write("code.js", fenced("return 2;"));
   assert.notEqual(whole.shapeVersion, capture([entry("code.js", "whole")]).shapeVersion);
@@ -73,7 +73,7 @@ linuxTest("explicit manifests parse fenced members strictly and preserve whole-f
     assert.throws(() => capture([entry("bad", "fenced")]));
     const whole = capture([entry("bad", "whole")]).files[0];
     assert.equal(whole.text, text); assert.deepEqual(whole.fences, []);
-    assert.deepEqual(whole.exterior, text.split("\n"));
+    assert.deepEqual(whole.exterior, [text]);
   }
   write("plain", "no fences"); assert.throws(() => capture([entry("plain", "fenced")]), /no fences/);
 });
@@ -149,7 +149,7 @@ linuxTest("opened intermediate directory stays anchored across a symlink swap", 
   assert.equal(swapped, true);
 });
 
-linuxTest("changing a file during descriptor read refuses rather than approving mixed bytes", t => {
+linuxTest("observable size and metadata mutation during read refuses", t => {
   const { write, capture } = fixture(t); const file = write("file", "before");
   const originalRead = fs.readSync; let changed = false;
   fs.readSync = function (...args) {
@@ -173,4 +173,36 @@ linuxTest("directory root descriptor must explicitly carry O_DIRECTORY", t => {
 test("non-Linux capture refuses before inspecting descriptors or manifests", { skip: process.platform === "linux" }, () => {
   let touched = false; const hostile = new Proxy({}, { get() { touched = true; throw Error(); } });
   assert.throws(() => captureStrictManifest(hostile, hostile, hostile), /requires Linux/); assert.equal(touched, false);
+});
+
+linuxTest("ambiguous separators and BOM refuse; raw whole and exterior endings bind", t => {
+ const {write,capture}=fixture(t);
+ for(const sep of ['\r','\v','\f','\u0085','\u2028','\u2029']) {
+  for(const text of [fenced('body'+sep+'// /SKEL[1]'), 'outside'+sep+'// SKEL[2] fake\n'+fenced('body')]) {
+   write('file',text); assert.throws(()=>capture([entry('file','fenced')]),/separator/);
+   assert.equal(capture([entry('file')]).files[0].text,text);
+  }
+ }
+ for(const mode of ['whole','fenced']) {write('file','\uFEFF'+fenced('body'));assert.throws(()=>capture([entry('file',mode)]),/BOM/);}
+ write('file','template\r\n');const a=capture([entry('file')]);write('file','template\n');assert.notEqual(a.shapeVersion,capture([entry('file')]).shapeVersion);
+ write('file',fenced('body'));const file=capture([entry('file','fenced')]).files[0];assert.equal(file.display.map(l=>l.text+l.ending).join(''),file.text);assert.equal(file.display[2].kind,'body');assert.equal(file.fences[0].openLine,2);
+});
+
+linuxTest('structured errors redact host paths and expose stable safe context', t => {
+ const {root,write,capture}=fixture(t);fs.symlinkSync('/missing-host-secret',path.join(root,'link'));
+ for(const [name,mode,text,code] of [['missing','whole',null,'CAPTURE_MISSING'],['link','whole',null,'CAPTURE_LINK'],['bom','whole','\uFEFFtext','CAPTURE_BOM'],['separator','fenced',fenced('x\vy'),'CAPTURE_SEPARATOR'],['bad','fenced','// SKEL[1] unclosed','CAPTURE_MARKERS']]) {
+  if(text!==null)write(name,text);
+  assert.throws(()=>capture([entry(name,mode)]),err=>{assert.ok(err instanceof StrictCaptureError);assert.equal(err.code,code);assert.equal(err.path,name);assert.ok(!err.message.includes(root));assert.ok(!err.message.includes('/proc/'));return true;});
+ }
+ write('part:123:name', '// /SKEL[1]\n');
+ assert.throws(() => capture([entry('part:123:name', 'fenced')]), error => {
+  assert.equal(error.path, 'part:123:name'); assert.equal(error.line, 1); return true;
+ });
+});
+linuxTest('line caps bound whole visual display before allocation and reconstruct all separators',t=>{
+ const {write,capture}=fixture(t);const text='a\r\nb\nc\rd\ve\ff\u0085g\u2028h\u2029';write('file',text);
+ const file=capture([entry('file')]).files[0];assert.equal(file.display.length,9);assert.equal(file.display.map(l=>l.text+l.ending).join(''),text);assert.ok(file.display.every(l=>l.kind==='exterior'));assert.deepEqual(file.fences,[]);
+ assert.throws(()=>capture([entry('file')],{maxFileLines:8}),e=>e.code==='CAPTURE_LINE_LIMIT');
+ write('one','a\n');write('two','b\n');assert.throws(()=>capture([entry('one'),entry('two')],{maxTotalLines:3}),e=>e.code==='CAPTURE_LINE_LIMIT');
+ assert.equal(capture([entry('one'),entry('two')],{maxTotalLines:4}).files.length,2);
 });

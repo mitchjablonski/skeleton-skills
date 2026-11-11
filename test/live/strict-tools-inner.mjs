@@ -13,6 +13,7 @@ const shellQuote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 const steps = [
   { name: "Read", input: { file_path: "/work/inside.txt" } },
   { name: "Edit", input: { file_path: "/work/inside.txt", old_string: "PUBLIC_PROBE", new_string: "PUBLIC_EDITED" } },
+  { name: "Read", input: { file_path: "/opt/public-control.txt" } },
   { name: "Read", input: { file_path: privatePath } },
   {
     name: "Bash",
@@ -191,13 +192,15 @@ try {
 
 const insideText = fs.readFileSync("/work/inside.txt", "utf8");
 const results = latestToolResults;
+const privatePathMissing = /(?:file does not exist|enoent|no such file or directory)/i;
 const checks = {
   clientExitZero: childExit === 0,
-  exactlyFourToolResults: results.length === 4 && results.every((result, index) => result.toolUseId === `toolu_strict_probe_${index + 1}`),
+  exactlyFiveToolResults: results.length === 5 && results.every((result, index) => result.toolUseId === `toolu_strict_probe_${index + 1}`),
   workspaceReadReturnedFixture: results[0]?.isError === false && results[0]?.content.includes("PUBLIC_PROBE") === true,
   workspaceEditApplied: insideText === "PUBLIC_EDITED\n",
-  privateReadDenied: results[2]?.isError === true && !results[2]?.content.includes("PRIVATE_RECEIPT_DO_NOT_MOUNT"),
-  bashRanAndPrivatePathUnavailable: results[3]?.isError === false && results[3]?.content.includes("PUBLIC_EDITED") === true && results[3]?.content.includes("BASH_RAN_PRIVATE_UNAVAILABLE") === true,
+  absolutePublicControlReadable: results[2]?.tool === "Read" && results[2]?.isError === false && results[2]?.content.includes("PUBLIC_CONTROL"),
+  privateReadReportsMissingPath: results[3]?.tool === "Read" && results[3]?.isError === true && privatePathMissing.test(results[3]?.content ?? "") && !results[3]?.content.includes("PRIVATE_RECEIPT_DO_NOT_MOUNT"),
+  bashRanWithWorkspaceControlAndPrivatePathUnavailable: results[4]?.isError === false && results[4]?.content.includes("PUBLIC_EDITED") === true && results[4]?.content.includes("BASH_RAN_PRIVATE_UNAVAILABLE") === true,
   noOutputOverflow: !outputOverflow && !errorOverflow,
   noMalformedApiRequests: malformedRequests === 0,
   apiOfferedOnlyFixedTools: apiRequests.length > 0 && apiRequests.every((request) => request.exactFixedToolSet),

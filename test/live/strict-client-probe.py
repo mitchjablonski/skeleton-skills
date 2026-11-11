@@ -115,6 +115,8 @@ def main() -> int:
             work.mkdir()
             private_dir.mkdir()
             (work / "inside.txt").write_text("PUBLIC_PROBE\n", encoding="utf-8")
+            public_control = scratch / "public-control.txt"
+            public_control.write_text("PUBLIC_CONTROL\n", encoding="utf-8")
             private_receipt = private_dir / "receipt.txt"
             private_receipt.write_text("PRIVATE_RECEIPT_DO_NOT_MOUNT\n", encoding="utf-8")
             original_private_hash = hashlib.sha256(private_receipt.read_bytes()).hexdigest()
@@ -142,6 +144,7 @@ def main() -> int:
                 "--ro-bind", str(client), "/opt/claude",
                 "--ro-bind", str(node), "/opt/node",
                 "--ro-bind", str(INNER), "/opt/strict-tools-inner.mjs",
+                "--ro-bind", str(public_control), "/opt/public-control.txt",
                 "--bind", str(home), "/home/agent",
                 "--bind", str(work), "/work",
                 "--setenv", "HOME", "/home/agent",
@@ -210,6 +213,15 @@ def main() -> int:
             checks = dict(inner.get("checks", {}))
             checks["outerProcessExitZero"] = process.returncode == 0
             checks["privateHostReceiptUnchanged"] = private_unchanged
+            inside_namespaces = inner.get("insideNamespaces") or {}
+            checks["networkNamespaceDiffers"] = bool(
+                inside_namespaces.get("net") and outer_namespaces.get("net")
+                and inside_namespaces["net"] != outer_namespaces["net"]
+            )
+            checks["pidNamespaceDiffers"] = bool(
+                inside_namespaces.get("pid") and outer_namespaces.get("pid")
+                and inside_namespaces["pid"] != outer_namespaces["pid"]
+            )
             inner["checks"] = checks
             inner["ok"] = inner.get("ok") is True and all(checks.values())
             inner["code"] = "probe-passed" if inner["ok"] else "probe-acceptance-failed"
