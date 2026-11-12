@@ -120,6 +120,10 @@ test("enforces body byte limit, strict UTF-8 and top-level plain-object JSON wit
   expectCode("MODEL_BODY_LIMIT", () => parseModelRequest(request({ body, headers }), { ...STRICT_MODEL_PROFILE, maxBodyBytes: body.length - 1 }));
   expectCode("MODEL_CONTENT_LENGTH", () => parseModelRequest(request({ body, headers: { "content-length": "1" } })));
   expectCode("MODEL_BODY_UTF8", () => parseModelRequest(request({ body: Buffer.from([0xff]) })));
+  expectCode("MODEL_BODY_UTF8", () => parseModelRequest(request({ body: '{"value":"\uD800"}' })));
+  expectCode("MODEL_BODY_UTF8", () => parseModelRequest(request({ body: '{"value":"\uDC00"}' })));
+  const validSurrogatePair = '{"emoji":"\uD83D\uDE42"}';
+  assert.equal(parseModelRequest(request({ body: validSurrogatePair })).bodyText, validSurrogatePair);
   expectCode("MODEL_BODY_BOM", () => parseModelRequest(request({ body: "\uFEFF{}" })));
   expectCode("MODEL_BODY_JSON", () => parseModelRequest(request({ body: "{" })));
   for (const source of ["[]", "null", "42", '"text"'])

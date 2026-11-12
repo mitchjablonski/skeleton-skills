@@ -71,13 +71,17 @@ They can miss same-size writes within a filesystem timestamp tick and accept
 torn bytes that never coexisted as a complete file. The hash still binds exactly
 the captured/rendered bytes, not an atomic source observation. They do not prove
 an atomic multi-file snapshot or prevent all concurrent writes.
-The host still needs a reviewed freeze/stage and commit/publication protocol,
-private immutable capture storage, identity/enrollment binding, baseline policy,
+An [immutable capture-store primitive](strict-capture-store.md) now rebuilds and
+persists validated captures. The host still needs its protected-service
+integration, a reviewed freeze/stage and commit/publication protocol,
+identity/enrollment binding, complete enumeration and baseline policy,
 anti-rollback and actual supported launcher profile before strict activation.
 Neither hash is human authentication or a transition capability.
 The descriptor traversal assumes genuine host-controlled procfs and does not
 enforce a no-mount-crossing policy; supported-root filesystem/profile validation
 is still a launcher gate. Prototype v1 intents do not carry `captureVersion`.
 [Protocol v2](strict-protocol-v2.md) adds the pair to parsers, authority and
-journal replay, but the protected decision path stays disabled until its host
-and UI explicitly require V2 and complete the remaining integration gates.
+journal replay. The [opt-in V2 adapter](strict-v2-adapter.md) validates shown
+captures and exact-pair confirmation, but is not production-wired. The protected
+decision path stays disabled until its host requires V2 and completes the
+remaining integration gates.
