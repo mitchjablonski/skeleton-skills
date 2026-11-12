@@ -53,10 +53,12 @@ needs explicit reviewed host semantics.
 
 ## Integration gates
 
-The decision controller still emits V1 intents. Claude's protected adapter must
-explicitly emit and check V2, correlate the echoed capture digest, and confirm
-the authoritative approved pair. It must not infer exact bytes from shape
-equality or use the public live-review page as an authority source.
+The legacy decision controller still emits V1 intents. The separate
+[opt-in V2 adapter](strict-v2-adapter.md) validates shown captures, emits and
+checks exact capture pairs, and confirms the authoritative approved pair.
+Neither path is production-wired to a protected listener. The host must require
+V2 and serve its own persisted captures; shape equality or the public live-review
+page cannot establish exact bytes or authority.
 
 Private capture and Recapture primitives now exist, but their protected service
 integration is still required. Complete host

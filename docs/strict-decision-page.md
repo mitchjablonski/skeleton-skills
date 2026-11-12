@@ -196,13 +196,13 @@ The controller's `shown` value (version and pending notes) has no trustworthy so
 **C4. Re-read and Recapture are separate actions.**
 
 - **Re-read (refresh state)** keeps the meaning it has in strict-transport.md section 4 and lib/review-decision.mjs. It's a GET of AuthorityState that changes nothing, keeps a kept intent and its Retry, and is the recovery action after an unknown outcome.
-- **Recapture** is new. It asks the authority to capture the workspace again, which can change `reviewVersion`. It's a POST behind the same Origin, Fetch Metadata and binding checks, and the host operation #83 leaves unspecified ("refreshing a changed draft's reviewable version").
-  - **Unchanged content** writes no journal entry.
-  - **Changed content** moves `AuthorityState.reviewVersion`, so it is a journaled state change. Otherwise #83's replay of the journal wouldn't reproduce the current state. It shouldn't consume the 1024-entry transaction cap, so we ask Sol for a separate allowance for recapture entries, or an equivalent.
+- **Recapture** now has a [V2 journaled core operation](strict-recapture.md). In skeleton phase it selects the independently captured shape/raw-byte pair. The protected service must durably publish the capture before committing its authority reference. The proposed HTTP action is a POST behind the same Origin, Fetch Metadata and binding checks; that service is not implemented.
+  - **Unchanged content** journals a `recaptured` result with `changed:false` and preserves the revision, including revision zero. Exact retries return that original result.
+  - **Changed content** updates the selected `reviewVersion`/`captureVersion` pair and advances the revision without rotating the round. Every new terminal Recapture outcome consumes the shared 1024-entry journal cap; there is no separate allowance or automatic pruning.
   - On the page, a changed capture moves the page (`setShown`), which discards any kept intent. If a Retry is pending with an unknown outcome, the page says "Recapture ends the pending Retry. After that, this page can no longer ask the service for the original answer. Retry first if you want it." and asks for confirmation. Re-read alone can't tell whether the earlier request committed.
-- **When capture happens.** The first capture is made when a review round opens: at registration, or after reshape rotates the round (#83). Later captures happen only when the human presses Recapture, never at the agent's request. Registration comes before the agent scaffolds, so that first capture is usually empty or partial. The page says so: "This capture was taken before the skeleton was written. Press Recapture when the agent says the skeleton is ready." The first real review is therefore a human Recapture.
-- **In fill**, the approved version is fixed. Recapture there is a drift view only: it shows the current exteriors against the approved capture, writes nothing, and moves neither `reviewVersion` nor `approvedVersion`. Reshape names the approved version and opens a new round, which gets its own first capture.
-- After a Recapture, the page shows a **diff against the previously rendered capture and against the approved capture**, including files removed since then, so a change or an omission is visible.
+- **Proposed capture lifecycle (not implemented).** The first capture would be made when a review round opens: at registration, or after reshape rotates the round (#83). Later captures happen only when the human presses Recapture, never at the agent's request. Registration comes before the agent scaffolds, so that first capture is usually empty or partial. The page says so: "This capture was taken before the skeleton was written. Press Recapture when the agent says the skeleton is ready." The first real review is therefore a human Recapture.
+- **In fill**, transactional Recapture refuses. A read-only drift view comparing current exteriors with the approved capture remains a separate proposed operation; it must not alter either selected or approved pair. Reshape names the approved pair and rotates the round; first-capture ordering for the protected service remains unresolved.
+- The proposed protected page would show a **diff against the previously rendered capture and against the approved capture**, including removed files. The V2 adapter does not implement a Recapture control or this diff view.
 - The page never live-reloads, and the tab's `shown.reviewVersion` is always the capture it rendered.
 
 **C5. Pending notes are declared on the decision page.** The listener can't see drafts on the review origin and must not trust that page's word. Approve is two explicit choices:
@@ -216,10 +216,10 @@ The declaration sets `shown.pendingNotes`. The listener takes no notes, because 
 
 **Needs from Sol.**
 
-- Capture under C1: path validation, no-follow reads, a pure-JS marker parse, host enumeration under a fixed ignore policy, and no silent drops.
+- The capture primitive implements path validation, descriptor-based no-follow reads, a pure-JS marker parse and fail-closed explicit manifests. Complete host enumeration under a fixed ignore policy remains required.
 - Drift and finalize checking every approved file.
-- Content-addressed private storage and the canonical exterior/fence-set serialization.
-- Recapture as a journaled host operation with its own allowance outside the transaction cap, and a definition of when first capture happens.
+- Canonical capture reconstruction and [immutable private storage](strict-capture-store.md) now exist as trusted-host primitives. Integrate them with the protected service; they do not establish capture/authority atomicity.
+- Journaled Recapture now exists with the shared transaction cap. Define first-capture ordering and the protected human action.
 - Approved captures referenced from the journal and covered by its integrity and anti-rollback protection.
 - A read-only, version-addressed capture route.
 - A ruling on whether the baselined coverage set is part of what the human approves (today it isn't).
@@ -246,7 +246,7 @@ The declaration sets `shown.pendingNotes`. The listener takes no notes, because 
 - **Fill:** fill a step after approval; the strict version of the exteriors is unchanged and drift passes.
 - **Collisions:** a pair with equal 12-hex `skeletonVersion` gets distinct strict versions.
 - **Perception:** bidi, zero-width and confusable fixtures render visibly flagged.
-- **Re-read and Recapture:** Re-read changes nothing and keeps a pending Retry. A cross-origin or bindingless Recapture is refused. An unchanged Recapture writes no journal entry, and 2000 unchanged Recaptures don't reach the transaction cap. A changed Recapture is journaled, and replaying the journal reproduces the current `reviewVersion`. Deleting the capture store gives the R3 refusal. A changed Recapture shows the diff and warns before ending a pending Retry.
+- **Re-read and Recapture:** Re-read changes nothing and keeps a pending Retry. Core tests cover journaled unchanged and changed Recaptures, exact retries, revision-zero replies, skeleton-only selection and the shared transaction cap. Protected-service tests must still prove cross-origin/binding refusal, missing-capture refusal, diff presentation and the warning before ending a pending Retry. Replaying the journal reproduces the selected shape/capture pair.
 - **Notes:** with "I have notes" selected, nothing can be sent.
 
 ## (d) requestId retention and recovery (UX requirements for Sol's journal)
@@ -276,7 +276,7 @@ Recovery copy, per state:
 
 **Needs from Sol.** R1 to R5 as journal behaviour, consistent with #83. A rejection code or evidence reason that distinguishes "record unreadable" and "journal full" from transient `unavailable`, because their copy differs: neither is fixed by retrying.
 
-**Unproven.** All of it until durable storage exists. #83's JSON reload tests aren't durable commits. Anti-rollback and capture/commit atomicity remain open gates, and Sol's #86 durable store doesn't implement either.
+**Implemented primitives, unproven integration.** Durable authority and immutable-capture storage adapters now exist, with bounded local Linux persistence tests. They do not prove power-loss behavior for a production profile or complete protected-service recovery. Anti-rollback and workspace capture/commit coordination remain open gates.
 
 **#79 tests.**
 
@@ -349,6 +349,6 @@ Recovery copy, per state:
 3. (a) Will egress refuse the full address list, checked on the connected address? Will the launcher refuse to start when interop, a non-workspace `/mnt/*` mount, a session bus or a browser opener is visible? Will it open the page in a fresh, launcher-private profile created on every launch? Can #75 keep `.git/config`, `.git/hooks` and `.git/info` read-only inside the boundary, or is host git a recorded residual?
 4. (b) Does the listener alone check the tab binding? Is the nonce exchange a POST from page script?
 5. (c) Do you accept capture rules C1: path validation before open, no subprocess or git, no symlinks, regular files only, caps, least privilege, a host-side pure-JS marker parse, and host enumeration with agent paths as candidates only, under a fixed ignore policy no project file can change, with no silent drops? Will drift and finalize check every approved file? Do you accept a full SHA-256 over the served exteriors and fence set, with the capture as the approved record?
-6. (c) Is Recapture the "refresh reviewable version" host operation #83 leaves open? When content changes, is it journaled with its own allowance outside the transaction cap, and does it write nothing when unchanged? Are approved captures retained under the record's integrity and anti-rollback protection? Is first capture at round open right? Is the coverage set part of what the human approves?
+6. (c) V2 Recapture now journals unchanged and changed outcomes under the shared cap. How will the protected coordinator order capture publication and authority references? How will approved captures gain integrity and anti-rollback protection? When does first capture happen, and how are empty/partial drafts represented? Is the coverage set part of what the human approves?
 7. (d) Do you accept R1 to R5, consistent with #83? Which codes or reasons will distinguish an unreadable record and a full journal from `unavailable` (today both are `unavailable`)? Is there an anti-rollback plan for restored backups?
 8. (e) How is evidence signed and refreshed, and what are its lifetime and revocation rules? Who writes the enrollment registry? Are `state-diverged` and `authority-refusing` authority-emitted or local?
