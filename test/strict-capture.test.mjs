@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { StrictCaptureError, captureStrictManifest } from "../lib/strict-capture.mjs";
+import { StrictCaptureError, captureStrictManifest, validateStoredCapture } from "../lib/strict-capture.mjs";
 
 const linuxTest = (name, fn) => test(name, { skip: process.platform !== "linux" }, fn);
 const entry = (name, mode = "whole") => ({ path: name, mode });
@@ -222,4 +222,21 @@ linuxTest('native errno mapping ignores keyword filenames and failure messages',
  write('changed','before');const read=fs.readSync;let changed=false;
  fs.readSync=function(...args){const n=read(...args);if(!changed&&n){changed=true;fs.appendFileSync(path.join(root,'changed'),'after');}return n;};
  try{assert.throws(()=>capture([entry('changed')]),e=>e.code==='CAPTURE_CHANGED'&&e.path==='changed');}finally{fs.readSync=read;}
+});
+
+linuxTest('stored captures rebuild all derived fields and reject tampering or cap bypass', t => {
+  const {write,capture}=fixture(t);write('code',fenced('return 1;'));write('context','a\r\nb\u2028c');
+  const original=capture([entry('code','fenced'),entry('context')]);
+  assert.deepEqual(validateStoredCapture(JSON.parse(JSON.stringify(original))),original);
+  for(const mutate of [v=>v.files[0].display[0].text='forged',v=>v.files[0].display[2].kind='exterior',
+    v=>v.files[0].fences[0].closeLine++,v=>v.files[0].exterior[0]='wrong',v=>v.files[0].rawSha256='0'.repeat(64),
+    v=>v.files[0].text+='body',v=>v.files[0].unixMode++,v=>v.captureVersion='0'.repeat(64),v=>v.shapeVersion='0'.repeat(64),
+    v=>v.totalBytes++,v=>v.files[0].byteLength++,v=>delete v.files[0].display,v=>v.extra=true,v=>v.files.reverse(),
+    v=>v.files[0].text='\ud800',v=>v.files.push(v.files[0])]) {
+    const corrupted=JSON.parse(JSON.stringify(original));mutate(corrupted);assert.throws(()=>validateStoredCapture(corrupted));
+  }
+  for(const limits of [{maxFiles:1},{maxTotalBytes:1},{maxFileBytes:1},{maxFileLines:1},{maxTotalLines:1}]) assert.throws(()=>validateStoredCapture(original,limits));
+  const hostile=JSON.parse(JSON.stringify(original));let called=false;
+  Object.defineProperty(hostile.files[0].display[0],'text',{get(){called=true;throw Error();},enumerable:true});
+  assert.throws(()=>validateStoredCapture(hostile));assert.equal(called,false);
 });

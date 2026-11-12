@@ -28,6 +28,10 @@ no commit assertion. Envelopes reject missing/extra fields and mixed versions.
 | reshape | Approved pair | Fresh round plus newly captured pair; clear both approved fields |
 | finalize | Approved pair | Matching shape and verified completion; current body-byte capture may differ |
 
+The V2-only private-host [Recapture operation](strict-recapture.md) names the
+current selected pair and installs the independently captured pair only in
+skeleton phase. Its distinct `recaptured` result is never an approval.
+
 V2 host facts are exactly `{contentVersion,captureVersion,nextReviewRoundId,
 completionVerified}`. They come from the protected host's own checks, not the
 request. Finalize's boolean is not itself verification. It must represent real
@@ -54,7 +58,8 @@ explicitly emit and check V2, correlate the echoed capture digest, and confirm
 the authoritative approved pair. It must not infer exact bytes from shape
 equality or use the public live-review page as an authority source.
 
-Private capture persistence, Recapture state operations, complete host
+Private capture and Recapture primitives now exist, but their protected service
+integration is still required. Complete host
 enumeration, content freeze/staging and commit publication, anti-rollback,
 enrollment/session lifecycle, protected origin and authenticated live evidence
 remain required. This change supplies protocol/core/storage groundwork only;

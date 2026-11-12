@@ -122,3 +122,12 @@ test('v2 exact capture fields are mandatory full lowercase digests and cannot do
     assert.equal(strictIntentConflict(fill,{...intent2(),action,expectedRevision:1,captureVersion:fill.captureVersion}),'stale-review');
   }
 });
+
+test('recapture is v2-only and exact result binds unchanged revision zero',()=>{
+ const req={...intent2(),action:'recapture'};assert.ok(parseStrictIntent(req));assert.equal(parseStrictIntent({...intent(),action:'recapture'}),null);
+ assert.equal(strictIntentConflict(state2(),req),null);
+ const reply={kind:'recaptured',action:'recapture',protocolVersion:2,requestId:'r',reviewVersion:shape2,captureVersion:capture2,revision:0,changed:false};
+ assert.ok(parseStrictResult(reply));
+ for(const change of [{protocolVersion:1},{action:'approve'},{changed:'false'},{captureVersion:'short'},{extra:true}])assert.equal(parseStrictResult({...reply,...change}),null);
+ const missing={...reply};delete missing.changed;assert.equal(parseStrictResult(missing),null);
+});
