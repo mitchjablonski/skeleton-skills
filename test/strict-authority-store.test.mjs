@@ -254,3 +254,13 @@ storeTest('v2 exact-capture commits and terminal refusals survive stored reopen 
   const corrupt=record();delete corrupt.journal[1].result.captureVersion;
   fs.writeFileSync(path.join(dir,'authority.json'),JSON.stringify(corrupt));assert.throws(()=>openAuthorityStore(dir));
 });
+
+storeTest('unchanged recapture persists and reopens before and after changed capture',t=>{
+ const {dir,record}=fixture(t),shape='a'.repeat(64),raw='b'.repeat(64),next='c'.repeat(64);
+ createAuthorityStore(dir,{...initial(),protocolVersion:2,reviewVersion:shape,captureVersion:raw,approvedCaptureVersion:null});
+ const req={...request(),protocolVersion:2,action:'recapture',reviewVersion:shape,captureVersion:raw};const host={...facts(),contentVersion:shape,captureVersion:raw};
+ const reply=openAuthorityStore(dir).submit(req,host);assert.equal(reply.changed,false);assert.equal(reply.revision,0);assert.equal(record().journal.length,1);
+ assert.deepEqual(openAuthorityStore(dir).submit(req,null),reply);
+ assert.equal(openAuthorityStore(dir).submit({...req,requestId:'changed'},{...host,captureVersion:next}).changed,true);
+ assert.deepEqual(openAuthorityStore(dir).submit(req,null),reply);assert.equal(record().state.revision,1);assert.equal(record().journal.length,2);
+});
