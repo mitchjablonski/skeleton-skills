@@ -182,3 +182,29 @@ test('v2 records reject dropped capture fields, mismatched journal versions and 
     assert.equal(planAuthorityTransaction(corrupt,intent2(),facts2()).result.code,'unavailable');
   }
 });
+
+test('recapture journals unchanged revision-zero outcome and replays it after later changes',()=>{
+ const req=intent2({action:'recapture'});const unchanged=planAuthorityTransaction(fresh2(),req,facts2());
+ assert.equal(unchanged.result.kind,'recaptured');assert.equal(unchanged.result.changed,false);assert.equal(unchanged.result.revision,0);assert.equal(unchanged.persist,true);assert.equal(unchanged.record.journal.length,1);
+ const changedReq=intent2({action:'recapture',requestId:'new'});
+ const changed=planAuthorityTransaction(unchanged.record,changedReq,facts2({captureVersion:NEXT2}));
+ assert.equal(changed.result.changed,true);assert.equal(changed.record.state.revision,1);assert.equal(changed.record.state.reviewVersion,SHAPE2);assert.equal(changed.record.state.captureVersion,NEXT2);
+ assert.equal(changed.record.state.reviewRoundId,'round1');assert.equal(changed.record.state.approvedVersion,null);assert.equal(changed.record.state.approvedCaptureVersion,null);
+ const restarted=roundtrip(changed.record);assert.ok(parseAuthorityRecord(restarted));assert.deepEqual(planAuthorityTransaction(restarted,req,null).result,unchanged.result);
+ assert.equal(planAuthorityTransaction(restarted,intent2({requestId:'new'}),null).result.code,'request-reused');
+ assert.equal(planAuthorityTransaction(restarted,intent2({action:'recapture',requestId:'race'}),facts2()).result.code,'revision-conflict');
+ const approveReq=intent2({requestId:'approve',expectedRevision:1,captureVersion:NEXT2});const fill=planAuthorityTransaction(restarted,approveReq,facts2({captureVersion:NEXT2})).record;
+ assert.deepEqual(planAuthorityTransaction(roundtrip(fill),req,null).result,unchanged.result);
+ assert.equal(planAuthorityTransaction(fill,{...approveReq,action:'recapture'},null).result.code,'request-reused');
+ const forbidden=planAuthorityTransaction(fill,intent2({action:'recapture',requestId:'forbidden',expectedRevision:2,captureVersion:NEXT2}),facts2({captureVersion:NEXT2}));
+ assert.equal(forbidden.result.code,'invalid-transition');assert.equal(forbidden.persist,true);assert.ok(parseAuthorityRecord(roundtrip(forbidden.record)));
+});
+test('recapture validates host facts, v1 refusal, shape changes and common cap',()=>{
+ const req=intent2({action:'recapture'});
+ for(const change of [{nextReviewRoundId:'round2'},{completionVerified:true}])assert.equal(planAuthorityTransaction(fresh2(),req,facts2(change)).result.code,'invalid-transition');
+ assert.equal(planAuthorityTransaction(fresh2(),{...req,protocolVersion:1},facts2()).result.code,'invalid-transition');
+ const changed=planAuthorityTransaction(fresh2(),req,facts2({contentVersion:NEXT2}));assert.equal(changed.record.state.reviewVersion,NEXT2);assert.ok(parseAuthorityRecord(roundtrip(changed.record)));
+ const record=roundtrip(fresh2());
+ for(let n=0;n<MAX_AUTHORITY_JOURNAL_ENTRIES;n++){const r=intent2({action:'recapture',requestId:'cap'+n});record.journal.push({intent:r,facts:facts2(),result:{kind:'recaptured',action:'recapture',protocolVersion:2,requestId:r.requestId,reviewVersion:SHAPE2,captureVersion:RAW2,revision:0,changed:false},stateAfter:initial2()});}
+ assert.ok(parseAuthorityRecord(record));assert.equal(planAuthorityTransaction(record,req,facts2()).result.code,'unavailable');assert.equal(planAuthorityTransaction(record,intent2({action:'recapture',requestId:'cap0'}),null).replayed,true);
+});
