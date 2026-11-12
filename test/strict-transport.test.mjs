@@ -15,8 +15,9 @@ import { clientScript, renderHtml, renderShell } from "../lib/review.mjs";
 import {
   AUTHORITY_STATES, INTENTS, RESULTS, STRICT_ACTIONS, STRICT_REJECTIONS, VERSION_A, VERSION_B,
   committedFor, createMockAuthority, intentFor, parseAuthorityState, parseStrictIntent, parseStrictResult,
+  CAPTURE_1, CAPTURE_2, CAPTURE_3, SHAPE_A, SHAPE_B, V2_INITIAL_STATE, createPlannerAuthority, v2ShownFor,
 } from "./fixtures/strict-results.mjs";
-import { SKEL_DECISION_REJECTION, skelDecisionConfirms, skelDecisionController, skelDecisionOutcome, skelDecisionRender, skelMountDecision } from "../lib/review-decision.mjs";
+import { SKEL_DECISION_REJECTION, SKEL_DECISION_V2_ABSENT_GATES, skelDecisionConfirms, skelDecisionController, skelDecisionOutcome, skelDecisionRender, skelMountDecision, skelShownProtocol } from "../lib/review-decision.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LIB = path.join(HERE, "..", "lib");
@@ -851,4 +852,257 @@ test("#77: an Intent built by the UI carries no token or secret, only the contra
   assert.ok(parseStrictIntent(auth.calls.submit[0]));
   assert.deepEqual(auth.calls.submit[0], intentFor(AUTHORITY_STATES.skeleton, "approve", "req-1"));
   assert.doesNotMatch(DECISION, /x-skeleton-token|sessionStorage|localStorage|fetch\(/, "the module uses no review token, storage or network of its own");
+});
+
+// ---- V2 exact-capture adapter (#77 after #90), against the REAL V2 planner ----
+
+async function setupV2({ auth = createPlannerAuthority(), shown } = {}) {
+  const ctl = skelDecisionController({ channel: auth, shown: shown ?? v2ShownFor(auth.state), newRequestId: ids() });
+  await ctl.load();
+  return { auth, ctl };
+}
+const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+const v2Approve = (s, requestId) => ({ protocolVersion: 2, requestId, action: "approve", projectId: s.projectId, sessionId: s.sessionId, reviewRoundId: s.reviewRoundId, reviewVersion: s.reviewVersion, expectedRevision: s.revision, captureVersion: s.captureVersion });
+
+test("#77 V2: approve binds the shown shape AND raw capture; approved only after the planner commits and the re-read confirms the pair", async () => {
+  const { auth, ctl } = await setupV2();
+  assert.equal(action(ctl.view(), "approve").enabled, true);
+  const id = ctl.view().identity;
+  assert.equal(id.protocolVersion, 2);
+  assert.equal(id.captureVersion, CAPTURE_1);
+  assert.equal(id.shownCaptureVersion, CAPTURE_1);
+  assert.equal(id.approvedCaptureVersion, null);
+  const out = await ctl.decide("approve");
+  assert.equal(out.kind, "committed");
+  assert.deepEqual(auth.calls.submit[0], v2Approve(V2_INITIAL_STATE, "req-1"));
+  assert.ok(parseStrictIntent(auth.calls.submit[0]));
+  assert.equal(auth.state.approvedCaptureVersion, CAPTURE_1);
+  assert.deepEqual(ctl.view().approved, { reviewVersion: SHAPE_A, revision: 1, captureVersion: CAPTURE_1 });
+  assert.match(ctl.view().message.text, new RegExp(CAPTURE_1));
+});
+
+test("#77 V2: reshape names the approved shape + approvedCapture and confirms on the planner's rotated round", async () => {
+  const auth = createPlannerAuthority();
+  assert.equal((await auth.submit(v2Approve(auth.state, "seed-approve"))).kind, "committed");
+  auth.setFacts({ nextReviewRoundId: "example-round-2", contentVersion: SHAPE_B, captureVersion: CAPTURE_2 });
+  const fill = auth.state;
+  const { ctl } = await setupV2({ auth });
+  assert.equal(action(ctl.view(), "reshape").enabled, true);
+  const out = await ctl.decide("reshape");
+  assert.equal(out.kind, "committed");
+  assert.deepEqual(auth.calls.submit.at(-1), { protocolVersion: 2, requestId: "req-1", action: "reshape", projectId: fill.projectId, sessionId: fill.sessionId, reviewRoundId: fill.reviewRoundId, reviewVersion: SHAPE_A, expectedRevision: fill.revision, captureVersion: CAPTURE_1 });
+  assert.equal(ctl.view().status, "ready");
+  assert.equal(ctl.view().message.title, "Reshape recorded");
+  assert.equal(auth.state.reviewRoundId, "example-round-2");
+  assert.equal(auth.state.captureVersion, CAPTURE_2);
+  // The page's approved capture disagreeing with the state holds reshape.
+  const auth2 = createPlannerAuthority();
+  await auth2.submit(v2Approve(auth2.state, "seed"));
+  const { ctl: ctl2 } = await setupV2({ auth: auth2, shown: v2ShownFor(auth2.state, { approvedCaptureVersion: CAPTURE_3 }) });
+  assert.equal(action(ctl2.view(), "reshape").enabled, false);
+  assert.match(action(ctl2.view(), "reshape").reason, /approved raw capture/);
+});
+
+test("#77 V2: a same-shape raw capture swap in the state (real Recapture) holds the decision and never re-enables it", async () => {
+  const { auth, ctl } = await setupV2();
+  auth.setFacts({ captureVersion: CAPTURE_2 });
+  assert.equal(auth.recapture("other-actor-recapture").kind, "recaptured");
+  assert.equal(auth.state.reviewVersion, SHAPE_A, "same shape");
+  assert.equal(auth.state.captureVersion, CAPTURE_2, "different raw capture");
+  assert.equal((await ctl.decide("approve")).kind, "stale");
+  assert.equal(auth.calls.submit.length, 0, "nothing sent");
+  assert.equal(ctl.view().status, "stale");
+  await ctl.load(); // Re-read: the page still shows CAPTURE_1
+  assert.equal(ctl.view().status, "ready");
+  const a = action(ctl.view(), "approve");
+  assert.equal(a.enabled, false);
+  assert.match(a.reason, /raw capture/);
+  assert.deepEqual(await ctl.decide("approve"), { kind: "refused-locally" });
+  assert.equal(auth.calls.submit.length, 0);
+  // Only a page that explicitly shows the new capture may approve, and it binds that capture.
+  await ctl.setShown(v2ShownFor(auth.state));
+  await ctl.load();
+  assert.equal((await ctl.decide("approve")).kind, "committed");
+  assert.equal(auth.calls.submit[0].captureVersion, CAPTURE_2);
+});
+
+test("#77 V2: a page showing the right shape but a different raw capture can't approve; the digest is never taken from the state", async () => {
+  const { auth, ctl } = await setupV2({ shown: v2ShownFor(V2_INITIAL_STATE, { captureVersion: CAPTURE_2 }) });
+  assert.equal(action(ctl.view(), "approve").enabled, false);
+  assert.equal(ctl.view().identity.shownCaptureVersion, CAPTURE_2);
+  assert.deepEqual(await ctl.decide("approve"), { kind: "refused-locally" });
+  assert.equal(auth.calls.submit.length, 0);
+});
+
+test("#77 V2 race: a same-shape raw swap on the page during the pre-send read sends nothing", async () => {
+  const auth = createPlannerAuthority();
+  const gate = deferred();
+  let hold = false;
+  const channel = { getState: async () => { if (hold) await gate.promise; return auth.getState(); }, submit: (i) => auth.submit(i) };
+  const ctl = skelDecisionController({ channel, shown: v2ShownFor(auth.state), newRequestId: ids() });
+  await ctl.load();
+  hold = true;
+  const p = ctl.decide("approve");
+  const moved = ctl.setShown(v2ShownFor(auth.state, { captureVersion: CAPTURE_2 }));
+  hold = false;
+  gate.resolve();
+  await moved;
+  assert.equal((await p).kind, "stale");
+  assert.equal(auth.calls.submit.length, 0);
+  assert.equal(ctl.view().status, "stale");
+  assert.equal(ctl.view().approved, null);
+});
+
+test("#77 V2 race: a same-shape raw swap on the page while the approve is in flight reports the commit but never shows approval or retains", async () => {
+  const auth = createPlannerAuthority();
+  const gate = deferred();
+  const channel = { getState: () => auth.getState(), submit: async (i) => { const r = await auth.submit(i); await gate.promise; return r; } };
+  const ctl = skelDecisionController({ channel, shown: v2ShownFor(auth.state), newRequestId: ids() });
+  await ctl.load();
+  const p = ctl.decide("approve");
+  await tick(); await tick();
+  assert.equal(auth.calls.submit.length, 1, "in flight");
+  const moved = ctl.setShown(v2ShownFor(auth.state, { captureVersion: CAPTURE_2 }));
+  gate.resolve();
+  await moved;
+  assert.equal((await p).kind, "committed");
+  assert.equal(auth.commits(), 1);
+  const v = ctl.view();
+  assert.equal(v.status, "stale");
+  assert.equal(v.approved, null);
+  assert.equal(ctl.requestRetained, null);
+  assert.match(v.message.text, /recorded it/);
+  r6Check(v.message.text);
+});
+
+test("#77 V2: mixed-protocol, missing or wrong digest committed replies and recaptured results are malformed", () => {
+  const intent = v2Approve(V2_INITIAL_STATE, "req-1");
+  const good = { kind: "committed", requestId: "req-1", action: "approve", reviewVersion: SHAPE_A, revision: 1, protocolVersion: 2, captureVersion: CAPTURE_1 };
+  assert.deepEqual(skelDecisionOutcome(good, intent), { kind: "committed", revision: 1 });
+  const { protocolVersion, captureVersion, ...v1Reply } = good;
+  assert.equal(skelDecisionOutcome(v1Reply, intent).kind, "malformed", "V1 reply to a V2 intent");
+  assert.equal(skelDecisionOutcome({ ...good, captureVersion: CAPTURE_2 }, intent).kind, "malformed", "wrong raw digest");
+  assert.equal(skelDecisionOutcome({ ...good, reviewVersion: SHAPE_B }, intent).kind, "malformed", "wrong shape digest");
+  assert.equal(skelDecisionOutcome({ ...v1Reply, protocolVersion: 2 }, intent).kind, "malformed", "missing raw digest");
+  assert.equal(skelDecisionOutcome({ kind: "recaptured", requestId: "req-1", action: "recapture", protocolVersion: 2, reviewVersion: SHAPE_A, captureVersion: CAPTURE_1, revision: 1, changed: true }, intent).kind, "malformed");
+  const v1Intent = INTENTS.approve;
+  assert.equal(skelDecisionOutcome({ ...committedFor(v1Intent), protocolVersion: 2, captureVersion: CAPTURE_1 }, v1Intent).kind, "malformed", "V2 reply to a V1 intent");
+  assert.equal(skelDecisionOutcome(committedFor(v1Intent), v1Intent).kind, "committed");
+  // Confirmation needs the approved capture, in the intent's protocol.
+  const fill = { ...V2_INITIAL_STATE, phase: "fill", approvedVersion: SHAPE_A, approvedCaptureVersion: CAPTURE_1, revision: 1 };
+  assert.equal(skelDecisionConfirms(fill, intent, 1), true);
+  assert.equal(skelDecisionConfirms({ ...fill, approvedCaptureVersion: CAPTURE_2 }, intent, 1), false);
+  const { protocolVersion: _p, captureVersion: _c, approvedCaptureVersion: _a, ...v1Fill } = fill;
+  assert.equal(skelDecisionConfirms(v1Fill, intent, 1), false, "a V1 state confirms nothing for V2");
+  assert.equal(skelDecisionConfirms(fill, { ...v1Intent, reviewVersion: SHAPE_A, expectedRevision: 0 }, 1), false, "a V2 state confirms nothing for V1");
+});
+
+test("#77 V2: a mixed or wrong-capture committed reply, or a recaptured result, in the controller is never shown as approved", async () => {
+  for (const reply of [
+    { kind: "committed", requestId: "req-1", action: "approve", reviewVersion: SHAPE_A, revision: 1 },
+    { kind: "committed", requestId: "req-1", action: "approve", reviewVersion: SHAPE_A, revision: 1, protocolVersion: 2, captureVersion: CAPTURE_2 },
+    { kind: "recaptured", requestId: "req-1", action: "recapture", protocolVersion: 2, reviewVersion: SHAPE_A, captureVersion: CAPTURE_1, revision: 1, changed: true },
+  ]) {
+    const { auth, ctl } = await setupV2();
+    auth.force(reply);
+    assert.equal((await ctl.decide("approve")).kind, "malformed");
+    assert.equal(ctl.view().approved, null);
+    assert.equal(ctl.view().status, "stale");
+    assert.equal(ctl.requestRetained, null);
+  }
+});
+
+test("#77 V2: a reply lost after a real commit keeps the exact request; Re-read never settles it; the same-ID Retry replays the original", async () => {
+  const { auth, ctl } = await setupV2();
+  auth.loseNextReply();
+  assert.equal((await ctl.decide("approve")).kind, "unknown");
+  assert.equal(auth.commits(), 1, "the planner really committed");
+  assert.equal(ctl.requestRetained, "req-1");
+  assert.equal(ctl.view().approved, null);
+  await ctl.load(); // the current state shows the approve in effect, but that settles nothing
+  const v = ctl.view();
+  assert.equal(auth.state.approvedCaptureVersion, CAPTURE_1);
+  assert.equal(v.approved, null);
+  assert.equal(v.message.title, "Still unconfirmed");
+  r6Check(v.message.text);
+  assert.deepEqual(v.actions.map((a) => [a.action, a.retry]), [["approve", true]]);
+  assert.equal((await ctl.decide("approve")).kind, "committed");
+  assert.deepEqual(auth.calls.submit[1], auth.calls.submit[0], "the exact original requestID and pair, not rebuilt from the current state");
+  assert.equal(auth.calls.submit[1].expectedRevision, 0);
+  assert.equal(auth.commits(), 1, "replayed, not decided twice");
+  assert.deepEqual(ctl.view().approved, { reviewVersion: SHAPE_A, revision: 1, captureVersion: CAPTURE_1 });
+});
+
+test("#77 V2: a missing, V1 or malformed shown context refuses, with no fallback to V1", async () => {
+  const base = v2ShownFor(V2_INITIAL_STATE);
+  const { protocolVersion, captureVersion, approvedCaptureVersion, ...v1Shown } = base;
+  const { approvedCaptureVersion: _drop, ...noApprovedCap } = base;
+  const cases = {
+    "V1 shown on V2 state": v1Shown,
+    "explicit protocolVersion 1 on V2 state": { ...v1Shown, protocolVersion: 1 },
+    "missing approvedCaptureVersion": noApprovedCap,
+    "non-digest captureVersion": { ...base, captureVersion: "not-a-digest" },
+    "undefined captureVersion": { ...base, captureVersion: undefined },
+    "captureVersion without protocolVersion": { ...v1Shown, captureVersion: CAPTURE_1 },
+    "protocolVersion 1 with a capture": { ...base, protocolVersion: 1 },
+    "unknown protocolVersion": { ...base, protocolVersion: 3 },
+    "approved capture without approved version": { ...base, approvedCaptureVersion: CAPTURE_1 },
+  };
+  for (const [name, shown] of Object.entries(cases)) {
+    const { auth, ctl } = await setupV2({ shown });
+    const a = action(ctl.view(), "approve");
+    assert.equal(a.enabled, false, name);
+    assert.ok(a.reason, name);
+    assert.deepEqual(await ctl.decide("approve"), { kind: "refused-locally" }, name);
+    assert.equal(auth.calls.submit.length, 0, name);
+  }
+  assert.equal(skelShownProtocol(v1Shown), 1);
+  assert.equal(skelShownProtocol(base), 2);
+  assert.equal(skelShownProtocol(noApprovedCap), null);
+  assert.equal(skelShownProtocol(null), null);
+  // A V1 state with a V2 shown context refuses too.
+  const { auth, ctl } = await setup({ shown: { ...SHOWN, reviewVersion: SHAPE_A, protocolVersion: 2, captureVersion: CAPTURE_1, approvedCaptureVersion: null } });
+  assert.equal(action(ctl.view(), "approve").enabled, false);
+  assert.deepEqual(await ctl.decide("approve"), { kind: "refused-locally" });
+  assert.equal(auth.calls.submit.length, 0);
+});
+
+test("#77 V2: Recapture is never offered or sent by the decision UI", async () => {
+  const { auth, ctl } = await setupV2();
+  assert.ok(ctl.view().actions.every((a) => a.action !== "recapture"));
+  assert.deepEqual(await ctl.decide("recapture"), { kind: "refused-locally" });
+  assert.equal(auth.calls.submit.length, 0);
+});
+
+test("#77 V2: identity draws as text only, with the shown and authority pair; the intent has no token or secret", async () => {
+  const { auth, ctl } = await setupV2();
+  const node = skelDecisionRender(fakeDoc(), ctl.view(), { decide() {}, reread() {} });
+  const dl = byAttr(node, "data-decision-identity")[0];
+  const text = dl.children.map((c) => c.textContent);
+  for (const label of ["Protocol", "Raw capture shown", "Raw capture under review", "Approved raw capture"]) assert.ok(text.includes(label), label);
+  assert.ok(text.includes(CAPTURE_1));
+  assert.ok(dl.children.every((c) => c.children.every((k) => k.tag === "#text")), "text nodes only");
+  await ctl.decide("approve");
+  assert.deepEqual(Object.keys(auth.calls.submit[0]).sort(), ["action", "captureVersion", "expectedRevision", "projectId", "protocolVersion", "requestId", "reviewRoundId", "reviewVersion", "sessionId"]);
+});
+
+test("#77 V2: future gates stay absent and explicit", () => {
+  assert.deepEqual([...SKEL_DECISION_V2_ABSENT_GATES], ["listener-authenticated-origin", "capture-persistence", "capture-freeze", "anti-rollback"]);
+  assert.ok(Object.isFrozen(SKEL_DECISION_V2_ABSENT_GATES));
+});
+
+test("#77 V1 regression: default prototype intents, replies and identity carry no V2 fields", async () => {
+  const { auth, ctl } = await setup();
+  const id = ctl.view().identity;
+  for (const k of ["protocolVersion", "captureVersion", "approvedCaptureVersion", "shownCaptureVersion"]) assert.ok(!(k in id), k);
+  const node = skelDecisionRender(fakeDoc(), ctl.view(), { decide() {}, reread() {} });
+  assert.ok(!byAttr(node, "data-decision-identity")[0].children.map((c) => c.textContent).includes("Protocol"));
+  assert.equal(skelShownProtocol(SHOWN), 1);
+  auth.force({ ...committedFor(intentFor(AUTHORITY_STATES.skeleton, "approve", "req-1")), protocolVersion: 2, captureVersion: CAPTURE_1 });
+  assert.equal((await ctl.decide("approve")).kind, "malformed");
+  assert.equal(ctl.view().approved, null);
+  await ctl.load();
+  assert.equal((await ctl.decide("approve")).kind, "committed");
+  assert.deepEqual(auth.calls.submit[1], intentFor(AUTHORITY_STATES.skeleton, "approve", "req-2"));
+  assert.deepEqual(ctl.view().approved, { reviewVersion: VERSION_A, revision: 5 });
 });

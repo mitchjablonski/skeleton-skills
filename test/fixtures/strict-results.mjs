@@ -14,6 +14,7 @@ import {
   STRICT_ACTIONS, STRICT_PROTOCOL_VERSION, STRICT_REJECTIONS,
   parseAuthorityState, parseStrictIntent, parseStrictResult, strictIntentConflict, strictIntentIdentity,
 } from "../../lib/strict-protocol.mjs";
+import { createAuthorityRecord, planAuthorityTransaction } from "../../lib/strict-authority.mjs";
 
 export { STRICT_ACTIONS, STRICT_PROTOCOL_VERSION, STRICT_REJECTIONS, parseAuthorityState, parseStrictIntent, parseStrictResult };
 
@@ -56,6 +57,72 @@ export const RESULTS = Object.freeze({
   committed: Object.freeze(committedFor(INTENTS.approve)),
   ...Object.fromEntries(STRICT_REJECTIONS.map((code) => [code, Object.freeze({ kind: "rejected", requestId: INTENTS.approve.requestId, code })])),
 });
+
+// ---- V2 exact-capture fixtures (#77 after #90) ----
+
+export const SHAPE_A = "a".repeat(64);
+export const SHAPE_B = "b".repeat(64);
+export const CAPTURE_1 = "1".repeat(64);
+export const CAPTURE_2 = "2".repeat(64);
+export const CAPTURE_3 = "3".repeat(64);
+
+/** A V2 bootstrap state (revision 0, as createAuthorityRecord requires). */
+export const V2_INITIAL_STATE = Object.freeze({ ...IDS, phase: "skeleton", reviewVersion: SHAPE_A, approvedVersion: null, revision: 0, protocolVersion: 2, captureVersion: CAPTURE_1, approvedCaptureVersion: null });
+
+/** The explicit V2 shown context for a state: the pair the page says it shows. */
+export function v2ShownFor(state, extra = {}) {
+  const phase = { skeleton: "scaffold", fill: "fill", finalized: "done" }[state.phase];
+  return { phase, reviewVersion: state.reviewVersion, approvedVersion: state.approvedVersion, pendingNotes: false, protocolVersion: 2, captureVersion: state.captureVersion, approvedCaptureVersion: state.approvedCaptureVersion, ...extra };
+}
+
+/**
+ * A mock DecisionChannel whose decisions come from the REAL V2 planner
+ * (lib/strict-authority.mjs planAuthorityTransaction), so pair semantics can't
+ * drift from it. NOT an implementation: no authentication, no persistence
+ * beyond this closure, no capture freeze or anti-rollback; the host facts are
+ * test-supplied, which is exactly what a real host must NOT do unverified.
+ *   - `facts` is the host's independent observation (contentVersion,
+ *     captureVersion, nextReviewRoundId, completionVerified); setFacts moves it.
+ *   - `recapture(requestId)` is another actor submitting a V2 Recapture to the
+ *     same planner (never through the decision UI).
+ *   - `loseNextReply()` commits the next submit normally and then throws, an
+ *     unknown outcome after a real commit.
+ *   - `force(result)` answers the next submit with a fixed result, unplanned.
+ */
+export function createPlannerAuthority({ initialState = V2_INITIAL_STATE, facts } = {}) {
+  let record = createAuthorityRecord(initialState);
+  if (!record) throw new Error("bad initial state");
+  let host = facts ?? { contentVersion: initialState.reviewVersion, captureVersion: initialState.captureVersion, nextReviewRoundId: null, completionVerified: false };
+  let lose = 0;
+  const forced = [];
+  const calls = { getState: 0, submit: [] };
+  const plan = (intent) => {
+    const p = planAuthorityTransaction(record, intent, host);
+    if (p.persist) record = p.record;
+    return p.result;
+  };
+  return {
+    calls,
+    get state() { return { ...record.state }; },
+    get record() { return record; },
+    commits: () => record.journal.filter((e) => e.result.kind === "committed").length,
+    setFacts(next) { host = { ...host, ...next }; },
+    recapture(requestId) {
+      const s = record.state;
+      return plan({ protocolVersion: 2, requestId, action: "recapture", projectId: s.projectId, sessionId: s.sessionId, reviewRoundId: s.reviewRoundId, reviewVersion: s.reviewVersion, expectedRevision: s.revision, captureVersion: s.captureVersion });
+    },
+    loseNextReply() { lose++; },
+    force(result) { forced.push(result); },
+    async getState() { calls.getState++; return { ...record.state }; },
+    async submit(intent) {
+      calls.submit.push({ ...intent });
+      if (forced.length) return forced.shift();
+      const result = plan(intent);
+      if (lose) { lose--; throw new Error("reply lost after commit"); }
+      return result;
+    },
+  };
+}
 
 // ---- a reference mock authority (tests only) ----
 
