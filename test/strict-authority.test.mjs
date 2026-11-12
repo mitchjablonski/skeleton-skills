@@ -133,3 +133,52 @@ test("full journals retain exact retries and refuse new requests without pruning
   const oversized = { ...record, journal: new Array(MAX_AUTHORITY_JOURNAL_ENTRIES + 1) };
   assert.equal(parseAuthorityRecord(oversized), null);
 });
+
+const SHAPE2='a'.repeat(64), RAW2='b'.repeat(64), NEXT2='c'.repeat(64);
+const initial2=()=>({...initial(),protocolVersion:2,reviewVersion:SHAPE2,captureVersion:RAW2,approvedCaptureVersion:null});
+const intent2=(change={})=>({...intent(),protocolVersion:2,reviewVersion:SHAPE2,captureVersion:RAW2,...change});
+const facts2=(change={})=>({...facts(),contentVersion:SHAPE2,captureVersion:RAW2,...change});
+const fresh2=()=>createAuthorityRecord(initial2());
+test('v2 approval binds independent shape and raw capture; exact retries survive changed facts',()=>{
+  const approved=planAuthorityTransaction(fresh2(),intent2(),facts2());
+  assert.equal(approved.result.kind,'committed');assert.equal(approved.result.protocolVersion,2);assert.equal(approved.result.captureVersion,RAW2);
+  assert.equal(approved.record.protocolVersion,2);assert.equal(approved.record.state.approvedCaptureVersion,RAW2);
+  assert.deepEqual(parseAuthorityRecord(roundtrip(approved.record)),approved.record);
+  assert.deepEqual(planAuthorityTransaction(roundtrip(approved.record),intent2(),null).result,approved.result);
+  assert.equal(planAuthorityTransaction(approved.record,intent2({captureVersion:NEXT2}),null).result.code,'request-reused');
+  for(const change of [{captureVersion:NEXT2},{contentVersion:NEXT2}]) {
+    const refusal=planAuthorityTransaction(fresh2(),intent2(),facts2(change));
+    assert.equal(refusal.result.code,'stale-review');assert.equal(refusal.persist,true);assert.equal(refusal.record.state.revision,0);
+    assert.equal(planAuthorityTransaction(roundtrip(refusal.record),intent2(),facts2()).result.code,'stale-review');
+  }
+  const downgraded=planAuthorityTransaction(fresh2(),intent(),facts());
+  assert.equal(downgraded.result.code,'invalid-transition');assert.equal(downgraded.persist,false);
+  assert.equal(planAuthorityTransaction(fresh2(),intent2(),facts()).result.code,'unavailable');
+});
+test('v2 reshape installs a new capture pair and finalize permits legitimate changed body bytes',()=>{
+  const fill=planAuthorityTransaction(fresh2(),intent2(),facts2()).record;
+  const reshape=intent2({requestId:'reshape',action:'reshape',expectedRevision:1});
+  const next=planAuthorityTransaction(fill,reshape,facts2({contentVersion:NEXT2,captureVersion:'d'.repeat(64),nextReviewRoundId:'round2'}));
+  assert.equal(next.result.kind,'committed');assert.equal(next.result.captureVersion,RAW2);
+  assert.equal(next.record.state.reviewVersion,NEXT2);assert.equal(next.record.state.captureVersion,'d'.repeat(64));
+  assert.equal(next.record.state.approvedVersion,null);assert.equal(next.record.state.approvedCaptureVersion,null);
+  assert.ok(parseAuthorityRecord(roundtrip(next.record)));
+  const finalize=intent2({requestId:'finalize',action:'finalize',expectedRevision:1});
+  const completed=planAuthorityTransaction(fill,finalize,facts2({captureVersion:NEXT2,completionVerified:true}));
+  assert.equal(completed.result.kind,'committed');assert.equal(completed.result.captureVersion,RAW2);
+  assert.equal(completed.record.state.approvedCaptureVersion,RAW2);assert.equal(completed.record.state.phase,'finalized');
+  assert.ok(parseAuthorityRecord(roundtrip(completed.record)));
+  assert.equal(planAuthorityTransaction(fill,{...finalize,captureVersion:NEXT2},facts2({captureVersion:NEXT2,completionVerified:true})).result.code,'stale-review');
+  assert.equal(planAuthorityTransaction(fill,finalize,facts2({contentVersion:NEXT2,completionVerified:true})).result.code,'stale-review');
+  assert.equal(planAuthorityTransaction(fill,finalize,facts2({captureVersion:NEXT2})).result.code,'invalid-transition');
+});
+test('v2 records reject dropped capture fields, mismatched journal versions and downgrade envelopes',()=>{
+  const tx=planAuthorityTransaction(fresh2(),intent2(),facts2()).record;
+  for(const mutate of [v=>{v.protocolVersion=1;},v=>{delete v.state.captureVersion;},v=>{delete v.initialState.approvedCaptureVersion;},
+    v=>{delete v.journal[0].intent.captureVersion;},v=>{delete v.journal[0].facts.captureVersion;},v=>{delete v.journal[0].result.captureVersion;},
+    v=>{delete v.journal[0].stateAfter.approvedCaptureVersion;},v=>{v.journal[0].intent.protocolVersion=1;},
+    v=>{delete v.journal[0].result.protocolVersion;},v=>{v.journal[0].facts.captureVersion=NEXT2;}]) {
+    const corrupt=roundtrip(tx);mutate(corrupt);assert.equal(parseAuthorityRecord(corrupt),null);
+    assert.equal(planAuthorityTransaction(corrupt,intent2(),facts2()).result.code,'unavailable');
+  }
+});

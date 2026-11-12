@@ -72,3 +72,8 @@ automatic retry loop. No compaction or recovery procedure is implemented yet.
 
 The default CLI/state stores are unchanged. No containment or durable human
 approval claim follows from this planner or its tests.
+
+V2 exact-capture records and transitions are specified in
+[strict-protocol-v2.md](strict-protocol-v2.md). V1 prototype compatibility is not
+an acceptable production registration or downgrade path. Capture persistence
+and content/commit coordination remain outside the planner and store adapter.

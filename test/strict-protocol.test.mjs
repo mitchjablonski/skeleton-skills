@@ -95,3 +95,30 @@ test("strict result echoes committed identity and handles unknown transport outc
     assert.equal(parseStrictResult(changing), null, "discriminator must remain valid in the copied record");
   }
 });
+
+// V1 is disabled prototype compatibility; a future strict launcher must require V2.
+const shape2 = 'a'.repeat(64), capture2 = 'b'.repeat(64);
+const state2 = () => ({ ...state(), protocolVersion: 2, reviewVersion: shape2, captureVersion: capture2, approvedCaptureVersion: null });
+const intent2 = () => ({ ...intent(), protocolVersion: 2, reviewVersion: shape2, captureVersion: capture2 });
+test('v2 exact capture fields are mandatory full lowercase digests and cannot downgrade', () => {
+  assert.ok(parseAuthorityState(state2())); assert.ok(parseStrictIntent(intent2()));
+  const result = { kind: 'committed', protocolVersion: 2, requestId: 'r', action: 'approve', reviewVersion: shape2, captureVersion: capture2, revision: 1 };
+  assert.ok(parseStrictResult(result));
+  for (const [make, parse, keys] of [[state2, parseAuthorityState, ['captureVersion','approvedCaptureVersion','protocolVersion']], [intent2, parseStrictIntent, ['captureVersion','protocolVersion']], [() => ({...result}), parseStrictResult, ['captureVersion','protocolVersion']]]) {
+    for (const key of keys) { const v = make(); delete v[key]; assert.equal(parse(v), null, key); }
+    for (const key of ['reviewVersion','captureVersion']) for (const bad of ['short','A'.repeat(64),'a'.repeat(63)]) assert.equal(parse({...make(),[key]:bad}),null);
+    const v=make(); let invoked=false;Object.defineProperty(v,'captureVersion',{get(){invoked=true;throw Error();}});assert.equal(parse(v),null);assert.equal(invoked,false);
+  }
+  assert.equal(parseStrictIntent({...intent2(),protocolVersion:1}),null);
+  assert.equal(parseAuthorityState({...state2(),protocolVersion:1}),null);
+  assert.equal(strictIntentConflict(state2(),intent()),'invalid-transition');
+  assert.equal(strictIntentConflict(state(),intent2()),'invalid-transition');
+  assert.equal(strictIntentConflict(state2(),intent2()),null);
+  assert.equal(strictIntentConflict(state2(),{...intent2(),captureVersion:'c'.repeat(64)}),'stale-review');
+  assert.notEqual(strictIntentIdentity(intent2()),strictIntentIdentity({...intent2(),captureVersion:'c'.repeat(64)}));
+  const fill={...state2(),phase:'fill',approvedVersion:shape2,approvedCaptureVersion:capture2,revision:1,captureVersion:'d'.repeat(64)};
+  for(const action of ['reshape','finalize']) {
+    assert.equal(strictIntentConflict(fill,{...intent2(),action,expectedRevision:1}),null);
+    assert.equal(strictIntentConflict(fill,{...intent2(),action,expectedRevision:1,captureVersion:fill.captureVersion}),'stale-review');
+  }
+});

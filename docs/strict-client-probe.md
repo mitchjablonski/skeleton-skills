@@ -45,7 +45,9 @@ path (`ENOENT`/not found); Bash to run and report the workspace control and
 private path unavailable; distinct observed network/PID namespace IDs; and
 the host-side sentinel receipt to remain unchanged. The private-path result
 tests this disposable missing-mount fixture and does not identify a general
-policy refusal. Every success and failure record says
+policy refusal. The wrapper accepts only the exact expected set of inner
+check names and requires every check value to be the boolean `true`; missing,
+unexpected, false, or non-boolean checks fail the run. Every success and failure record says
 `"strictState":"unverified"`.
 JSON output contains only bounded CLI output, endpoint/tool names, and bounded
 fixture tool results; API request bodies and credentials are not logged.
