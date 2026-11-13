@@ -188,8 +188,11 @@ setTimeout(() => { location.href = "${url4}"; }, 1500);
   const tabE = await browser.newPage();
   await tabE.goto(`${A}/`);
   const ran = await until(() => attackerHits.includes("/ran"));
-  // Wait for the delayed top-level navigation to reach the listener instead of sleeping.
-  const navSeen = await until(() => log.slice(n).filter((e) => e.method === "GET" && e.url === "/" && e.code === "document-site").length >= 2, 15000);
+  // The iframe and prefetch alone produce refused document GETs, so prove the
+  // top-level navigation itself: the hostile tab must end up on the listener
+  // origin showing the static refusal page.
+  const navSeen = await tabE.waitUntil(`location.origin === ${JSON.stringify(origin)}
+    && /can only be opened from the launcher's control window/.test(document.body.innerText)`, 15000);
   const eText = await tabE.eval("document.body.innerText").catch(() => "");
   const reached = logSince(n);
   const anyOk = log.slice(n).some((e) => e.status < 400 && !e.url.startsWith("/assets/"));
@@ -201,7 +204,7 @@ setTimeout(() => { location.href = "${url4}"; }, 1500);
   const fOk = await tabF.waitUntil("!!document.querySelector('[data-strict-capture]')");
   const has = (method, url, code) => log.slice(n).some((e) => e.method === method && e.url === url && (!code || e.code === code));
   const expected = { ran, formOrBeaconBind: has("POST", "/api/bind", "same-origin-required"), preflight: has("OPTIONS", "/api/view"),
-    simpleView: has("GET", "/api/view", "same-origin-required"), iframeAndNavigation: navSeen };
+    simpleView: has("GET", "/api/view", "same-origin-required"), iframeRefused: has("GET", "/", "document-site"), topLevelNavigationRefused: navSeen };
   row("B6", "hostile same-site origin: its script runs, and form POST, no-cors bind, simple and preflighted view reads, iframe and top-level navigation all reach the listener and are refused; the nonce still binds",
     Object.values(expected).every(Boolean) && !anyOk && fOk && !/data-strict-capture/.test(eText),
     { expected, listener: reached, hostileTabText: eText.slice(0, 160), nonceStillBinds: fOk });
