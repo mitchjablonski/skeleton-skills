@@ -1,5 +1,9 @@
 # Isolated real TLS lab
 
+The [combined relay fixture](strict-relay-tls.md) adds an actual pinned CLI in a
+separate sibling namespace. This original eight-case lab remains its independent
+TLS regression control.
+
 This disabled opt-in fixture exercises actual Node TLS and HTTP against a local
 HTTPS server inside a fresh disposable user/network namespace. It uses only a
 fixed dummy upstream key and performs no external DNS, internet or model call.
