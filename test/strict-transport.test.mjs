@@ -844,7 +844,8 @@ test("#77: the default page is unchanged — the decision module isn't loaded, s
       // The disabled capture-view prototype (host model, browser DOM half and
       // host convenience renderer) intentionally reuses the shown parser and
       // its own modules. No other lib/bin file may load either prototype.
-      if (dir === "lib" && ["strict-capture-view.mjs", "strict-capture-view-model.mjs", "strict-capture-view-dom.mjs"].includes(f)) continue;
+      if (dir === "lib" && ["strict-capture-view.mjs", "strict-capture-view-model.mjs", "strict-capture-view-dom.mjs",
+        "strict-decision-listener.mjs", "strict-decision-app.mjs"].includes(f)) continue;
       assert.doesNotMatch(fs.readFileSync(path.join(HERE, "..", dir, f), "utf-8"), /review-decision|strict-capture-view/, `${dir}/${f} loads a protected UI prototype`);
     }
   }

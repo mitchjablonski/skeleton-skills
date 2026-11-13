@@ -43,12 +43,12 @@ applies to what the view shows. It refuses:
   read as own keys only;
 - an end-of-file marker anywhere but the last line;
 - a separator inside a line's text;
-- NUL or lone surrogates;
+- NUL or lone surrogates, or a leading BOM;
 - line text plus endings whose UTF-8 length isn't exactly the file's
   `byteLength`, so truncated or padded text refuses;
 - fences whose open/close marker lines don't parse to the same id and title,
-  using the marker grammar copied from `lib/markers.mjs` (a test keeps the
-  copies identical);
+  using the marker grammar copied from `lib/markers.mjs` (a test compares
+  the declarations text-for-text, and round-trips every comment style);
 - line kinds that disagree with the fences;
 - an unparsed marker-like line in a fenced file;
 - a whole file with fences, or a fenced file without them;

@@ -1,0 +1,14 @@
+/* #77 prototype decision page: fixed, project-independent styles. */
+:root { color-scheme: light dark; --fg: #1b1b1b; --bg: #fafafa; --muted: #5c5c5c; --line: #d6d6d6; --warn: #8a4b00; }
+@media (prefers-color-scheme: dark) { :root { --fg: #e8e8e8; --bg: #161616; --muted: #a8a8a8; --line: #3a3a3a; --warn: #f0b060; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+main { max-width: 72rem; margin: 0 auto; padding: 1rem; }
+.disabled-note { color: var(--warn); }
+.rows { display: grid; grid-template-columns: max-content 1fr; gap: .2rem 1rem; }
+.rows dd { margin: 0; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+.source { list-style: none; padding: 0; font-family: ui-monospace, monospace; font-size: 13px; }
+.source .line { border-bottom: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; }
+.source .body { opacity: .75; }
+.source .marker { font-weight: 600; }
+.line-number, .line-kind, .line-ending { color: var(--muted); }
+.line-escaped { display: block; color: var(--warn); }
