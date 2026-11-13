@@ -29,7 +29,8 @@ purpose until this is settled.
   - the control window, including its PTY, session and descriptors, and
     injection through `TIOCSTI` or procfs;
   - display, clipboard and accessibility channels: X11, Wayland and WSLg
-    sockets and environment variables, and OSC 52 clipboard reads;
+    sockets and environment variables. Terminal clipboard and title escapes
+    (OSC 52, OSC 0/1/2) are filtered out of the agent's PTY output;
   - desktop automation.
 - **The control window** is a fresh terminal or window that only the launcher
   owns, with its own PTY, session and file descriptors.
@@ -50,9 +51,8 @@ purpose until this is settled.
 **What a code proves, and what it doesn't.** Possessing a valid code doesn't
 prove a human typed it, that the page was open when it was typed, or that
 anyone read the bytes. It proves only that the code issued to the protected
-tab for that state reached the control window, and that nothing in between
-was allowed. Compared with H0, H3 adds one property: the decision is tied to
-a code that was shown only with that snapshot, which is the #66 property.
+tab for that state reached the control window. Compared with H0, H3 adds one property: the decision is tied to
+a code that was issued only with that snapshot, which is the #66 property.
 Whether that is worth the friction is the maintainer's call.
 
 ## Proposed design (H3)
@@ -78,7 +78,9 @@ Whether that is worth the friction is the maintainer's call.
     rendered.
   - It prints both version prefixes and the revision beside the code.
   - A Re-read that brings a different capture replaces the view and its codes
-    together. A tab never shows a code for bytes it isn't showing.
+    together. It also resets the notes declaration and the reshape extra
+    step, so a choice made for one capture never carries over to another. A
+    tab never shows a code for bytes it isn't showing.
 - **Approve waits for the notes declaration.** The approve code appears only
   after the human picks "I have no unsent notes on this version" (C5). The
   choice is display-only and needs no POST. "I have notes" shows no code.
@@ -106,15 +108,18 @@ Whether that is worth the friction is the maintainer's call.
   - Crockford normalization (case, I/L→1, O→0, hyphens and spaces ignored);
   - bracketed paste is accepted only when it contains no newline, escape or
     control bytes;
-  - raw input is never echoed back.
+  - raw input is never echoed back. The window runs the terminal in raw mode
+    and draws its own masked input line.
 - **Output policy:** the window prints only launcher-generated text: fixed
   copy, hex digests, revisions and opaque ids. It never prints paths, fence
   titles, notes or any other agent-influenced text.
 - **Commands:**
   - **`approve <code>` and `reshape <code>`.** The window sends
-    `{action, code, requestId}` to the authority. Before committing, it
-    echoes the shape and capture version prefixes and the revision from the
-    authority's reply.
+    `{action, code, requestId}` to the authority, which verifies and commits
+    in one step. The window then echoes the committed reply: action, shape
+    and capture version prefixes, revision and time. There is no pre-commit
+    confirm round-trip. If one is ever added, its second phase must carry the
+    exact expected revision and pair through the same CAS.
   - **`recapture`.** No code is needed, because the page isn't involved. It
     is a deliberate command that needs its own typed confirmation line. If
     a Retry is pending, it shows the existing copy: "Recapture ends the
@@ -123,7 +128,8 @@ Whether that is worth the friction is the maintainer's call.
     is a human Recapture, per the decision page doc (C4).
   - **`retry`.** It resends the kept Intent with its original request id.
   - **`status`.**
-  - Each code-less command needs confirmation on its own line.
+  - `recapture` and `retry` each need confirmation on their own line.
+    `status` doesn't.
 - **One verification is one atomic step in the authority.** The authority
   serializes the following:
   1. look up the current state;
@@ -143,8 +149,16 @@ Whether that is worth the friction is the maintainer's call.
   - No history oracle: it doesn't say whether the code was stale, for
     another action or mistyped.
   - After N failures in a round (proposed N = 5) the round stops accepting
-    codes until the human runs `recapture` or the launcher reopens the
-    review. A global cap per session applies too.
+    codes. A global cap per session applies too. The counters are persisted
+    in the authority store, so a restart doesn't reset them. How each phase
+    unlocks:
+    - **Skeleton phase:** a human `recapture`. An unchanged Recapture also
+      resets the counter, so the cap limits tries per action, not per code.
+      That is acceptable, because only the human can type there.
+    - **Fill phase,** where transactional Recapture refuses (C4): the human
+      ends the session from the control window and starts a new strict
+      session from the launcher. That session gets a new round key.
+    - **Session cap:** the session ends.
   - 40 bits gives a finite, probabilistic guess and collision chance. The
     caps, and the agent's inability to type into the window, keep online
     guessing out of reach. The doc makes no stronger claim.
@@ -208,7 +222,12 @@ or reopened. Anyone who observes a code before then can use it.
   - a spoofed control-window title on the agent terminal.
 
   New launch-refusal rows are needed for the X11/Wayland/WSLg sockets and
-  environment variables, and for OSC 52 reads.
+  environment variables. OSC 52 handling is a setting in the human's
+  terminal, which the launcher can't inspect. So the whole-process launcher
+  filters the agent's PTY output instead. It drops OSC 52 (clipboard read
+  and write) and OSC 0/1/2 (window titles). That closes the
+  clipboard-replacement and spoofed-title rows, and the matching #79 rows
+  test the filter.
 - **#78.** The checkpoint copy (#110) already sends the human to the control
   window. `awaiting-review` would name the commands.
 
@@ -221,6 +240,8 @@ or reopened. Anyone who observes a code before then can use it.
   - is the only Intent writer.
 - **Protocol:** an approved change for the code-carrying Intent or the verify
   operation, with request-id dedupe that includes the code.
+- **PTY filtering:** an output filter on the agent's PTY that drops OSC 52
+  and OSC 0/1/2.
 - **The control process:** a fresh, isolated PTY, session and descriptors,
   with real evidence that the agent can't reach it through `TIOCSTI`,
   procfs, the PTY, display servers, the clipboard or automation.
