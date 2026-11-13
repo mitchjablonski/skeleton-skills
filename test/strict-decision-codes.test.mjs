@@ -7,13 +7,17 @@ import { parseDecisionCodes, commandFor, bindingLine, CONTROL_BANNER, DECISION_C
 const A = "a".repeat(64), B = "b".repeat(64), C = "c".repeat(64), D = "d".repeat(64);
 const scaffold = (o = {}) => ({ binding: { protocolVersion: 2, projectId: "p", sessionId: "s", reviewRoundId: "r", phase: "scaffold",
   reviewVersion: A, captureVersion: B, approvedVersion: null, approvedCaptureVersion: null, pendingNotes: false, ...o } });
-const fill = (o = {}) => scaffold({ phase: "fill", approvedVersion: C, approvedCaptureVersion: D, ...o });
+// In fill the rendered (selected) pair is the approved pair.
+const fill = (o = {}) => scaffold({ phase: "fill", reviewVersion: C, captureVersion: D, approvedVersion: C, approvedCaptureVersion: D, ...o });
 const entry = (o = {}) => ({ code: "K7M2-QX9D", revision: 4, reviewVersion: A, captureVersion: B, ...o });
 
 test("approve binds the selected pair; reshape binds the approved pair", () => {
   assert.deepEqual(parseDecisionCodes({ approve: entry() }, scaffold()), { approve: entry() });
   assert.deepEqual(parseDecisionCodes({ reshape: entry({ reviewVersion: C, captureVersion: D }) }, fill()), { reshape: entry({ reviewVersion: C, captureVersion: D }) });
-  assert.equal(parseDecisionCodes({ reshape: entry() }, fill()), null, "reshape on the selected pair");
+  assert.equal(parseDecisionCodes({ reshape: entry() }, fill()), null, "reshape on another pair");
+  // The page renders the selected pair; a reshape code is never shown when that differs from the approved pair.
+  assert.equal(parseDecisionCodes({ reshape: entry({ reviewVersion: C, captureVersion: D }) }, fill({ reviewVersion: A, captureVersion: B })), null);
+  assert.equal(parseDecisionCodes({ reshape: entry({ reviewVersion: C, captureVersion: D }) }, fill({ captureVersion: B })), null);
   assert.equal(parseDecisionCodes({ approve: entry({ captureVersion: D }) }, scaffold()), null, "approve for another capture");
   assert.deepEqual(parseDecisionCodes({}, scaffold()), {});
 });
@@ -38,6 +42,7 @@ test("malformed codes and entries refuse", () => {
 test("display helpers and banner", () => {
   assert.equal(commandFor("approve", entry()), "approve K7M2-QX9D");
   assert.equal(bindingLine(entry()), `shape ${A.slice(0, 12)}… · capture ${B.slice(0, 12)}… · revision 4`);
+  assert.equal(bindingLine(entry(), "reshape"), `approved shape ${A.slice(0, 12)}… · approved capture ${B.slice(0, 12)}… · revision 4`);
   assert.equal(CONTROL_BANNER, "SKELETON STRICT CONTROL");
   assert.ok(DECISION_CODE_RE.test("0123-4567"));
 });

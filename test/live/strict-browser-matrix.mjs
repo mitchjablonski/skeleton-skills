@@ -285,6 +285,72 @@ setTimeout(() => { location.href = "${url4}"; }, 1500);
   row("B15", "fill: the reshape code appears only after 'Show' and the acknowledgement, and hides again if unchecked",
     r0.length === 0 && r1.length === 0 && r2[0] === "reshape R5H9-2KQV" && r3.length === 0, { r0, r1, r2, r3 });
 
+  // B16: a failed Re-read after "no notes" leaves no code panel (and no capture).
+  current = { binding, capture: cap, codes: { approve: approveEntry(cap) } };
+  const tabI = await browser.newPage();
+  await tabI.goto(listener.mintNavigation());
+  await tabI.waitUntil("!!document.querySelector('[data-strict-capture]')");
+  await tabI.eval("document.getElementById('notes-none').click()");
+  const iBefore = await tabI.eval("document.querySelectorAll('#decide .decision-code').length");
+  current = { read() { throw new Error("store offline"); } };
+  n = log.length;
+  await tabI.eval("document.getElementById('reread').click()");
+  await until(() => log.slice(n).some((e) => e.url === "/api/view"));
+  await tabI.waitUntil("!document.getElementById('reread').disabled");
+  const iAfter = await tabI.eval("({ panel: document.getElementById('decide').childElementCount, view: document.getElementById('view').childElementCount })");
+  row("B16", "a Re-read that fails after 'no notes' was chosen clears the code panel and the capture",
+    iBefore === 1 && iAfter.panel === 0 && iAfter.view === 0, { codesBefore: iBefore, after: iAfter, listener: logSince(n) });
+
+  // B17: codes the listener drops never reach the panel; the capture still shows.
+  const dropCases = {
+    pendingNotes: { binding: { ...binding, pendingNotes: true }, capture: cap, codes: { approve: approveEntry(cap) } },
+    otherCapture: { binding, capture: cap, codes: { approve: approveEntry(cap2) } },
+    reshapeNotRendered: { binding: { ...binding, phase: "fill", approvedVersion: cap2.shapeVersion, approvedCaptureVersion: cap2.captureVersion },
+      capture: cap, codes: { reshape: approveEntry(cap2) } },
+    donePhase: { binding: { ...binding, phase: "done", approvedVersion: cap.shapeVersion, approvedCaptureVersion: cap.captureVersion }, capture: cap, codes: {} },
+  };
+  const drops = {};
+  for (const [name, state] of Object.entries(dropCases)) {
+    current = state;
+    const t = await browser.newPage();
+    await t.goto(listener.mintNavigation());
+    await t.waitUntil("!!document.querySelector('[data-strict-capture]')");
+    drops[name] = await t.eval("({ panel: document.getElementById('decide').childElementCount, reshapeButton: !!document.getElementById('show-reshape'), status: document.getElementById('status').textContent, rule: !!document.querySelector('.code-rule') })");
+    await t.close();
+  }
+  row("B17", "dropped codes (pending notes, another capture, reshape when the rendered pair isn't the approved pair) and the done phase show no code panel; the capture still shows",
+    Object.values(drops).every((d) => d.panel === 0 && !d.reshapeButton && d.rule)
+      && ["pendingNotes", "otherCapture", "reshapeNotRendered"].every((k) => /don't match this capture/.test(drops[k].status)), drops);
+
+  // B18: the page's own re-check. A fake server (same app and assets) sends codes
+  // for another capture without marking them dropped; the page must show none.
+  current = { binding, capture: cap, codes: {} };
+  const realTab = JSON.parse(await new Promise((resolve) => {
+    const r = http.request(`${origin}/api/bind`, { method: "POST", headers: { origin, "sec-fetch-site": "same-origin", "content-type": "application/json" } },
+      (res) => { let b = ""; res.on("data", (c) => { b += c; }); res.on("end", () => resolve(b)); });
+    r.end(JSON.stringify({ nonce: new URL(listener.mintNavigation()).hash.slice(3) }));
+  })).tab;
+  const fetchListener = (url, headers) => new Promise((resolve) => http.get(`${origin}${url}`, { headers }, (res) => {
+    let b = ""; res.on("data", (c) => { b += c; }); res.on("end", () => resolve(b)); }));
+  const shellHtml = await fetchListener("/", { "sec-fetch-site": "none", "sec-fetch-mode": "navigate", "sec-fetch-dest": "document" });
+  const realView = JSON.parse(await fetchListener("/api/view", { "sec-fetch-site": "same-origin", "x-skel-tab": realTab })).view;
+  const fake = http.createServer((req, res) => {
+    if (req.url === "/") { res.writeHead(200, { "content-type": "text/html" }); return res.end(shellHtml); }
+    const m = /^\/assets\/([a-z-]+\.(?:mjs|css))$/.exec(req.url);
+    if (m) { res.writeHead(200, { "content-type": m[1].endsWith(".css") ? "text/css" : "text/javascript" }); return res.end(fs.readFileSync(new URL(`../../lib/${m[1]}`, import.meta.url))); }
+    if (req.url === "/api/bind") { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ tab: "F".repeat(43) })); }
+    if (req.url === "/api/view") { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ view: realView, codes: { approve: approveEntry(cap2) }, codesDropped: false })); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise((r) => fake.listen(0, "127.0.0.1", r));
+  const tabK = await browser.newPage();
+  await tabK.goto(`http://127.0.0.1:${fake.address().port}/#n=${"Q".repeat(43)}`);
+  await tabK.waitUntil("!!document.querySelector('[data-strict-capture]')");
+  const k = await tabK.eval("({ panel: document.getElementById('decide').childElementCount, status: document.getElementById('status').textContent })");
+  fake.close();
+  row("B18", "the page re-checks codes itself: codes for another capture sent as valid are not shown",
+    k.panel === 0 && /don't match this capture/.test(k.status), k);
+
   // Rows that need a decision route (not in the prototype).
   row("B9", "Approve arms late after focus/visibility and needs a separate confirm", null, "no decision route in the prototype");
   row("B10", "double-click lure and focus steal from the review origin don't approve", null, "no decision route in the prototype");

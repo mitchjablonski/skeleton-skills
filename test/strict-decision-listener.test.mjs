@@ -168,8 +168,9 @@ lt("view/state need the live tab binding; the model is a valid browser view mode
   const v = await s.req("GET", "/api/view", { ...s.api, [TAB_HEADER]: tab });
   assert.equal(v.status, 200);
   const body = JSON.parse(v.text);
-  assert.deepEqual(Object.keys(body), ["view", "codes"]);
+  assert.deepEqual(Object.keys(body), ["view", "codes", "codesDropped"]);
   assert.deepEqual(body.codes, {});
+  assert.equal(body.codesDropped, false);
   const model = parseStrictCaptureViewModel(body.view);
   assert.equal(model.shown.captureVersion, s.cap.captureVersion);
   const st = JSON.parse((await s.req("GET", "/api/state", { ...s.api, [TAB_HEADER]: tab })).text);
@@ -222,7 +223,7 @@ test("listener and app are prototypes: nothing in lib/bin imports them; app has 
 
 // ---- H3 proposal: codes travel with the capture they bind (prototype) ----
 const CODE = "K7M2-QX9D";
-lt("codes are served in the same response as the capture they bind; mismatched codes refuse the whole view", async (t) => {
+lt("codes are served in the same response as the capture they bind; mismatched codes are dropped, the capture still shows", async (t) => {
   const cap = realCapture();
   let codes = null;
   const s = await setup(t, { provider: { read: () => ({ binding: bindingFor(cap), capture: cap, codes }) } });
@@ -232,6 +233,7 @@ lt("codes are served in the same response as the capture they bind; mismatched c
   const ok = await get();
   assert.equal(ok.status, 200);
   assert.deepEqual(JSON.parse(ok.text).codes, codes);
+  assert.equal(JSON.parse(ok.text).codesDropped, false);
   const bad = [
     { approve: { ...codes.approve, captureVersion: "0".repeat(64) } },           // another capture
     { reshape: { ...codes.approve } },                                             // not allowed in scaffold
@@ -241,9 +243,14 @@ lt("codes are served in the same response as the capture they bind; mismatched c
     { approve: { ...codes.approve, revision: -1 } },
     { finalize: { ...codes.approve } },                                            // finalize is out of v1
   ];
+  // approve while notes are pending is dropped too
+
   for (const [i, c] of bad.entries()) {
     codes = c;
     const r = await get();
-    assert.deepEqual([r.status, JSON.parse(r.text)], [503, { error: "codes" }], `case ${i}`);
+    const body = JSON.parse(r.text);
+    assert.equal(r.status, 200, `case ${i}`);
+    assert.deepEqual([body.codes, body.codesDropped], [{}, true], `case ${i}`);
+    parseStrictCaptureViewModel(body.view); // the capture itself is still served
   }
 });

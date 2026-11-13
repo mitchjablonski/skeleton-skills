@@ -17,3 +17,4 @@ main { max-width: 72rem; margin: 0 auto; padding: 1rem; }
 .code-warning { font-weight: 600; }
 .decision-code { font-size: 1.4em; letter-spacing: .08em; }
 .code-binding, .code-held { color: var(--muted); }
+.code-rule { color: var(--muted); font-size: .9em; }

@@ -140,7 +140,7 @@ This section prototypes the page side of
 adopted**, and the control window that would accept codes doesn't exist. No
 code is derived, verified or sent here.
 
-- **Response shape.** `GET /api/view` returns `{ view, codes }`.
+- **Response shape.** `GET /api/view` returns `{ view, codes, codesDropped }`.
   `provider.read()` may return `codes`: `{ approve | reshape: { code,
   revision, reviewVersion, captureVersion } }`. Because they come from the
   same read as the capture, codes always travel with the capture they bind.
@@ -149,32 +149,45 @@ code is derived, verified or sent here.
   - The codes must be canonical Crockford `XXXX-XXXX`.
   - Only phase-allowed actions are accepted: approve in scaffold, reshape in
     fill, none in done. Finalize is out of v1.
-  - Approve binds the selected pair and is never accepted while the binding
-    says notes are pending. Reshape binds the approved pair.
+  - Approve binds the selected (rendered) pair and is never accepted while the
+    binding says notes are pending.
+  - Reshape binds the approved pair, and is accepted only when the rendered
+    (selected) pair *is* the approved pair. Its binding line says "approved
+    shape … · approved capture …".
   - Every code names the same revision.
-- **Refusals.** The listener refuses the whole view with `503 codes` if the
-  codes don't match. The page re-checks them against the capture it actually
-  rendered and shows none if they don't match.
+- **Dropped codes.** If the codes don't pass, the listener drops them and
+  still serves the capture (`codes: {}`, `codesDropped: true`). The page then
+  says that codes were withheld. The page also re-checks the codes against
+  the capture it rendered, and shows none if they don't match.
 - **The panel** sits in fixed chrome: sticky, double-bordered and outside
   `#view`.
   - The approve code appears only after "I have no unsent notes on this
-    version". "I have notes" shows no code.
-  - The reshape code appears only after "Show the reshape code" plus an
-    acknowledgement, and unchecking hides it.
-  - Each code shows its shape and capture version prefixes and revision. The
-    panel names the control window's banner (`SKELETON STRICT CONTROL`) and
-    says never to paste the code anywhere else.
-  - Every load rebuilds the panel, so a declaration never carries over to
-    another capture.
+    version". The reshape code appears only after "Show the reshape code" plus
+    an acknowledgement.
+  - Each code shows its version prefixes and revision, and the panel names
+    the control window's banner (`SKELETON STRICT CONTROL`).
+  - Every load empties the panel first, so a declaration never carries over
+    and a failed load leaves no code.
+  - A load counter drops stale responses.
+  - A fixed line in the shell, which is always present and never
+    agent-influenced, says real codes appear only in that panel.
 - **Browser rows** in `test/live/strict-browser-matrix.mjs`:
   - **B13:** the code is hidden until the notes choice and sits outside the
-    capture, and a skeleton lure ("approve ZZZZ-ZZZZ") stays inside the
-    capture.
+    capture; a skeleton lure stays inside the capture.
   - **B14:** a Re-read with a different capture resets the declaration.
   - **B15:** the reshape steps.
+  - **B16:** a failed Re-read clears the panel.
+  - **B17:** dropped codes and the done phase show no panel.
+  - **B18:** the page's own re-check against a fake server that sends
+    mismatched codes as valid.
+- **Mutations killed:**
 
-  Mutations that showed the approve code without the declaration, or ignored
-  the reshape acknowledgement, failed B13/B14 and B15.
+  | Mutation | Fails |
+  | --- | --- |
+  | Approve code shown without the declaration | B13, B14 |
+  | Reshape acknowledgement ignored | B15 |
+  | The page's re-check removed | B18 |
+  | Panel clearing removed | B16 |
 
 ## Not shown (still open)
 
