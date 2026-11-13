@@ -132,7 +132,12 @@ Whether that is worth the friction is the maintainer's call.
   - `recapture` and `retry` each need confirmation on their own line.
     `status` doesn't.
 - **One verification is one atomic step in the authority.** The authority
-  serializes the following:
+  holds its serialization lock across the following, including the journal
+  lookup before any current-state validation:
+  0. look up `requestId` in the journal. If present, an identical canonical
+     request returns its stored result immediately, even if the current
+     revision, pair, round or allowed action has changed. A different request
+     reusing that id refuses. Only an absent id continues to step 1;
   1. look up the current state;
   2. check the action is allowed;
   3. recompute the expected code for that exact action, revision and pair,
@@ -245,12 +250,26 @@ or reopened. Anyone who observes a code before then can use it.
 - **The authority:**
   - owns the round key and its lifecycle (creation, rotation on reshape,
     restart behavior);
-  - performs serialized verify, build-Intent and CAS on exact state;
+  - before implementation, pins an approved minimum key entropy and the named
+    operating-system CSPRNG source used to generate it;
+  - performs the journal lookup, verify, build-Intent and CAS under the same
+    serialization lock, with exact retries resolved before current-state
+    validation;
   - is the only Intent writer.
 - **Protocol:** an approved change for the code-carrying Intent or the verify
-  operation, with request-id dedupe that includes the code.
-- **PTY filtering:** an output filter on the agent's PTY that drops OSC 52
-  and OSC 0/1/2.
+  operation, with request-id dedupe that includes the code. Before
+  implementation, it must pin:
+  - the canonical request identity, including code normalization, so an
+    identical same-id retry returns the journaled result before current-state
+    validation, differing reuse refuses, and only an absent id continues;
+  - length-prefix width and byte order, each field's byte encoding, canonical
+    revision representation and hash forms;
+  - which HMAC bits are truncated, their bit order and their exact Crockford
+    character mapping;
+  - approved test vectors covering canonical encoding, code derivation,
+    normalization and journal-first retry behavior.
+- **PTY filtering:** a stateful output parser on the agent's PTY that drops
+  OSC 52 and OSC 0/1/2, including the split-read and wrapped forms listed above.
 - **The control process:** a fresh, isolated PTY, session and descriptors,
   with real evidence that the agent can't reach it through `TIOCSTI`,
   procfs, the PTY, display servers, the clipboard or automation.
