@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -107,11 +108,56 @@ lt("bind: exact Origin, JSON only, one-time unexpired nonce; minting again revok
   assert.equal((await s.bind(n3)).status, 403, "expired nonce");
 });
 
-lt("oversized bind body is cut off", async (t) => {
+lt("oversized bind body is cut off and the nonce stays bindable", async (t) => {
   const s = await setup(t);
-  s.l.mintNavigation();
-  const r = await s.req("POST", "/api/bind", s.post, JSON.stringify({ nonce: "x".repeat(4096) })).catch((e) => ({ error: e.code }));
+  const nonce = s.nonceOf(s.l.mintNavigation());
+  const padded = JSON.stringify({ nonce }) + " ".repeat(2048); // valid JSON, only too big
+  const r = await s.req("POST", "/api/bind", s.post, padded).catch((e) => ({ error: e.code }));
   assert.ok(r.error || r.status >= 400, JSON.stringify(r));
+  assert.equal((await s.bind(nonce)).status, 200, "the cut-off request did not consume the nonce");
+});
+
+lt("non-ASCII tab or nonce values are refused without crashing the listener", async (t) => {
+  const s = await setup(t);
+  const nonce = s.nonceOf(s.l.mintNavigation());
+  const bad = "\u00e9".repeat(43);
+  const a = await s.req("GET", "/api/view", { ...s.api, [TAB_HEADER]: Buffer.from(bad).toString("latin1") });
+  assert.equal(a.status, 403);
+  assert.equal((await s.req("POST", "/api/bind", s.post, JSON.stringify({ nonce: bad }))).status, 403);
+  assert.equal((await s.bind(nonce)).status, 200, "listener still alive and the real nonce still valid");
+});
+
+lt("a cookie bomb (~700 KiB of cookies set by another 127.0.0.1 origin) does not take the page down", async (t) => {
+  const s = await setup(t);
+  const cookie = Array.from({ length: 180 }, (_, i) => `c${i}=${"x".repeat(3990)}`).join("; ");
+  const r = await s.req("GET", "/", { ...s.doc, cookie });
+  assert.equal(r.status, 200);
+  const tab = JSON.parse((await s.req("POST", "/api/bind", { ...s.post, cookie }, JSON.stringify({ nonce: s.nonceOf(s.l.mintNavigation()) }))).text).tab;
+  assert.equal((await s.req("GET", "/api/view", { ...s.api, cookie, [TAB_HEADER]: tab })).status, 200);
+});
+
+lt("a refused document gets a static script-free reopen page, not JSON", async (t) => {
+  const s = await setup(t);
+  const r = await s.req("GET", "/", { ...s.doc, "sec-fetch-site": "same-origin" }); // e.g. a reload
+  assert.equal(r.status, 403);
+  assert.match(r.headers["content-type"], /^text\/html/);
+  assert.match(r.text, /Reopen the decision page/);
+  assert.doesNotMatch(r.text, /<script|<link|src=|href=/i);
+  assert.equal(r.headers["content-security-policy"], DECISION_LISTENER_CSP);
+});
+
+lt("raw protocol edge cases: duplicate Host, HTTP/1.0, absolute-form targets", async (t) => {
+  const s = await setup(t);
+  const raw = (text) => new Promise((resolve) => {
+    const sock = net.connect(s.port, "127.0.0.1", () => sock.end(text));
+    let out = ""; sock.on("data", (d) => { out += d; }); sock.on("close", () => resolve(out)); sock.on("error", () => resolve(out));
+  });
+  const meta = "sec-fetch-site: none\r\nsec-fetch-mode: navigate\r\nsec-fetch-dest: document\r\nconnection: close\r\n";
+  assert.match(await raw(`GET / HTTP/1.1\r\nhost: ${s.host}\r\nhost: evil.example:1\r\n${meta}\r\n`), /^HTTP\/1\.1 (421|400)/);
+  assert.match(await raw(`GET / HTTP/1.1\r\nhost: evil.example:1\r\nhost: ${s.host}\r\n${meta}\r\n`), /^HTTP\/1\.1 (421|400)/);
+  assert.match(await raw(`GET / HTTP/1.0\r\nhost: ${s.host}\r\n${meta}\r\n`), /^HTTP\/1\.1 505/);
+  assert.match(await raw(`GET http://${s.host}/ HTTP/1.1\r\nhost: ${s.host}\r\n${meta}\r\n`), /^HTTP\/1\.1 (4\d\d)/);
+  assert.match(await raw(`GET / HTTP/1.1\r\nhost: ${s.host}\r\n${meta}\r\n`), /^HTTP\/1\.1 200/, "control: a clean request still works");
 });
 
 lt("view/state need the live tab binding; the model is a valid browser view model", async (t) => {
