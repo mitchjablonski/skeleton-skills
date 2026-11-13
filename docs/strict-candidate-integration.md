@@ -52,7 +52,7 @@ Every drift case first passes a valid selected-body fill as its positive control
 then applies the targeted mutation and requires its specific fixture or enumeration
 error code. The unchanged-body case deliberately skips that fill. Both wrong
 review-version and wrong capture-version bindings are checked. Malformed marker
-parsing propagates through enumeration as `ENUM_UNAVAILABLE`; it does not pass
+parsing propagates through enumeration as typed `ENUM_MARKERS`; it does not pass
 by triggering the unchanged-body check. Removing the explicit mode check or
 whole-file check in temporary mutation runs made their respective negative tests
 fail, even with the redundant shape identity check still enabled.

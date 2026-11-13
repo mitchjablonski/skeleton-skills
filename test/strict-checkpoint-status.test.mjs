@@ -197,6 +197,15 @@ test("a vanished file or unlistable copy is a stop-in-doubt refusal, never sessi
     assert.doesNotMatch(s.detail, /something the session wrote/);
   }
 });
+test("only proven enumeration marker faults offer fill restart; unavailable remains uncertain", () => {
+  const marker=checkpointStatus(refused("capture-refused", {kind:"ENUM_MARKERS",path:"plan.js",line:null}));
+  assert.ok(Object.hasOwn(CONTENT_CODES,"ENUM_MARKERS"));
+  assert.equal(marker.boundaryInDoubt,false);
+  assert.ok(marker.actions.includes("restart-from-approved"));
+  const uncertain=checkpointStatus(refused("capture-refused", {kind:"ENUM_UNAVAILABLE",path:null,line:null}));
+  assert.equal(uncertain.boundaryInDoubt,true);
+  assert.ok(!uncertain.actions.includes("restart-from-approved"));
+});
 
 test("host manifest/runtime faults never blame the session or offer restart", () => {
   for (const kind of ["CAPTURE_DUPLICATE", "ENUM_UNSUPPORTED_NAMES"]) {
