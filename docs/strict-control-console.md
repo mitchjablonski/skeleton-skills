@@ -17,6 +17,14 @@ Strict stays disabled.
 
 ## Authority interface (proposal)
 
+This is the interface of a **new private authority adapter** bound to one
+project and session. It is not the raw V2 `submit`: the V2 Intent rejects an
+extra `code` field. The adapter needs its own command ledger with a canonical
+normalized code, private immutable project/session context, a journal-first
+same-ID lookup and serialized verify plus exact-state CAS. Recapture must work
+on a host-owned quiescent capture. A retry is never rebuilt from the current
+state. All of that belongs to Codex (#76).
+
 Every reply echoes the request's `requestId`. A reply without it, or with
 another id, is malformed and the outcome is unknown. Replies are read as own
 data properties only, so a getter or a proxy trap is also malformed.
