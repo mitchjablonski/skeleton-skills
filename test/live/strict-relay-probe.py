@@ -216,15 +216,19 @@ def main():
    if verification!=expected:raise RuntimeError('candidate outcome mismatch')
    rounds.append({**evidence,'case':case,'seed':seed,'verification':verification})
   protocol=[]
-  for label,payload,expected in [('oversized',struct.pack('!I',2*1024*1024+1),'RELAY_FRAME_BYTES'),('override',{'version':1,'id':1,'request':{'method':'POST','target':'/v1/messages','rawHeaders':[],'bodyBase64':'e30=','destination':'127.0.0.1'}},'RELAY_FRAME'),('partial',struct.pack('!I',20)+b'{','RELAY_PARTIAL_TIMEOUT')]:
+  for label,payload,expected in [('oversized',struct.pack('!I',2*1024*1024+1),'RELAY_FRAME_BYTES'),('override',{'version':1,'id':1,'request':{'method':'POST','target':'/v1/messages','rawHeaders':[],'bodyBase64':'e30=','destination':'127.0.0.1'}},'RELAY_FRAME'),('partial',struct.pack('!I',20)+b'{','RELAY_PARTIAL_TIMEOUT'),('null',None,'RELAY_FRAME')]:
    host,endpoint,errors=start_host(node,root,sentinel,label)
    try:
     if isinstance(payload,bytes):endpoint.sendall(payload)
     else:send_frame(endpoint,payload)
     refusal=recv_frame(endpoint)
     if refusal.get('ok') is not False or refusal.get('code')!=expected:raise RuntimeError('protocol refusal wrong')
+    if label=='null':
+     # A malformed top-level value must revoke the channel, not merely fail one
+     # frame and leave a subsequent valid provider request usable.
+     if endpoint.recv(1)!=b'':raise RuntimeError('null frame did not revoke channel')
     endpoint.close();summary=line(host.stdout);host.wait(timeout=10)
-    if summary.get('send')!=0 or summary.get('snapshot',{}).get('inFlight')!=0:raise RuntimeError('malformed protocol reached provider')
+    if summary.get('send')!=0 or summary.get('snapshot',{}).get('inFlight')!=0 or summary.get('closed') is not True or summary.get('snapshot',{}).get('closed') is not True:raise RuntimeError('malformed protocol reached provider or did not revoke broker')
     protocol.append(expected)
    finally:
     endpoint.close()

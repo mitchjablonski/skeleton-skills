@@ -65,8 +65,10 @@ const keys=(v,n)=>v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).sort
 async function frame(raw){
  let id=null,owns=false;
  try {
-   let f;try{f=JSON.parse(raw);}catch{throw Object.assign(Error(),{code:'RELAY_FRAME'});}id=f.id;
-  if(!keys(f,['version','id','request'])||f.version!==1||!Number.isSafeInteger(id)||id!==last+1||id>32)throw Object.assign(Error(),{code:'RELAY_FRAME'});
+   let f;try{f=JSON.parse(raw);}catch{throw Object.assign(Error(),{code:'RELAY_FRAME'});}
+  if(!keys(f,['version','id','request']))throw Object.assign(Error(),{code:'RELAY_FRAME'});
+  id=f.id;
+  if(f.version!==1||!Number.isSafeInteger(id)||id!==last+1||id>32)throw Object.assign(Error(),{code:'RELAY_FRAME'});
   last=id;
   if(!keys(f.request,['method','target','rawHeaders','bodyBase64'])||typeof f.request.bodyBase64!=='string')throw Object.assign(Error(),{code:'RELAY_FRAME'});
   if(busy)throw Object.assign(Error(),{code:'BROKER_CONCURRENCY'});

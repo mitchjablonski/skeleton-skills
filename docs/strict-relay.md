@@ -91,9 +91,11 @@ The stopped selected-only fill must pass. The outside sentinel stays unchanged.
 Source is never reconstructed from tool output or repaired after teardown.
 
 Separate disposable host sessions exercise a declared oversized frame, an extra
-destination override field and an incomplete frame. Each requires its intended
-RELAY_FRAME_BYTES, RELAY_FRAME or RELAY_PARTIAL_TIMEOUT refusal with zero provider
-sends. These are synthetic ingress checks, not additional actual CLI runs.
+destination override field, an incomplete frame and a top-level JSON null.
+Each requires its intended RELAY_FRAME_BYTES, RELAY_FRAME or
+RELAY_PARTIAL_TIMEOUT refusal with zero provider sends and a closed broker.
+The null case also requires channel EOF, preventing reuse after the malformed
+frame. These are synthetic ingress checks, not additional actual CLI runs.
 
 On 2026-11-12 a pinned Linux run reported Claude Code 2.1.323, four outside
 provider requests, and namespace pid:[4026532234]. A detached writer's control
