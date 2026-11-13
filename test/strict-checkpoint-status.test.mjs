@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import {
   checkpointStatus, parseCheckpointReport, CHECKPOINT_PHASES, CHECKPOINT_REFUSALS, DRIFT_KINDS, CHECKPOINT_ACTIONS,
-  CONTENT_CODES, BOUNDARY_CODES, HOST_CODES, NO_CLAIM, AGENT_WAIT,
+  CONTENT_CODES, BOUNDARY_CODES, LINK_CODES, HOST_CODES, NO_CLAIM, AGENT_WAIT,
 } from "../lib/strict-checkpoint-status.mjs";
 
 const report = (o = {}) => ({ version: 1, phase: "running", stage: "fill", round: "round-1", refusal: null, detail: null, ...o });
@@ -18,7 +18,7 @@ const ALL = () => {
     if (phase !== "refused" && !(stage === "scaffold" && FILL_ONLY_PHASES.includes(phase))) out.push(report({ phase, stage }));
   for (const stage of ["scaffold", "fill"]) for (const r of CHECKPOINT_REFUSALS)
     if (!(stage === "scaffold" && FILL_ONLY_REFUSALS.includes(r))) out.push(refused(r, detailFor(r), stage));
-  for (const kind of Object.keys({ ...CONTENT_CODES, ...BOUNDARY_CODES, ...HOST_CODES }))
+  for (const kind of Object.keys({ ...CONTENT_CODES, ...BOUNDARY_CODES, ...LINK_CODES, ...HOST_CODES }))
     for (const stage of ["scaffold", "fill"]) out.push(refused("capture-refused", { kind, path: null, line: null }, stage));
   return out;
 };
@@ -80,7 +80,7 @@ test("other refusals: not used, no reopen of review, restart only for fill cause
     assert.equal(s.boundaryInDoubt, false);
     assert.ok(!s.actions.includes("reopen-decision-page"), label(r));
     assert.ok(s.actions.includes("end-session"));
-    const restartable = r.stage === "fill" && (["drift", "check-unavailable"].includes(r.refusal)
+    const restartable = r.stage === "fill" && (r.refusal === "check-unavailable" || (r.refusal === "drift" && r.detail.kind !== "link")
       || (r.refusal === "capture-refused" && Object.hasOwn(CONTENT_CODES, r.detail.kind)));
     assert.equal(s.actions.includes("restart-from-approved"), restartable, label(r));
     assert.equal(/Restart the fill/.test(s.next), restartable, `${label(r)} next matches actions`);
@@ -134,13 +134,13 @@ test("ended doesn't claim every process is gone", () => {
 
 test("details name kind, path and line; hidden, combining and reordering characters are escaped", () => {
   for (const kind of DRIFT_KINDS) assert.match(checkpointStatus(refused("drift", { kind, path: "src/a.js", line: 7 })).headline, /in src\/a\.js at line 7\.$/, kind);
-  for (const [ch, hex] of [["\u202E", "202E"], ["\u3164", "3164"], ["\u0336", "336"], ["\u200B", "200B"], ["\uFEFF", "FEFF"]]) {
+  for (const [ch, hex] of [["\u3164", "3164"], ["\u0336", "336"], ["\u034F", "34F"]]) {
     const s = checkpointStatus(refused("drift", { kind: "exterior", path: `src/x${ch}y.js`, line: null }));
     assert.match(s.headline, new RegExp(`\\\\u\\{${hex}\\}`), hex);
     assert.ok(!s.headline.includes(ch), hex);
   }
-  const cap = checkpointStatus(refused("capture-refused", { kind: "ENUM_UNAVAILABLE", path: "a.js", line: null }, "scaffold"));
-  assert.match(cap.headline, /ENUM_UNAVAILABLE/);
+  const cap = checkpointStatus(refused("capture-refused", { kind: "CAPTURE_MARKERS", path: "a.js", line: null }, "scaffold"));
+  assert.match(cap.headline, /CAPTURE_MARKERS/);
   assert.match(cap.next, /rewritten in a new session/);
 });
 
@@ -180,4 +180,44 @@ test("prototype: nothing in lib/bin loads the checkpoint status module", () => {
 test("the standing note and agent notice have their exact reviewed wording", () => {
   assert.equal(NO_CLAIM, "Strict status remains unverified: this report is the launcher's account of its own steps, not proof that the boundary held.");
   assert.equal(AGENT_WAIT, "Stopped by the strict launcher. Wait for the human.");
+});
+
+test("every real CAPTURE_/ENUM_ code is mapped to exactly one group", () => {
+  const src = (f) => readFileSync(new URL(`../lib/${f}`, import.meta.url), "utf8");
+  const real = new Set([...`${src("strict-capture.mjs")}\n${src("strict-enumeration.mjs")}`.matchAll(/\b(?:CAPTURE|ENUM)_[A-Z_]+\b/g)].map((m) => m[0]));
+  const groups = [CONTENT_CODES, BOUNDARY_CODES, LINK_CODES, HOST_CODES];
+  for (const code of real) assert.equal(groups.filter((g) => Object.hasOwn(g, code)).length, 1, code);
+  for (const g of groups) for (const code of Object.keys(g)) assert.ok(real.has(code), `${code} is not a real code`);
+});
+
+test("a vanished file or unlistable copy is a stop-in-doubt refusal, never session content", () => {
+  for (const kind of ["CAPTURE_MISSING", "CAPTURE_CHANGED", "ENUM_CHANGED"]) {
+    const s = checkpointStatus(refused("capture-refused", { kind, path: null, line: null }));
+    assert.equal(s.boundaryInDoubt, true, kind);
+    assert.doesNotMatch(s.detail, /something the session wrote/);
+  }
+});
+
+test("causes the launcher can't attribute (ENUM_UNAVAILABLE, host manifest/runtime faults) never blame the session or offer restart", () => {
+  for (const kind of ["ENUM_UNAVAILABLE", "CAPTURE_DUPLICATE", "ENUM_UNSUPPORTED_NAMES"]) {
+    const s = checkpointStatus(refused("capture-refused", { kind, path: null, line: null }));
+    assert.ok(Object.hasOwn(HOST_CODES, kind), kind);
+    assert.ok(!s.actions.includes("restart-from-approved"), kind);
+    assert.doesNotMatch(s.detail, /something the session wrote/);
+  }
+});
+
+test("display paths follow safePath: byte limit and no format/separator characters", () => {
+  for (const path of ["a/\u202Eb", "a\u2028b", "a\u2029b", "\u00e9".repeat(2049)])
+    assert.equal(parseCheckpointReport(refused("drift", { kind: "exterior", path, line: null })), null, JSON.stringify(path.slice(0, 8)));
+  assert.ok(parseCheckpointReport(refused("drift", { kind: "exterior", path: "\u00e9".repeat(2048), line: null })));
+});
+
+test("links never offer restart, and the copy says the session probably made them", () => {
+  for (const r of [refused("drift", { kind: "link", path: "a", line: null }), refused("capture-refused", { kind: "CAPTURE_LINK", path: null, line: null }),
+    refused("capture-refused", { kind: "ENUM_TYPE", path: null, line: null })]) {
+    const s = checkpointStatus(r);
+    assert.ok(!s.actions.includes("restart-from-approved"), label(r));
+    assert.match(s.detail, /session probably created it/);
+  }
 });
