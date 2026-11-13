@@ -191,15 +191,15 @@ test("every real CAPTURE_/ENUM_ code is mapped to exactly one group", () => {
 });
 
 test("a vanished file or unlistable copy is a stop-in-doubt refusal, never session content", () => {
-  for (const kind of ["CAPTURE_MISSING", "CAPTURE_CHANGED", "ENUM_CHANGED"]) {
+  for (const kind of ["CAPTURE_MISSING", "CAPTURE_CHANGED", "ENUM_CHANGED", "CAPTURE_LINK", "ENUM_UNAVAILABLE"]) {
     const s = checkpointStatus(refused("capture-refused", { kind, path: null, line: null }));
     assert.equal(s.boundaryInDoubt, true, kind);
     assert.doesNotMatch(s.detail, /something the session wrote/);
   }
 });
 
-test("causes the launcher can't attribute (ENUM_UNAVAILABLE, host manifest/runtime faults) never blame the session or offer restart", () => {
-  for (const kind of ["ENUM_UNAVAILABLE", "CAPTURE_DUPLICATE", "ENUM_UNSUPPORTED_NAMES"]) {
+test("host manifest/runtime faults never blame the session or offer restart", () => {
+  for (const kind of ["CAPTURE_DUPLICATE", "ENUM_UNSUPPORTED_NAMES"]) {
     const s = checkpointStatus(refused("capture-refused", { kind, path: null, line: null }));
     assert.ok(Object.hasOwn(HOST_CODES, kind), kind);
     assert.ok(!s.actions.includes("restart-from-approved"), kind);
@@ -214,8 +214,7 @@ test("display paths follow safePath: byte limit and no format/separator characte
 });
 
 test("links never offer restart, and the copy says the session probably made them", () => {
-  for (const r of [refused("drift", { kind: "link", path: "a", line: null }), refused("capture-refused", { kind: "CAPTURE_LINK", path: null, line: null }),
-    refused("capture-refused", { kind: "ENUM_TYPE", path: null, line: null })]) {
+  for (const r of [refused("drift", { kind: "link", path: "a", line: null }), refused("capture-refused", { kind: "ENUM_TYPE", path: null, line: null })]) {
     const s = checkpointStatus(r);
     assert.ok(!s.actions.includes("restart-from-approved"), label(r));
     assert.match(s.detail, /session probably created it/);

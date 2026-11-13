@@ -75,9 +75,12 @@ The supervisor mapping below comes from Sol's review of the first draft.
 ### When the stop itself is in doubt
 
 These refusals are: `teardown-unproven`, `writer-survived`, `restart-unproven`,
-and `capture-refused` with `CAPTURE_CHANGED`, `ENUM_CHANGED` or
-`CAPTURE_MISSING`. A file vanishing from the stopped copy is the same signal
-as one changing.
+and `capture-refused` with `CAPTURE_CHANGED`, `ENUM_CHANGED`, `CAPTURE_MISSING`,
+`CAPTURE_LINK` or `ENUM_UNAVAILABLE`. Capture runs after the listing, so a file
+that vanished or became a link since it was listed is the same signal as one
+changing. Enumeration collapses every raw error into `ENUM_UNAVAILABLE` (I/O,
+permissions, procfs, a vanished or changed file, a malformed marker). The
+cause is lost and may be a mutation, so it is treated the same way.
 
 - **The copy says** a session process may still be running.
 - **What is refused:** capture, checks and restart.
@@ -101,8 +104,8 @@ stage, and only for these causes:
 | Refusal | Means | Restart from approved |
 | --- | --- | --- |
 | capture-refused, content codes | Something the session wrote: malformed markers, non-UTF-8 text, a BOM, an ambiguous separator, a line or size limit, or an unsupported or too-long name | fill only |
-| capture-refused, link codes, and drift `link` | A symlink, hard link or special file (`CAPTURE_LINK`, `ENUM_TYPE`). The session probably made it, but a link can reach outside the project | no |
-| capture-refused, host codes | A launcher or environment fault, or a cause the launcher can't attribute: root, I/O, device boundary, handles, budget, policy, unsupported platform, a duplicate in the launcher's own capture list (`CAPTURE_DUPLICATE`), the runtime's name listing (`ENUM_UNSUPPORTED_NAMES`), and `ENUM_UNAVAILABLE`. Enumeration collapses every raw error into `ENUM_UNAVAILABLE` (I/O, permissions, procfs, a vanished file, a malformed marker), so it is never blamed on the session until a typed cause is kept | no |
+| capture-refused `ENUM_TYPE`, and drift `link` | A symlink, device or special file found while listing. The session probably made it, but a link can reach outside the project | no |
+| capture-refused, host codes | A launcher or environment fault, or a cause the launcher can't attribute: root, I/O, device boundary, handles, budget, policy, unsupported platform, a duplicate in the launcher's own capture list (`CAPTURE_DUPLICATE`), and the runtime's name listing (`ENUM_UNSUPPORTED_NAMES`) | no |
 | store-outcome-unknown | Storing may or may not have completed. The request identity is kept for reconciliation, and a reload or re-read can't settle it. The copy never says "nothing was used" | no |
 | approved-unreadable | The approved record or capture can't be read or doesn't match. Every request and session refuses until recovery outside the host (decision-page R3) | no |
 | drift (not `link`) | Something other than the selected step body changed (kind, path, line) | fill only |
