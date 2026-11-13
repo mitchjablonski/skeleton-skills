@@ -168,6 +168,7 @@ def main():
     seed=fixture.session_command(node,root,'seed-valid',['--seed',stage/'tree',session])
     if seed.get('captureVersion')!=prepared['captureVersion'] or seed.get('reviewVersion')!=prepared['reviewVersion'] or seed.get('exactStoredClone') is not True:raise RuntimeError('seed mismatch')
     evidence=relay.actual_round(client,node,root,1,'valid',checkpoint,held,endpoint.fileno())
+    if evidence['client']['requests']!=4:raise RuntimeError('pinned combined profile requires exactly four CLI requests')
     if not worker:raise RuntimeError('missing worker topology evidence')
     safe=True
     verification=fixture.session_command(node,root,'check-valid',['--check',stage/'tree',session,'valid'])
@@ -188,9 +189,10 @@ def main():
    endpoint.close();summary=relay.line(process.stdout)
    child=relay.wait_until(lambda:relay.read_json(service['controls']/'child-exit') if (service['controls']/'child-exit').exists() else None,'service child finished')
    if child!={'code':0} or summary.get('snapshot',{}).get('closed') is not True or summary.get('snapshot',{}).get('inFlight')!=0:raise RuntimeError('service broker not settled')
-   t=summary.get('tls',{});expected_requests=evidence['client']['requests'] if scenario=='valid' else int(scenario=='redirect')
-   if t.get('connects')!=(expected_requests if scenario=='valid' else 1) or t.get('requests')!=expected_requests or t.get('httpRequests')!=expected_requests or t.get('liveSockets')!=0 or t.get('keyObserved') is not bool(expected_requests):raise RuntimeError('TLS request/key counts wrong')
-   if scenario=='valid' and (summary.get('toolResultsVerified') is not True or any(x!='8.8.8.8' for x in t['peers']) or any(x!='api.anthropic.com' for x in t['sni'])):raise RuntimeError('real TLS acceptance failed')
+   t=summary.get('tls',{});expected_requests=4 if scenario=='valid' else int(scenario=='redirect');expected_connects=4 if scenario=='valid' else 1
+   if t.get('connects')!=expected_connects or t.get('resolves')!=expected_connects or t.get('requests')!=expected_requests or t.get('httpRequests')!=expected_requests or t.get('liveSockets')!=0 or t.get('keyObserved') is not bool(expected_requests):raise RuntimeError('TLS request/key counts wrong')
+   if scenario=='valid' and (summary.get('toolResultsVerified') is not True or t.get('peers')!=['8.8.8.8']*4 or t.get('sni')!=['api.anthropic.com']*4 or t.get('tcpConnections')!=4 or t.get('secureConnections')!=4 or t.get('tlsClientErrors')!=0):raise RuntimeError('real TLS acceptance failed')
+   if scenario=='untrusted' and (t.get('tcpConnections',0)<1 or t.get('secureConnections')!=0 or t.get('tlsClientErrors',0)<1):raise RuntimeError('untrusted row did not demonstrate rejected TLS handshake')
    row.update(service=state,tls=t,serviceDeath=service_death(service,checkpoint,relay));service=None;safe=True
    if sentinel.read_bytes()!=original:raise RuntimeError('private sentinel modified')
    rows.append(row)

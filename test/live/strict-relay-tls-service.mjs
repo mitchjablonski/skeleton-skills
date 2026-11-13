@@ -7,7 +7,7 @@ const [rawFd,hostNetworkNamespace,scenario,sentinel]=process.argv.slice(2);
 if(!['valid','untrusted','peer-mismatch','redirect'].includes(scenario)||!sentinel?.startsWith('/'))throw Error('LAB_INVOCATION');
 const read=name=>fs.readFileSync('/fixtures/'+name,'utf8');
 const provider=createFixedProvider(sentinel),sockets=new Set(),sni=[];
-let httpRequests=0,keyObserved=true;
+let httpRequests=0,keyObserved=true,tcpConnections=0,secureConnections=0,tlsClientErrors=0;
 const server=https.createServer({key:read('server.key'),cert:read('server.crt'),ALPNProtocols:['http/1.1']},async(req,res)=>{
  httpRequests++;keyObserved&&=req.headers['x-api-key']==='strict-mock-upstream-dummy-only';
  let size=0;const chunks=[];
@@ -21,8 +21,9 @@ const server=https.createServer({key:read('server.key'),cert:read('server.crt'),
   res.end(Buffer.concat(outgoing,total));
  }catch{res.destroy();}
 });
-server.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});
-server.on('secureConnection',socket=>sni.push(socket.servername));
+server.on('connection',socket=>{tcpConnections++;sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});
+server.on('secureConnection',socket=>{secureConnections++;sni.push(socket.servername);});
+server.on('tlsClientError',()=>{tlsClientErrors++;});
 await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(443,'8.8.8.8',resolve);});
 const tls=createTlsLabTransport({ca:read(scenario==='untrusted'?'other-ca.crt':'ca.crt'),answers:scenario==='peer-mismatch'?['8.8.4.4']:undefined,hostNetworkNamespace});
 let resolves=0;
@@ -36,5 +37,5 @@ async function cancelSockets(){
 process.stdout.write(JSON.stringify({event:'ready',scenario,networkNamespace:fs.readlinkSync('/proc/self/ns/net'),pidNamespace:fs.readlinkSync('/proc/self/ns/pid')})+'\n');
 await serveRelay({fd:Number(rawFd),transport,evidence:provider.evidence,onStop:cancelSockets,onFinish:async()=>{
  await cancelSockets();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
- return {scenario,serviceNetworkNamespace:fs.readlinkSync('/proc/self/ns/net'),tls:{connects:tls.evidence.connects,requests:tls.evidence.requests,peers:tls.evidence.peers,sni,httpRequests,keyObserved:httpRequests>0&&keyObserved,resolves,liveSockets:sockets.size}};
+ return {scenario,serviceNetworkNamespace:fs.readlinkSync('/proc/self/ns/net'),tls:{connects:tls.evidence.connects,requests:tls.evidence.requests,peers:tls.evidence.peers,sni,httpRequests,keyObserved:httpRequests>0&&keyObserved,resolves,liveSockets:sockets.size,tcpConnections,secureConnections,tlsClientErrors}};
 }});

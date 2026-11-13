@@ -88,6 +88,15 @@ request and cannot demonstrate pre-send credential withholding. Every row uses
 real TLS, exact refusal/count checks, fresh service namespaces, socket cleanup,
 authoritative broker close and stable service PID1 teardown.
 
+Service evidence counts accepted TCP connections, completed server-side TLS
+connections and TLS client errors. The untrusted row must reach at least one
+actual TCP connection, complete zero secure connections and produce a TLS error,
+with zero HTTP requests or dummy key. It cannot pass through connection refusal
+alone. The pinned combined valid profile requires exactly four requests, four
+TCP/secure connections, four matching peer/SNI entries and zero TLS errors.
+Resolver and connection counts must match in every row; the independent relay's
+broader request-count tolerance remains unchanged.
+
 An initial pinned Linux run on 2026-11-12 passed all four rows. CLI reported
 2.1.323, four real TLS requests observed peer 8.8.8.8 and SNI api.anthropic.com,
 and the detached writer advanced 41 to 55 bytes after client exit. Worker netns
