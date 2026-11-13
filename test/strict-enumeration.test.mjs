@@ -6,7 +6,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import vm from "node:vm";
 import { enumerateStrictManifest, STRICT_ENUMERATION_POLICY } from "../lib/strict-enumeration.mjs";
-import { captureStrictManifest } from "../lib/strict-capture.mjs";
+import { captureStrictManifest, StrictCaptureError } from "../lib/strict-capture.mjs";
 import { createCaptureStore, openCaptureStore } from "../lib/strict-capture-store.mjs";
 const linuxTest=(name,fn)=>test(name,{skip:process.platform!=="linux"},fn);
 function candidateSource() {
@@ -45,7 +45,50 @@ linuxTest("newline-heavy text stays whole and a cross-line marker candidate stil
  f.write("blank.txt"," \n".repeat(32000)+"ordinary text");
  assert.deepEqual(f.enumerate().manifest,[{path:"blank.txt",mode:"whole"}]);
  f.write("blank.txt","//\n\uFEFF /SKEL[1]");
- assert.throws(()=>f.enumerate(),error=>error.code==="ENUM_UNAVAILABLE");
+ assert.throws(()=>f.enumerate(),error=>error.code==="ENUM_MARKERS");
+});
+linuxTest("only a typed malformed-marker cause becomes an editable enumeration refusal",t=>{
+ const f=fixture(t);
+ for(const text of ["// SKEL[1] unclosed", "// /SKEL[1]\n", "// SKEL[1] a\n// /SKEL[2]\n"]) {
+  f.write("file",text);
+  assert.throws(()=>f.enumerate(),error=>error.code==="ENUM_MARKERS");
+ }
+ f.write("file","// SKEL[1] valid\ninitial\n// /SKEL[1]\n");
+ assert.deepEqual(f.enumerate().manifest,[{path:"file",mode:"fenced"}]);
+ for(const failure of [
+  Object.assign(new Error("I/O"),{code:"EIO"}),
+  Object.assign(new Error("denied"),{code:"EACCES"}),
+  Object.assign(new Error("missing"),{code:"ENOENT"}),
+  new StrictCaptureError("CAPTURE_CHANGED"),
+  new StrictCaptureError("CAPTURE_MISSING"),
+  new StrictCaptureError("CAPTURE_IO"),
+  Object.assign(new Error("spoof marker"),{code:"CAPTURE_MARKERS"}),
+  new Error("runtime"),
+ ]) {
+  const original=fs.readSync;let injected=false;
+  fs.readSync=function(fd,...args){
+   if(fs.readlinkSync(`/proc/self/fd/${fd}`)===path.join(f.root,"file")){injected=true;throw failure;}
+   return original(fd,...args);
+  };
+  try {assert.throws(()=>f.enumerate(),error=>error.code==="ENUM_UNAVAILABLE");}
+  finally {fs.readSync=original;}
+  assert.equal(injected,true);
+ }
+});
+linuxTest("a valid whole read changing to malformed fenced text remains observed drift",t=>{
+ const f=fixture(t),valid="// SKEL[1] valid\ninitial\n// /SKEL[1]\n";
+ const file=f.write("file",valid), before=fs.statSync(file);
+ const original=fs.openSync;let opens=0,changed=false;
+ fs.openSync=function(name,...args){
+  if(String(name).startsWith("/proc/self/fd/") && String(name).endsWith("/file") && ++opens===2) {
+   fs.writeFileSync(file,valid.replace("// /SKEL[1]","// /SKEL[2]"));
+   const future=new Date(before.mtimeMs+60000);fs.utimesSync(file,future,future);changed=true;
+  }
+  return original(name,...args);
+ };
+ try {assert.throws(()=>f.enumerate(),error=>error.code==="ENUM_CHANGED");}
+ finally {fs.openSync=original;}
+ assert.equal(changed,true);assert.equal(opens,2);
 });
 linuxTest("fixed all-text coverage ignores project policy and reports exact directory exclusions",t=>{
  const {write,enumerate,fd,base}=fixture(t);

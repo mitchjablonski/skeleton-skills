@@ -148,7 +148,7 @@ export function runCandidateIntegration(source) {
     fs.writeFileSync(path.join(fillRoot,'plan.js'),original.replace('initial\n','filled\nsecond selected line\n'));
     const delta=assertSelectedFill(approved,capture(fillRoot).capture); trace.push('mock-fill-delta-checked');
     const negatives=[];
-    const expectedCodes={'selected-unchanged':'FIXTURE_SELECTED_UNCHANGED',member:'FIXTURE_MEMBERS',mode:'FIXTURE_MODE',exterior:'FIXTURE_EXTERIOR','other-fence':'FIXTURE_OTHER_FENCE','whole-file':'FIXTURE_WHOLE','malformed-markers':'ENUM_UNAVAILABLE',symlink:'ENUM_TYPE',hardlink:'ENUM_TYPE'};
+    const expectedCodes={'selected-unchanged':'FIXTURE_SELECTED_UNCHANGED',member:'FIXTURE_MEMBERS',mode:'FIXTURE_MODE',exterior:'FIXTURE_EXTERIOR','other-fence':'FIXTURE_OTHER_FENCE','whole-file':'FIXTURE_WHOLE','malformed-markers':'ENUM_MARKERS',symlink:'ENUM_TYPE',hardlink:'ENUM_TYPE'};
     const validFill=original.replace('initial\n','filled\nsecond selected line\n');
     for(const [name,mutate] of [
       ['selected-unchanged',()=>{}],
@@ -273,5 +273,3 @@ function main() {
   }
 }
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) main();
-
-

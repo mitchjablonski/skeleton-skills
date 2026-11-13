@@ -49,6 +49,16 @@ subtree contents do not consume visit/byte limits because they are not inspected
 
 ## Remaining gates
 
+Only a typed `StrictCaptureError` with code `CAPTURE_MARKERS` from the capture
+parser becomes `ENUM_MARKERS`, after a bounded fresh metadata check against the
+original named entry. Observed drift takes precedence as `ENUM_CHANGED`; a
+failed metadata read remains unavailable. These checks do not prove atomicity
+or detect every same-tick mutation. All other
+unexpected capture/runtime/I/O errors retain conservative `ENUM_UNAVAILABLE`,
+including missing or changed files and objects that merely claim a marker code.
+The checkpoint copy may offer a fresh fill restart for `ENUM_MARKERS`; it never
+offers restart for uncertain `ENUM_UNAVAILABLE`. No partial manifest is returned.
+
 This is neither an atomic directory snapshot nor an assertion about all
 workspace bytes. Concurrent insertions can escape observation, regular files
 can be replaced between observations, and same-size writes can yield torn bytes.
