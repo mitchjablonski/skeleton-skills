@@ -1,10 +1,9 @@
-// Outside-host deterministic mock broker. Inherited socketpair only; no listener/network.
-import fs from 'node:fs';
+// Opt-in fixture relay. Importing it starts no process, socket or broker.
 import net from 'node:net';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {setTimeout as delay} from 'node:timers/promises';
 import {createMockModelBroker} from '../../lib/strict-model-broker.mjs';
-const fd=Number(process.argv[2]),sentinel=process.argv[3];
-if(!Number.isInteger(fd)||fd<3||!sentinel?.startsWith('/'))throw Error('host invocation');
 const MAX=2*1024*1024;
 const writer=String.raw`import os,pathlib,json,time
 if os.fork():
@@ -22,14 +21,14 @@ end=time.monotonic()+90
 while time.monotonic()<end:
  os.pwrite(fd,b'filled!',offset);os.write(log,b'x');time.sleep(.01)
 `;
+
+export function createFixedProvider(sentinel) {
 const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
 const steps=[{name:'Read',input:{file_path:'/work/plan.js'}},{name:'Edit',input:{file_path:'/work/plan.js',old_string:'initial',new_string:'filled!'}},{name:'Bash',input:{command:'if test -e '+quote(sentinel)+'; then echo RELAY_PRIVATE_VISIBLE; exit 1; fi; /usr/bin/python3 -I -c '+quote(writer),description:'Check missing private fixture and start detached writer'}}];
 const evidence={resolve:0,connect:0,send:0,closes:0,credentialAdded:true,requests:[],refusals:[],frameLimit:false,partialTimeout:false,closed:false,toolResultsVerified:false};
 let resultCount=0;
-const transport={
- async resolve(host){evidence.resolve++;if(host!=='api.anthropic.com')throw Error('host');return ['8.8.8.8'];},
- async connect(o){evidence.connect++;if(o.address!=='8.8.8.8'||o.port!==443||o.servername!=='api.anthropic.com'||o.rejectUnauthorized!==true||o.alpn!=='http/1.1')throw Error('pin');return {peerAddress:o.address,tls:{authorized:true,hostname:'api.anthropic.com',servername:o.servername,alpn:o.alpn},
- async request(r){
+
+return {evidence,async respond(r){
   evidence.send++;evidence.credentialAdded&&=r.headers['x-api-key']==='strict-mock-upstream-dummy-only';
   evidence.requests.push({target:r.target,credentialAdded:evidence.credentialAdded});
   await delay(300); // Fixed provider latency keeps the existing rolling rate profile intact.
@@ -54,8 +53,19 @@ const transport={
    send('message_delta',{delta:{stop_reason:response.stop_reason,stop_sequence:null},usage:{output_tokens:1}});send('message_stop',{});bytes=Buffer.from(output);
   }
   return {status:200,rawHeaders:['content-type',type],body:{async *[Symbol.asyncIterator](){yield bytes;}}};
- },close(){evidence.closes++;}};}
-};
+
+}};
+}
+function mockTransport(provider) {
+ const {evidence}=provider;
+ return {
+  async resolve(host){evidence.resolve++;if(host!=='api.anthropic.com')throw Error('host');return ['8.8.8.8'];},
+  async connect(o){evidence.connect++;if(o.address!=='8.8.8.8'||o.port!==443||o.servername!=='api.anthropic.com'||o.rejectUnauthorized!==true||o.alpn!=='http/1.1')throw Error('pin');return {peerAddress:o.address,tls:{authorized:true,hostname:'api.anthropic.com',servername:o.servername,alpn:o.alpn},request:provider.respond,close(){evidence.closes++;}};}
+ };
+}
+export async function serveRelay({fd,transport,evidence,onStop=async()=>{},onFinish=async()=>({})}) {
+ if(!Number.isInteger(fd)||fd<3)throw Error('relay descriptor');
+ let resolveDone;const completed=new Promise(resolve=>{resolveDone=resolve;});
 const broker=createMockModelBroker({transport,sessionBudget:{maxResponseBytes:65536,maxSessionResponseBytes:1048576}});
 const socket=new net.Socket({fd,readable:true,writable:true});
 let pending=Buffer.alloc(0),last=0,busy=false,done=false,frames=0,partialTimer=null;
@@ -77,7 +87,7 @@ async function frame(raw){
   busy=true;owns=true;
   const r=await broker.submit({method:f.request.method,target:f.request.target,rawHeaders:f.request.rawHeaders,body:bytes});
   reply({version:1,id,ok:true,status:r.status,headers:r.headers,bodyBase64:r.body.toString('base64')});
- }catch(error){const code=['RELAY_FRAME','BROKER_CONCURRENCY','BROKER_CLOSED','MODEL_TARGET','MODEL_BODY_LIMIT','BROKER_HEADERS','BROKER_FRAMING','BROKER_RATE','BROKER_REQUESTS','BROKER_SESSION_BYTES'].includes(error.code)?error.code:'RELAY_REFUSED';evidence.refusals.push(code);reply({version:1,id,ok:false,code});if(code==='RELAY_FRAME'){await broker.close();socket.end();}}
+ }catch(error){const code=['RELAY_FRAME','BROKER_CONCURRENCY','BROKER_CLOSED','MODEL_TARGET','MODEL_BODY_LIMIT','BROKER_HEADERS','BROKER_FRAMING','BROKER_RATE','BROKER_REQUESTS','BROKER_SESSION_BYTES','BROKER_TLS','BROKER_PEER','MODEL_REDIRECT_REFUSED','BROKER_TIMEOUT'].includes(error.code)?error.code:'RELAY_REFUSED';evidence.refusals.push(code);reply({version:1,id,ok:false,code});if(code==='RELAY_FRAME'){await broker.close();socket.end();}}
  finally{if(owns)busy=false;}
 }
 socket.on('data',chunk=>{
@@ -86,6 +96,15 @@ socket.on('data',chunk=>{
  if(!partialTimer)partialTimer=setTimeout(()=>{evidence.partialTimeout=true;void broker.close();reply({version:1,id:null,ok:false,code:'RELAY_PARTIAL_TIMEOUT'});socket.end();},2000);
  while(pending.length>=4){const size=pending.readUInt32BE();if(size>MAX){evidence.frameLimit=true;void broker.close();reply({version:1,id:null,ok:false,code:'RELAY_FRAME_BYTES'});socket.end();return;}if(pending.length<size+4)return;if(++frames>32){void broker.close();socket.destroy();return;}const raw=pending.subarray(4,4+size);pending=pending.subarray(4+size);void frame(raw);}if(!pending.length){clearTimeout(partialTimer);partialTimer=null;}
 });
-process.stdin.setEncoding('utf8');process.stdin.on('data',async text=>{if(text==='STOP\n'){await broker.close();evidence.closed=true;process.stdout.write(JSON.stringify({event:'closed'})+'\n');}});
-async function finish(){if(done)return;done=true;clearTimeout(partialTimer);await broker.close();evidence.closed=true;process.stdout.write(JSON.stringify({event:'summary',strictState:'unverified',...evidence,snapshot:broker.snapshot()})+'\n');process.stdin.destroy();}
+process.stdin.setEncoding('utf8');process.stdin.on('data',async text=>{if(text==='STOP\n'){await broker.close();evidence.closed=true;await onStop();process.stdout.write(JSON.stringify({event:'closed'})+'\n');}});
+async function finish(){if(done)return;done=true;clearTimeout(partialTimer);await broker.close();evidence.closed=true;const extra=await onFinish();process.stdout.write(JSON.stringify({event:'summary',strictState:'unverified',...evidence,snapshot:broker.snapshot(),...extra})+'\n');process.stdin.destroy();resolveDone();}
 socket.on('error',()=>{});socket.on('close',finish);socket.on('end',()=>socket.end());
+
+ return completed;
+}
+if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
+ const fd=Number(process.argv[2]),sentinel=process.argv[3];
+ if(!sentinel?.startsWith('/'))throw Error('host invocation');
+ const provider=createFixedProvider(sentinel);
+ await serveRelay({fd,transport:mockTransport(provider),evidence:provider.evidence});
+}

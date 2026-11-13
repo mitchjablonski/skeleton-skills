@@ -1,5 +1,9 @@
 # Outside mock broker / actual CLI relay fixture (#75)
 
+The separate [combined real TLS fixture](strict-relay-tls.md) runs this ingress
+against a sibling isolated TLS service; this original mock probe remains a
+regression control.
+
 This opt-in development experiment runs the actual pinned Claude CLI inside a
 fresh PID/network namespace, with only a loopback HTTP shim connected through
 one inherited socketpair endpoint to an outside-host mock broker. The outside
