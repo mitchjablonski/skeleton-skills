@@ -422,11 +422,14 @@ test("browser marker grammar is identical to lib/markers.mjs and lib/strict-capt
   const raw = (name) => new RegExp(`const ${name} = String\\.raw\`([^\`]*)\`;`).exec(markers)?.[1];
   assert.equal(raw("COMMENT"), M.COMMENT);
   assert.equal(raw("ID"), M.ID);
-  const comment = M.COMMENT, id = M.ID;
-  const open = new RegExp(String.raw`^\s*${comment}\s*SKEL\[${id}\]\s*(.*?)\s*(?:\*\/\}?|-->)?\s*$`);
-  assert.equal(open.source, M.OPEN);
-  assert.match(markers, /const OPEN_RE = new RegExp\(String\.raw`\^\\s\*\$\{COMMENT\}\\s\*SKEL\\\[\$\{ID\}\\\]\\s\*\(\.\*\?\)\\s\*\(\?:\\\*\\\/\\\}\?\|-->\)\?\\s\*\$`\);/);
-  assert.match(markers, /const CLOSE_RE = new RegExp\(String\.raw`\^\\s\*\$\{COMMENT\}\\s\*\\\/SKEL\\\[\$\{ID\}\\\]\\s\*\(\?:\\\*\\\/\\\}\?\|-->\)\?\\s\*\$`\);/);
+  const dom = src("strict-capture-view-dom.mjs");
+  for (const name of ["COMMENT", "ID", "OPEN_RE", "CLOSE_RE"]) {
+    const declaration = (source) => source.split("\n").find((line) => line.startsWith(`const ${name} = `));
+    assert.ok(declaration(markers), name);
+    assert.equal(declaration(dom), declaration(markers), name);
+  }
+  const parser = (source) => source.slice(source.indexOf("function openMarker(line) {"), source.indexOf("\n}", source.indexOf("function openMarker(line) {")) + 2);
+  assert.equal(parser(dom), parser(markers));
   assert.ok(capture.includes(`const markerCandidate = /${M.CANDIDATE}/;`));
 });
 
