@@ -28,19 +28,36 @@ reachability.
 
 **The browser checks structure, not authenticity.** It cannot recompute
 SHA-256 synchronously and does not try, so the digests it shows are the host's.
-It refuses models that are malformed, inconsistent or over the limits:
+Short of the digests, it re-derives every canonical rule the host's validator
+applies to what the view shows. It refuses:
 
-- wrong schema, or extra or missing keys at any level;
+- a wrong schema, or extra or missing keys at any level;
 - a `shown` that is not exactly the one derived from the binding;
-- file paths that are not strictly increasing;
+- unsafe paths (the same rules as `safePath` in `lib/strict-capture.mjs`):
+  absolute, drive letters, `.`/`..`/empty segments, backslashes,
+  control/format/separator characters such as bidi overrides;
+- paths that are not strictly increasing;
 - a `totalBytes` that doesn't match;
 - line numbers out of sequence;
-- line endings outside the file's mode (fenced files split on CRLF/LF only);
+- line endings outside the file's mode (fenced files split on CRLF/LF only),
+  read as own keys only;
 - an end-of-file marker anywhere but the last line;
+- a separator inside a line's text;
+- NUL or lone surrogates;
+- line text plus endings whose UTF-8 length isn't exactly the file's
+  `byteLength`, so truncated or padded text refuses;
+- fences whose open/close marker lines don't parse to the same id and title,
+  using the marker grammar copied from `lib/markers.mjs` (a test keeps the
+  copies identical);
 - line kinds that disagree with the fences;
+- an unparsed marker-like line in a fenced file;
 - a whole file with fences, or a fenced file without them;
-- text longer than the file's byte length;
-- getters or sparse arrays.
+- getters, sparse arrays, or limits raised above the defaults.
+
+The host can't produce any of these, so `renderStrictCaptureView` only returns
+`VIEW_MODEL` if the host and browser rules ever disagree, which would be a bug.
+Fence titles and line text with invisible or reordering characters are also
+shown escaped.
 
 These checks are defence in depth. Authenticity comes only from the protected
 origin that served the model.

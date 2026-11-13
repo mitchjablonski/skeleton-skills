@@ -84,7 +84,8 @@ function bindingFor(cap, extra = {}) {
 const mount = () => { const doc = fakeDoc(); return { doc, container: doc.createElement("div") }; };
 
 const src = (f) => readFileSync(new URL(`../lib/${f}`, import.meta.url), "utf8");
-const importsOf = (text) => [...text.matchAll(/^import [\s\S]*? from "([^"]+)";$/gm)].map((m) => m[1]).sort();
+// Static edges in any form: import/export ... from, bare import, either quote.
+const importsOf = (text) => [...text.matchAll(/^\s*(?:import|export)\b[^;]*?\bfrom\s*["']([^"']+)["']|^\s*import\s*["']([^"']+)["']/gm)].map((m) => m[1] ?? m[2]).sort();
 const SINKS = [/innerHTML/, /outerHTML/, /insertAdjacentHTML/, /addEventListener\(/, /fetch\(/, /node:fs/, /XMLHttpRequest/, /eval\(/, /new Function/, /setTimeout/, /href/, /mermaid\./i, /localStorage/, /document\.cookie/];
 const code = (text) => text.replace(/^\s*\/\/.*$/gm, "");
 
@@ -377,6 +378,18 @@ test("browser refuses a malformed or inconsistent model and leaves nothing curre
     oversizeLine: (m) => { m.files[1].display[0].text = "x".repeat(m.files[1].byteLength + 1); },
     sparse: (m) => { m.files[0].display.length += 1; },
     getter: (m) => { Object.defineProperty(m.files[0], "path", { get: () => "a", enumerable: true }); },
+    truncatedText: (m) => { for (const l of m.files[1].display) l.text = ""; },
+    rloPath: (m) => { m.files[0].path = "a/\u202Esj.txt"; },
+    absolutePath: (m) => { m.files[0].path = "/etc/passwd"; },
+    dotdotPath: (m) => { m.files[0].path = "../../etc/passwd"; },
+    hiddenBreak: (m) => { const l = m.files[1].display[0]; l.text = l.text.slice(0, 2) + "\n" + l.text.slice(3); },
+    nulText: (m) => { const l = m.files[1].display[0]; l.text = "\0" + l.text.slice(1); },
+    loneSurrogate: (m) => { const l = m.files[1].display[0]; l.text = "\uD800" + l.text.slice(3); },
+    titleDrift: (m) => { m.files[0].fences[0].title = "harmless"; },
+    markerRewritten: (m) => { const l = m.files[0].display[m.files[0].fences[0].openLine - 1]; l.text = "harmless".padEnd(l.text.length, " ").slice(0, l.text.length); },
+    idDrift: (m) => { m.files[0].fences[0].id = "2"; },
+    inheritedEnding: (m) => { m.files[1].display[0].ending = "toString"; },
+    hiddenMarker: (m) => { const l = m.files[0].display[0]; l.text = "// SKEL[9" + "x".repeat(Math.max(0, l.text.length - 9)); },
   };
   for (const [name, edit] of Object.entries(cases)) {
     const { doc, container } = mount();
@@ -401,4 +414,49 @@ test("browser limits can only be lowered", () => {
   assert.throws(() => parseStrictCaptureViewModel(m, { maxFiles: 10 ** 6 }), isModel("VIEW_MODEL"));
   assert.throws(() => parseStrictCaptureViewModel(m, { bogus: 1 }), isModel("VIEW_MODEL"));
   assert.equal(parseStrictCaptureViewModel(m, { maxFiles: 2 }).files.length, 2);
+});
+
+test("browser marker grammar is identical to lib/markers.mjs and lib/strict-capture.mjs", async () => {
+  const { STRICT_MARKER_SOURCES: M } = await import("../lib/strict-capture-view-dom.mjs");
+  const markers = src("markers.mjs"), capture = src("strict-capture.mjs");
+  const raw = (name) => new RegExp(`const ${name} = String\\.raw\`([^\`]*)\`;`).exec(markers)?.[1];
+  assert.equal(raw("COMMENT"), M.COMMENT);
+  assert.equal(raw("ID"), M.ID);
+  const comment = M.COMMENT, id = M.ID;
+  const open = new RegExp(String.raw`^\s*${comment}\s*SKEL\[${id}\]\s*(.*?)\s*(?:\*\/\}?|-->)?\s*$`);
+  assert.equal(open.source, M.OPEN);
+  assert.match(markers, /const OPEN_RE = new RegExp\(String\.raw`\^\\s\*\$\{COMMENT\}\\s\*SKEL\\\[\$\{ID\}\\\]\\s\*\(\.\*\?\)\\s\*\(\?:\\\*\\\/\\\}\?\|-->\)\?\\s\*\$`\);/);
+  assert.match(markers, /const CLOSE_RE = new RegExp\(String\.raw`\^\\s\*\$\{COMMENT\}\\s\*\\\/SKEL\\\[\$\{ID\}\\\]\\s\*\(\?:\\\*\\\/\\\}\?\|-->\)\?\\s\*\$`\);/);
+  assert.ok(capture.includes(`const markerCandidate = /${M.CANDIDATE}/;`));
+});
+
+test("host-valid long fence ids and titles still render through the wrapper and the browser", () => {
+  const title = "t".repeat(5000), id = "a" + "b".repeat(299);
+  const cap = makeCapture([{ path: "long.js", mode: "fenced", text: `// SKEL[${id}] ${title}\nbody\n// /SKEL[${id}]\n` }]);
+  const a = mount();
+  renderStrictCaptureView({ ...a, capture: cap, binding: bindingFor(cap) });
+  assert.ok(byClass(a.container, "fence-title")[0].textContent === title);
+  const b = mount();
+  renderStrictCaptureViewModel({ ...b, model: wire(buildStrictCaptureViewModel({ capture: cap, binding: bindingFor(cap) })) });
+  assert.equal(a.container.textContent, b.container.textContent);
+});
+
+test("a fence title with invisible or reordering characters is also shown escaped", () => {
+  const cap = makeCapture([{ path: "t.js", mode: "fenced", text: "// SKEL[1] safe \u202Etxt.exe\nbody\n// /SKEL[1]\n" }]);
+  const { doc, container } = mount();
+  renderStrictCaptureView({ doc, container, capture: cap, binding: bindingFor(cap) });
+  assert.match(byClass(container, "fence-title-escaped")[0].textContent, /\\u\{202E\}/);
+});
+
+test("a Proxy array is copied at its checked length; a growing length is never re-read", () => {
+  const cap = BOTH();
+  const m = wire(buildStrictCaptureViewModel({ capture: cap, binding: bindingFor(cap) }));
+  let reads = 0;
+  const real = m.files;
+  m.files = new Proxy(real, { get(t, k, r) { if (k === "length") { reads++; return reads > 2 ? 1e9 : t.length; } return Reflect.get(t, k, r); },
+    getPrototypeOf: () => Array.prototype });
+  const parsed = parseStrictCaptureViewModel(m); // copied once at the checked length
+  assert.equal(parsed.files.length, 2);
+  assert.ok(Array.isArray(parsed.files) && !Object.isExtensible(parsed.files));
+  assert.ok(reads <= 2, `length read ${reads} times`);
 });
