@@ -115,7 +115,11 @@ test("browser module's whole import graph is browser-safe (no node:, Buffer, pro
 });
 
 test("no production module imports the renderer", () => {
-  const own = new Set(["strict-capture-view.mjs", "strict-capture-view-model.mjs", "strict-capture-view-dom.mjs"]);
+  // The capture view's own modules, plus the disabled #77 listener prototype
+  // and its browser app, which serve it. Their own test pins that nothing
+  // else loads the listener or app.
+  const own = new Set(["strict-capture-view.mjs", "strict-capture-view-model.mjs", "strict-capture-view-dom.mjs",
+    "strict-decision-listener.mjs", "strict-decision-app.mjs"]);
   for (const f of readdirSync(new URL("../lib/", import.meta.url)).filter((n) => /\.(m?js|css)$/.test(n) && !own.has(n)))
     assert.doesNotMatch(src(f), /strict-capture-view/, f);
   for (const f of readdirSync(new URL("../bin/", import.meta.url)))
@@ -389,6 +393,7 @@ test("browser refuses a malformed or inconsistent model and leaves nothing curre
     markerRewritten: (m) => { const l = m.files[0].display[m.files[0].fences[0].openLine - 1]; l.text = "harmless".padEnd(l.text.length, " ").slice(0, l.text.length); },
     idDrift: (m) => { m.files[0].fences[0].id = "2"; },
     inheritedEnding: (m) => { m.files[1].display[0].ending = "toString"; },
+    bom: (m) => { const l = m.files[1].display[0]; l.text = "\uFEFF" + l.text.slice(3); },
     hiddenMarker: (m) => { const l = m.files[0].display[0]; l.text = "// SKEL[9" + "x".repeat(Math.max(0, l.text.length - 9)); },
   };
   for (const [name, edit] of Object.entries(cases)) {
@@ -431,6 +436,18 @@ test("browser marker grammar is identical to lib/markers.mjs and lib/strict-capt
   const parser = (source) => source.slice(source.indexOf("function openMarker(line) {"), source.indexOf("\n}", source.indexOf("function openMarker(line) {")) + 2);
   assert.equal(parser(dom), parser(markers));
   assert.ok(capture.includes(`const markerCandidate = /${M.CANDIDATE}/;`));
+});
+
+test("host-valid fenced files in every comment style and line ending render through host and browser", () => {
+  const styles = [["// ", ""], ["# ", ""], ["-- ", ""], ["; ", ""], ["/* ", " */"], ["/*", "*/"], ["<!-- ", " -->"], ["{/* ", " */}"], ["\t; ", ""]];
+  for (const [o, c] of styles) for (const eol of ["\n", "\r\n"]) {
+    const text = `x${eol}${o}SKEL[a.1] title ${c}${eol}body${eol}${o}/SKEL[a.1]${c}${eol}tail`;
+    const cap = makeCapture([{ path: "s.txt", mode: "fenced", text }]);
+    const a = mount(), b = mount();
+    renderStrictCaptureView({ ...a, capture: cap, binding: bindingFor(cap) });
+    renderStrictCaptureViewModel({ ...b, model: wire(buildStrictCaptureViewModel({ capture: cap, binding: bindingFor(cap) })) });
+    assert.equal(a.container.textContent, b.container.textContent, JSON.stringify([o, c, eol]));
+  }
 });
 
 test("host-valid long fence ids and titles still render through the wrapper and the browser", () => {
