@@ -42,7 +42,7 @@ for index,name in enumerate(('plan.js','context.txt')):
             time.sleep(.005)
         os._exit(0)
     os.waitpid(launcher,0)
-(stage/'init').write_text(json.dumps({'pid':1,'namespace':os.readlink('/proc/self/ns/pid')}))
+(stage/'init').write_text(json.dumps({'pid':os.getpid(),'namespace':os.readlink('/proc/self/ns/pid')}))
 time.sleep(20)
 '''
 
@@ -83,7 +83,14 @@ def run_helper(node,stage,scratch,number):
     if process.returncode:
         raise RuntimeError('candidate helper failed: '+output.read_text()[:1024]+errors.read_text()[:1024])
     value=json.loads(output.read_text())
-    if value.get('ok') is not True or value.get('strictState')!='unverified' or value.get('completionVerified') is not False:
+    expected_negatives=['selected-unchanged','member','mode','exterior','other-fence','whole-file','malformed-markers','symlink','hardlink','wrong-review-pair','wrong-capture-pair']
+    expected_trace=['private-copy','enumerate','independent-capture','durable-capture-put','authority-reference','mock-approve','fresh-approved-capture-clone','mock-fill-delta-checked']
+    expected_keys={'ok','strictState','scope','trace','delta','negativeCases','exactStoredClone','completionVerified'}
+    if (set(value)!=expected_keys or value.get('ok') is not True or value.get('strictState')!='unverified'
+        or value.get('completionVerified') is not False or value.get('exactStoredClone') is not True
+        or value.get('negativeCases')!=expected_negatives or value.get('trace')!=expected_trace
+        or value.get('scope')!='controlled mock candidate integration; caller-established quiescence prerequisite'
+        or value.get('delta')!={'selectedPath':'plan.js','selectedFence':'1','selectedBodyChanged':True}):
         raise RuntimeError('invalid helper result')
     return value
 

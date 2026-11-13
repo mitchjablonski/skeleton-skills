@@ -17,6 +17,8 @@ export const FIXTURE_CONTEXT = 'controlled fixture context\n';
 const MEMBERS = ['context.txt', 'plan.js'];
 const MAX_BYTES = 1024 * 1024;
 const mkdir = p => fs.mkdirSync(p, { mode: 0o700 });
+const check = (condition,code) => { if(!condition) throw Object.assign(new Error(code),{code}); };
+const equal = (a,b) => JSON.stringify(a)===JSON.stringify(b);
 function ownedRoot(prefix) {
   assert.ok(['strict-candidate-inner-','strict-candidate-source-'].includes(prefix));
   const parent=fs.realpathSync(os.tmpdir());
@@ -45,7 +47,7 @@ function capture(root) {
   try {
     const enumeration = enumerateStrictManifest(fd);
     // No exclusions or extra members are admitted by this fixed experiment.
-    assert.deepEqual(enumeration.manifest.map(f => f.path), MEMBERS);
+    check(equal(enumeration.manifest.map(f => f.path), MEMBERS),'FIXTURE_MEMBERS');
     assert.deepEqual(enumeration.exclusions, []);
     return { enumeration, capture: captureStrictManifest(fd, enumeration.manifest) };
   } finally { fs.closeSync(fd); }
@@ -81,8 +83,11 @@ function copy(source, destination) {
   return capture(destination);
 }
 function materialize(store, pair, root) {
-  const approved = validateStoredCapture(store.get(pair.captureVersion));
-  assert.equal(approved.shapeVersion, pair.reviewVersion);
+  let approved;
+  try { approved = validateStoredCapture(store.get(pair.captureVersion)); }
+  catch { check(false,'FIXTURE_CAPTURE_PAIR'); }
+  check(approved.captureVersion===pair.captureVersion,'FIXTURE_CAPTURE_PAIR');
+  check(approved.shapeVersion===pair.reviewVersion,'FIXTURE_REVIEW_PAIR');
   mkdir(root);
   for (const file of approved.files) {
     assert.ok(MEMBERS.includes(file.path));
@@ -96,22 +101,23 @@ function bodies(file) {
 }
 export function assertSelectedFill(approvedValue, candidateValue) {
   const approved = validateStoredCapture(approvedValue), candidate = validateStoredCapture(candidateValue);
-  assert.deepEqual(candidate.files.map(f => [f.path,f.mode,f.unixMode]), approved.files.map(f => [f.path,f.mode,f.unixMode]));
-  assert.equal(candidate.shapeVersion, approved.shapeVersion);
+  check(equal(candidate.files.map(f => f.path),approved.files.map(f => f.path)),'FIXTURE_MEMBERS');
   let selectedChanged = false;
   for (let i=0;i<approved.files.length;i++) {
     const a=approved.files[i], b=candidate.files[i];
-    assert.deepEqual(b.exterior,a.exterior);
-    assert.deepEqual(b.fences.map(f=>[f.id,f.title]),a.fences.map(f=>[f.id,f.title]));
-    if(a.path !== 'plan.js') { assert.equal(b.rawSha256,a.rawSha256); continue; }
+    check(a.mode===b.mode && a.unixMode===b.unixMode,'FIXTURE_MODE');
+    if(a.path !== 'plan.js') { check(b.rawSha256===a.rawSha256,'FIXTURE_WHOLE'); continue; }
+    check(equal(b.exterior,a.exterior),'FIXTURE_EXTERIOR');
+    check(equal(b.fences.map(f=>[f.id,f.title]),a.fences.map(f=>[f.id,f.title])),'FIXTURE_FENCES');
     assert.equal(a.mode,'fenced'); assert.deepEqual(a.fences.map(f=>f.id),['1','2']);
     const oldBodies=bodies(a), newBodies=bodies(b);
     for(let n=0;n<a.fences.length;n++) {
       if(a.fences[n].id==='1') selectedChanged=oldBodies[n]!==newBodies[n];
-      else assert.equal(newBodies[n],oldBodies[n]);
+      else check(newBodies[n]===oldBodies[n],'FIXTURE_OTHER_FENCE');
     }
   }
-  assert.ok(selectedChanged);
+  check(selectedChanged,'FIXTURE_SELECTED_UNCHANGED');
+  check(candidate.shapeVersion===approved.shapeVersion,'FIXTURE_SHAPE');
   return Object.freeze({selectedPath:'plan.js',selectedFence:'1',selectedBodyChanged:true});
 }
 export function runCandidateIntegration(source) {
@@ -142,6 +148,8 @@ export function runCandidateIntegration(source) {
     fs.writeFileSync(path.join(fillRoot,'plan.js'),original.replace('initial\n','filled\nsecond selected line\n'));
     const delta=assertSelectedFill(approved,capture(fillRoot).capture); trace.push('mock-fill-delta-checked');
     const negatives=[];
+    const expectedCodes={'selected-unchanged':'FIXTURE_SELECTED_UNCHANGED',member:'FIXTURE_MEMBERS',mode:'FIXTURE_MODE',exterior:'FIXTURE_EXTERIOR','other-fence':'FIXTURE_OTHER_FENCE','whole-file':'FIXTURE_WHOLE','malformed-markers':'ENUM_UNAVAILABLE',symlink:'ENUM_TYPE',hardlink:'ENUM_TYPE'};
+    const validFill=original.replace('initial\n','filled\nsecond selected line\n');
     for(const [name,mutate] of [
       ['selected-unchanged',()=>{}],
       ['member',r=>fs.writeFileSync(path.join(r,'extra.txt'),'extra')],
@@ -153,12 +161,18 @@ export function runCandidateIntegration(source) {
       ['symlink',r=>{fs.unlinkSync(path.join(r,'context.txt'));fs.symlinkSync(path.join(privateRoot,'context.txt'),path.join(r,'context.txt'));}],
       ['hardlink',r=>{fs.unlinkSync(path.join(r,'context.txt'));fs.linkSync(path.join(privateRoot,'context.txt'),path.join(r,'context.txt'));}],
     ]) {
-      const root=path.join(scratch,'negative-'+name); materialize(captures,pair,root); mutate(root);
-      assert.throws(()=>assertSelectedFill(approved,capture(root).capture)); negatives.push(name);
+      const root=path.join(scratch,'negative-'+name); materialize(captures,pair,root);
+      if(name!=='selected-unchanged') {
+        fs.writeFileSync(path.join(root,'plan.js'),validFill);
+        assertSelectedFill(approved,capture(root).capture); // Positive control before the targeted mutation.
+      }
+      mutate(root);
+      assert.throws(()=>assertSelectedFill(approved,capture(root).capture),error=>error.code===expectedCodes[name],name); negatives.push(name);
     }
     // A second clone uses stored approved bytes despite prior mock fill.
     materialize(captures,pair,path.join(scratch,'fresh-again'));
-    assert.throws(()=>materialize(captures,{...pair,reviewVersion:'0'.repeat(64)},path.join(scratch,'wrong-pair')));
+    assert.throws(()=>materialize(captures,{...pair,reviewVersion:'0'.repeat(64)},path.join(scratch,'wrong-pair')),error=>error.code==='FIXTURE_REVIEW_PAIR'); negatives.push('wrong-review-pair');
+    assert.throws(()=>materialize(captures,{...pair,captureVersion:'0'.repeat(64)},path.join(scratch,'wrong-capture')),error=>error.code==='FIXTURE_CAPTURE_PAIR'); negatives.push('wrong-capture-pair');
     return {ok:true,strictState:'unverified',scope:'controlled mock candidate integration; caller-established quiescence prerequisite',trace,delta,negativeCases:negatives,exactStoredClone:true,completionVerified:false};
   } finally { cleanupOwned(owned); }
 }
@@ -184,4 +198,5 @@ function main() {
   }
 }
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) main();
+
 

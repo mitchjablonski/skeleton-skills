@@ -48,6 +48,14 @@ completion criterion. Built-in negative cases reject member addition, mode drift
 exterior drift, another fence body change, whole-file drift, unchanged selected
 body, malformed markers, symlinks and hard links. A second fresh
 clone must still equal the approved capture; wrong approved pair binding fails.
+Every drift case first passes a valid selected-body fill as its positive control,
+then applies the targeted mutation and requires its specific fixture or enumeration
+error code. The unchanged-body case deliberately skips that fill. Both wrong
+review-version and wrong capture-version bindings are checked. Malformed marker
+parsing propagates through enumeration as `ENUM_UNAVAILABLE`; it does not pass
+by triggering the unchanged-body check. Removing the explicit mode check or
+whole-file check in temporary mutation runs made their respective negative tests
+fail, even with the redundant shape identity check still enabled.
 
 A successful record reports operation order, negative cases and exact clone
 identity. Exit 1 reports a failed attempt. The outer checkpoint probe remains
@@ -82,8 +90,10 @@ directory and reports failure. Fill execution remains a host-controlled mock;
 there is no fill-worker namespace in this slice.
 
 On 2026-11-12 the pinned Node 20.20.0 / system Python WSL run passed both rounds,
-tracking three pidfds each, with namespaces `pid:[4026532231]` and
-`pid:[4026532233]`. Both rounds passed all nine negative cases. These identifiers
+tracking three pidfds each, with namespaces `pid:[4026532233]` and
+`pid:[4026532235]`. Both rounds passed all eleven negative cases. The outer probe
+checks the exact expected negative-case list, operation trace and helper result
+fields. These identifiers
 are observations, not expected constants or production qualification.
 
 Temporary roots carry a UUID ownership marker;
