@@ -27,6 +27,11 @@ through the host, validate the binding and pin one version for their entire read
 repeated path lookups through a moving pointer are not a consistent snapshot.
 Clients needing a fixed directory reopen between publications. No independent
 authority field can override the recovered pointer selection.
+The managed root and raw pointer are not a consumer read interface. The host
+serializes selection resolution with publication and blocks new resolutions while
+an intent is pending, including after pointer replacement. It exposes the new
+selection only after parent sync and durable completion. Readers already pinned
+to a previously completed immutable version may finish against that version.
 
 **Ordinary-checkout export.** The host produces an explicit patch/archive or an
 explicitly requested merge into an identified checkout, with recorded base and
@@ -51,7 +56,7 @@ refuses the checkpoint. Human review occurs only after this verified quiescence.
 Copy the stopped stage into private storage and independently capture/validate
 that copy. Subsequent tests run against disposable clones, never that candidate.
 
-The approved skeleton remains `(approvedReviewVersion, approvedCaptureVersion)`.
+The approved skeleton remains `(approvedVersion, approvedCaptureVersion)`.
 Finalize checks its shape, all permitted step-body transitions and completion
 against that retained approved capture. Final filled bytes require a distinct
 `finalCaptureVersion`; they must never overwrite or masquerade as the approved
@@ -71,20 +76,26 @@ intent naming the expected old pointer and exact new pointer, atomically replace
 `current`, syncs its parent, and durably records completion before returning a
 success receipt. Authority finalization and pointer replacement are separate
 operations: recovery reconciles both, and never interprets one as proof of the
-other. A pending operation exposes no successful publication receipt.
+other. A pending operation exposes neither a new selection nor a successful
+publication receipt; the resolution barrier remains held through completion or
+refusal and across recovery.
 
 | Crash/failure boundary | Required recovery |
 |---|---|
 | Before candidate/capture durability | No publication; quarantine incomplete objects; recapture only through a new verified operation. |
 | Durable objects, no intent | Unselected orphan; never infer approval or select it automatically. |
-| Durable intent, pointer still old | Validate intent, predecessor, all referenced objects and authority facts; resume exact authorized replacement or report pending/refused. |
-| Replacement occurred, parent sync uncertain | Treat outcome as uncertain; inspect persisted pointer after restart and reconcile only exact old/new states. No success inferred from an interrupted syscall. |
-| New pointer durable, completion absent | Validate exact intent/new pointer and append recovered completion; preserve the same publication/request identity. |
+| Durable intent, pointer still old | Validate intent, predecessor, all referenced objects and authority facts; if valid, complete the exact authorized replacement, parent sync and completion record. Missing or invalid facts refuse; recovery does not choose whether to publish a valid intent. |
+| Replacement occurred, parent sync uncertain | Block selection resolution, inspect the persisted pointer after restart and validate the intent, predecessor, objects and authority facts. For exact old/new states with valid evidence, complete the exact authorized replacement if needed, parent sync and completion record. Otherwise refuse. No success inferred from an interrupted syscall. |
+| New pointer durable, completion absent | Block selection resolution, validate exact intent/new pointer, referenced objects and authority facts, and append durable recovered completion before exposing the selection; preserve the same publication/request identity. Missing or invalid evidence refuses. |
 | Completion durable, response lost | Exact retry returns retained success; never publish twice. |
 | Missing/corrupt object, unexpected pointer or conflicting journal | Refuse reads/publication requiring that state; require explicit outside-host investigation. Never rebuild authority from live files. |
 | Export interrupted mid-application | Report partial checkout application; use recorded base/output and explicit export recovery, never a managed success receipt. |
 
-Recovery runs before serving current selection or admitting new publication.
+Recovery runs before admitting any reader resolution or new publication. A valid
+pending intent must deterministically complete its exact authorized selection;
+missing, invalid or conflicting evidence refuses resolution and publication
+requiring that state. Recovery cannot expose a pending selection, substitute a
+different output or treat the old pointer as cancellation of a valid intent.
 No automatic rollback, temporary-file promotion or garbage collection is implied.
 Retention must preserve every object needed by pending intents, selected versions,
 receipts and recovery; reclamation needs a separate reviewed policy.
@@ -112,6 +123,9 @@ Acceptance before any publication claim requires a reproducible fixture run:
   and demonstrate that the immutable version cannot change through agent aliases.
 - Inject every crash boundary above, including lost replies; verify deterministic
   request replay, refusal of corrupt/missing objects and consistent pinned reads.
+- Pause after pointer replacement and before parent sync/completion; verify new
+  reader resolutions remain blocked, previously pinned readers retain their old
+  version, and restart completes valid intents before admitting any resolution.
 - For managed selection, prove old-or-new atomic pointer visibility and durable
   recovery on the selected profile. For export, demonstrate base conflicts and
   partial-application reporting under the explicitly chosen export contract.
