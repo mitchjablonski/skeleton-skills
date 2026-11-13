@@ -92,9 +92,16 @@ request.
 - **Mismatch.** The copy is generic. It shows the current prefixes, the
   revision and the attempts left. It never echoes the code and has no history
   oracle.
-- **End.** After `end` is confirmed, every command except `status` and `help`
-  is refused. If the end has an unknown outcome, the console says so and
-  asks for `end` again.
+- **End.** Once `end` is confirmed, the console refuses every command
+  except `end`, `status` and `help` until an `ended` reply arrives. It stays
+  that way while the outcome is unknown. After `ended`, only `status` and
+  `help` work.
+- **Prompts.** Any other command cancels a pending yes/no question,
+  including `status`, `help` and a refused line.
+- **Resend mismatch and lock.** Under journal-first lookup, these would
+  prove nothing was recorded. The console keeps the request anyway, so a
+  misordered authority can't make it lose an unknown outcome. Each further
+  retry may spend an attempt.
 - **Output.**
   - Output is only fixed copy, validated 12-hex prefixes, integers and a
     validated UTC timestamp. The echo comes from the committed reply.

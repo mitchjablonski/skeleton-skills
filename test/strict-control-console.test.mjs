@@ -231,3 +231,32 @@ test("a failing request-id factory sends nothing and never abandons a pending re
   assert.equal(m.calls.filter((x) => x.name !== "verify").length, 0, "nothing else was sent");
   assert.equal(m.calls.length, 1);
 });
+
+test("an end with an unknown outcome blocks every other request until it ends", async () => {
+  const { m, c } = make({ verify: [unavailable], end: [unavailable, echo({ kind: "ended" })] });
+  await c.handle("approve K7M2-QX9D");
+  await c.handle("end");
+  assert.deepEqual(await c.handle("yes"), [C.endUnknown]);
+  for (const cmd of ["approve M3P8-4TWZ", "reshape M3P8-4TWZ", "retry", "recapture"]) assert.deepEqual(await c.handle(cmd), [C.ending], cmd);
+  assert.equal(m.calls.filter((x) => x.name === "verify").length, 1, "no new decision went out");
+  assert.match((await c.handle("end"))[0], /again/);
+  await c.handle("yes");
+  assert.ok(c.ended());
+  assert.deepEqual(await c.handle("approve M3P8-4TWZ"), [C.ended]);
+});
+
+test("status and help cancel a pending yes/no prompt", async () => {
+  const { m, c } = make({ recapture: [echo({ kind: "recaptured", changed: false, revision: 1, reviewVersion: A, captureVersion: B })], state: [{ phase: "skeleton", revision: 1, reviewVersion: A, captureVersion: B }] });
+  for (const interrupt of ["status", "help"]) {
+    await c.handle("recapture");
+    await c.handle(interrupt);
+    assert.deepEqual(await c.handle("yes"), [C.unknownCommand], interrupt);
+  }
+  assert.equal(m.calls.filter((x) => x.name === "recapture").length, 0);
+});
+
+test("journal-full copy follows R4: earlier requests still resolve, recovery is outside the session", () => {
+  assert.match(C.journalFull, /Earlier requests still resolve/);
+  assert.match(C.journalFull, /recovery outside this session/);
+  assert.doesNotMatch(C.journalFull, /new journal|End the session/);
+});
