@@ -82,7 +82,7 @@ def members(namespace):
     return result
 
 
-def one_round(bwrap, scratch, number, previous_namespace):
+def one_round(bwrap, scratch, number, previous_namespace, stage_setup=None):
     import resource
 
     def child_limits():
@@ -91,6 +91,8 @@ def one_round(bwrap, scratch, number, previous_namespace):
 
     stage = scratch / ('stage-%d' % number)
     stage.mkdir()
+    if stage_setup is not None:
+        stage_setup(stage)
     info = scratch / ('info-%d' % number)
     stderr_path = scratch / ('stderr-%d' % number)
     handles = []

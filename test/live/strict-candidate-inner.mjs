@@ -59,7 +59,7 @@ function exclusiveFile(target, bytes, mode) {
 function copy(source, destination) {
   const stat = fs.lstatSync(source);
   assert.ok(stat.isDirectory() && !stat.isSymbolicLink());
-  assert.deepEqual(fs.readdirSync(source).sort(), MEMBERS);
+  check(equal(fs.readdirSync(source).sort(), MEMBERS),'FIXTURE_MEMBERS');
   mkdir(destination);
   for (const name of MEMBERS) {
     const from = path.join(source, name), before = fs.lstatSync(from);
@@ -176,9 +176,84 @@ export function runCandidateIntegration(source) {
     return {ok:true,strictState:'unverified',scope:'controlled mock candidate integration; caller-established quiescence prerequisite',trace,delta,negativeCases:negatives,exactStoredClone:true,completionVerified:false};
   } finally { cleanupOwned(owned); }
 }
+// Fixed local fixture-session commands. The outer Python host owns this root
+// across worker lifetimes; none of these paths is bound into the worker.
+function sessionRoot(value, create=false) {
+  check(path.isAbsolute(value),'FIXTURE_SESSION');
+  const root=path.resolve(value), parent=path.dirname(root);
+  check(path.basename(root)==='host-session' && fs.realpathSync(parent)===parent,'FIXTURE_SESSION');
+  check(/^strict-candidate-probe-[A-Za-z0-9_-]{8}$/.test(path.basename(parent)),'FIXTURE_SESSION');
+  const marker=path.join(parent,'.fixture-owner'), stat=fs.lstatSync(marker);
+  check(stat.isFile() && !stat.isSymbolicLink() && stat.nlink===1,'FIXTURE_SESSION');
+  check(/^[a-f0-9-]{36}$/.test(fs.readFileSync(marker,'utf8')),'FIXTURE_SESSION');
+  if(create) { mkdir(root); exclusiveFile(path.join(root,'.fixture-session'),Buffer.from(randomUUID()),0o600); }
+  check(fs.realpathSync(root)===root && !fs.lstatSync(root).isSymbolicLink(),'FIXTURE_SESSION');
+  const token=fs.lstatSync(path.join(root,'.fixture-session'));
+  check(token.isFile() && token.nlink===1 && token.size===36,'FIXTURE_SESSION');
+  return root;
+}
+function approvedSession(root) {
+  const record=parseAuthorityRecord(JSON.parse(fs.readFileSync(path.join(root,'authority','authority.json'),'utf8')));
+  check(record?.state.protocolVersion===2 && record.state.phase==='fill','FIXTURE_APPROVAL');
+  const pair={reviewVersion:record.state.approvedVersion,captureVersion:record.state.approvedCaptureVersion};
+  const store=openCaptureStore(path.join(root,'captures'));
+  const approved=validateStoredCapture(store.get(pair.captureVersion));
+  check(approved.shapeVersion===pair.reviewVersion,'FIXTURE_REVIEW_PAIR');
+  return {store,pair,approved};
+}
+function runSession(action,source,session,caseName) {
+  const root=sessionRoot(session,action==='--prepare');
+  if(action==='--prepare') {
+    const observed=copy(source,path.join(root,'candidate'));
+    const store=createCaptureStore(path.join(root,'captures'));
+    const stored=store.put(observed.capture);
+    check(openCaptureStore(path.join(root,'captures')).get(stored.captureVersion).captureVersion===stored.captureVersion,'FIXTURE_CAPTURE_PAIR');
+    const initial={protocolVersion:2,projectId:'fixture',sessionId:'fixture',reviewRoundId:'round',phase:'skeleton',reviewVersion:stored.shapeVersion,captureVersion:stored.captureVersion,approvedVersion:null,approvedCaptureVersion:null,revision:0};
+    const authority=createAuthorityStore(path.join(root,'authority'),initial);
+    const result=authority.submit({protocolVersion:2,projectId:'fixture',sessionId:'fixture',reviewRoundId:'round',requestId:'mock-approve',action:'approve',reviewVersion:stored.shapeVersion,captureVersion:stored.captureVersion,expectedRevision:0},{contentVersion:stored.shapeVersion,captureVersion:stored.captureVersion,nextReviewRoundId:null,completionVerified:false});
+    check(result.kind==='committed','FIXTURE_APPROVAL');
+    approvedSession(root);
+    return {ok:true,strictState:'unverified',action:'prepare',reviewVersion:stored.shapeVersion,captureVersion:stored.captureVersion,trace:['private-copy','enumerate','independent-capture','durable-capture-put','authority-reference','mock-approve']};
+  }
+  const {store,pair,approved}=approvedSession(root);
+  if(action==='--seed') {
+    // Destination must be the absent tree child of an existing outer-owned stage.
+    check(path.isAbsolute(source) && path.basename(source)==='tree','FIXTURE_DESTINATION');
+    const stage=path.dirname(source);
+    check(path.dirname(stage)===path.dirname(root) && /^stage-[0-9]+$/.test(path.basename(stage)) && fs.realpathSync(stage)===stage,'FIXTURE_DESTINATION');
+    materialize(store,pair,source);
+    for(const file of approved.files) {
+      const a=fs.statSync(path.join(source,file.path)), b=fs.statSync(path.join(root,'candidate',file.path));
+      check(a.ino!==b.ino || a.dev!==b.dev,'FIXTURE_FRESH_INODE');
+    }
+    return {ok:true,strictState:'unverified',action:'seed',...pair,exactStoredClone:true};
+  }
+  check(action==='--check' && ['valid','exterior','member','mode'].includes(caseName),'FIXTURE_CASE');
+  // Establish the positive fill control independently even when an added member
+  // prevents the subsequent full-tree copy/enumeration from succeeding.
+  const sourceFd=fs.openSync(source,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
+  let selectedPlan;
+  try { selectedPlan=captureStrictManifest(sourceFd,[{path:'plan.js',mode:'fenced'}]).files[0]; }
+  finally { fs.closeSync(sourceFd); }
+  const baselinePlan=approved.files.find(file=>file.path==='plan.js');
+  check(selectedPlan.fences[0]?.id==='1' && bodies(selectedPlan)[0]!==bodies(baselinePlan)[0],'FIXTURE_SELECTED_UNCHANGED');
+  const codes={valid:null,exterior:'FIXTURE_EXTERIOR',member:'FIXTURE_MEMBERS',mode:'FIXTURE_MODE'};
+  let refusal=null;
+  try {
+    const observed=copy(source,path.join(root,'checked-'+caseName));
+    assertSelectedFill(approved,observed.capture);
+  } catch(error) { refusal=error.code; if(!refusal) throw error; }
+  check(refusal===codes[caseName],'FIXTURE_CASE_OUTCOME');
+  return {ok:true,strictState:'unverified',action:'check',case:caseName,outcome:refusal?'rejected':'accepted',code:refusal,selectedBodyChanged:true,completionVerified:false};
+}
 function main() {
   let source,owned;
   try {
+    if(['--prepare','--seed','--check'].includes(process.argv[2])) {
+      const [action,source,session,caseName]=process.argv.slice(2);
+      check(process.argv.length===(action==='--check'?6:5),'FIXTURE_ARGUMENTS');
+      console.log(JSON.stringify(runSession(action,source,session,caseName))); return;
+    }
     if(process.argv.length===3 && process.argv[2]==='--self-test') {
       owned=ownedRoot('strict-candidate-source-'); source=path.join(owned.root,'source'); mkdir(source);
       exclusiveFile(path.join(source,'plan.js'),Buffer.from(FIXTURE_PLAN),0o600);
