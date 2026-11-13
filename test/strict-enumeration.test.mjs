@@ -4,10 +4,35 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import vm from "node:vm";
 import { enumerateStrictManifest, STRICT_ENUMERATION_POLICY } from "../lib/strict-enumeration.mjs";
 import { captureStrictManifest } from "../lib/strict-capture.mjs";
 import { createCaptureStore, openCaptureStore } from "../lib/strict-capture-store.mjs";
 const linuxTest=(name,fn)=>test(name,{skip:process.platform!=="linux"},fn);
+function candidateSource() {
+ const source=fs.readFileSync(new URL("../lib/strict-enumeration.mjs",import.meta.url),"utf8");
+ return source.slice(source.indexOf("function markerCandidate(text) {"),source.indexOf("\nfunction limits("));
+}
+test("linear candidate scan preserves conservative multiline Unicode and comment semantics",()=>{
+ const candidate=vm.runInNewContext(candidateSource()+"\nmarkerCandidate");
+ const legacy=/^\s*(?:\/\/|#|--|;|\/\*|<!--|\{\/\*)\s*\/?SKEL\[/m;
+ const chunks=["", "text", " ", "\t", "\n", "\r\n", "\u2028", "\u2029", "\uFEFF", "\v", "//", "#", "--", ";", "/*", "<!--", "{/*", "SKEL[", "/SKEL[", "skel[", "x\n// SKEL["];
+ for(const a of chunks) for(const b of chunks) for(const c of chunks) {
+  const text=a+b+c;
+  assert.equal(candidate(text),legacy.test(text),JSON.stringify(text));
+ }
+});
+test("newline and whitespace candidate scans finish in a bounded child",()=>{
+ execFileSync(process.execPath,["--input-type=module","-e",`
+  import assert from 'node:assert/strict';
+  import vm from 'node:vm';
+  const candidate=vm.runInNewContext(${JSON.stringify(candidateSource())}+'\\nmarkerCandidate');
+  assert.equal(candidate('\\n'.repeat(1024*1024)),false);
+  assert.equal(candidate(' \\n'.repeat(500000)+'x'),false);
+  assert.equal(candidate('//'+ ' \\n'.repeat(500000)+'SKEL['),true);
+  assert.equal(candidate(('// \\n').repeat(200000)+'x'),false);
+ `],{timeout:15000,stdio:"pipe"});
+});
 function fixture(t){
  const base=fs.mkdtempSync(path.join(os.tmpdir(),"skel-enumeration-")),root=path.join(base,"work");fs.mkdirSync(root);
  const fd=fs.openSync(root,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
@@ -15,6 +40,13 @@ function fixture(t){
  const write=(name,text="text")=>{const file=path.join(root,name);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,text);return file;};
  return {base,root,fd,write,enumerate:limits=>enumerateStrictManifest(fd,STRICT_ENUMERATION_POLICY,limits)};
 }
+linuxTest("newline-heavy text stays whole and a cross-line marker candidate still refuses",t=>{
+ const f=fixture(t);
+ f.write("blank.txt"," \n".repeat(32000)+"ordinary text");
+ assert.deepEqual(f.enumerate().manifest,[{path:"blank.txt",mode:"whole"}]);
+ f.write("blank.txt","//\n\uFEFF /SKEL[1]");
+ assert.throws(()=>f.enumerate(),error=>error.code==="ENUM_UNAVAILABLE");
+});
 linuxTest("fixed all-text coverage ignores project policy and reports exact directory exclusions",t=>{
  const {write,enumerate,fd,base}=fixture(t);
  write("z.unknown","all text");write("src/hidden.js","// SKEL[1] value\nreturn 1;\n// /SKEL[1]\n");
