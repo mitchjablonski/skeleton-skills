@@ -225,7 +225,9 @@ def main():
     if refusal.get('ok') is not False or refusal.get('code')!=expected:raise RuntimeError('protocol refusal wrong')
     if label=='null':
      # A malformed top-level value must revoke the channel, not merely fail one
-     # frame and leave a subsequent valid provider request usable.
+     # frame and leave a subsequent valid provider request usable. Require EOF
+     # before the host's five-second idle timeout could disguise missing revocation.
+     endpoint.settimeout(1)
      if endpoint.recv(1)!=b'':raise RuntimeError('null frame did not revoke channel')
     endpoint.close();summary=line(host.stdout);host.wait(timeout=10)
     if summary.get('send')!=0 or summary.get('snapshot',{}).get('inFlight')!=0 or summary.get('closed') is not True or summary.get('snapshot',{}).get('closed') is not True:raise RuntimeError('malformed protocol reached provider or did not revoke broker')
