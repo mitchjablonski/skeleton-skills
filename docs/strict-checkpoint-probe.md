@@ -1,5 +1,10 @@
 # Development-only checkpoint teardown probe
 
+Failure cleanup waits for namespace-init pidfd exit after killing it and closes
+tracked descriptors even if a later wrapper wait fails. A controlled unexpected
+third-writer injection refused membership and completed cleanup without a fixture
+removal error. Unknown teardown still fails; this is not production recovery.
+
 Run on Linux or WSL with system Python 3.10+ under `/usr`, Bubblewrap supporting
 `--as-pid-1` and `--info-fd`, enabled user/PID namespaces, readable host `/proc`,
 and kernel/Python pidfd open and signal support:

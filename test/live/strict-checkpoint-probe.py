@@ -158,20 +158,25 @@ def one_round(bwrap, scratch, number, previous_namespace):
                     'candidateBytes': [len(data) for data in candidate], 'allPidfdsExitedBeforeRead': True,
                     'noLiveNamespaceMembersBeforeRead': True, 'bothWritersAdvanced': True}
     finally:
-        if init_fd is not None:
-            try:
-                signal.pidfd_send_signal(init_fd, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        if process is not None and process.poll() is None:
-            # On pre-pidfd startup failure, bwrap's death also triggers its parent-death policy.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=TIMEOUT)
-        for fd in handles:
-            os.close(fd)
+        try:
+            if init_fd is not None:
+                try:
+                    signal.pidfd_send_signal(init_fd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                # Let namespace teardown finish before removing writable fixtures.
+                if not select.select([init_fd], [], [], TIMEOUT)[0]:
+                    raise RuntimeError('cleanup namespace init did not exit')
+            if process is not None and process.poll() is None:
+                # On pre-pidfd startup failure, bwrap death triggers parent-death policy.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=TIMEOUT)
+        finally:
+            for fd in handles:
+                os.close(fd)
 
 
 def main():
