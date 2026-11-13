@@ -389,6 +389,7 @@ test("browser refuses a malformed or inconsistent model and leaves nothing curre
     markerRewritten: (m) => { const l = m.files[0].display[m.files[0].fences[0].openLine - 1]; l.text = "harmless".padEnd(l.text.length, " ").slice(0, l.text.length); },
     idDrift: (m) => { m.files[0].fences[0].id = "2"; },
     inheritedEnding: (m) => { m.files[1].display[0].ending = "toString"; },
+    bom: (m) => { const l = m.files[1].display[0]; l.text = "\uFEFF" + l.text.slice(3); },
     hiddenMarker: (m) => { const l = m.files[0].display[0]; l.text = "// SKEL[9" + "x".repeat(Math.max(0, l.text.length - 9)); },
   };
   for (const [name, edit] of Object.entries(cases)) {
@@ -418,16 +419,27 @@ test("browser limits can only be lowered", () => {
 
 test("browser marker grammar is identical to lib/markers.mjs and lib/strict-capture.mjs", async () => {
   const { STRICT_MARKER_SOURCES: M } = await import("../lib/strict-capture-view-dom.mjs");
-  const markers = src("markers.mjs"), capture = src("strict-capture.mjs");
-  const raw = (name) => new RegExp(`const ${name} = String\\.raw\`([^\`]*)\`;`).exec(markers)?.[1];
-  assert.equal(raw("COMMENT"), M.COMMENT);
-  assert.equal(raw("ID"), M.ID);
-  const comment = M.COMMENT, id = M.ID;
-  const open = new RegExp(String.raw`^\s*${comment}\s*SKEL\[${id}\]\s*(.*?)\s*(?:\*\/\}?|-->)?\s*$`);
-  assert.equal(open.source, M.OPEN);
-  assert.match(markers, /const OPEN_RE = new RegExp\(String\.raw`\^\\s\*\$\{COMMENT\}\\s\*SKEL\\\[\$\{ID\}\\\]\\s\*\(\.\*\?\)\\s\*\(\?:\\\*\\\/\\\}\?\|-->\)\?\\s\*\$`\);/);
-  assert.match(markers, /const CLOSE_RE = new RegExp\(String\.raw`\^\\s\*\$\{COMMENT\}\\s\*\\\/SKEL\\\[\$\{ID\}\\\]\\s\*\(\?:\\\*\\\/\\\}\?\|-->\)\?\\s\*\$`\);/);
+  const dom = src("strict-capture-view-dom.mjs"), markers = src("markers.mjs"), capture = src("strict-capture.mjs");
+  // Compare the declaration text itself, line for line, in both files.
+  const decl = (text, name) => {
+    const m = new RegExp(`^const ${name} = (.*);$`, "m").exec(text);
+    assert.ok(m, `${name} declared`);
+    return m[1];
+  };
+  for (const name of ["COMMENT", "ID", "OPEN_RE", "CLOSE_RE"]) assert.equal(decl(dom, name), decl(markers, name), name);
   assert.ok(capture.includes(`const markerCandidate = /${M.CANDIDATE}/;`));
+});
+
+test("host-valid fenced files in every comment style and line ending render through host and browser", () => {
+  const styles = [["// ", ""], ["# ", ""], ["-- ", ""], ["; ", ""], ["/* ", " */"], ["/*", "*/"], ["<!-- ", " -->"], ["{/* ", " */}"], ["\t; ", ""]];
+  for (const [o, c] of styles) for (const eol of ["\n", "\r\n"]) {
+    const text = `x${eol}${o}SKEL[a.1] title ${c}${eol}body${eol}${o}/SKEL[a.1]${c}${eol}tail`;
+    const cap = makeCapture([{ path: "s.txt", mode: "fenced", text }]);
+    const a = mount(), b = mount();
+    renderStrictCaptureView({ ...a, capture: cap, binding: bindingFor(cap) });
+    renderStrictCaptureViewModel({ ...b, model: wire(buildStrictCaptureViewModel({ capture: cap, binding: bindingFor(cap) })) });
+    assert.equal(a.container.textContent, b.container.textContent, JSON.stringify([o, c, eol]));
+  }
 });
 
 test("host-valid long fence ids and titles still render through the wrapper and the browser", () => {
