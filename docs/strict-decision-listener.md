@@ -85,7 +85,7 @@ constant-time. A successful bind returns a fresh tab binding. The page keeps
 that binding only in module memory and sends it as `x-skel-tab`. Only the
 latest bound tab is live: a new bind or mint revokes the old one.
 
-**Reads.** `GET /api/view` returns the host-built view model. `GET /api/state`
+**Reads.** `GET /api/view` returns `{ view, codes }`: the host-built view model and any decision codes (below). `GET /api/state`
 returns `{ binding }`. Both need the live tab binding. A provider failure
 returns `503 { error: "unavailable" }`, or the `VIEW_*` code for a capture or
 pair refusal. Exception text is never echoed.
@@ -132,6 +132,66 @@ model leaves the view empty. Re-read is a GET that changes nothing.
      and the nonce was still unconsumed afterwards.
   4. Another `127.0.0.1` origin plants about 160 KB of cookies. The real page
      in the same browser profile still binds and renders.
+
+## Decision codes (H3 proposal, prototype)
+
+This section prototypes the page side of
+[strict-human-channel.md](strict-human-channel.md). That design is **not
+adopted**, and the control window that would accept codes doesn't exist. No
+code is derived, verified or sent here.
+
+- **Response shape.** `GET /api/view` returns `{ view, codes, codesDropped }`.
+  `provider.read()` may return `codes`: `{ approve | reshape: { code,
+  revision, reviewVersion, captureVersion } }`. Because they come from the
+  same read as the capture, codes always travel with the capture they bind.
+- **Checks.** `lib/strict-decision-codes.mjs` is browser-safe, has no imports
+  and is used by both the listener and the page.
+  - The codes must be canonical Crockford `XXXX-XXXX`.
+  - Only phase-allowed actions are accepted: approve in scaffold, reshape in
+    fill, none in done. Finalize is out of v1.
+  - Approve binds the selected (rendered) pair and is never accepted while the
+    binding says notes are pending.
+  - Reshape binds the approved pair, and is accepted only when the rendered
+    (selected) pair *is* the approved pair. Its binding line says "approved
+    shape … · approved capture …".
+    A fill capture that includes filled bodies has a different capture
+    version, so in a normal fill state no reshape code appears. One appears
+    only when the fill page renders the approved capture itself (the approved
+    exteriors). This fail-closed outcome is intended, not a bug.
+  - Every code names the same revision.
+- **Dropped codes.** If the codes don't pass, the listener drops them and
+  still serves the capture (`codes: {}`, `codesDropped: true`). The page then
+  says that codes were withheld. The page also re-checks the codes against
+  the capture it rendered, and shows none if they don't match.
+- **The panel** sits in fixed chrome: sticky, double-bordered and outside
+  `#view`.
+  - The approve code appears only after "I have no unsent notes on this
+    version". The reshape code appears only after "Show the reshape code" plus
+    an acknowledgement.
+  - Each code shows its version prefixes and revision, and the panel names
+    the control window's banner (`SKELETON STRICT CONTROL`).
+  - Every load empties the panel first, so a declaration never carries over
+    and a failed load leaves no code.
+  - A load counter drops stale responses.
+  - A fixed line in the shell, which is always present and never
+    agent-influenced, says real codes appear only in that panel.
+- **Browser rows** in `test/live/strict-browser-matrix.mjs`:
+  - **B13:** the code is hidden until the notes choice and sits outside the
+    capture; a skeleton lure stays inside the capture.
+  - **B14:** a Re-read with a different capture resets the declaration.
+  - **B15:** the reshape steps.
+  - **B16:** a failed Re-read clears the panel.
+  - **B17:** dropped codes and the done phase show no panel.
+  - **B18:** the page's own re-check against a fake server that sends
+    mismatched codes as valid.
+- **Mutations killed:**
+
+  | Mutation | Fails |
+  | --- | --- |
+  | Approve code shown without the declaration | B13, B14 |
+  | Reshape acknowledgement ignored | B15 |
+  | The page's re-check removed | B18 |
+  | Panel clearing removed | B16 |
 
 ## Not shown (still open)
 
