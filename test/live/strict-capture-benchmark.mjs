@@ -44,7 +44,7 @@ function summarizeRss(values) {
     medianObservedBytes: percentile(sorted, 0.5),
     p95ObservedBytes: percentile(sorted, 0.95),
     peakObservedBytes: sorted.at(-1),
-    note: "process RSS observations after samples, not per-operation allocation",
+    note: "process RSS baseline plus after-sample observations, not per-operation allocation",
   };
 }
 function benchmark(fn) {

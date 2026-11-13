@@ -27,10 +27,16 @@ the new-object path; authority stores are prepared before timing. Timed authorit
 submissions use synthetic matching facts, not independent completion evidence.
 
 One JSON object reports median and nearest-rank p95, minimum/maximum, fixture or
-record byte sizes, platform and Node version, and process RSS snapshots after
-samples. RSS is observed process memory, not per-operation allocation. Unsupported
+record byte sizes, platform and Node version, and process RSS baseline plus
+after-sample snapshots. RSS is observed process memory, not per-operation allocation.
+Stored reads include the capture store's file, directory and parent syncs; they
+are not raw cached-file read timings. Unsupported
 operations retain explicit rows so partial results remain visible. Cleanup status
 is separate from timing success. Native Windows reports unsupported; Linux errors
 or mounted-storage refusals provide no durability evidence. No thresholds are
 adopted. The harness does not test crash recovery, power loss or production
 activation; local and mounted measurements must not be conflated.
+
+An unreadable dataset directory can abort the remaining operations for that root;
+inspect root status as well as individual rows. A zero process exit is not an
+acceptance gate: inspect every operation and `cleanupVerified` separately.
