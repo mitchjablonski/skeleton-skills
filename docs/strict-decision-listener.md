@@ -85,7 +85,7 @@ constant-time. A successful bind returns a fresh tab binding. The page keeps
 that binding only in module memory and sends it as `x-skel-tab`. Only the
 latest bound tab is live: a new bind or mint revokes the old one.
 
-**Reads.** `GET /api/view` returns the host-built view model. `GET /api/state`
+**Reads.** `GET /api/view` returns `{ view, codes }`: the host-built view model and any decision codes (below). `GET /api/state`
 returns `{ binding }`. Both need the live tab binding. A provider failure
 returns `503 { error: "unavailable" }`, or the `VIEW_*` code for a capture or
 pair refusal. Exception text is never echoed.
@@ -132,6 +132,49 @@ model leaves the view empty. Re-read is a GET that changes nothing.
      and the nonce was still unconsumed afterwards.
   4. Another `127.0.0.1` origin plants about 160 KB of cookies. The real page
      in the same browser profile still binds and renders.
+
+## Decision codes (H3 proposal, prototype)
+
+This section prototypes the page side of
+[strict-human-channel.md](strict-human-channel.md). That design is **not
+adopted**, and the control window that would accept codes doesn't exist. No
+code is derived, verified or sent here.
+
+- **Response shape.** `GET /api/view` returns `{ view, codes }`.
+  `provider.read()` may return `codes`: `{ approve | reshape: { code,
+  revision, reviewVersion, captureVersion } }`. Because they come from the
+  same read as the capture, codes always travel with the capture they bind.
+- **Checks.** `lib/strict-decision-codes.mjs` is browser-safe, has no imports
+  and is used by both the listener and the page.
+  - The codes must be canonical Crockford `XXXX-XXXX`.
+  - Only phase-allowed actions are accepted: approve in scaffold, reshape in
+    fill, none in done. Finalize is out of v1.
+  - Approve binds the selected pair and is never accepted while the binding
+    says notes are pending. Reshape binds the approved pair.
+  - Every code names the same revision.
+- **Refusals.** The listener refuses the whole view with `503 codes` if the
+  codes don't match. The page re-checks them against the capture it actually
+  rendered and shows none if they don't match.
+- **The panel** sits in fixed chrome: sticky, double-bordered and outside
+  `#view`.
+  - The approve code appears only after "I have no unsent notes on this
+    version". "I have notes" shows no code.
+  - The reshape code appears only after "Show the reshape code" plus an
+    acknowledgement, and unchecking hides it.
+  - Each code shows its shape and capture version prefixes and revision. The
+    panel names the control window's banner (`SKELETON STRICT CONTROL`) and
+    says never to paste the code anywhere else.
+  - Every load rebuilds the panel, so a declaration never carries over to
+    another capture.
+- **Browser rows** in `test/live/strict-browser-matrix.mjs`:
+  - **B13:** the code is hidden until the notes choice and sits outside the
+    capture, and a skeleton lure ("approve ZZZZ-ZZZZ") stays inside the
+    capture.
+  - **B14:** a Re-read with a different capture resets the declaration.
+  - **B15:** the reshape steps.
+
+  Mutations that showed the approve code without the declaration, or ignored
+  the reshape acknowledgement, failed B13/B14 and B15.
 
 ## Not shown (still open)
 

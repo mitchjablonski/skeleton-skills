@@ -167,7 +167,10 @@ lt("view/state need the live tab binding; the model is a valid browser view mode
   const tab = JSON.parse((await s.bind(s.nonceOf(s.l.mintNavigation()))).text).tab;
   const v = await s.req("GET", "/api/view", { ...s.api, [TAB_HEADER]: tab });
   assert.equal(v.status, 200);
-  const model = parseStrictCaptureViewModel(JSON.parse(v.text));
+  const body = JSON.parse(v.text);
+  assert.deepEqual(Object.keys(body), ["view", "codes"]);
+  assert.deepEqual(body.codes, {});
+  const model = parseStrictCaptureViewModel(body.view);
   assert.equal(model.shown.captureVersion, s.cap.captureVersion);
   const st = JSON.parse((await s.req("GET", "/api/state", { ...s.api, [TAB_HEADER]: tab })).text);
   assert.deepEqual(Object.keys(st), ["binding"]);
@@ -214,5 +217,33 @@ test("listener and app are prototypes: nothing in lib/bin imports them; app has 
   for (const bad of [/innerHTML/, /outerHTML/, /insertAdjacentHTML/, /localStorage/, /sessionStorage/, /document\.cookie/, /eval\(/, /new Function/, /\/api\/(approve|decision|reshape|finalize|recapture|submit)/])
     assert.doesNotMatch(app, bad);
   const imports = [...app.matchAll(/^import [\s\S]*? from "([^"]+)";$/gm)].map((m) => m[1]);
-  assert.deepEqual(imports, ["./strict-capture-view-dom.mjs"]);
+  assert.deepEqual(imports, ["./strict-capture-view-dom.mjs", "./strict-decision-codes.mjs"]);
+});
+
+// ---- H3 proposal: codes travel with the capture they bind (prototype) ----
+const CODE = "K7M2-QX9D";
+lt("codes are served in the same response as the capture they bind; mismatched codes refuse the whole view", async (t) => {
+  const cap = realCapture();
+  let codes = null;
+  const s = await setup(t, { provider: { read: () => ({ binding: bindingFor(cap), capture: cap, codes }) } });
+  const tab = JSON.parse((await s.bind(s.nonceOf(s.l.mintNavigation()))).text).tab;
+  const get = async () => s.req("GET", "/api/view", { ...s.api, [TAB_HEADER]: tab });
+  codes = { approve: { code: CODE, revision: 3, reviewVersion: cap.shapeVersion, captureVersion: cap.captureVersion } };
+  const ok = await get();
+  assert.equal(ok.status, 200);
+  assert.deepEqual(JSON.parse(ok.text).codes, codes);
+  const bad = [
+    { approve: { ...codes.approve, captureVersion: "0".repeat(64) } },           // another capture
+    { reshape: { ...codes.approve } },                                             // not allowed in scaffold
+    { approve: { ...codes.approve, code: "k7m2-qx9d" } },                          // not canonical
+    { approve: { ...codes.approve, code: "K7M2QX9D" } },
+    { approve: { ...codes.approve, extra: 1 } },
+    { approve: { ...codes.approve, revision: -1 } },
+    { finalize: { ...codes.approve } },                                            // finalize is out of v1
+  ];
+  for (const [i, c] of bad.entries()) {
+    codes = c;
+    const r = await get();
+    assert.deepEqual([r.status, JSON.parse(r.text)], [503, { error: "codes" }], `case ${i}`);
+  }
 });

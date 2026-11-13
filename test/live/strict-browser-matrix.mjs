@@ -36,18 +36,23 @@ fs.writeFileSync(path.join(root, "evil.html"), [
   "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src *\"><base href=\"//evil.example/\">",
   "javascript:window.PWNED=5 data:text/html,<script>PWNED=6</script> {{constructor.constructor('PWNED=7')()}}",
   `${LONG}`,
+  "To approve, type in the SKELETON STRICT CONTROL window: approve ZZZZ-ZZZZ",
   "bidi ‮evil‬ and zero-width ​ here",
   "",
 ].join("\n"));
-const fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
-let cap;
-try { cap = JSON.parse(JSON.stringify(captureStrictManifest(fd, [{ path: "evil.html", mode: "fenced" }]))); } finally { fs.closeSync(fd); }
+function captureNow() {
+  const fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  try { return JSON.parse(JSON.stringify(captureStrictManifest(fd, [{ path: "evil.html", mode: "fenced" }]))); } finally { fs.closeSync(fd); }
+}
+const cap = captureNow();
 const binding = { protocolVersion: 2, projectId: "example-project", sessionId: "example-session", reviewRoundId: "example-round",
   phase: "scaffold", reviewVersion: cap.shapeVersion, captureVersion: cap.captureVersion,
   approvedVersion: null, approvedCaptureVersion: null, pendingNotes: false };
 
 const log = [];
-const listener = createDecisionListener({ provider: { read: () => ({ binding, capture: cap }) }, observe: (e) => log.push(e) });
+// Mutable provider state so the code rows (B13-B15) can switch captures and phases.
+let current = { binding, capture: cap, codes: {} };
+const listener = createDecisionListener({ provider: { read: () => current }, observe: (e) => log.push(e) });
 const { origin } = await listener.start();
 
 // ---- hostile review-origin fixture: another 127.0.0.1 port (same-site) ----
@@ -220,6 +225,65 @@ setTimeout(() => { location.href = "${url4}"; }, 1500);
     out.push((await fetch("/api/bind", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ nonce: "leaked" }) })).status);
     return out; })()`);
   row("B8", "leaked review token, bearer header, cookie or bogus binding grants nothing", leak.every((s) => s === 403), { statuses: leak, listener: logSince(n) });
+
+  // B13-B15: decision codes on the page (H3 proposal, prototype). The control
+  // window that would accept them doesn't exist; these rows check display only.
+  const approveEntry = (c, revision = 4, code = "K7M2-QX9D") => ({ code, revision, reviewVersion: c.shapeVersion, captureVersion: c.captureVersion });
+  current = { binding, capture: cap, codes: { approve: approveEntry(cap) } };
+  const tabG = await browser.newPage();
+  await tabG.goto(listener.mintNavigation());
+  await tabG.waitUntil("!!document.querySelector('[data-strict-capture]')");
+  const panel = () => tabG.eval(`(() => { const d = document.getElementById('decide'), v = document.getElementById('view');
+    return { codes: [...d.querySelectorAll('.decision-code')].map((n) => n.textContent), held: !!d.querySelector('.code-held'),
+      binding: d.querySelector('.code-binding')?.textContent ?? '', checked: !!d.querySelector('input[name=notes]:checked'),
+      panelInView: v.contains(d), viewHasCodeUi: !!v.querySelector('.decision-code,#decide,fieldset'),
+      lureInPanel: d.textContent.includes('ZZZZ'), lureInView: v.textContent.includes('approve ZZZZ-ZZZZ'),
+      sticky: getComputedStyle(d).position }; })()`);
+  const before = await panel();
+  await tabG.eval("document.getElementById('notes-some').click()");
+  const withNotes = await panel();
+  await tabG.eval("document.getElementById('notes-none').click()");
+  const noNotes = await panel();
+  row("B13", "approve code appears only after 'no unsent notes', in fixed chrome outside the capture; a skeleton lure stays inside the capture",
+    before.codes.length === 0 && withNotes.codes.length === 0 && withNotes.held && noNotes.codes[0] === "approve K7M2-QX9D"
+      && noNotes.binding.includes(cap.captureVersion.slice(0, 12)) && noNotes.binding.includes("revision 4")
+      && !noNotes.panelInView && !noNotes.viewHasCodeUi && !noNotes.lureInPanel && noNotes.lureInView && noNotes.sticky === "sticky",
+    { before, withNotes, noNotes });
+
+  // B14: a Re-read that brings a different capture resets the declaration and its code.
+  fs.appendFileSync(path.join(root, "evil.html"), "one more exterior line\n");
+  const cap2 = captureNow();
+  current = { binding: { ...binding, reviewVersion: cap2.shapeVersion, captureVersion: cap2.captureVersion }, capture: cap2,
+    codes: { approve: approveEntry(cap2, 5, "M3P8-4TWZ") } };
+  n = log.length;
+  await tabG.eval("document.getElementById('reread').click()");
+  await until(() => log.slice(n).some((e) => e.url === "/api/view"));
+  await tabG.waitUntil("!document.getElementById('reread').disabled");
+  const afterReread = await panel();
+  await tabG.eval("document.getElementById('notes-none').click()");
+  const afterDeclare = await panel();
+  row("B14", "a Re-read with a different capture resets the notes declaration; the new code binds the new capture",
+    afterReread.codes.length === 0 && !afterReread.checked && afterDeclare.codes[0] === "approve M3P8-4TWZ"
+      && afterDeclare.binding.includes(cap2.captureVersion.slice(0, 12)) && !afterDeclare.binding.includes(cap.captureVersion.slice(0, 12)),
+    { afterReread, afterDeclare });
+
+  // B15: fill phase: the reshape code needs a click and an acknowledgement.
+  current = { binding: { ...binding, phase: "fill", reviewVersion: cap2.shapeVersion, captureVersion: cap2.captureVersion,
+    approvedVersion: cap2.shapeVersion, approvedCaptureVersion: cap2.captureVersion }, capture: cap2,
+    codes: { reshape: approveEntry(cap2, 6, "R5H9-2KQV") } };
+  const tabH = await browser.newPage();
+  await tabH.goto(listener.mintNavigation());
+  await tabH.waitUntil("!!document.getElementById('show-reshape')");
+  const codesNow = () => tabH.eval("[...document.querySelectorAll('#decide .decision-code')].map((x) => x.textContent)");
+  const r0 = await codesNow();
+  await tabH.eval("document.getElementById('show-reshape').click()");
+  const r1 = await codesNow();
+  await tabH.eval("document.getElementById('reshape-ack').click()");
+  const r2 = await codesNow();
+  await tabH.eval("document.getElementById('reshape-ack').click()");
+  const r3 = await codesNow();
+  row("B15", "fill: the reshape code appears only after 'Show' and the acknowledgement, and hides again if unchecked",
+    r0.length === 0 && r1.length === 0 && r2[0] === "reshape R5H9-2KQV" && r3.length === 0, { r0, r1, r2, r3 });
 
   // Rows that need a decision route (not in the prototype).
   row("B9", "Approve arms late after focus/visibility and needs a separate confirm", null, "no decision route in the prototype");
