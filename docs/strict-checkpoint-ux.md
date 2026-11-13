@@ -78,9 +78,10 @@ These refusals are: `teardown-unproven`, `writer-survived`, `restart-unproven`,
 and `capture-refused` with `CAPTURE_CHANGED`, `ENUM_CHANGED`, `CAPTURE_MISSING`,
 `CAPTURE_LINK` or `ENUM_UNAVAILABLE`. Capture runs after the listing, so a file
 that vanished or became a link since it was listed is the same signal as one
-changing. Enumeration collapses every raw error into `ENUM_UNAVAILABLE` (I/O,
-permissions, procfs, a vanished or changed file, a malformed marker). The
-cause is lost and may be a mutation, so it is treated the same way.
+changing. Enumeration preserves only a typed parser `CAPTURE_MARKERS` refusal
+as `ENUM_MARKERS`. Other raw errors still collapse into `ENUM_UNAVAILABLE`
+(I/O, permissions, procfs, a vanished or changed file). The cause is lost and
+may be a mutation, so unavailable remains a stop-in-doubt refusal.
 
 - **The copy says** a session process may still be running.
 - **What is refused:** capture, checks and restart.
@@ -103,7 +104,7 @@ stage, and only for these causes:
 
 | Refusal | Means | Restart from approved |
 | --- | --- | --- |
-| capture-refused, content codes | Something the session wrote: malformed markers, non-UTF-8 text, a BOM, an ambiguous separator, a line or size limit, or an unsupported or too-long name | fill only |
+| capture-refused, content codes | Something the session wrote: proven malformed markers (`CAPTURE_MARKERS` or `ENUM_MARKERS`), non-UTF-8 text, a BOM, an ambiguous separator, a line or size limit, or an unsupported or too-long name | fill only |
 | capture-refused `ENUM_TYPE`, and drift `link` | A symlink, device or special file found while listing. The session probably made it, but a link can reach outside the project | no |
 | capture-refused, host codes | A launcher or environment fault, or a cause the launcher can't attribute: root, I/O, device boundary, handles, budget, policy, unsupported platform, a duplicate in the launcher's own capture list (`CAPTURE_DUPLICATE`), and the runtime's name listing (`ENUM_UNSUPPORTED_NAMES`) | no |
 | store-outcome-unknown | Storing may or may not have completed. The request identity is kept for reconciliation, and a reload or re-read can't settle it. The copy never says "nothing was used" | no |
