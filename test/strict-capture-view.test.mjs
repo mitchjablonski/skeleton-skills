@@ -115,7 +115,11 @@ test("browser module's whole import graph is browser-safe (no node:, Buffer, pro
 });
 
 test("no production module imports the renderer", () => {
-  const own = new Set(["strict-capture-view.mjs", "strict-capture-view-model.mjs", "strict-capture-view-dom.mjs"]);
+  // The capture view's own modules, plus the disabled #77 listener prototype
+  // and its browser app, which serve it. Their own test pins that nothing
+  // else loads the listener or app.
+  const own = new Set(["strict-capture-view.mjs", "strict-capture-view-model.mjs", "strict-capture-view-dom.mjs",
+    "strict-decision-listener.mjs", "strict-decision-app.mjs"]);
   for (const f of readdirSync(new URL("../lib/", import.meta.url)).filter((n) => /\.(m?js|css)$/.test(n) && !own.has(n)))
     assert.doesNotMatch(src(f), /strict-capture-view/, f);
   for (const f of readdirSync(new URL("../bin/", import.meta.url)))
