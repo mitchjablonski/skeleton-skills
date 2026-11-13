@@ -423,14 +423,18 @@ test("browser limits can only be lowered", () => {
 
 test("browser marker grammar is identical to lib/markers.mjs and lib/strict-capture.mjs", async () => {
   const { STRICT_MARKER_SOURCES: M } = await import("../lib/strict-capture-view-dom.mjs");
-  const dom = src("strict-capture-view-dom.mjs"), markers = src("markers.mjs"), capture = src("strict-capture.mjs");
-  // Compare the declaration text itself, line for line, in both files.
-  const decl = (text, name) => {
-    const m = new RegExp(`^const ${name} = (.*);$`, "m").exec(text);
-    assert.ok(m, `${name} declared`);
-    return m[1];
-  };
-  for (const name of ["COMMENT", "ID", "OPEN_RE", "CLOSE_RE"]) assert.equal(decl(dom, name), decl(markers, name), name);
+  const markers = src("markers.mjs"), capture = src("strict-capture.mjs");
+  const raw = (name) => new RegExp(`const ${name} = String\\.raw\`([^\`]*)\`;`).exec(markers)?.[1];
+  assert.equal(raw("COMMENT"), M.COMMENT);
+  assert.equal(raw("ID"), M.ID);
+  const dom = src("strict-capture-view-dom.mjs");
+  for (const name of ["COMMENT", "ID", "OPEN_RE", "CLOSE_RE"]) {
+    const declaration = (source) => source.split("\n").find((line) => line.startsWith(`const ${name} = `));
+    assert.ok(declaration(markers), name);
+    assert.equal(declaration(dom), declaration(markers), name);
+  }
+  const parser = (source) => source.slice(source.indexOf("function openMarker(line) {"), source.indexOf("\n}", source.indexOf("function openMarker(line) {")) + 2);
+  assert.equal(parser(dom), parser(markers));
   assert.ok(capture.includes(`const markerCandidate = /${M.CANDIDATE}/;`));
 });
 

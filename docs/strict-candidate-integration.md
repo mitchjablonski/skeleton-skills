@@ -86,14 +86,45 @@ Both rounds run the complete teardown and candidate helper sequence. Namespace
 descriptors stay open across rounds to prevent namespace identifier recycling;
 each restart must have a different namespace. Time, CPU, fixture file sizes and
 helper diagnostic sizes are bounded. Unproven teardown retains its scratch
-directory and reports failure. Fill execution remains a host-controlled mock;
-there is no fill-worker namespace in this slice.
+directory and reports failure.
+
+After those skeleton rounds the outer host prepares one persisted `host-session`
+outside every worker bind. Its real capture and mock-approved authority stores
+survive the following four fill-worker lifetimes. The fixed fixture-only helper
+commands are `--prepare SOURCE SESSION`, `--seed DESTINATION SESSION`, and
+`--check STOPPED_TREE SESSION CASE`. Session ownership markers and bounded paths
+are checked; these commands are trusted test-host continuations, not an API for
+model requests. The outer host owns final cleanup after proven teardown.
+
+Each fill round uses the checkpoint probe's optional `stage_setup` continuation
+to materialize a fresh `/stage/tree` exclusively from the stored approved capture.
+Exact capture identity and distinct inodes are checked before launch. The private
+capture/authority stores are never bound into the worker. Two detached writers
+retain source descriptors in each fresh namespace: one synchronously overwrites
+the selected fence body's fixed sentinel, and one writes its original byte back
+to the whole context file. Each successful write advances a separate control log
+beside `tree`; these control logs and readiness files are outside the captured
+source membership. They are not hard-link aliases of source files.
+
+The four cases accept selected-only fill and reject exterior drift, member
+addition and unix-mode drift with their exact intended codes. Each negative
+worker applies the valid selected edit before its targeted mutation. After all
+writers are dead, the host independently captures the stopped plan to confirm
+its selected body actually changed, then checks the complete candidate tree.
+This prevents unrelated unchanged-body failures from satisfying drift tests.
+No host repair or reconstruction occurs between teardown and capture. Fill is
+now actual controlled synchronous fixture execution in fresh namespaces; the
+standalone helper self-test still uses host-controlled mock fills.
 
 On 2026-11-12 the pinned Node 20.20.0 / system Python WSL run passed both rounds,
 tracking three pidfds each, with namespaces `pid:[4026532233]` and
 `pid:[4026532235]`. Both rounds passed all eleven negative cases. The outer probe
 checks the exact expected negative-case list, operation trace and helper result
-fields. These identifiers
+fields. A subsequent fresh-fill run accepted selected-only fill and rejected
+exterior/member/mode drift in namespaces `pid:[4026532235]`,
+`pid:[4026532237]`, `pid:[4026532239]`, and `pid:[4026532241]`, respectively;
+all four seeded the same persisted approved pair and tracked three pidfds each.
+These identifiers
 are observations, not expected constants or production qualification.
 
 Temporary roots carry a UUID ownership marker;

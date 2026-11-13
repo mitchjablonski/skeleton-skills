@@ -45,6 +45,38 @@ for index,name in enumerate(('plan.js','context.txt')):
 (stage/'init').write_text(json.dumps({'pid':os.getpid(),'namespace':os.readlink('/proc/self/ns/pid')}))
 time.sleep(20)
 '''
+FILL_INNER = r'''
+import json, os, pathlib, time
+stage=pathlib.Path('/stage')
+tree=stage/'tree'
+case=CASE_VALUE
+for index,name in enumerate(('plan.js','context.txt')):
+    launcher=os.fork()
+    if launcher==0:
+        os.setsid()
+        if os.fork(): os._exit(0)
+        source=tree/name
+        fd=os.open(str(source),os.O_RDWR)
+        content=source.read_bytes()
+        offset=content.index(b'initial') if index==0 else 0
+        replacement=b'filled!' if index==0 else content[:1]
+        os.pwrite(fd,replacement,offset)
+        if index==0:
+            if case=='exterior': os.pwrite(fd,b'// changed exterior',0)
+            elif case=='member': (tree/'extra.txt').write_text('fixture extra')
+            elif case=='mode': os.fchmod(fd,(os.fstat(fd).st_mode & 0o7777)^0o100)
+        log=os.open(str(stage/('writer-%d'%index)),os.O_CREAT|os.O_WRONLY|os.O_APPEND,0o600)
+        (stage/('ready-%d'%index)).write_text(json.dumps({'pid':os.getpid(),'ppid':os.getppid()}))
+        end=time.monotonic()+20
+        while time.monotonic()<end:
+            os.pwrite(fd,replacement,offset)
+            os.write(log,b'x')
+            time.sleep(.005)
+        os._exit(0)
+    os.waitpid(launcher,0)
+(stage/'init').write_text(json.dumps({'pid':os.getpid(),'namespace':os.readlink('/proc/self/ns/pid')}))
+time.sleep(20)
+'''
 
 def load_checkpoint():
     spec=importlib.util.spec_from_file_location('strict_checkpoint_fixture',HERE/'strict-checkpoint-probe.py')
@@ -92,6 +124,26 @@ def run_helper(node,stage,scratch,number):
         or value.get('scope')!='controlled mock candidate integration; caller-established quiescence prerequisite'
         or value.get('delta')!={'selectedPath':'plan.js','selectedFence':'1','selectedBodyChanged':True}):
         raise RuntimeError('invalid helper result')
+    return value
+
+def session_command(node,scratch,label,arguments):
+    output=scratch/(label+'.out')
+    errors=scratch/(label+'.err')
+    def limits():
+        resource.setrlimit(resource.RLIMIT_FSIZE,(MAX_OUTPUT,MAX_OUTPUT))
+        resource.setrlimit(resource.RLIMIT_CPU,(15,15))
+    with output.open('wb') as out,errors.open('wb') as err:
+        process=subprocess.Popen([str(node),str(HERE/'strict-candidate-inner.mjs'),*map(str,arguments)],stdin=subprocess.DEVNULL,stdout=out,stderr=err,env={},start_new_session=True,preexec_fn=limits)
+        try: process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid,signal.SIGKILL)
+            process.wait(timeout=8)
+            raise RuntimeError('session helper timeout')
+    if output.stat().st_size>MAX_OUTPUT or errors.stat().st_size>MAX_OUTPUT or process.returncode:
+        raise RuntimeError('session helper failed: '+output.read_text()[:1024]+errors.read_text()[:1024])
+    value=json.loads(output.read_text())
+    if value.get('ok') is not True or value.get('strictState')!='unverified':
+        raise RuntimeError('invalid session response')
     return value
 
 def main():
@@ -150,7 +202,31 @@ def main():
                 raise RuntimeError('fixture aliases remain after teardown')
             helper=run_helper(node,stage,root,number)
             rounds.append({**evidence,'candidateIntegration':helper,'helperInvokedAfterTeardown':True})
-        result.update(ok=True,code='candidate-probe-passed',rounds=rounds,freshNamespaceRestart=True,fillExecution='host-controlled mock only')
+        session=root/'host-session'
+        prepared=session_command(node,root,'prepare',['--prepare',stage,session])
+        if prepared.get('trace')!=['private-copy','enumerate','independent-capture','durable-capture-put','authority-reference','mock-approve']:
+            raise RuntimeError('invalid prepare order')
+        fill_rounds=[]
+        previous=rounds[-1]['namespace']
+        for number,case in enumerate(('valid','exterior','member','mode'),3):
+            fixture.INNER=FILL_INNER.replace('CASE_VALUE',repr(case))
+            seed_result=[]
+            def seed(stage):
+                seed_result.append(session_command(node,root,'seed-'+case,['--seed',stage/'tree',session]))
+                if seed_result[-1]!={'ok':True,'strictState':'unverified','action':'seed','reviewVersion':prepared['reviewVersion'],'captureVersion':prepared['captureVersion'],'exactStoredClone':True}:
+                    raise RuntimeError('seed did not resolve exact approved capture')
+            safe_cleanup=False
+            evidence=fixture.one_round(shutil.which('bwrap'),root,number,previous,stage_setup=seed)
+            safe_cleanup=True
+            if evidence['namespace'] in [r['namespace'] for r in rounds+fill_rounds]:
+                raise RuntimeError('fill namespace reused')
+            previous=evidence['namespace']
+            checked=session_command(node,root,'check-'+case,['--check',root/('stage-%d'%number)/'tree',session,case])
+            expected_code={'valid':None,'exterior':'FIXTURE_EXTERIOR','member':'FIXTURE_MEMBERS','mode':'FIXTURE_MODE'}[case]
+            if checked!={'ok':True,'strictState':'unverified','action':'check','case':case,'outcome':'accepted' if case=='valid' else 'rejected','code':expected_code,'selectedBodyChanged':True,'completionVerified':False}:
+                raise RuntimeError('unexpected fill case outcome')
+            fill_rounds.append({**evidence,'case':case,'seed':seed_result[0],'verification':checked,'checkedAfterTeardown':True})
+        result.update(ok=True,code='candidate-probe-passed',rounds=rounds,fillRounds=fill_rounds,freshNamespaceRestart=True,fillExecution='controlled synchronous namespace fixture')
         code=0
     except (OSError,ValueError,KeyError,RuntimeError,subprocess.SubprocessError) as exc:
         result.update(code='candidate-probe-failed' if code==1 else 'candidate-probe-unsupported',error=str(exc)[:2048])
