@@ -1,9 +1,11 @@
 // #77 persisted-capture DOM renderer. Scoped fake DOM; no network/FS/install.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { renderStrictCaptureView, currentStrictCaptureShown, StrictCaptureViewError } from "../lib/strict-capture-view.mjs";
+import { buildStrictCaptureViewModel } from "../lib/strict-capture-view-model.mjs";
+import { renderStrictCaptureViewModel, parseStrictCaptureViewModel, STRICT_CAPTURE_VIEW_MODEL_SCHEMA, StrictCaptureViewError as DomViewError } from "../lib/strict-capture-view-dom.mjs";
 import { validateStoredCapture } from "../lib/strict-capture.mjs";
 import { skelDecisionController, skelShownProtocol } from "../lib/review-decision.mjs";
 import { createPlannerAuthority } from "./fixtures/strict-results.mjs";
@@ -81,16 +83,42 @@ function bindingFor(cap, extra = {}) {
 }
 const mount = () => { const doc = fakeDoc(); return { doc, container: doc.createElement("div") }; };
 
-test("module is pure: no network/FS/listener/HTML sinks, imports only capture validator and adapter", () => {
-  const imports = [...SOURCE.matchAll(/^import .* from "([^"]+)";$/gm)].map((m) => m[1]);
-  assert.deepEqual(imports.sort(), ["./review-decision.mjs", "./strict-capture.mjs"]);
-  for (const bad of [/innerHTML/, /outerHTML/, /insertAdjacentHTML/, /addEventListener\(/, /fetch\(/, /node:fs/, /XMLHttpRequest/, /eval\(/, /new Function/, /setTimeout/, /href/, /mermaid\./i])
-    assert.doesNotMatch(SOURCE.replace(/^\/\/.*$/gm, ""), bad);
+const src = (f) => readFileSync(new URL(`../lib/${f}`, import.meta.url), "utf8");
+const importsOf = (text) => [...text.matchAll(/^import [\s\S]*? from "([^"]+)";$/gm)].map((m) => m[1]).sort();
+const SINKS = [/innerHTML/, /outerHTML/, /insertAdjacentHTML/, /addEventListener\(/, /fetch\(/, /node:fs/, /XMLHttpRequest/, /eval\(/, /new Function/, /setTimeout/, /href/, /mermaid\./i, /localStorage/, /document\.cookie/];
+const code = (text) => text.replace(/^\s*\/\/.*$/gm, "");
+
+test("modules are pure: no network/FS/listener/HTML sinks; host/browser imports are fixed", () => {
+  assert.deepEqual(importsOf(SOURCE), ["./strict-capture-view-dom.mjs", "./strict-capture-view-model.mjs"]);
+  assert.deepEqual(importsOf(src("strict-capture-view-model.mjs")), ["./review-decision.mjs", "./strict-capture-view-dom.mjs", "./strict-capture.mjs"]);
+  assert.deepEqual(importsOf(src("strict-capture-view-dom.mjs")), ["./review-decision.mjs"]);
+  for (const f of ["strict-capture-view.mjs", "strict-capture-view-model.mjs", "strict-capture-view-dom.mjs"])
+    for (const bad of SINKS) assert.doesNotMatch(code(src(f)), bad, `${f} ${bad}`);
+});
+
+test("browser module's whole import graph is browser-safe (no node:, Buffer, process, require)", () => {
+  const seen = new Set(), queue = ["strict-capture-view-dom.mjs"];
+  while (queue.length) {
+    const f = queue.shift();
+    if (seen.has(f)) continue;
+    seen.add(f);
+    const text = code(src(f));
+    for (const bad of [/from "node:/, /import\(/, /\bBuffer\b/, /\bprocess\./, /\brequire\(/, /__dirname/, /import\.meta/])
+      assert.doesNotMatch(text, bad, `${f} ${bad}`);
+    for (const spec of importsOf(text)) {
+      assert.match(spec, /^\.\/[a-z-]+\.mjs$/, `${f} imports ${spec}`);
+      queue.push(spec.slice(2));
+    }
+  }
+  assert.deepEqual([...seen].sort(), ["review-decision.mjs", "strict-capture-view-dom.mjs", "strict-protocol.mjs"]);
 });
 
 test("no production module imports the renderer", () => {
-  for (const f of ["review.mjs", "review-decision.mjs", "strict-capture.mjs", "strict-capture-store.mjs", "gate.mjs", "hook.mjs", "stop.mjs"])
-    assert.doesNotMatch(readFileSync(new URL(`../lib/${f}`, import.meta.url), "utf8"), /strict-capture-view/);
+  const own = new Set(["strict-capture-view.mjs", "strict-capture-view-model.mjs", "strict-capture-view-dom.mjs"]);
+  for (const f of readdirSync(new URL("../lib/", import.meta.url)).filter((n) => /\.(m?js|css)$/.test(n) && !own.has(n)))
+    assert.doesNotMatch(src(f), /strict-capture-view/, f);
+  for (const f of readdirSync(new URL("../bin/", import.meta.url)))
+    assert.doesNotMatch(readFileSync(new URL(`../bin/${f}`, import.meta.url), "utf8"), /strict-capture-view/, f);
 });
 
 test("fenced + whole capture renders identity, coverage, fences, lines and explicit endings as text", () => {
@@ -273,4 +301,104 @@ test("limits are bounded by the validator (lower limits refuse larger captures)"
   const cap = makeCapture([{ path: "a.js", mode: "fenced", text: FENCED }]);
   assert.throws(() => renderStrictCaptureView({ ...mount(), capture: cap, binding: bindingFor(cap), limits: { maxFileLines: 2 } }), (e) => e.code === "VIEW_CAPTURE");
   assert.throws(() => renderStrictCaptureView({ ...mount(), capture: cap, binding: bindingFor(cap), limits: { maxFileBytes: 10 ** 9 } }), (e) => e.code === "VIEW_CAPTURE");
+});
+
+// ---- host/browser split ----
+const BOTH = () => makeCapture([{ path: "a/fenced.js", mode: "fenced", text: FENCED }, { path: "b/ctx.txt", mode: "whole", text: WHOLE }]);
+const wire = (m) => JSON.parse(JSON.stringify(m)); // what the browser receives
+const isModel = (code) => (e) => e instanceof DomViewError && e.code === code;
+
+test("one error class across host, browser and convenience modules", () => {
+  assert.equal(StrictCaptureViewError, DomViewError);
+});
+
+test("host model is deeply frozen, JSON-stable and carries no raw text/exterior", () => {
+  const cap = BOTH();
+  const m = buildStrictCaptureViewModel({ capture: cap, binding: bindingFor(cap) });
+  assert.equal(m.schema, STRICT_CAPTURE_VIEW_MODEL_SCHEMA);
+  const frozenDeep = (v) => v === null || typeof v !== "object" || (Object.isFrozen(v) && Object.values(v).every(frozenDeep));
+  assert.ok(frozenDeep(m));
+  assert.deepEqual(wire(m), m);
+  for (const f of m.files) { assert.ok(!("text" in f)); assert.ok(!("exterior" in f)); }
+  assert.deepEqual(Object.keys(m.files[0]).sort(), ["byteLength", "display", "fences", "mode", "path", "rawSha256", "unixMode"]);
+  assert.equal(m.shown.reviewVersion, cap.shapeVersion);
+  assert.equal(m.shown.captureVersion, cap.captureVersion);
+});
+
+test("host model refuses in order: binding, capture, pair", () => {
+  const cap = BOTH();
+  assert.throws(() => buildStrictCaptureViewModel({ capture: { junk: 1 }, binding: { junk: 1 } }), isModel("VIEW_BINDING"));
+  assert.throws(() => buildStrictCaptureViewModel({ capture: { junk: 1 }, binding: bindingFor(cap) }), isModel("VIEW_CAPTURE"));
+  assert.throws(() => buildStrictCaptureViewModel({ capture: cap, binding: bindingFor(cap, { captureVersion: "0".repeat(64) }) }), isModel("VIEW_PAIR"));
+});
+
+test("browser renders the JSON-wired model identically to the host convenience renderer", () => {
+  const cap = BOTH();
+  const a = mount(), b = mount();
+  const host = renderStrictCaptureView({ ...a, capture: cap, binding: bindingFor(cap) });
+  const browser = renderStrictCaptureViewModel({ ...b, model: wire(buildStrictCaptureViewModel({ capture: cap, binding: bindingFor(cap) })) });
+  assert.equal(a.container.textContent, b.container.textContent);
+  assert.deepEqual(browser.shown, host.shown);
+  assert.equal(skelShownProtocol(browser.shown), 2);
+  assert.ok(browser.isCurrent());
+  assert.equal(currentStrictCaptureShown(b.container), browser.shown);
+});
+
+function tampered(edit) {
+  const cap = BOTH();
+  const m = wire(buildStrictCaptureViewModel({ capture: cap, binding: bindingFor(cap) }));
+  edit(m);
+  return m;
+}
+
+test("browser refuses a malformed or inconsistent model and leaves nothing current", () => {
+  const cases = {
+    schema: (m) => { m.schema = "skel-strict-capture-view/2"; },
+    extraTop: (m) => { m.token = "x"; },
+    shownDrift: (m) => { m.shown.captureVersion = "0".repeat(64); },
+    shownPhase: (m) => { m.shown.phase = "fill"; },
+    shownExtra: (m) => { m.shown.authenticated = true; },
+    totalBytes: (m) => { m.totalBytes += 1; },
+    noFiles: (m) => { m.files = []; },
+    order: (m) => { m.files.reverse(); },
+    duplicate: (m) => { m.files[1] = m.files[0]; m.totalBytes = m.files[0].byteLength * 2; },
+    fileExtra: (m) => { m.files[0].text = "raw"; },
+    mode: (m) => { m.files[0].mode = "partial"; },
+    digest: (m) => { m.files[0].rawSha256 = "ABC"; },
+    lineNumber: (m) => { m.files[0].display[1].line = 7; },
+    ending: (m) => { m.files[0].display[0].ending = "\u2028"; }, // fenced files split on CRLF/LF only
+    midEof: (m) => { m.files[0].display[0].ending = ""; },
+    lastEnding: (m) => { m.files[0].display.at(-1).ending = "\n"; },
+    kindDrift: (m) => { m.files[0].display.find((l) => l.kind === "body").kind = "exterior"; },
+    markerDrift: (m) => { m.files[0].display.find((l) => l.kind === "marker").kind = "body"; },
+    fenceRange: (m) => { m.files[0].fences[0].closeLine = 999; },
+    wholeFence: (m) => { m.files[1].fences = [{ id: "1", title: "t", openLine: 1, closeLine: 2 }]; },
+    fencedNoFence: (m) => { m.files[0].fences = []; for (const l of m.files[0].display) l.kind = "exterior"; },
+    oversizeLine: (m) => { m.files[1].display[0].text = "x".repeat(m.files[1].byteLength + 1); },
+    sparse: (m) => { m.files[0].display.length += 1; },
+    getter: (m) => { Object.defineProperty(m.files[0], "path", { get: () => "a", enumerable: true }); },
+  };
+  for (const [name, edit] of Object.entries(cases)) {
+    const { doc, container } = mount();
+    const cap = BOTH();
+    renderStrictCaptureView({ doc, container, capture: cap, binding: bindingFor(cap) });
+    assert.throws(() => renderStrictCaptureViewModel({ doc, container, model: tampered(edit) }), isModel("VIEW_MODEL"), name);
+    assert.equal(container.children.length, 0, name);
+    assert.equal(currentStrictCaptureShown(container), null, name);
+  }
+});
+
+test("browser refuses a bad binding with VIEW_BINDING and unusable DOM with VIEW_DOM", () => {
+  assert.throws(() => renderStrictCaptureViewModel({ ...mount(), model: tampered((m) => { m.binding.secret = "s"; }) }), isModel("VIEW_BINDING"));
+  assert.throws(() => renderStrictCaptureViewModel({ ...mount(), model: tampered((m) => { m.binding.phase = "fill"; }) }), isModel("VIEW_BINDING"));
+  assert.throws(() => renderStrictCaptureViewModel({ doc: {}, container: mount().container, model: tampered(() => {}) }), isModel("VIEW_DOM"));
+});
+
+test("browser limits can only be lowered", () => {
+  const m = tampered(() => {});
+  assert.throws(() => parseStrictCaptureViewModel(m, { maxFiles: 1 }), isModel("VIEW_MODEL"));
+  assert.throws(() => parseStrictCaptureViewModel(m, { maxFileLines: 2 }), isModel("VIEW_MODEL"));
+  assert.throws(() => parseStrictCaptureViewModel(m, { maxFiles: 10 ** 6 }), isModel("VIEW_MODEL"));
+  assert.throws(() => parseStrictCaptureViewModel(m, { bogus: 1 }), isModel("VIEW_MODEL"));
+  assert.equal(parseStrictCaptureViewModel(m, { maxFiles: 2 }).files.length, 2);
 });

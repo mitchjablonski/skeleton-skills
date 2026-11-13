@@ -1,23 +1,83 @@
 # Persisted strict capture view (#77)
 
-`lib/strict-capture-view.mjs` is a pure, optional DOM renderer for one
-validated persisted strict capture. It is mock groundwork: nothing in
-production imports it, and no route, page, server or listener loads it. It does
-no network, filesystem, timer or event-listener work.
+The persisted strict capture view renders one validated persisted strict
+capture as text-only DOM. It is mock groundwork: nothing in production imports
+it, and no route, page, server or listener loads it. None of its modules does
+network, filesystem, timer or event-listener work.
 
-This is a Node-host DOM prototype, tested with a fake DOM. Its canonical
-validator imports Node built-ins and uses Buffer; a browser cannot import this
-module directly. Browser delivery and real-browser rendering tests require a
-separate reviewed host/browser split. These tests do not establish browser UX
-or reachability under the launcher boundary.
+## Host/browser split
+
+The canonical validator needs Node (`node:crypto`, Buffer), so the view is
+split in two:
+
+| Module | Runs in | Job |
+| --- | --- | --- |
+| `lib/strict-capture-view-model.mjs` | host (Node) | Rebuild the capture with `validateStoredCapture`, check the pair against the binding, emit a plain JSON **view model** |
+| `lib/strict-capture-view-dom.mjs` | browser (plain ES module) | Structurally re-check the view model and render it |
+| `lib/strict-capture-view.mjs` | host | Convenience: model then render, same API as before the split |
+
+The browser module's whole import graph is `strict-capture-view-dom.mjs` ->
+`review-decision.mjs` -> `strict-protocol.mjs`, with no `node:` imports,
+Buffer, process or require. A unit test walks that graph.
+`test/live/strict-capture-view-browser.mjs` loads it in real headless Chrome
+under `script-src 'self'`, renders a model built from a real capture of a
+hostile fixture, and checks that a tampered model refuses. That is a smoke
+test against a throwaway loopback server. It is not the protected listener,
+and it says nothing about origin checks, authentication or launcher
+reachability.
+
+**The browser checks structure, not authenticity.** It cannot recompute
+SHA-256 synchronously and does not try, so the digests it shows are the host's.
+It refuses models that are malformed, inconsistent or over the limits:
+
+- wrong schema, or extra or missing keys at any level;
+- a `shown` that is not exactly the one derived from the binding;
+- file paths that are not strictly increasing;
+- a `totalBytes` that doesn't match;
+- line numbers out of sequence;
+- line endings outside the file's mode (fenced files split on CRLF/LF only);
+- an end-of-file marker anywhere but the last line;
+- line kinds that disagree with the fences;
+- a whole file with fences, or a fenced file without them;
+- text longer than the file's byte length;
+- getters or sparse arrays.
+
+These checks are defence in depth. Authenticity comes only from the protected
+origin that served the model.
+
+### View model (`skel-strict-capture-view/1`)
+
+```js
+{ schema: "skel-strict-capture-view/1",
+  binding,      // exact V2 binding (below)
+  shown,        // exact adapter shown context derived from binding
+  totalBytes,
+  files: [{ path, mode, unixMode, byteLength, rawSha256,
+            fences: [{ id, title, openLine, closeLine }],
+            display: [{ line, text, ending, kind }] }] }
+```
+
+Raw `text` and `exterior` stay on the host. The host returns a deeply frozen,
+JSON-stable object. The future listener must send it as an `application/json`
+response on its protected origin, never inlined into HTML.
 
 ## API
 
 ```js
+// host
+buildStrictCaptureViewModel({ capture, binding, limits? }) -> model   // VIEW_BINDING | VIEW_CAPTURE | VIEW_PAIR
 renderStrictCaptureView({ doc, container, capture, binding, limits? })
   -> frozen { shown, binding, isCurrent() }   // or throws StrictCaptureViewError
+// browser
+parseStrictCaptureViewModel(model, limits?) -> frozen model           // VIEW_BINDING | VIEW_MODEL
+renderStrictCaptureViewModel({ doc, container, model, limits? })
+  -> frozen { shown, binding, isCurrent() }   // VIEW_DOM | VIEW_BINDING | VIEW_MODEL | VIEW_RENDER
 currentStrictCaptureShown(container) -> shown | null
 ```
+
+All three modules share one `StrictCaptureViewError` class. Browser limits
+(`STRICT_CAPTURE_VIEW_LIMITS`) use the same ceilings as
+`STRICT_CAPTURE_LIMITS` and can only be lowered.
 
 `binding` is the protected host's registered V2 binding, supplied
 independently of the capture. It must have exactly these keys:
@@ -32,8 +92,11 @@ non-plain objects refuse too.
 
 ## Order of checks (atomic refusal)
 
+For `renderStrictCaptureView` (host convenience):
+
 1. The DOM handles must be usable (`VIEW_DOM`). The container's previous shown
-   context stops being current at once.
+   context stops being current, and the container is emptied at once (in the
+   same synchronous call, so nothing is painted in between).
 2. The binding is validated (`VIEW_BINDING`).
 3. The capture is rebuilt with `validateStoredCapture` before any element is
    created (`VIEW_CAPTURE`). Tampered display lines, fence titles, line endings,
@@ -43,7 +106,10 @@ non-plain objects refuse too.
 5. The view is built detached and then swapped in with one
    `container.replaceChildren(view)`. Any DOM failure is `VIEW_RENDER`.
 
-On any refusal after step 1, the container is emptied and nothing is current.
+`renderStrictCaptureViewModel` (browser) runs the same steps with step 2-4
+replaced by `parseStrictCaptureViewModel` (`VIEW_BINDING`, then `VIEW_MODEL`).
+
+On any refusal the container is emptied and nothing is current.
 No stale capture stays visible, and no old shown context stays usable.
 
 ## Rendering
