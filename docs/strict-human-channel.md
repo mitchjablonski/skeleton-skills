@@ -109,7 +109,8 @@ Whether that is worth the friction is the maintainer's call.
   - bracketed paste is accepted only when it contains no newline, escape or
     control bytes;
   - raw input is never echoed back. The window runs the terminal in raw mode
-    and draws its own masked input line.
+    and draws its own input line, showing the sanitized, normalized
+    characters. Typos stay visible and can be fixed before Enter.
 - **Output policy:** the window prints only launcher-generated text: fixed
   copy, hex digests, revisions and opaque ids. It never prints paths, fence
   titles, notes or any other agent-influenced text.
@@ -158,6 +159,10 @@ Whether that is worth the friction is the maintainer's call.
     - **Fill phase,** where transactional Recapture refuses (C4): the human
       ends the session from the control window and starts a new strict
       session from the launcher. That session gets a new round key.
+      - If a retry is pending, ending the session records its outcome as
+        unknown, the same rule as closing the window.
+      - Starting a new fill session that keeps the approved pair depends on
+        Sol's enrollment and session-lifecycle gate.
     - **Session cap:** the session ends.
   - 40 bits gives a finite, probabilistic guess and collision chance. The
     caps, and the agent's inability to type into the window, keep online
@@ -226,8 +231,12 @@ or reopened. Anyone who observes a code before then can use it.
   terminal, which the launcher can't inspect. So the whole-process launcher
   filters the agent's PTY output instead. It drops OSC 52 (clipboard read
   and write) and OSC 0/1/2 (window titles). That closes the
-  clipboard-replacement and spoofed-title rows, and the matching #79 rows
-  test the filter.
+  clipboard-replacement and spoofed-title rows only if the filter is a
+  stateful parser. The #79 rows test each case:
+  - sequences split across reads;
+  - both terminators, BEL and ST;
+  - the C1 OSC byte (0x9D) as well as ESC ];
+  - OSC sequences wrapped in DCS passthrough (tmux, screen).
 - **#78.** The checkpoint copy (#110) already sends the human to the control
   window. `awaiting-review` would name the commands.
 
