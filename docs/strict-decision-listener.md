@@ -154,6 +154,10 @@ code is derived, verified or sent here.
   - Reshape binds the approved pair, and is accepted only when the rendered
     (selected) pair *is* the approved pair. Its binding line says "approved
     shape … · approved capture …".
+    A fill capture that includes filled bodies has a different capture
+    version, so in a normal fill state no reshape code appears. One appears
+    only when the fill page renders the approved capture itself (the approved
+    exteriors). This fail-closed outcome is intended, not a bug.
   - Every code names the same revision.
 - **Dropped codes.** If the codes don't pass, the listener drops them and
   still serves the capture (`codes: {}`, `codesDropped: true`). The page then
