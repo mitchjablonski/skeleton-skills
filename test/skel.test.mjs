@@ -4348,5 +4348,22 @@ test("skel pr: a read-only Markdown PR body through scaffold, fill and done", ()
   const done = run("pr");
   assert.match(done, /markers were removed at the end/);
   assert.match(done, /\| Step \| Title \|\n\|---\|---\|\n\| 1 \| /);
-  assert.match(done, /Finalized: every step filled/);
+  assert.match(done, /Finalized: skel finalize ran, which requires every step filled and no drift/);
+});
+
+test("skel pr: a stale approval record isn't shown as this approval's, and marker errors are listed", () => {
+  const { dir, a, run } = project();
+  run("init", "Stroke smoothing");
+  run("approve");
+  const statePath = path.join(dir, ".skeleton", "state.json");
+  const st = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  fs.writeFileSync(statePath, JSON.stringify({ ...st, reviewEpoch: st.reviewEpoch + 1 }));
+  const stale = run("pr");
+  assert.match(stale, /\*\*The approval record can't be used\*\* \(the record of the approved skeleton belongs to a different approval\)/);
+  assert.doesNotMatch(stale, /Approved skeleton version|Source baseline|Drift from the approved skeleton: yes/);
+  fs.writeFileSync(statePath, JSON.stringify(st));
+  fs.appendFileSync(a, "\n// SKEL[9] never closed\n");
+  const broken = run("pr");
+  assert.match(broken, /\*\*Marker problems\*\*/);
+  assert.match(broken, /SKEL\\\[9\\\]/);
 });

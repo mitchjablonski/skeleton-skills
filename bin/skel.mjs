@@ -922,12 +922,15 @@ const commands = {
   pr() {
     const root = requireRoot();
     const state = requireState(root);
-    const { steps } = state.phase === "done" ? { steps: [] } : snapshot(root);
-    const record = state.phase === "scaffold" ? null : readSnapshot(root);
-    const drift = state.phase === "fill" ? verifySnapshot(root, state, snapshot(root).files) : null;
+    // One scan; the approval record is used only when it belongs to this
+    // skeleton (the same guard as status), so a stale record isn't shown.
+    const scan = state.phase === "done" ? { steps: [], errors: [], files: [] } : snapshot(root, state);
+    const drift = state.phase === "fill" ? verifySnapshot(root, state, scan.files) : null;
+    const record = state.phase === "fill" && !drift.reason ? readSnapshot(root) : null;
     const coverage = record && !coverageGap(record) ? record.coverage : null;
     process.stdout.write(renderPrBody({
-      title: state.title, phase: state.phase, steps, finalized: state.phase === "done" ? finalizedRecord(state) : null,
+      title: state.title, phase: state.phase, steps: scan.steps, errors: scan.errors,
+      finalized: state.phase === "done" ? finalizedRecord(state) : null,
       activeStep: state.activeStep ?? null, diagrams: readDiagrams(root), approvedVersion: record?.version ?? null,
       drift, coverage: coverage ? { id: coverage.id } : null,
     }));
