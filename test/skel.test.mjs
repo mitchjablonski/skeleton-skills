@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { scanFiles, scanText, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
@@ -253,10 +254,11 @@ function project(parent) {
  * (`data`; `read()` for a fresh read, which counts as a page view; `version()`
  * for a poll), and a stop function. `view: false` skips the first read.
  */
-async function serve(dir, args = ["--send"], env = {}, { view = true } = {}) {
+async function serve(dir, args = ["--send"], env = {}, { view = true, onStdout = null } = {}) {
   const child = spawn("node", [BIN, "serve", ...args], { cwd: dir, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
-  let err = "";
+  let err = "", allOut = "";
   child.stderr.on("data", (d) => { err += d; });
+  child.stdout.on("data", (d) => { allOut += d; onStdout?.(allOut); });
   const printed = await new Promise((resolve, reject) => {
     let out = "";
     child.stdout.on("data", (d) => {
@@ -277,7 +279,7 @@ async function serve(dir, args = ["--send"], env = {}, { view = true } = {}) {
   const data = view ? await read() : null;
   // Wait for the server to exit, so no keep-alive socket outlives the test.
   const stop = () => new Promise((resolve) => { if (child.exitCode !== null || child.signalCode !== null) return resolve(); child.once("exit", resolve); child.kill(); });
-  return { url, printed, token, html, client, data, read, version, stderr: () => err, stop };
+  return { url, printed, token, html, client, data, read, version, stderr: () => err, stdout: () => allOut, stop };
 }
 
 const post = (url, body, headers) => fetch(new URL("/api/feedback", url), { method: "POST", headers, body: JSON.stringify(body) });
@@ -2784,6 +2786,37 @@ test("#39: a mode switch keeps the token, so open tabs follow; any other start g
     await second?.stop();
     await third?.stop();
     await fourth?.stop();
+  }
+});
+
+test("#127: a briefly busy preferred port is waited for, so the review keeps its origin", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const first = await serve(dir, []);
+  const port = Number(new URL(first.url).port);
+  await first.stop();
+  // Something else holds the project's port for a moment (a closing server or
+  // a short-lived connection); serve must wait for it rather than move origin.
+  const blocker = net.createServer();
+  await new Promise((r) => blocker.listen(port, "127.0.0.1", r));
+  // Barrier: release the port only once serve reports it hit EADDRINUSE, so
+  // the test always exercises the retry (never passes on timing alone). The
+  // 10 s fallback only stops a broken run from hanging.
+  let released = false;
+  const free = () => { if (!released) { released = true; blocker.close(); } };
+  const release = setTimeout(free, 10_000);
+  let second;
+  try {
+    second = await serve(dir, [], {}, { onStdout: (out) => { if (/port \d+ is busy; waiting/.test(out)) free(); } });
+    assert.equal(second.url, first.url, "same port, so the page's origin and drafts survive");
+    await new Promise((r) => setTimeout(r, 300)); // let any duplicate banner arrive
+    assert.equal(second.stdout().match(/skel review: /g)?.length, 1, "the banner prints once, not once per retry");
+    assert.match(second.stdout(), /port \d+ is busy; waiting/);
+    assert.doesNotMatch(second.stderr(), /MaxListeners|Warning/, "no stacked listeners");
+  } finally {
+    clearTimeout(release);
+    free();
+    await second?.stop();
   }
 });
 
