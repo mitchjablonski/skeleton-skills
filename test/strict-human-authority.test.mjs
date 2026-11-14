@@ -2,8 +2,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHumanAuthorityRecord,parseHumanAuthorityRecord,planHumanAuthorityCommand,HUMAN_AUTHORITY_POLICY} from '../lib/strict-human-authority.mjs';
-import {parseHumanCommand,deriveHumanCode} from '../lib/strict-human-command.mjs';
-import {planAuthorityTransaction} from '../lib/strict-authority.mjs';
+import {parseHumanCommand,deriveHumanCode,humanCommandIdentity} from '../lib/strict-human-command.mjs';
+import {planAuthorityTransaction,parseAuthorityRecord} from '../lib/strict-authority.mjs';
 const A='a'.repeat(64),B='b'.repeat(64),C='c'.repeat(64),D='d'.repeat(64),at='2026-11-13T12:00:00.000Z';
 const state=()=>({protocolVersion:2,projectId:'p',sessionId:'s',reviewRoundId:'r1',phase:'skeleton',revision:0,reviewVersion:A,captureVersion:B,approvedVersion:null,approvedCaptureVersion:null});
 const enrollment=(caps={})=>({state:state(),policy:{policyVersion:HUMAN_AUTHORITY_POLICY,roundMismatchCap:3,sessionMismatchCap:5,commandCap:30,authorityCap:20,...caps},epoch:{epochId:'e1',reviewRoundId:'r1',keyHex:'00'.repeat(32)}});
@@ -104,4 +104,41 @@ test('oversized own-key objects refuse before copying properties or invoking acc
  let reads=0;const oversized={};for(let i=0;i<64;i++)Object.defineProperty(oversized,'extra'+i,{enumerable:true,get(){reads++;throw Error('never');}});
  assert.equal(createHumanAuthorityRecord(oversized),null);assert.equal(parseHumanAuthorityRecord(oversized),null);
  const planned=planHumanAuthorityCommand(r,c,oversized);assert.equal(planned.persist,false);assert.deepEqual(planned.record,r);assert.equal(reads,0);
+});
+
+// Build a public fixture directly: 1024 unchanged recaptures, each at revision
+// zero. The complete fixture is checked by the existing V2 parser on replay;
+// constructing it must not itself pay 1024 repeated prefix validations.
+function maximumRecaptureFixture(){
+ const r=copy(fresh({commandCap:1024,authorityCap:1024}));
+ for(let i=0;i<1024;i++){
+  const c=cmd('recapture','capture-'+i),effect=coreEffect(r,c);
+  const core={kind:'recaptured',requestId:c.requestId,action:'recapture',protocolVersion:2,reviewVersion:A,captureVersion:B,revision:0,changed:false};
+  r.authority.journal.push({intent:effect.evidence.intent,facts:effect.evidence.facts,result:core,stateAfter:copy(r.authority.state)});
+  const {protocolVersion,action,...result}=core;
+  r.commands.push({command:c,identityHex:humanCommandIdentity(c.operation,{requestId:c.requestId}).toString('hex'),observed:{epochId:'e1',revision:0,reviewRoundId:'r1',reviewVersion:A,captureVersion:B},evidence:effect.evidence,result,at});
+ }
+ return r;
+}
+test('maximum explicit 1024-entry core history replays, retries, and rejects ownership/tamper',()=>{
+ const r=maximumRecaptureFixture();assert.ok(parseAuthorityRecord(r.authority));
+ const canonical=parseHumanAuthorityRecord(r);assert.ok(canonical);assert.equal(canonical.commands.length,1024);assert.equal(canonical.authority.journal.length,1024);
+ for(const index of [0,511,1023]){const p=planHumanAuthorityCommand(r,r.commands[index].command,null);assert.equal(p.replayed,true);assert.equal(p.persist,false);assert.deepEqual(p.result,r.commands[index].result);}
+ assert.equal(planHumanAuthorityCommand(r,cmd('endSession','overflow'),null).result.kind,'journal-full');
+ for(const mutate of [
+  v=>{[v.authority.journal[511],v.authority.journal[512]]=[v.authority.journal[512],v.authority.journal[511]];},
+  v=>v.commands[511].evidence.facts.captureVersion=C,
+  v=>v.authority.journal[511].stateAfter.revision=1,
+  v=>v.authority.journal[511].result.changed=true,
+  v=>v.commands[511].result.changed=true,
+  v=>v.commands.splice(511,1),
+ ]){const v=copy(r);mutate(v);assert.equal(parseHumanAuthorityRecord(v),null,mutate.toString());}
+});
+
+test('evidence variants cannot bypass wrong-code, lock, admission or action gates',()=>{
+ let r=fresh({roundMismatchCap:1});const w=wrong(r,'bad');assert.equal(planHumanAuthorityCommand(r,w,coreEffect(r,w)).persist,false);r=run(r,w,no()).record;
+ const locked=verify(r,'locked');assert.equal(planHumanAuthorityCommand(r,locked,coreEffect(r,locked)).persist,false);
+ const recapture=cmd('recapture','invalid-core');const rejected=run(r,recapture,coreEffect(r,recapture,{nextReviewRoundId:'forbidden'}));assert.equal(rejected.result.code,'invalid-transition');assert.equal(rejected.record.authority.journal.length,1);assert.equal(rejected.record.current.roundMismatchCount,1);
+ r=run(r,cmd('endSession','end'),no()).record;const ended=cmd('recapture','after-end');assert.equal(planHumanAuthorityCommand(r,ended,coreEffect(r,ended)).persist,false);
+ r=fresh();const approve=verify(r,'approve');const e=coreEffect(r,approve,{}, {epochId:'e2',reviewRoundId:'r1',keyHex:'11'.repeat(32)});assert.equal(planHumanAuthorityCommand(r,approve,e).persist,false);
 });
