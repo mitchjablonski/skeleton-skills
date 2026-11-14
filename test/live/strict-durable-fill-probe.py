@@ -40,7 +40,7 @@ def session_command(node,root,label,arguments):
  return read_json(output)
 
 def private_path_denial(session,capture_version):
- # A separate mount-equivalent minimal worker, no private mount or inherited FD.
+ # Separate minimal sandbox only; actual CLI mount scoping is defined by actual_round.
  script="""import json,os,sys
 for raw in os.listdir('/proc/self/fd'):
  if int(raw)>2:
