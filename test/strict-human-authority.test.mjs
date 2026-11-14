@@ -1,7 +1,7 @@
 // Public fixture keys; this disabled candidate has no storage or auth surface.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createHumanAuthorityRecord,parseHumanAuthorityRecord,planHumanAuthorityCommand,HUMAN_AUTHORITY_POLICY} from '../lib/strict-human-authority.mjs';
+import {createHumanAuthorityRecord,parseHumanAuthorityRecord,prepareHumanAuthorityCommand,planHumanAuthorityCommand,HUMAN_AUTHORITY_POLICY} from '../lib/strict-human-authority.mjs';
 import {parseHumanCommand,deriveHumanCode,humanCommandIdentity} from '../lib/strict-human-command.mjs';
 import {planAuthorityTransaction,parseAuthorityRecord} from '../lib/strict-authority.mjs';
 const A='a'.repeat(64),B='b'.repeat(64),C='c'.repeat(64),D='d'.repeat(64),at='2026-11-13T12:00:00.000Z';
@@ -12,7 +12,7 @@ const cmd=(op,id,extras={})=>parseHumanCommand(op,{requestId:id,...extras});
 function verify(r,id,action='approve',code){const ep=r.epochs.at(-1);return cmd('verifyAndCommit',id,{action,code:code??deriveHumanCode(r.authority.state,action,Buffer.from(ep.keyHex,'hex'))});}
 const no=()=>({at,evidence:{kind:'no-core'}});
 function coreEffect(r,c,facts={},nextEpoch){const s=r.authority.state,action=c.operation==='recapture'?'recapture':c.action,selected=action!=='reshape';return {at,evidence:{kind:nextEpoch?'reshape':'core',intent:{protocolVersion:2,requestId:c.requestId,action,projectId:s.projectId,sessionId:s.sessionId,reviewRoundId:s.reviewRoundId,reviewVersion:selected?s.reviewVersion:s.approvedVersion,captureVersion:selected?s.captureVersion:s.approvedCaptureVersion,expectedRevision:s.revision},facts:{contentVersion:s.reviewVersion,captureVersion:s.captureVersion,nextReviewRoundId:null,completionVerified:false,...facts},...(nextEpoch?{nextEpoch}:{})}};}
-const run=(r,c,e)=>{const p=planHumanAuthorityCommand(r,c,e);assert.equal(p.persist,true,JSON.stringify(p.result));assert.ok(parseHumanAuthorityRecord(p.record));return p;};
+const run=(r,c,e)=>{const prep=prepareHumanAuthorityCommand(r,c);assert.deepEqual(prep,e.evidence.kind==='no-core'?{kind:'needs-no-core'}:{kind:'needs-core',intent:e.evidence.intent});const p=planHumanAuthorityCommand(r,c,e);assert.equal(p.persist,true,JSON.stringify(p.result));assert.ok(parseHumanAuthorityRecord(p.record));return p;};
 const copy=v=>JSON.parse(JSON.stringify(v));
 const wrong=(r,id,action='approve')=>{const good=verify(r,id,action);return {...good,code:good.code==='0000-0000'?'1111-1111':'0000-0000'};};
 
@@ -141,4 +141,28 @@ test('evidence variants cannot bypass wrong-code, lock, admission or action gate
  const recapture=cmd('recapture','invalid-core');const rejected=run(r,recapture,coreEffect(r,recapture,{nextReviewRoundId:'forbidden'}));assert.equal(rejected.result.code,'invalid-transition');assert.equal(rejected.record.authority.journal.length,1);assert.equal(rejected.record.current.roundMismatchCount,1);
  r=run(r,cmd('endSession','end'),no()).record;const ended=cmd('recapture','after-end');assert.equal(planHumanAuthorityCommand(r,ended,coreEffect(r,ended)).persist,false);
  r=fresh();const approve=verify(r,'approve');const e=coreEffect(r,approve,{}, {epochId:'e2',reviewRoundId:'r1',keyHex:'11'.repeat(32)});assert.equal(planHumanAuthorityCommand(r,approve,e).persist,false);
+});
+
+
+test('preparation ready results agree with final planner without effects or secret exposure',()=>{
+ let r=fresh({commandCap:2}),c=wrong(r,'bad');r=run(r,c,no()).record;r=run(r,cmd('endSession','end'),no()).record;
+ let effects=0;const hostile=new Proxy({},{get(){effects++;throw Error('effect');}});
+ const cases=[[null,c],[r,null],[r,{...c,extra:true}],[r,c],[r,verify(r,'bad')],[r,cmd('endSession','end')],[r,cmd('endSession','full')]];
+ for(const [record,command] of cases){
+  const prep=prepareHumanAuthorityCommand(record,command),final=planHumanAuthorityCommand(record,command,hostile);
+  assert.deepEqual(prep,{kind:'ready-result',result:final.result,persist:final.persist,replayed:final.replayed});
+  assert.ok(Object.isFrozen(prep));assert.ok(Object.isFrozen(prep.result));
+  assert.equal(/keyHex|identityHex|evidence|"code":"[0-9A-Z]{4}-/.test(JSON.stringify(prep)),false);
+ }
+ assert.equal(effects,0);
+});
+
+test('preparation exposes only exact intent or no-core and never touches host dependencies',()=>{
+ const r=fresh(),c=verify(r,'approve');let reads=0;
+ const host={get clock(){reads++;throw Error('clock');},get observe(){reads++;throw Error('observer');},get randomBytes(){reads++;throw Error('entropy');}};
+ assert.deepEqual(prepareHumanAuthorityCommand(r,c,host),{kind:'needs-core',intent:coreEffect(r,c).evidence.intent});
+ assert.deepEqual(prepareHumanAuthorityCommand(r,wrong(r,'bad'),host),{kind:'needs-no-core'});
+ assert.equal(reads,0);
+ const getter=Object.defineProperty({...c},'code',{enumerable:true,get(){reads++;throw Error('code');}});
+ assert.equal(prepareHumanAuthorityCommand(r,getter).result.code,'invalid-transition');assert.equal(reads,0);
 });
