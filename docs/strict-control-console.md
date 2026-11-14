@@ -98,7 +98,8 @@ request.
   no console line says the session or its processes ended.
   - Once `end` is confirmed, the console refuses every command except `end`,
     `status` and `help` until `admissions-revoked` arrives. It stays that way
-    while the outcome is unknown.
+    while the outcome is unknown, and each further `end` resends the same
+    request (same id), so the journal returns the original answer.
   - A `journal-full` reply to `end` is definitive. The console says to stop
     the session from the launcher, instead of asking for `end` again.
   - After revocation, only `status` and `help` work. `status` shows

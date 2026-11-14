@@ -316,3 +316,18 @@ test("status accepts a state without admissions, and refuses an unknown admissio
   const bad = make({ state: [{ phase: "skeleton", revision: 0, reviewVersion: A, captureVersion: B, admissions: "open" }] }).c;
   assert.match((await bad.handle("status"))[0], /state is unknown/);
 });
+
+test("an end with an unknown outcome is resent with its original request id", async () => {
+  const { m, c } = make({ end: [unavailable, () => { throw new Error("lost"); }, echo({ kind: "admissions-revoked", at: "2026-11-14T03:00:00.000Z" })] });
+  await c.handle("end"); assert.deepEqual(await c.handle("yes"), [C.endUnknown]);
+  await c.handle("end"); assert.deepEqual(await c.handle("yes"), [C.endUnknown]);
+  await c.handle("end"); assert.deepEqual(await c.handle("yes"), [C.revoked]);
+  const ids = m.calls.filter((x) => x.name === "end").map((x) => x.arg.requestId);
+  assert.equal(ids.length, 3);
+  assert.equal(new Set(ids).size, 1, "every resend uses the first end's id");
+});
+
+test("status refuses admissions: null", async () => {
+  const { c } = make({ state: [{ phase: "skeleton", revision: 0, reviewVersion: A, captureVersion: B, admissions: null }] });
+  assert.match((await c.handle("status"))[0], /state is unknown/);
+});
