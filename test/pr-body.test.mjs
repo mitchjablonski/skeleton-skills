@@ -78,3 +78,13 @@ test("agent-written diagram names and titles are escaped in headings and cells",
   assert.match(md, /\| 1 \| a\\\|b \\\| fake \\\| \| to do \| `p\\\|q.js:1` \|/);
   assert.match(md, /### Architecture: d&lt;b&gt; @&#8203;x/);
 });
+
+test("many delimiter runs at an admitted size don't crash (iterative maximum)", () => {
+  const diagram = "```\n".repeat(160000); // 640 kB, under readDiagrams' 1 MB bound
+  const out = fence("mermaid", diagram);
+  assert.ok(out.startsWith("````mermaid\n") && out.endsWith("\n````"));
+  const path = "a`".repeat(160000);
+  assert.equal(code(path).slice(0, 4), "`` a", "two-backtick span, padded because the path ends in a backtick");
+  const tildes = fence("mermaid", "~~~~~ x ~~~~~~~\n".repeat(50000));
+  assert.ok(tildes.startsWith("````````mermaid"), "fence outgrows the longest tilde run (7)");
+});
