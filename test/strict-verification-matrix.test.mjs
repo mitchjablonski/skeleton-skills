@@ -50,12 +50,13 @@ test("kinds are known, no Kind or Status cell claims more than fixture evidence,
 test("browser row ids cited in the matrix exist in the probe", () => {
   const probe = read("test/live/strict-browser-matrix.mjs");
   const defined = new Set([...probe.matchAll(/row\("(B\d+)"/g)].map((m) => m[1]));
-  for (const m of doc.matchAll(/\(B(\d+)(?:–B(\d+))?(?:, B(\d+))*\)|B(\d+)(?:–B(\d+))?/g)) {
-    const nums = m.slice(1).filter(Boolean).map(Number);
-    if (!nums.length) continue;
-    const [lo, hi] = [nums[0], nums[1] ?? nums[0]];
-    for (let n = lo; n <= hi; n++) assert.ok(defined.has(`B${n}`), `B${n} is cited but not a probe row`);
+  const cited = new Set();
+  for (const m of doc.matchAll(/\bB(\d+)(?:–B(\d+))?\b/g)) {
+    const lo = Number(m[1]), hi = Number(m[2] ?? m[1]);
+    for (let n = lo; n <= hi; n++) cited.add(`B${n}`);
   }
+  assert.ok(cited.has("B12") && cited.has("B1") && cited.has("B18"), "ids after a range are read too");
+  for (const id of cited) assert.ok(defined.has(id), `${id} is cited but not a probe row`);
 });
 
 test("unit-kind rows cite test files that npm test runs", () => {

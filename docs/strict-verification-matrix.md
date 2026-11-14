@@ -34,9 +34,9 @@ on an actual supported profile, and the test forbids claiming it.
 
 | Probe | Last run | Environment | Result |
 | --- | --- | --- | --- |
-| `test/live/strict-browser-matrix.mjs` | 2026-11-14 at commit 00dbf19 | Chrome 143.0.7499.192 with sandbox on, Node 20.20.0, Linux (WSL2) | B1–B8 and B12–B18 PASS; B9–B11 not applicable |
-| `test/live/strict-decision-listener-browser.mjs` | 2026-11-14 at commit 00dbf19 | same | PASS (4 runs) |
-| `test/live/strict-capture-view-browser.mjs` | 2026-11-14 at commit 00dbf19 | same | PASS |
+| `test/live/strict-browser-matrix.mjs` | 2026-11-14 (UTC) at commit 00dbf19 | Chrome 143.0.7499.192 with sandbox on, Node 20.20.0, Linux (WSL2) | B1–B8 and B12–B18 PASS; B9–B11 not applicable |
+| `test/live/strict-decision-listener-browser.mjs` | 2026-11-14 (UTC) at commit 00dbf19 | same | PASS (4 runs) |
+| `test/live/strict-capture-view-browser.mjs` | 2026-11-14 (UTC) at commit 00dbf19 | same | PASS |
 
 Codex-owned live probes record their observed runs in their own documents,
 which the X rows cite.
@@ -57,8 +57,8 @@ which the X rows cite.
 | C10 | `skel status` distinguishes unsupported / unverified / active / ended, and only evidence the verifier accepts gives active. Missing, stale or unreadable evidence removes active | `test/strict-status.test.mjs` | unit | fixture verifier only. No evidence producer exists, and authenticating evidence is open |
 | C11 | Approve arming, double-click and focus-steal lures | none | — | not applicable under H3 (no web decision route); it would become a control-window row under H1 |
 | C12 | Duplicate actions and retry dedupe through the real transport | `test/strict-control-console.test.mjs`, `test/strict-h3-mock-flow.test.mjs` | unit | console and mock only; the real transport is open |
-| C13 | Source changes between review and commit: edits between steps, and a hostile review page showing A while the workspace holds B. The decision binds the stored capture, not the live files | `test/strict-capture-view.test.mjs`, `test/strict-h3-mock-flow.test.mjs`, `docs/strict-decision-page.md` | unit, design | binding logic only; the protected capture, freeze and real launcher are open |
-| C14 | Recovery: crash then retry returns the original result; the listener stops mid-request; a lost historical outcome; reload after `unavailable`; a full journal | `test/strict-control-console.test.mjs`, `test/strict-h3-mock-flow.test.mjs` | unit | console and mock only; the real listener, authority restart and journal are open |
+| C13 | Source changes between review and commit: edits between steps, and a hostile review page showing A while the workspace holds B. The decision binds the stored capture, not the live files | `test/strict-capture-view.test.mjs`, `test/strict-h3-mock-flow.test.mjs`, `docs/strict-decision-page.md` | unit, design | binding logic only: the decision binds the rendered capture and refuses a swapped pair. "Review page shows A while the workspace holds B" is untested. The protected capture, freeze and real launcher are open |
+| C14 | Recovery: crash then retry returns the original result; the listener stops mid-request; a lost historical outcome; reload after `unavailable`; a full journal | `test/strict-control-console.test.mjs`, `test/strict-h3-mock-flow.test.mjs` | unit | covered against the console/mock only: retry after a lost reply returns the original result, and the journal-full copy. No evidence yet for the listener stopping mid-request, a lost historical outcome, or reload after `unavailable`. The real listener, authority restart and journal are open |
 | C15 | In-session CLI transitions refuse in strict, even when active | `test/strict-status.test.mjs` | unit | helper only, not wired into the CLI (open) |
 | C16 | Forged, replayed or other-key evidence is refused. A deleted `.skeleton/` shows `state-diverged` | none | — | open; no evidence producer |
 | C17 | The agent's terminal can't fake "strict: active", an origin or a reopen prompt, and none of it reaches the control channel | `docs/strict-decision-page.md` | design | open; needs the #75 control channel |
@@ -95,8 +95,7 @@ status.
 ## Process requirements
 
 - **Cross-review.** Each side cross-reviews the other's evidence before a
-  row moves (#79). Every PR behind these rows had both-team exact-head
-  review.
+  row moves (#79).
 - **Fixture-only labels.** The Kind column marks fixture-only tests as such.
 - **Thresholds.** Performance thresholds must be agreed before claiming
   acceptable overhead (X8).
