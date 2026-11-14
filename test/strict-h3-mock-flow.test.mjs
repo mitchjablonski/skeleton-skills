@@ -198,7 +198,7 @@ lt("journal identity includes the operation; a lost end reply retries exactly; n
   assert.equal(authority.endEffects(), 1, "the exact retry came from the journal");
   // The console then sees the session as ended.
   await con.handle("end");
-  assert.match((await con.handle("yes"))[0], /session has ended/);
+  assert.match((await con.handle("yes"))[0], /logical closure only.*does not prove that any process stopped/);
   // After closure: no recapture effects (revision, selected capture, counters) and no decisions.
   const before = authority.authorityState();
   assert.deepEqual(await authority.recapture({ requestId: "x-2" }), { requestId: "x-2", kind: "rejected", code: "session-ended" });
