@@ -1134,15 +1134,20 @@ const commands = {
     };
     // The preferred port can be briefly busy (a server that is still closing,
     // or a short-lived connection's ephemeral port): retry it for a moment
-    // before falling back to any free port (about 4 seconds).
+    // before falling back to any free port (about 4 seconds). The listening
+    // handler is registered once; listen() is called without a callback so
+    // retries don't stack handlers.
     let attempts = 0;
     const onError = (err) => {
       if (err.code !== "EADDRINUSE") throw err;
-      if (++attempts <= 40) return void setTimeout(() => { server.once("error", onError); server.listen(preferred, "127.0.0.1", onListening); }, 100);
-      server.listen(0, "127.0.0.1", onListening);
+      if (attempts === 0) console.log(`skel serve: port ${preferred} is busy; waiting up to 4 seconds for it…`);
+      if (++attempts <= 40) return void setTimeout(() => { server.once("error", onError); server.listen(preferred, "127.0.0.1"); }, 100);
+      console.log(`skel serve: port ${preferred} stayed busy, so this review uses a different port. Tabs open on the old address keep their drafts there; reopen the review at the new URL below.`);
+      server.listen(0, "127.0.0.1");
     };
+    server.once("listening", onListening);
     server.once("error", onError);
-    server.listen(preferred, "127.0.0.1", onListening);
+    server.listen(preferred, "127.0.0.1");
   },
 
   // Internal: the full fence search, run by `serve` in a child process.
