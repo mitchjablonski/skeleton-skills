@@ -14,6 +14,7 @@ This selects a rule for this disabled candidate only. It does not adopt the earl
 
 - `createHumanAuthorityRecord({state, policy, epoch})`: fresh V2 skeleton, revision zero, empty history only. An epoch has `epochId`, `reviewRoundId` and exactly 32 key bytes as lowercase `keyHex`. Keys are host-supplied; consistency is not entropy or origin proof.
 - `parseHumanAuthorityRecord(value)` and `replayHumanAuthorityRecord(value)`: return a canonical immutable record or refuse. Replay reconstructs all history rather than trusting serialized counters, current state or claimed effects.
+- `prepareHumanAuthorityCommand(record, command)` returns an exact retained result, a no-core disposition, or the exact derived core intent; it exposes no keys or expected code and grants no authority to observe on `unavailable`.
 - `planHumanAuthorityCommand(record, command, trustedEffect)`: accepts the exact canonical output of `parseHumanCommand`. Returns `{record, result, persist, replayed}`. A trusted effect supplies canonical `at` and exact `evidence`; it is an internal host input, never a public command field.
 
 Public commands contain only their canonical operation/version, request ID, and action/code where applicable. They cannot supply project/session, revision, pairs, keys, facts or V2 intents. The pure effect seam is not a safe public ingress API.
@@ -40,6 +41,6 @@ The planner never invokes an observer or storage. A future coordinator must auth
 
 The console already accepts lockout guidance `unlock: 'new-session'`. Its alternative `unlock: 'recapture'` remains compatibility for another proposed policy; this candidate never emits it. No console is connected to this planner.
 
-## Remaining gates
+## Disabled storage adapter and remaining gates
 
-One-file durable writer, protected enrollment/channel/key ownership, bounded independent quiescent observation, capture integrity and availability, unknown durability outcomes, storage health/recovery, external antirollback and verified supervisor teardown remain required. No raw V2 submit path may bypass the future private command transaction. No strict activation, publication, real credentials or production containment follows from this module.
+The separate [disabled storage adapter](strict-human-authority-store.md) provides the one-file candidate transaction, using shared pure preparation rather than a second writer. It is not runtime-wired or authenticated. Production durability qualification, protected enrollment/channel/key ownership, bounded independent quiescent observation, capture integrity and availability, unknown durability outcomes, storage health/recovery, external antirollback and verified supervisor teardown remain required. No raw V2 submit path may bypass the future private command transaction. No strict activation, publication, real credentials or production containment follows from this module.

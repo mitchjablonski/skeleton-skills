@@ -114,6 +114,6 @@ test('keys require exactly 32 private buffer bytes and copy before inspecting st
  assert.deepEqual(original,key(),'caller key bytes are retained unchanged');
 });
 
-test('pure candidates stay disabled and production lib/bin do not import them',()=>{
- for(const directory of ['lib','bin'])for(const file of readdirSync(new URL('../'+directory+'/',import.meta.url)))if(!['strict-human-command.mjs','strict-human-authority.mjs'].includes(file))assert.doesNotMatch(readFileSync(new URL('../'+directory+'/'+file,import.meta.url),'utf8'),/strict-human-(command|authority)/);
+test('candidate authority modules stay isolated from runtime entrypoints',()=>{
+ for(const directory of ['lib','bin'])for(const file of readdirSync(new URL('../'+directory+'/',import.meta.url)))if(!['strict-human-command.mjs','strict-human-authority.mjs','strict-human-authority-store.mjs','strict-authority-file.mjs'].includes(file))assert.doesNotMatch(readFileSync(new URL('../'+directory+'/'+file,import.meta.url),'utf8'),/strict-human-(command|authority)/);
 });
