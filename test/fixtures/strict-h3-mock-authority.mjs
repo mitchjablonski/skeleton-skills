@@ -5,8 +5,15 @@
 // durability, isolation, key custody, enrollment or anti-rollback, and no
 // per-session attempt cap (only the per-round cap). Strict stays disabled
 // and nothing in lib/ or bin/ imports this.
+//
+// Attempt policy: Codex's candidate-no-recapture-reset-v1 (#124/#133).
+// Failures and the key are kept across changed AND unchanged Recapture (V2
+// never changes reviewRoundId on Recapture), and a locked round unlocks only
+// with a new session. Reshape starts a new round with fresh counters.
+// Journal identity is the real humanCommandIdentity (operation included), and
+// every operation looks up its exact prior identity before any effect.
 
-import { deriveHumanCode, parseHumanCommand } from "../../lib/strict-human-command.mjs";
+import { deriveHumanCode, humanCommandIdentity, parseHumanCommand } from "../../lib/strict-human-command.mjs";
 
 export function createMockH3Authority({ projectId, sessionId, pair, key, maxAttempts = 5, clock = () => new Date(Date.UTC(2026, 10, 14)) }) {
   let round = 1, revision = 0, phase = "skeleton", selected = { ...pair }, approved = null, pending = null;
@@ -24,6 +31,7 @@ export function createMockH3Authority({ projectId, sessionId, pair, key, maxAtte
     if (dropNextReply) { dropNextReply = false; throw new Error("reply lost after commit"); }
     return reply;
   };
+  const idOf = (operation, args) => humanCommandIdentity(operation, args).toString("hex");
   const lookup = (requestId, identity) => {
     const hit = journal.get(requestId);
     if (!hit) return null;
@@ -36,11 +44,11 @@ export function createMockH3Authority({ projectId, sessionId, pair, key, maxAtte
       lastWireCode = args?.code;
       const cmd = parseHumanCommand("verifyAndCommit", args);
       if (!cmd) throw new Error("malformed command");
-      const identity = `${cmd.action}|${cmd.code}`;
+      const identity = idOf("verifyAndCommit", args);
       const prior = lookup(cmd.requestId, identity); // journal first
       if (prior) return prior;
       if (ended) return finish(cmd.requestId, identity, { kind: "rejected", code: "session-ended" });
-      if (locked) return finish(cmd.requestId, identity, { kind: "locked", unlock: phase === "skeleton" ? "recapture" : "new-session" });
+      if (locked) return finish(cmd.requestId, identity, { kind: "locked", unlock: "new-session" });
       const allowed = (cmd.action === "approve" && phase === "skeleton") || (cmd.action === "reshape" && phase === "fill"
         && selected.reviewVersion === approved.reviewVersion && selected.captureVersion === approved.captureVersion);
       if (!allowed) return finish(cmd.requestId, identity, { kind: "rejected", code: "invalid-transition" });
@@ -64,23 +72,25 @@ export function createMockH3Authority({ projectId, sessionId, pair, key, maxAtte
     async recapture(args) {
       const cmd = parseHumanCommand("recapture", args);
       if (!cmd) throw new Error("malformed command");
-      const prior = lookup(cmd.requestId, "recapture");
+      const identity = idOf("recapture", args);
+      const prior = lookup(cmd.requestId, identity);
       if (prior) return prior;
-      if (ended) return finish(cmd.requestId, "recapture", { kind: "rejected", code: "session-ended" });
-      if (phase !== "skeleton") return finish(cmd.requestId, "recapture", { kind: "refused", reason: "fill-phase" });
+      if (ended) return finish(cmd.requestId, identity, { kind: "rejected", code: "session-ended" });
+      if (phase !== "skeleton") return finish(cmd.requestId, identity, { kind: "refused", reason: "fill-phase" });
       const next = pending ?? selected;
       const changed = next.reviewVersion !== selected.reviewVersion || next.captureVersion !== selected.captureVersion;
       if (changed) { selected = { ...next }; revision += 1; }
-      pending = null; attempts = 0; locked = false;
-      return finish(cmd.requestId, "recapture", { kind: "recaptured", changed, revision, ...selected });
+      pending = null; // attempts, lock and key are kept (candidate-no-recapture-reset-v1)
+      return finish(cmd.requestId, identity, { kind: "recaptured", changed, revision, ...selected });
     },
     async endSession(args) {
       const cmd = parseHumanCommand("endSession", args);
       if (!cmd) throw new Error("malformed command");
-      const prior = lookup(cmd.requestId, "end"); // journal first: a reused id never replaces its entry
+      const identity = idOf("endSession", args);
+      const prior = lookup(cmd.requestId, identity); // journal first: a reused id never replaces its entry
       if (prior) return prior;
       ended = true;
-      return finish(cmd.requestId, "end", { kind: "ended" });
+      return finish(cmd.requestId, identity, { kind: "ended" });
     },
     async state() { return { phase, revision, reviewVersion: selected.reviewVersion, captureVersion: selected.captureVersion }; },
 

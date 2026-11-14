@@ -128,14 +128,20 @@ lt("a lost reply after commit: retry returns the journaled answer and commits on
   assert.equal(authority.authorityState().revision, 1, "committed once");
 });
 
-lt("five wrong codes lock the round; recapture unlocks it", async (t) => {
-  const { page, con } = await setup(t);
+lt("five wrong codes lock the round; recapture keeps the lock (candidate-no-recapture-reset-v1); only a new session unlocks", async (t) => {
+  const { authority, page, con, remember } = await setup(t);
   const real = (await page()).codes.approve.code;
   const wrong = real.startsWith("0") ? "1111-1111" : "0000-0000";
-  for (let i = 0; i < 5; i++) assert.match((await con.handle(`approve ${wrong}`))[0], /doesn't match/);
-  assert.deepEqual(await con.handle(`approve ${real}`), [C.locked.recapture]);
-  await con.handle("recapture"); await con.handle("yes");
-  assert.match((await con.handle(`approve ${real}`))[0], /^Recorded: approve/);
+  for (let i = 0; i < 4; i++) assert.match((await con.handle(`approve ${wrong}`))[0], /doesn't match/);
+  // An unchanged recapture keeps the count: the fifth failure still locks.
+  await con.handle("recapture"); assert.match((await con.handle("yes"))[0], /unchanged/);
+  assert.match((await con.handle(`approve ${wrong}`))[0], /doesn't match/);
+  assert.deepEqual(await con.handle(`approve ${real}`), [C.locked["new-session"]]);
+  // A changed recapture keeps the lock too, and the page's fresh code is still refused.
+  const capB = remember(captureOf("const a = 9;\n// SKEL[1] step one\nthrow Error('SKEL_TODO');\n// /SKEL[1]\n"));
+  authority.stageCapture(pairOf(capB));
+  await con.handle("recapture"); assert.match((await con.handle("yes"))[0], /new snapshot/);
+  assert.deepEqual(await con.handle(`approve ${(await page()).codes.approve.code}`), [C.locked["new-session"]]);
 });
 
 test("console and codec normalise admitted code spellings identically", () => {
@@ -169,16 +175,26 @@ lt("the listener drops codes that don't bind the rendered capture, including a r
   assert.deepEqual([forced.codes, forced.dropped], [{}, true]);
 });
 
-lt("end: a reused id never replaces its journal entry, and nothing is accepted after the session ends", async (t) => {
+lt("journal identity includes the operation; a lost end reply retries exactly; nothing changes after the session ends", async (t) => {
   const { authority, page, con } = await setup(t);
   const code = (await page()).codes.approve.code;
   const wrong = code.startsWith("0") ? "1111-1111" : "0000-0000";
   const first = await authority.verifyAndCommit({ action: "approve", code: wrong, requestId: "x-1" });
   assert.equal(first.kind, "mismatch");
+  // Cross-operation reuse of an id is refused and never replaces the original entry.
   assert.deepEqual(await authority.endSession({ requestId: "x-1" }), { requestId: "x-1", kind: "rejected", code: "request-reused" });
+  assert.deepEqual(await authority.recapture({ requestId: "x-1" }), { requestId: "x-1", kind: "rejected", code: "request-reused" });
   assert.deepEqual(await authority.verifyAndCommit({ action: "approve", code: wrong, requestId: "x-1" }), first, "original entry kept");
+  // A lost end reply, retried with the SAME id, returns the journaled answer (journal first).
+  authority.loseNextReply();
+  await assert.rejects(authority.endSession({ requestId: "e-1" }), /reply lost/);
+  assert.deepEqual(await authority.endSession({ requestId: "e-1" }), { requestId: "e-1", kind: "ended" });
+  // Through the console: an unknown end blocks other requests; ending again (a new id) reports ended.
   await con.handle("end");
   assert.match((await con.handle("yes"))[0], /session has ended/);
+  // After closure: no recapture effects (revision, selected capture, counters) and no decisions.
+  const before = authority.authorityState();
   assert.deepEqual(await authority.recapture({ requestId: "x-2" }), { requestId: "x-2", kind: "rejected", code: "session-ended" });
   assert.equal((await authority.verifyAndCommit({ action: "approve", code, requestId: "x-3" })).code, "session-ended");
+  assert.deepEqual(authority.authorityState(), before, "nothing mutated after end");
 });
