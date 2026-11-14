@@ -952,6 +952,12 @@ const commands = {
     }
     if (running) {
       try { process.kill(running.pid); } catch (err) { if (err.code !== "ESRCH") throw err; }
+      // Let it exit and release the port first, so the new server can take
+      // the same port (and origin) instead of racing it onto a random one.
+      for (const end = Date.now() + 3000; Date.now() < end;) {
+        try { process.kill(running.pid, 0); } catch { break; }
+        await new Promise((r) => setTimeout(r, 50));
+      }
       if (!protectedReads) console.log("replaced the running review server: it didn't show that its reads need the review token. Reload any tab still open on it, using the URL below.");
     }
     const { session } = feedbackEnabled ? newServeSession() : {};
@@ -1126,10 +1132,16 @@ const commands = {
       explainMode();
       console.log("Keep this process running while reviewing. Stop with Ctrl+C or `skel serve --stop` from another terminal.");
     };
-    server.once("error", (err) => {
+    // The preferred port can be briefly busy (a server that is still closing,
+    // or a short-lived connection's ephemeral port): retry it for a moment
+    // before falling back to any free port (about 4 seconds).
+    let attempts = 0;
+    const onError = (err) => {
       if (err.code !== "EADDRINUSE") throw err;
+      if (++attempts <= 40) return void setTimeout(() => { server.once("error", onError); server.listen(preferred, "127.0.0.1", onListening); }, 100);
       server.listen(0, "127.0.0.1", onListening);
-    });
+    };
+    server.once("error", onError);
     server.listen(preferred, "127.0.0.1", onListening);
   },
 

@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { scanFiles, scanText, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
@@ -2784,6 +2785,29 @@ test("#39: a mode switch keeps the token, so open tabs follow; any other start g
     await second?.stop();
     await third?.stop();
     await fourth?.stop();
+  }
+});
+
+test("#127: a briefly busy preferred port is waited for, so the review keeps its origin", async () => {
+  const { dir, run } = project();
+  run("init", "T");
+  const first = await serve(dir, []);
+  const port = Number(new URL(first.url).port);
+  await first.stop();
+  // Something else holds the project's port for a moment (a closing server or
+  // a short-lived connection); serve must wait for it rather than move origin.
+  const blocker = net.createServer();
+  await new Promise((r) => blocker.listen(port, "127.0.0.1", r));
+  // Held past serve's own startup (about 1.6 s on a WSL /mnt checkout), well inside its retry window.
+  const release = setTimeout(() => blocker.close(), 2500);
+  let second;
+  try {
+    second = await serve(dir, []);
+    assert.equal(second.url, first.url, "same port, so the page's origin and drafts survive");
+  } finally {
+    clearTimeout(release);
+    blocker.close();
+    await second?.stop();
   }
 });
 
