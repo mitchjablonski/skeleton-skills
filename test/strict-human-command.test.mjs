@@ -114,6 +114,6 @@ test('keys require exactly 32 private buffer bytes and copy before inspecting st
  assert.deepEqual(original,key(),'caller key bytes are retained unchanged');
 });
 
-test('codec is disabled and production lib/bin do not import it',()=>{
- for(const directory of ['lib','bin'])for(const file of readdirSync(new URL('../'+directory+'/',import.meta.url)))if(file!=='strict-human-command.mjs')assert.doesNotMatch(readFileSync(new URL('../'+directory+'/'+file,import.meta.url),'utf8'),/strict-human-command/);
+test('pure candidates stay disabled and production lib/bin do not import them',()=>{
+ for(const directory of ['lib','bin'])for(const file of readdirSync(new URL('../'+directory+'/',import.meta.url)))if(!['strict-human-command.mjs','strict-human-authority.mjs'].includes(file))assert.doesNotMatch(readFileSync(new URL('../'+directory+'/'+file,import.meta.url),'utf8'),/strict-human-(command|authority)/);
 });
