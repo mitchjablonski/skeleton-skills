@@ -24,7 +24,7 @@ export function createMockH3Authority({ projectId, sessionId, pair, key, maxAtte
     reviewVersion: selected.reviewVersion, captureVersion: selected.captureVersion,
     approvedVersion: approved?.reviewVersion ?? null, approvedCaptureVersion: approved?.captureVersion ?? null, revision,
   });
-  const at = () => clock().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const at = () => clock().toISOString(); // same .mmmZ shape the real authority sends
   const finish = (requestId, identity, body) => {
     const reply = Object.freeze({ requestId, ...body });
     journal.set(requestId, { identity, reply });
@@ -90,9 +90,9 @@ export function createMockH3Authority({ projectId, sessionId, pair, key, maxAtte
       const prior = lookup(cmd.requestId, identity); // journal first: a reused id never replaces its entry
       if (prior) return prior;
       ended = true; endEffects += 1;
-      return finish(cmd.requestId, identity, { kind: "ended" });
+      return finish(cmd.requestId, identity, { kind: "admissions-revoked", at: at() }); // closes decisions; stops nothing
     },
-    async state() { return { phase, revision, reviewVersion: selected.reviewVersion, captureVersion: selected.captureVersion }; },
+    async state() { return { phase, revision, reviewVersion: selected.reviewVersion, captureVersion: selected.captureVersion, admissions: ended ? "revoked" : "live" }; },
 
     // --- issuance for the protected page, and test hooks ---
     authorityState,

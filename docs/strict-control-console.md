@@ -42,8 +42,8 @@ recapture({ requestId }) ->
   { kind: "recaptured", requestId, changed, revision, reviewVersion, captureVersion }
   { kind: "refused", requestId, reason: "fill-phase" | "locked" }
   (plus rejected / journal-full / record-unreadable / unavailable as above)
-endSession({ requestId }) -> { kind: "ended", requestId }
-state() -> { phase, revision, reviewVersion, captureVersion }
+endSession({ requestId }) -> { kind: "admissions-revoked", requestId, at }   // closes new decisions only
+state() -> { phase, revision, reviewVersion, captureVersion, admissions? }   // admissions: "live" | "revoked"
 ```
 
 **Order of checks.** The authority looks up an exact same-ID retry in its
@@ -92,10 +92,18 @@ request.
 - **Mismatch.** The copy is generic. It shows the current prefixes, the
   revision and the attempts left. It never echoes the code and has no history
   oracle.
-- **End.** Once `end` is confirmed, the console refuses every command
-  except `end`, `status` and `help` until an `ended` reply arrives. It stays
-  that way while the outcome is unknown. After `ended`, only `status` and
-  `help` work.
+- **End.** `end` asks the authority to close new decision admission. The
+  reply, `admissions-revoked`, closes decisions only: it doesn't stop the
+  agent or prove any process exited. The launcher's own stop does that, and
+  no console line says the session or its processes ended.
+  - Once `end` is confirmed, the console refuses every command except `end`,
+    `status` and `help` until `admissions-revoked` arrives. It stays that way
+    while the outcome is unknown, and each further `end` resends the same
+    request (same id), so the journal returns the original answer.
+  - A `journal-full` reply to `end` is definitive. The console says to stop
+    the session from the launcher, instead of asking for `end` again.
+  - After revocation, only `status` and `help` work. `status` shows
+    `admissions: revoked`.
 - **Prompts.** Any other command cancels a pending yes/no question,
   including `status`, `help` and a refused line.
 - **Resend mismatch and lock.** Under journal-first lookup, these would

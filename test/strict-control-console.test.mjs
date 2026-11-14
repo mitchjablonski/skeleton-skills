@@ -155,7 +155,7 @@ test("recapture: needs yes, warns and abandons a kept request, reports changed/u
 });
 
 test("end: needs yes, warns about a kept request, then every command but status/help is refused", async () => {
-  const { m, c } = make({ verify: [unavailable], end: [echo({ kind: "ended" })] });
+  const { m, c } = make({ verify: [unavailable], end: [echo({ kind: "admissions-revoked", at: AT })] });
   await c.handle("approve K7M2-QX9D");
   assert.equal((await c.handle("end"))[0], C.endAbandons);
   await c.handle("yes");
@@ -216,7 +216,7 @@ test("prototype: pure (no I/O imports), and nothing in lib/bin loads it", () => 
 
 test("a failing request-id factory sends nothing and never abandons a pending retry", async () => {
   let fail = false, n = 0;
-  const m = mock({ verify: [unavailable], recapture: [echo({ kind: "recaptured", changed: false, revision: 1, reviewVersion: A, captureVersion: B })], end: [echo({ kind: "ended" })] });
+  const m = mock({ verify: [unavailable], recapture: [echo({ kind: "recaptured", changed: false, revision: 1, reviewVersion: A, captureVersion: B })], end: [echo({ kind: "admissions-revoked", at: AT })] });
   const c = createControlConsole({ authority: m.authority, newRequestId: () => { if (fail) throw new Error("rng"); return `id-${++n}`; } });
   await c.handle("approve K7M2-QX9D");
   const before = c.kept();
@@ -232,8 +232,8 @@ test("a failing request-id factory sends nothing and never abandons a pending re
   assert.equal(m.calls.length, 1);
 });
 
-test("an end with an unknown outcome blocks every other request until it ends", async () => {
-  const { m, c } = make({ verify: [unavailable], end: [unavailable, echo({ kind: "ended" })] });
+test("an end with an unknown outcome blocks every other request until decisions are confirmed closed", async () => {
+  const { m, c } = make({ verify: [unavailable], end: [unavailable, echo({ kind: "admissions-revoked", at: AT })] });
   await c.handle("approve K7M2-QX9D");
   await c.handle("end");
   assert.deepEqual(await c.handle("yes"), [C.endUnknown]);
@@ -259,4 +259,75 @@ test("journal-full copy follows R4: earlier requests still resolve, recovery is 
   assert.match(C.journalFull, /Earlier requests still resolve/);
   assert.match(C.journalFull, /recovery outside this session/);
   assert.doesNotMatch(C.journalFull, /new journal|End the session/);
+});
+
+// Every line the console can print about ending, including both confirm prompts.
+const flatten = (o) => typeof o === "string" ? [o] : Object.values(o).flatMap(flatten);
+const BANNED = /\bend(?:ed|ing|s)? (?:the|this)(?: strict)? session|session (?:is over|has ended|ended)|\bstops? the (?:session|agent)\b|closing this window|process(?:es)? (?:stopped|exited|died)|was stopped/i;
+const ALLOWED = /doesn't stop the agent|stop the session from the launcher|launcher's own stop/gi;
+
+test("no console line says the session, the agent or its processes ended or stopped", async () => {
+  const prompts = [];
+  const { c } = make({ verify: [unavailable], end: [unavailable] });
+  prompts.push(...await c.handle("end"));
+  await c.handle("yes");
+  prompts.push(...await c.handle("end"));
+  for (const line of [...flatten(C), ...prompts]) assert.doesNotMatch(line.replace(ALLOWED, ""), BANNED, line);
+  assert.equal(prompts[0], "Close new decisions for this strict session? This doesn't stop the agent.");
+  assert.equal(prompts[2], "Try again to close new decisions for this strict session?");
+  assert.equal(C.revoked, "New decisions are now closed for this session. This doesn't stop the agent or prove any process has exited; the launcher's own stop does that.");
+});
+
+test("end closes decisions only, and status shows admissions revoked or live", async () => {
+  const { c } = make({ end: [echo({ kind: "admissions-revoked", at: "2026-11-14T03:00:00.000Z" })],
+    state: [{ phase: "fill", revision: 3, reviewVersion: A, captureVersion: B, admissions: "revoked" }] });
+  await c.handle("end");
+  assert.deepEqual(await c.handle("yes"), [C.revoked]);
+  assert.match((await c.handle("status")).join(" "), /New decisions are closed for this session/);
+  const live = make({ state: [{ phase: "fill", revision: 3, reviewVersion: A, captureVersion: B, admissions: "live" }] }).c;
+  const out = await live.handle("status");
+  assert.match(out[0], /^Phase fill/);
+  assert.ok(!out.join(" ").includes("closed"));
+});
+
+test("journal-full on end is definitive: it says to stop from the launcher, never 'type end again', and blocks other requests", async () => {
+  const { m, c } = make({ end: [echo({ kind: "journal-full" })] });
+  await c.handle("end");
+  assert.deepEqual(await c.handle("yes"), [C.endJournalFull]);
+  assert.doesNotMatch(C.endJournalFull, /type end again/i);
+  assert.match(C.endJournalFull, /Stop the session from the launcher/);
+  assert.equal(c.ended(), false);
+  assert.deepEqual(await c.handle("approve K7M2-QX9D"), [C.ending]);
+  assert.equal(m.calls.filter((x) => x.name === "verify").length, 0);
+});
+
+test("an admissions-revoked reply without a valid time, or an 'ended' reply, is not taken as revocation", async () => {
+  for (const reply of [echo({ kind: "admissions-revoked" }), echo({ kind: "admissions-revoked", at: "now" }), echo({ kind: "admissions-revoked", at: "2026-13-99T99:99:99Z" }), echo({ kind: "ended" })]) {
+    const { c } = make({ end: [reply] });
+    await c.handle("end");
+    assert.deepEqual(await c.handle("yes"), [C.endUnknown]);
+    assert.equal(c.ended(), false);
+  }
+});
+
+test("status accepts a state without admissions, and refuses an unknown admissions value", async () => {
+  const ok = make({ state: [{ phase: "skeleton", revision: 0, reviewVersion: A, captureVersion: B }] }).c;
+  assert.match((await ok.handle("status"))[0], /^Phase skeleton/);
+  const bad = make({ state: [{ phase: "skeleton", revision: 0, reviewVersion: A, captureVersion: B, admissions: "open" }] }).c;
+  assert.match((await bad.handle("status"))[0], /state is unknown/);
+});
+
+test("an end with an unknown outcome is resent with its original request id", async () => {
+  const { m, c } = make({ end: [unavailable, () => { throw new Error("lost"); }, echo({ kind: "admissions-revoked", at: "2026-11-14T03:00:00.000Z" })] });
+  await c.handle("end"); assert.deepEqual(await c.handle("yes"), [C.endUnknown]);
+  await c.handle("end"); assert.deepEqual(await c.handle("yes"), [C.endUnknown]);
+  await c.handle("end"); assert.deepEqual(await c.handle("yes"), [C.revoked]);
+  const ids = m.calls.filter((x) => x.name === "end").map((x) => x.arg.requestId);
+  assert.equal(ids.length, 3);
+  assert.equal(new Set(ids).size, 1, "every resend uses the first end's id");
+});
+
+test("status refuses admissions: null", async () => {
+  const { c } = make({ state: [{ phase: "skeleton", revision: 0, reviewVersion: A, captureVersion: B, admissions: null }] });
+  assert.match((await c.handle("status"))[0], /state is unknown/);
 });
