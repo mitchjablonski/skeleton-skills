@@ -148,7 +148,16 @@ test("console and codec normalise admitted code spellings identically", () => {
 
 lt("the listener drops codes that don't bind the rendered capture, including a reshape code while a filled body is shown", async (t) => {
   const { authority, page, con, remember } = await setup(t);
+  // Skeleton phase, approve allowed: an approve code carrying another capture's pair is dropped for its pair.
+  authority.overrideCodes((s) => ({ approve: { code: "K7M2-QX9D", revision: s.revision, reviewVersion: s.reviewVersion, captureVersion: "0".repeat(64) } }));
+  assert.deepEqual([(await page()).codes, (await page()).dropped], [{}, true]);
+  authority.overrideCodes(null);
   await con.handle(`approve ${(await page()).codes.approve.code}`);
+  // Fill, rendered pair == approved pair, reshape allowed: a reshape code with the wrong pair is dropped too.
+  authority.overrideCodes((s) => ({ reshape: { code: "K7M2-QX9D", revision: s.revision, reviewVersion: s.approvedVersion, captureVersion: "0".repeat(64) } }));
+  assert.equal((await page()).dropped, true);
+  authority.overrideCodes(null);
+  assert.deepEqual(Object.keys((await page()).codes), ["reshape"], "the honest reshape code is accepted");
   // A filled-body capture is selected in fill: it differs from the approved pair.
   const filled = remember(captureOf("const a = 1;\n// SKEL[1] step one\nreturn 42;\n// /SKEL[1]\n"));
   authority.selectInFill(pairOf(filled));
@@ -158,9 +167,6 @@ lt("the listener drops codes that don't bind the rendered capture, including a r
   authority.overrideCodes((s) => ({ reshape: { code: "K7M2-QX9D", revision: s.revision, reviewVersion: s.approvedVersion, captureVersion: s.approvedCaptureVersion } }));
   const forced = await page();
   assert.deepEqual([forced.codes, forced.dropped], [{}, true]);
-  // An approve code bound to another capture is dropped too.
-  authority.overrideCodes((s) => ({ approve: { code: "K7M2-QX9D", revision: s.revision, reviewVersion: s.reviewVersion, captureVersion: "0".repeat(64) } }));
-  assert.equal((await page()).dropped, true);
 });
 
 lt("end: a reused id never replaces its journal entry, and nothing is accepted after the session ends", async (t) => {
