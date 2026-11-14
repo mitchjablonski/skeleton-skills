@@ -95,7 +95,7 @@ def main():
   (source/'context.txt').write_text('controlled fixture context\n')
   session=root/'host-session';code=1
   prepared=session_command(node,root,'prepare',['--prepare',source,session])
-  if prepared.get('trace')!=['private-copy','enumerate','independent-capture','durable-capture-put','authority-reference','protected-observer-under-lock','durable-injected-approve']:raise RuntimeError('prepare order invalid')
+  if prepared.get('trace')!=['private-copy','enumerate','independent-capture','durable-capture-put','authority-reference','protected-observer-under-lock','console-injected-approve','lost-approval-response','console-same-id-retry']:raise RuntimeError('prepare order invalid')
   result.update(privatePathDenial=private_path_denial(session,prepared['captureVersion']))
   for disposable in (source/'plan.js',session/'candidate'/'plan.js'):
    original=disposable.read_bytes()
