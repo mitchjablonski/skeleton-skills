@@ -148,3 +148,11 @@ linux('post-rename, release-directory and historical-record sync faults retain u
   assert.equal(f.record().commands.length,1);assert.equal(f.record().authority.journal.length,1);
  }
 });
+
+linux('sampled key bytes are snapshotted before the epoch identity callback',t=>{
+ const f=fixture(t),sample=Buffer.alloc(32,7),dir=path.join(f.base,'snapshot-key');
+ const handle=createHumanAuthorityStore(dir,f.enrollment,{...f.deps,keyBytes:()=>sample,epochId(){sample.fill(9);return 'snapshot-epoch';}});
+ assert.equal(handle.state().phase,'skeleton');
+ const record=JSON.parse(fs.readFileSync(path.join(dir,'human-authority.json'),'utf8'));
+ assert.equal(record.initial.epoch.keyHex,'07'.repeat(32));assert.equal(sample[0],9);
+});
