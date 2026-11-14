@@ -1,0 +1,211 @@
+{
+  "schema": "strict-human-code-vectors-v1",
+  "proposalOnly": true,
+  "description": "Public deterministic test keys; disabled pure codec candidate, not human authentication or protocol adoption.",
+  "codeVectors": [
+    {
+      "name": "approve-basic",
+      "action": "approve",
+      "state": {
+        "protocolVersion": 2,
+        "projectId": "project-1",
+        "sessionId": "session-1",
+        "reviewRoundId": "round-1",
+        "phase": "skeleton",
+        "reviewVersion": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "captureVersion": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "approvedVersion": null,
+        "approvedCaptureVersion": null,
+        "revision": 4
+      },
+      "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "messageHex": "736b656c2d68756d616e2d636f64652d763100000007617070726f76650000000970726f6a6563742d310000000973657373696f6e2d3100000007726f756e642d31000000013400000040616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610000004062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262",
+      "hmacHex": "bbd6f45e84b7e14788caaf97fe943d2a2ddf56515bfcd0617c289cfc156f6abd",
+      "code": "QFBF-8QM4"
+    },
+    {
+      "name": "reshape-approved",
+      "action": "reshape",
+      "state": {
+        "protocolVersion": 2,
+        "projectId": "project-1",
+        "sessionId": "session-1",
+        "reviewRoundId": "round-1",
+        "phase": "fill",
+        "reviewVersion": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "captureVersion": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "approvedVersion": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "approvedCaptureVersion": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "revision": 4
+      },
+      "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "messageHex": "736b656c2d68756d616e2d636f64652d763100000007726573686170650000000970726f6a6563742d310000000973657373696f6e2d3100000007726f756e642d31000000013400000040616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610000004062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262",
+      "hmacHex": "3a958dede1a629918e58209f347287a22e06fb026b752a3a8b7eb986bcd1ecb1",
+      "code": "7AAR-VVF1"
+    },
+    {
+      "name": "approve-zero",
+      "action": "approve",
+      "state": {
+        "protocolVersion": 2,
+        "projectId": "project-1",
+        "sessionId": "session-1",
+        "reviewRoundId": "round-1",
+        "phase": "skeleton",
+        "reviewVersion": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "captureVersion": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "approvedVersion": null,
+        "approvedCaptureVersion": null,
+        "revision": 0
+      },
+      "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "messageHex": "736b656c2d68756d616e2d636f64652d763100000007617070726f76650000000970726f6a6563742d310000000973657373696f6e2d3100000007726f756e642d31000000013000000040616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610000004062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262",
+      "hmacHex": "f0999e8e7c9a88bfd6ea62f230835f89a51299f011c5ed84a2f240dc7d535658",
+      "code": "Y2CS-X3KW"
+    },
+    {
+      "name": "approve-max-revision",
+      "action": "approve",
+      "state": {
+        "protocolVersion": 2,
+        "projectId": "project-1",
+        "sessionId": "session-1",
+        "reviewRoundId": "round-1",
+        "phase": "skeleton",
+        "reviewVersion": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "captureVersion": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "approvedVersion": null,
+        "approvedCaptureVersion": null,
+        "revision": 9007199254740991
+      },
+      "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "messageHex": "736b656c2d68756d616e2d636f64652d763100000007617070726f76650000000970726f6a6563742d310000000973657373696f6e2d3100000007726f756e642d31000000103930303731393932353437343039393100000040616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610000004062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262",
+      "hmacHex": "f76206ac039485e37e1478d19dd4a337c28776e0be7901c688dde6c3fddc29c1",
+      "code": "YXH0-DB03"
+    },
+    {
+      "name": "approve-id-boundary",
+      "action": "approve",
+      "state": {
+        "protocolVersion": 2,
+        "projectId": "p...............................................................................................................................................................................................................................................................",
+        "sessionId": "s:.-_9",
+        "reviewRoundId": "round:2",
+        "phase": "skeleton",
+        "reviewVersion": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "captureVersion": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "approvedVersion": null,
+        "approvedCaptureVersion": null,
+        "revision": 4
+      },
+      "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "messageHex": "736b656c2d68756d616e2d636f64652d763100000007617070726f766500000100702e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e00000006733a2e2d5f3900000007726f756e643a32000000013400000040616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610000004062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262",
+      "hmacHex": "c6bc51db3ee008c83cb8b19a239f8d2e17cede03628a67d4ee8e9a532bdf1458",
+      "code": "RTY5-3PSY"
+    }
+  ],
+  "commandVectors": [
+    {
+      "name": "verify-normalized",
+      "operation": "verifyAndCommit",
+      "input": {
+        "requestId": "req-1",
+        "action": "approve",
+        "code": "qfbf 8qm4"
+      },
+      "canonical": {
+        "operationVersion": "human-code-v1",
+        "operation": "verifyAndCommit",
+        "requestId": "req-1",
+        "action": "approve",
+        "code": "QFBF-8QM4"
+      },
+      "identityHex": "736b656c2d68756d616e2d636f6d6d616e642d76310000000d68756d616e2d636f64652d76310000000f766572696679416e64436f6d6d6974000000057265712d3100000007617070726f766500000009514642462d38514d34"
+    },
+    {
+      "name": "verify-aliases",
+      "operation": "verifyAndCommit",
+      "input": {
+        "requestId": "req-2",
+        "action": "reshape",
+        "code": "ioll-0000"
+      },
+      "canonical": {
+        "operationVersion": "human-code-v1",
+        "operation": "verifyAndCommit",
+        "requestId": "req-2",
+        "action": "reshape",
+        "code": "1011-0000"
+      },
+      "identityHex": "736b656c2d68756d616e2d636f6d6d616e642d76310000000d68756d616e2d636f64652d76310000000f766572696679416e64436f6d6d6974000000057265712d32000000077265736861706500000009313031312d30303030"
+    },
+    {
+      "name": "recapture",
+      "operation": "recapture",
+      "input": {
+        "requestId": "req-3"
+      },
+      "canonical": {
+        "operationVersion": "human-code-v1",
+        "operation": "recapture",
+        "requestId": "req-3"
+      },
+      "identityHex": "736b656c2d68756d616e2d636f6d6d616e642d76310000000d68756d616e2d636f64652d763100000009726563617074757265000000057265712d330000000000000000"
+    },
+    {
+      "name": "end",
+      "operation": "endSession",
+      "input": {
+        "requestId": "req-4"
+      },
+      "canonical": {
+        "operationVersion": "human-code-v1",
+        "operation": "endSession",
+        "requestId": "req-4"
+      },
+      "identityHex": "736b656c2d68756d616e2d636f6d6d616e642d76310000000d68756d616e2d636f64652d76310000000a656e6453657373696f6e000000057265712d340000000000000000"
+    }
+  ],
+  "normalizationVectors": [
+    {
+      "input": "k7m2-qx9d",
+      "expected": "K7M2-QX9D"
+    },
+    {
+      "input": " IOLL 0000 ",
+      "expected": "1011-0000"
+    },
+    {
+      "input": "                                                                                                                                                                                               QFBF-8QM4",
+      "expected": "QFBF-8QM4"
+    },
+    {
+      "input": "                                                                                                                                                                                                QFBF-8QM4",
+      "expected": null
+    },
+    {
+      "input": "QFBF\t8QM4",
+      "expected": null
+    },
+    {
+      "input": "QFBF\n8QM4",
+      "expected": null
+    },
+    {
+      "input": "ＱFBF-8QM4",
+      "expected": null
+    },
+    {
+      "input": "QFBF-8QMＵ",
+      "expected": null
+    },
+    {
+      "input": "QFBF-8QMU",
+      "expected": null
+    },
+    {
+      "input": "QFBF-8QM",
+      "expected": null
+    }
+  ]
+}
