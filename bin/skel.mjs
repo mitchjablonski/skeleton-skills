@@ -14,6 +14,7 @@ import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs"
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, refreshReceiptIndex, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { strictStatus } from "../lib/strict-status.mjs";
+import { renderPrBody } from "../lib/pr-body.mjs";
 import { PLUGIN_ID, claudeConfigDir, hasLegacyHooks, installStatus, isSkelConfigHook, isSkelHook, pluginEvidence, pluginStatus, registrationNotice, rulePath, skelStopHook } from "../lib/install-status.mjs";
 import { isLegacyCopy, renderLegacy } from "../lib/legacy-copy.mjs";
 import { enrollment } from "../lib/config-hook.mjs";
@@ -43,6 +44,7 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
                                      start a skeleton in this project (--force replaces an existing one)
   track <file...>                    show unfenced skeleton files (types, wiring) in the review too
   status [--json]                    phase, active step, every step's status
+  pr                                 print a Markdown pull-request body from the plan (read-only)
   review                             write .skeleton/review.html (static; copy feedback by hand)
   serve [--port N] [--send] [--stop] serve live read-only; --send enables feedback
   feedback [--wait SECONDS]          print (and archive) the human's latest feedback (waits up to 110s)
@@ -915,6 +917,20 @@ const commands = {
       const unknown = [...new Set(ids)].filter((id) => !steps.some((st) => st.id === id));
       if (unknown.length) console.log(`  ! diagram ${d.name}: node${unknown.length > 1 ? "s" : ""} ${unknown.map((i) => `step_${i.replace(/\./g, "_")}`).join(", ")} match no step`);
     }
+  },
+
+  pr() {
+    const root = requireRoot();
+    const state = requireState(root);
+    const { steps } = state.phase === "done" ? { steps: [] } : snapshot(root);
+    const record = state.phase === "scaffold" ? null : readSnapshot(root);
+    const drift = state.phase === "fill" ? verifySnapshot(root, state, snapshot(root).files) : null;
+    const coverage = record && !coverageGap(record) ? record.coverage : null;
+    process.stdout.write(renderPrBody({
+      title: state.title, phase: state.phase, steps, finalized: state.phase === "done" ? finalizedRecord(state) : null,
+      activeStep: state.activeStep ?? null, diagrams: readDiagrams(root), approvedVersion: record?.version ?? null,
+      drift, coverage: coverage ? { id: coverage.id } : null,
+    }));
   },
 
   async review() {

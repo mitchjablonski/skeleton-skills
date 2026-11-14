@@ -4324,3 +4324,29 @@ test("#48 upgrade: a protected #43-only server without feedback ordering is repl
     assert.match(run("serve"), /already running/);
   } finally { await current?.stop(); await old.stop(); }
 });
+
+test("skel pr: a read-only Markdown PR body through scaffold, fill and done", () => {
+  const { dir, a, run } = project();
+  run("init", "Stroke smoothing");
+  const statePath = path.join(dir, ".skeleton", "state.json");
+  const before = fs.readFileSync(statePath, "utf-8");
+  const scaffold = run("pr");
+  assert.match(scaffold, /^## Stroke smoothing\n/);
+  assert.match(scaffold, /hasn't been approved yet/);
+  assert.match(scaffold, /\| 1 \| .* \| to do \| `src\/a\.ts:\d+` \|/);
+  assert.equal(fs.readFileSync(statePath, "utf-8"), before, "pr changes no state");
+  run("approve");
+  run("next");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
+  const fill = run("pr");
+  assert.match(fill, /Approved skeleton version: `[0-9a-f]+`/);
+  assert.match(fill, /\| 1 \| .* \| being filled \|/);
+  assert.match(fill, /Drift from the approved skeleton \(its own files\): none\./);
+  run("done"); run("next");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
+  run("done"); run("finalize");
+  const done = run("pr");
+  assert.match(done, /markers were removed at the end/);
+  assert.match(done, /\| Step \| Title \|\n\|---\|---\|\n\| 1 \| /);
+  assert.match(done, /Finalized: every step filled/);
+});
