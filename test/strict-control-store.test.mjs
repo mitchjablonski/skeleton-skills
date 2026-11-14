@@ -1,0 +1,47 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {captureStrictManifest} from '../lib/strict-capture.mjs';
+import {createCaptureStore,openCaptureStore} from '../lib/strict-capture-store.mjs';
+import {createHumanAuthorityStore,openHumanAuthorityStore} from '../lib/strict-human-authority-store.mjs';
+import {HUMAN_AUTHORITY_POLICY} from '../lib/strict-human-authority.mjs';
+import {deriveHumanCode} from '../lib/strict-human-command.mjs';
+import {createControlConsole,CONSOLE_COPY} from '../lib/strict-control-console.mjs';
+
+test('console recovers lost durable approval and end replies with the original identities',{skip:process.platform!=='linux'},async t=>{
+ const base=fs.mkdtempSync(path.join(os.tmpdir(),'control-store-'));t.after(()=>fs.rmSync(base,{recursive:true,force:true}));
+ const work=path.join(base,'work');fs.mkdirSync(work);fs.writeFileSync(path.join(work,'file'),'// SKEL[1] body\nreturn 1;\n// /SKEL[1]\n');
+ const fd=fs.openSync(work,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY);t.after(()=>fs.closeSync(fd));
+ const capture=()=>captureStrictManifest(fd,[{path:'file',mode:'fenced'}]),observed=capture();
+ const captures=createCaptureStore(path.join(base,'captures'));captures.put(observed);
+ const dir=path.join(base,'authority'),file=path.join(dir,'human-authority.json'),record=()=>JSON.parse(fs.readFileSync(file,'utf8'));
+ const counts={observe:0,clock:0,key:0,epoch:0,round:0};
+ const deps={captureStore:captures,observeUnderLock(){counts.observe++;assert.ok(fs.statSync(path.join(dir,'.authority-lock')).isDirectory());return capture();},clock(){counts.clock++;return '2026-11-14T12:00:00.000Z';},keyBytes(){counts.key++;return Buffer.alloc(32,7);},epochId(){counts.epoch++;return 'epoch';},roundId(){counts.round++;return 'next-round';}};
+ const state={protocolVersion:2,projectId:'p',sessionId:'s',reviewRoundId:'round',phase:'skeleton',revision:0,reviewVersion:observed.shapeVersion,captureVersion:observed.captureVersion,approvedVersion:null,approvedCaptureVersion:null};
+ let writer=createHumanAuthorityStore(dir,{state,policy:{policyVersion:HUMAN_AUTHORITY_POLICY,roundMismatchCap:2,sessionMismatchCap:4,commandCap:20,authorityCap:10}},deps);
+ const r=record(),code=deriveHumanCode(r.authority.state,'approve',Buffer.from(r.epochs.at(-1).keyHex,'hex'));
+ const calls=[],results=[],lost=new Set(['verifyAndCommit','endSession']);
+ const invoke=(operation,args)=>{calls.push({operation,args:{...args}});const result=writer[operation](args);results.push(result);if(lost.delete(operation)){assert.equal(result.kind,operation==='endSession'?'admissions-revoked':'committed');throw Error('fixture dropped committed response');}return result;};
+ let ids=0;const ui=createControlConsole({newRequestId:()=>`console-${++ids}`,authority:{verifyAndCommit:args=>invoke('verifyAndCommit',args),endSession:args=>invoke('endSession',args)}});
+ const fail=()=>{throw Error('replay invoked protected callback');};
+ const reopen=()=>{writer=openHumanAuthorityStore(dir,{projectId:'p',sessionId:'s'},{captureStore:openCaptureStore(path.join(base,'captures')),observeUnderLock:fail,clock:fail,keyBytes:fail,epochId:fail,roundId:fail});};
+ assert.deepEqual(await ui.handle('approve '+code),[CONSOLE_COPY.unknownOutcome]);
+ assert.equal(ui.kept().requestId,'console-1');assert.equal(record().commands.length,1);assert.equal(record().authority.journal.length,1);
+ assert.equal(record().authority.state.phase,'fill');assert.equal(record().authority.state.approvedCaptureVersion,observed.captureVersion);
+ const approvalBytes=fs.readFileSync(file),approvalCounts={...counts};reopen();
+ await ui.handle('retry');assert.match((await ui.handle('yes'))[0],/^Recorded: approve/);
+ assert.deepEqual(calls[1],calls[0]);assert.deepEqual(results[1],results[0]);assert.equal(ui.kept(),null);
+ assert.deepEqual(fs.readFileSync(file),approvalBytes);assert.deepEqual(counts,approvalCounts);
+ // A new end needs only the host clock; its recovery must need no protected callback.
+ writer=openHumanAuthorityStore(dir,{projectId:'p',sessionId:'s'},deps);
+ await ui.handle('end');assert.deepEqual(await ui.handle('yes'),[CONSOLE_COPY.endUnknown]);
+ assert.equal(record().current.admissions,'revoked');assert.equal(record().commands.length,2);assert.equal(record().authority.journal.length,1);
+ const endBytes=fs.readFileSync(file),endCounts={...counts};assert.equal(endCounts.clock,approvalCounts.clock+1);assert.equal(endCounts.observe,1);assert.equal(endCounts.key,1);assert.equal(endCounts.epoch,1);assert.equal(endCounts.round,0);
+ assert.deepEqual(await ui.handle('approve '+code),[CONSOLE_COPY.ending]);assert.equal(calls.length,3);
+ reopen();await ui.handle('end');assert.deepEqual(await ui.handle('yes'),[CONSOLE_COPY.revoked]);
+ assert.deepEqual(calls[3],calls[2]);assert.deepEqual(results[3],results[2]);assert.equal(ids,2);assert.equal(ui.ended(),true);
+ assert.deepEqual(fs.readFileSync(file),endBytes);assert.deepEqual(counts,endCounts);
+ assert.equal(record().commands.length,2);assert.equal(record().authority.journal.length,1);
+});

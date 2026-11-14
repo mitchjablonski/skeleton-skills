@@ -8,6 +8,7 @@ import {createCaptureStore,openCaptureStore} from '../../lib/strict-capture-stor
 import {createHumanAuthorityStore,openHumanAuthorityStore} from '../../lib/strict-human-authority-store.mjs';
 import {HUMAN_AUTHORITY_POLICY} from '../../lib/strict-human-authority.mjs';
 import {deriveHumanCode} from '../../lib/strict-human-command.mjs';
+import {createControlConsole,CONSOLE_COPY} from '../../lib/strict-control-console.mjs';
 import {assertSelectedFill} from './strict-candidate-inner.mjs';
 const [action,source,session,caseName]=process.argv.slice(2);
 const members=['context.txt','plan.js'];
@@ -28,11 +29,21 @@ try{
   const state={protocolVersion:2,projectId:'fixture',sessionId:'fixture',reviewRoundId:'round',phase:'skeleton',reviewVersion:observed.shapeVersion,captureVersion:observed.captureVersion,approvedVersion:null,approvedCaptureVersion:null,revision:0};
   const store=createHumanAuthorityStore(dir,{state,policy:{policyVersion:HUMAN_AUTHORITY_POLICY,roundMismatchCap:2,sessionMismatchCap:4,commandCap:20,authorityCap:10}},{captureStore:captures,observeUnderLock(){assert.ok(fs.statSync(path.join(dir,'.authority-lock')).isDirectory());observations++;return capture(staged);}});
   const r=record(),key=Buffer.from(r.epochs.at(-1).keyHex,'hex');
-  const command={requestId:'fixture-injected-approve',action:'approve',code:deriveHumanCode(r.authority.state,'approve',key)};
-  const result=store.verifyAndCommit(command);assert.equal(result.kind,'committed');assert.equal(observations,1);
+  const code=deriveHumanCode(r.authority.state,'approve',key);let writer=store,command,result,sends=0,ids=0;
+  const control=createControlConsole({newRequestId(){ids++;return 'fixture-injected-approve';},authority:{verifyAndCommit(args){
+   sends++;const reply=writer.verifyAndCommit(args);assert.equal(reply.kind,'committed');
+   if(sends===1){command={...args};result=reply;throw Error('fixture dropped committed response');}
+   assert.deepEqual(args,command);assert.deepEqual(reply,result);return reply;
+  }}});
+  assert.deepEqual(await control.handle('approve '+code),[CONSOLE_COPY.unknownOutcome]);
+  const committedBytes=fs.readFileSync(path.join(dir,'human-authority.json'));
+  writer=openHumanAuthorityStore(dir,{projectId:'fixture',sessionId:'fixture'},{captureStore:openCaptureStore(path.join(session,'captures')),observeUnderLock:fail,clock:fail,keyBytes:fail,epochId:fail,roundId:fail});
+  await control.handle('retry');assert.match((await control.handle('yes'))[0],/^Recorded: approve/);
+  assert.equal(control.kept(),null);assert.equal(sends,2);assert.equal(ids,1);assert.equal(observations,1);
+  assert.deepEqual(fs.readFileSync(path.join(dir,'human-authority.json')),committedBytes);
   const after=record();assert.equal(after.commands.length,1);assert.equal(after.authority.journal.length,1);assert.equal(after.authority.state.phase,'fill');
   fs.writeFileSync(path.join(session,'fixture-command.json'),JSON.stringify({command,result}),{mode:0o600,flag:'wx'});
-  answer={ok:true,strictState:'unverified',action:'prepare',reviewVersion:observed.shapeVersion,captureVersion:observed.captureVersion,trace:['private-copy','enumerate','independent-capture','durable-capture-put','authority-reference','protected-observer-under-lock','durable-injected-approve']};
+  answer={ok:true,strictState:'unverified',action:'prepare',reviewVersion:observed.shapeVersion,captureVersion:observed.captureVersion,trace:['private-copy','enumerate','independent-capture','durable-capture-put','authority-reference','protected-observer-under-lock','console-injected-approve','lost-approval-response','console-same-id-retry']};
  }else{
   const captures=openCaptureStore(path.join(session,'captures')),saved=JSON.parse(fs.readFileSync(path.join(session,'fixture-command.json'),'utf8'));
   const before=fs.readFileSync(path.join(session,'authority','human-authority.json'));
