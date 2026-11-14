@@ -3271,13 +3271,42 @@ test("#18: skel processes racing the migration all succeed and lose nothing", { 
   for (let round = 0; round < 3; round++) {
     const m = legacyProject();
     const before = m.records();
-    const codes = await Promise.all(Array.from({ length: 6 }, () => new Promise((resolve) => {
-      spawn("node", [BIN, "migrate"], { cwd: m.dir, env: m.env, stdio: "ignore" }).on("exit", resolve);
+    const children = await Promise.all(Array.from({ length: 6 }, () => new Promise((resolve) => {
+      const child = spawn(process.execPath, [BIN, "migrate"], { cwd: m.dir, env: m.env, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "", error = null, timedOut = false;
+      child.stdout.on("data", data => { stdout += data.toString().slice(0, Math.max(0, 8192 - stdout.length)); });
+      child.stderr.on("data", data => { stderr += data.toString().slice(0, Math.max(0, 8192 - stderr.length)); });
+      child.on("error", err => { error = err.code ?? err.message; });
+      const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 30_000);
+      child.on("close", (code, signal) => { clearTimeout(timer); resolve({ code, signal, stdout, stderr, error, timedOut }); });
     })));
-    assert.deepEqual(codes, [0, 0, 0, 0, 0, 0]);
+    assert.deepEqual(children.map(child => child.code), [0, 0, 0, 0, 0, 0], `round ${round}: ${JSON.stringify(children)}`);
     inNew(m, before);
     assert.deepEqual(onlyFiles(m.newDir).filter((f) => f.includes(".migrate.")), []);
   }
+});
+
+test("#18: migration planning observes a competing commit before classifying missing old files", () => {
+  const m = legacyProject();
+  const before = m.records();
+  const options = { key: m.key, from: m.oldDir, to: m.newDir, keyOf: projectKey };
+  const read = fs.readFileSync;
+  let reads = 0, committed = false;
+  fs.readFileSync = function(file, ...args) {
+    const bytes = read.call(this, file, ...args);
+    // First read is anyOld; the second is the first per-file scan. Commit a
+    // real competing migration after that old read but before the next suffix.
+    if (file === m.oldFile("") && ++reads === 2) {
+      committed = true;
+      migrateProject(options);
+    }
+    return bytes;
+  };
+  try { assert.doesNotThrow(() => migrateProject(options)); }
+  finally { fs.readFileSync = read; }
+  assert.equal(committed, true, "forced the competing commit during the scan");
+  inNew(m, before);
+  assert.deepEqual(onlyFiles(m.oldDir), [`${m.key}.migrated`]);
 });
 
 test("#18: migrateProject: a lost race, a filesystem without hard links, and one dir reached two ways", () => {
