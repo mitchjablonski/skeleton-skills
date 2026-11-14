@@ -181,6 +181,7 @@ For no HTTP listener, use `skel review` to generate a static HTML file, then reg
 | `skel init "<title>" [--gate ask\|deny] [--force]` | Start a skeleton (`.skeleton/state.json`); won't replace one in progress without `--force` |
 | `skel track <file…>` | Include unfenced skeleton files (e.g. new types) in the review; must be inside the project |
 | `skel status [--json]` | Phase, active step, each step's status, and diagram nodes that match no step |
+| `skel pr` | Print a Markdown pull-request body from the plan: the steps with their status and locations, the architecture diagrams, and the approved version and drift result. Read-only; paste it into your PR |
 | `skel serve [--port N] [--send] [--stop]` | Default: live read-only review; copy feedback into chat. `--send` enables direct feedback delivery. Prints the page's URL with its token (`#t=…`). Reuses a server in the same mode, and prints the same URL; uses a stable port per project |
 | `skel review` | Static `.skeleton/review.html` with no HTTP listener; copy feedback into chat |
 | `skel feedback [--wait S]` | Send-mode only: print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise, `READ_ONLY` at once for a read-only server, or `NO_SERVER` when none has answered for 10s) |
