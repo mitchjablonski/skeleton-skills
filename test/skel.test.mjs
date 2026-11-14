@@ -4324,3 +4324,46 @@ test("#48 upgrade: a protected #43-only server without feedback ordering is repl
     assert.match(run("serve"), /already running/);
   } finally { await current?.stop(); await old.stop(); }
 });
+
+test("skel pr: a read-only Markdown PR body through scaffold, fill and done", () => {
+  const { dir, a, run } = project();
+  run("init", "Stroke smoothing");
+  const statePath = path.join(dir, ".skeleton", "state.json");
+  const before = fs.readFileSync(statePath, "utf-8");
+  const scaffold = run("pr");
+  assert.match(scaffold, /^## Stroke smoothing\n/);
+  assert.match(scaffold, /hasn't been approved yet/);
+  assert.match(scaffold, /\| 1 \| .* \| to do \| `src\/a\.ts:\d+` \|/);
+  assert.equal(fs.readFileSync(statePath, "utf-8"), before, "pr changes no state");
+  run("approve");
+  run("next");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
+  const fill = run("pr");
+  assert.match(fill, /Approved skeleton version: `[0-9a-f]+`/);
+  assert.match(fill, /\| 1 \| .* \| being filled \|/);
+  assert.match(fill, /Drift from the approved skeleton \(its own files\): none\./);
+  run("done"); run("next");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
+  run("done"); run("finalize");
+  const done = run("pr");
+  assert.match(done, /markers were removed at the end/);
+  assert.match(done, /\| Step \| Title \|\n\|---\|---\|\n\| 1 \| /);
+  assert.match(done, /Finalized: skel finalize ran, which requires every step filled and no drift/);
+});
+
+test("skel pr: a stale approval record isn't shown as this approval's, and marker errors are listed", () => {
+  const { dir, a, run } = project();
+  run("init", "Stroke smoothing");
+  run("approve");
+  const statePath = path.join(dir, ".skeleton", "state.json");
+  const st = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  fs.writeFileSync(statePath, JSON.stringify({ ...st, reviewEpoch: st.reviewEpoch + 1 }));
+  const stale = run("pr");
+  assert.match(stale, /\*\*The approval record can't be used\*\* \(the record of the approved skeleton belongs to a different approval\)/);
+  assert.doesNotMatch(stale, /Approved skeleton version|Source baseline|Drift from the approved skeleton: yes/);
+  fs.writeFileSync(statePath, JSON.stringify(st));
+  fs.appendFileSync(a, "\n// SKEL[9] never closed\n");
+  const broken = run("pr");
+  assert.match(broken, /\*\*Marker problems\*\*/);
+  assert.match(broken, /SKEL\\\[9\\\]/);
+});
