@@ -194,11 +194,11 @@ lt("journal identity includes the operation; a lost end reply retries exactly; n
   authority.loseNextReply();
   await assert.rejects(authority.endSession({ requestId: "e-1" }), /reply lost/);
   assert.equal(authority.endEffects(), 1);
-  assert.deepEqual(await authority.endSession({ requestId: "e-1" }), { requestId: "e-1", kind: "ended" });
+  assert.deepEqual(await authority.endSession({ requestId: "e-1" }), { requestId: "e-1", kind: "admissions-revoked", at: "2026-11-14T00:00:00Z" });
   assert.equal(authority.endEffects(), 1, "the exact retry came from the journal");
   // The console then sees the session as ended.
   await con.handle("end");
-  assert.match((await con.handle("yes"))[0], /session has ended/);
+  assert.match((await con.handle("yes"))[0], /New decisions are now closed/);
   // After closure: no recapture effects (revision, selected capture, counters) and no decisions.
   const before = authority.authorityState();
   assert.deepEqual(await authority.recapture({ requestId: "x-2" }), { requestId: "x-2", kind: "rejected", code: "session-ended" });

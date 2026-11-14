@@ -155,7 +155,7 @@ test("recapture: needs yes, warns and abandons a kept request, reports changed/u
 });
 
 test("end: needs yes, warns about a kept request, then every command but status/help is refused", async () => {
-  const { m, c } = make({ verify: [unavailable], end: [echo({ kind: "ended" })] });
+  const { m, c } = make({ verify: [unavailable], end: [echo({ kind: "admissions-revoked", at: AT })] });
   await c.handle("approve K7M2-QX9D");
   assert.equal((await c.handle("end"))[0], C.endAbandons);
   await c.handle("yes");
@@ -216,7 +216,7 @@ test("prototype: pure (no I/O imports), and nothing in lib/bin loads it", () => 
 
 test("a failing request-id factory sends nothing and never abandons a pending retry", async () => {
   let fail = false, n = 0;
-  const m = mock({ verify: [unavailable], recapture: [echo({ kind: "recaptured", changed: false, revision: 1, reviewVersion: A, captureVersion: B })], end: [echo({ kind: "ended" })] });
+  const m = mock({ verify: [unavailable], recapture: [echo({ kind: "recaptured", changed: false, revision: 1, reviewVersion: A, captureVersion: B })], end: [echo({ kind: "admissions-revoked", at: AT })] });
   const c = createControlConsole({ authority: m.authority, newRequestId: () => { if (fail) throw new Error("rng"); return `id-${++n}`; } });
   await c.handle("approve K7M2-QX9D");
   const before = c.kept();
@@ -233,7 +233,7 @@ test("a failing request-id factory sends nothing and never abandons a pending re
 });
 
 test("an end with an unknown outcome blocks every other request until it ends", async () => {
-  const { m, c } = make({ verify: [unavailable], end: [unavailable, echo({ kind: "ended" })] });
+  const { m, c } = make({ verify: [unavailable], end: [unavailable, echo({ kind: "admissions-revoked", at: AT })] });
   await c.handle("approve K7M2-QX9D");
   await c.handle("end");
   assert.deepEqual(await c.handle("yes"), [C.endUnknown]);
@@ -259,4 +259,32 @@ test("journal-full copy follows R4: earlier requests still resolve, recovery is 
   assert.match(C.journalFull, /Earlier requests still resolve/);
   assert.match(C.journalFull, /recovery outside this session/);
   assert.doesNotMatch(C.journalFull, /new journal|End the session/);
+});
+
+test("end closes decisions only: the copy never says the session or its processes ended", async () => {
+  const { c } = make({ end: [echo({ kind: "admissions-revoked", at: AT })], state: [{ phase: "fill", revision: 3, reviewVersion: A, captureVersion: B, admissions: "revoked" }] });
+  const prompt = await c.handle("end");
+  assert.match(prompt.join(" "), /doesn't stop the agent/);
+  const out = await c.handle("yes");
+  assert.deepEqual(out, [C.revoked]);
+  assert.match(C.revoked, /doesn't stop the agent or prove any process has exited/);
+  for (const line of [C.revoked, C.ended, C.endUnknown, C.ending, C.endAbandons, C.rejectedDecision["session-ended"], C.rejectedRecapture["session-ended"]])
+    assert.doesNotMatch(line, /session (has )?ended|processes? (stopped|exited)(?! or)|was stopped/i, line);
+  assert.match((await c.handle("status")).join(" "), /New decisions are closed for this session/);
+});
+
+test("an admissions-revoked reply without a valid time, or an 'ended' reply, is not taken as revocation", async () => {
+  for (const reply of [echo({ kind: "admissions-revoked" }), echo({ kind: "admissions-revoked", at: "now" }), echo({ kind: "ended" })]) {
+    const { c } = make({ end: [reply] });
+    await c.handle("end");
+    assert.deepEqual(await c.handle("yes"), [C.endUnknown]);
+    assert.equal(c.ended(), false);
+  }
+});
+
+test("status accepts a state without admissions, and refuses an unknown admissions value", async () => {
+  const ok = make({ state: [{ phase: "skeleton", revision: 0, reviewVersion: A, captureVersion: B }] }).c;
+  assert.match((await ok.handle("status"))[0], /^Phase skeleton/);
+  const bad = make({ state: [{ phase: "skeleton", revision: 0, reviewVersion: A, captureVersion: B, admissions: "open" }] }).c;
+  assert.match((await bad.handle("status"))[0], /state is unknown/);
 });

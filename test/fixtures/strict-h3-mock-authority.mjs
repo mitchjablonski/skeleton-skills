@@ -90,9 +90,9 @@ export function createMockH3Authority({ projectId, sessionId, pair, key, maxAtte
       const prior = lookup(cmd.requestId, identity); // journal first: a reused id never replaces its entry
       if (prior) return prior;
       ended = true; endEffects += 1;
-      return finish(cmd.requestId, identity, { kind: "ended" });
+      return finish(cmd.requestId, identity, { kind: "admissions-revoked", at: at() }); // closes decisions; stops nothing
     },
-    async state() { return { phase, revision, reviewVersion: selected.reviewVersion, captureVersion: selected.captureVersion }; },
+    async state() { return { phase, revision, reviewVersion: selected.reviewVersion, captureVersion: selected.captureVersion, admissions: ended ? "revoked" : "live" }; },
 
     // --- issuance for the protected page, and test hooks ---
     authorityState,

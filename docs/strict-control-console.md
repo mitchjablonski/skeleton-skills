@@ -42,8 +42,8 @@ recapture({ requestId }) ->
   { kind: "recaptured", requestId, changed, revision, reviewVersion, captureVersion }
   { kind: "refused", requestId, reason: "fill-phase" | "locked" }
   (plus rejected / journal-full / record-unreadable / unavailable as above)
-endSession({ requestId }) -> { kind: "ended", requestId }
-state() -> { phase, revision, reviewVersion, captureVersion }
+endSession({ requestId }) -> { kind: "admissions-revoked", requestId, at }   // closes new decisions only
+state() -> { phase, revision, reviewVersion, captureVersion, admissions? }   // admissions: "live" | "revoked"
 ```
 
 **Order of checks.** The authority looks up an exact same-ID retry in its
