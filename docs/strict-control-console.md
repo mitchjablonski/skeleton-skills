@@ -27,7 +27,7 @@ state. All of that belongs to Codex (#76).
 
 Every reply echoes the request's `requestId`. A reply without it, or with
 another id, is malformed and the outcome is unknown. Replies are read as own
-data properties only, so a getter or a proxy trap is also malformed.
+data properties only; unexpected own fields, accessors and throwing proxy traps are malformed. No authority-supplied text is printed.
 
 ```js
 verifyAndCommit({ action, code, requestId }) ->
@@ -42,8 +42,11 @@ recapture({ requestId }) ->
   { kind: "recaptured", requestId, changed, revision, reviewVersion, captureVersion }
   { kind: "refused", requestId, reason: "fill-phase" | "locked" }
   (plus rejected / journal-full / record-unreadable / unavailable as above)
-endSession({ requestId }) -> { kind: "ended", requestId }
-state() -> { phase, revision, reviewVersion, captureVersion }
+endSession({ requestId }) -> { kind: "admissions-revoked", requestId, at }
+  // at: canonical UTC ISO milliseconds, e.g. 2026-11-13T04:00:00.000Z
+  // legacy compatibility only: { kind: "ended", requestId }
+state() -> { phase, revision, reviewVersion, captureVersion, admissions: "live" | "revoked" }
+  // legacy four-field state without admissions is also accepted
 ```
 
 **Order of checks.** The authority looks up an exact same-ID retry in its
@@ -55,8 +58,9 @@ console keeps the request and says the outcome is still unknown.
 **Request ids.** The launcher's `newRequestId` must return a unique id from a
 CSPRNG. The console doesn't detect reuse. If the factory throws or returns an
 invalid id, nothing is sent, and a pending retry is never abandoned. The
-replacement id is generated before `recapture` or `end` clears the kept
-request.
+replacement id is generated before `recapture` or the first `end` clears the kept
+request. An unknown end retains its original request id; confirming `end` again
+resends that same request without consulting the id factory.
 
 ## Rules (enforced by `test/strict-control-console.test.mjs`)
 
@@ -93,9 +97,19 @@ request.
   revision and the attempts left. It never echoes the code and has no history
   oracle.
 - **End.** Once `end` is confirmed, the console refuses every command
-  except `end`, `status` and `help` until an `ended` reply arrives. It stays
-  that way while the outcome is unknown. After `ended`, only `status` and
-  `help` work.
+  except `end`, `status` and `help` until a valid, matching closure reply arrives.
+  `admissions-revoked` requires a real canonical UTC millisecond timestamp;
+  malformed timestamps, wrong ids, unsafe replies and throws keep the ending
+  gate and original end id. After closure, only `status` and `help` work.
+  Closure means new decision admissions are closed. It proves no process died
+  and supplies no supervisor evidence, teardown completion or restart permission.
+  The legacy `ended` reply is explicitly described as logical closure only.
+- **State admission notice.** Optional `admissions` must be exactly `live` or
+  `revoked` when present. A revoked state adds the same truthful closed notice.
+  A state read never reconciles an unknown request, clears an ending gate or
+  changes `ended()`. Legacy four-field state remains readable.
+- **Lock copy.** `new-session` is neutral about whether a round or session cap
+  fired, and directs recovery to the protected host outside this console.
 - **Prompts.** Any other command cancels a pending yes/no question,
   including `status`, `help` and a refused line.
 - **Resend mismatch and lock.** Under journal-first lookup, these would
@@ -106,3 +120,8 @@ request.
   - Output is only fixed copy, validated 12-hex prefixes, integers and a
     validated UTC timestamp. The echo comes from the committed reply.
   - Raw input and authority-supplied text never appear in it.
+
+The disabled [private human authority store](strict-human-authority-store.md)
+supplies the durable `admissions-revoked` reply and five-field state contract.
+This text-layer compatibility adds no store, listener, writer, launcher or runtime
+wiring. Its `ended()` accessor reports confirmed logical admission closure only.

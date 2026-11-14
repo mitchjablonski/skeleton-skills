@@ -260,3 +260,53 @@ test("journal-full copy follows R4: earlier requests still resolve, recovery is 
   assert.match(C.journalFull, /recovery outside this session/);
   assert.doesNotMatch(C.journalFull, /new journal|End the session/);
 });
+
+test("durable admission closure validates time, keeps the original end id, and proves no process stop", async () => {
+  const at = "2026-11-13T04:00:00.000Z";
+  const invalid = [
+    echo({ kind: "admissions-revoked" }),
+    ...[AT, "2026-02-30T04:00:00.000Z", "2026-11-13T24:00:00.000Z", "2026-11-13T04:00:00.00Z", "bad"].map(at => echo({ kind: "admissions-revoked", at })),
+    () => ({ kind: "admissions-revoked", requestId: "wrong", at }),
+    echo({ kind: "admissions-revoked", at, action: "approve" }),
+    a => Object.defineProperty({ kind: "admissions-revoked", requestId: a.requestId, at }, "extra", { get() { throw Error("never read"); } }),
+    a => Object.defineProperty({ kind: "admissions-revoked", requestId: a.requestId }, "at", { get() { throw Error("never read"); } }),
+    () => new Proxy({}, { ownKeys() { throw Error("trap"); } }),
+    () => { throw Error("transport"); }, unavailable,
+  ];
+  for (const reply of invalid) {
+    const { m, c } = make({ end: [reply, echo({ kind: "admissions-revoked", at })], state: [{ phase: "skeleton", revision: 1, reviewVersion: A, captureVersion: B, admissions: "revoked" }] });
+    await c.handle("end"); assert.deepEqual(await c.handle("yes"), [C.endUnknown]);
+    assert.equal(c.ended(), false);
+    const status = await c.handle("status");
+    assert.ok(status.includes(C.admissionsClosed)); assert.ok(status.includes(C.ending));
+    for (const cmd of ["approve K7M2-QX9D", "recapture", "retry"]) assert.deepEqual(await c.handle(cmd), [C.ending]);
+    await c.handle("end"); assert.deepEqual(await c.handle("yes"), [C.admissionsClosed]);
+    const calls = m.calls.filter(x => x.name === "end");
+    assert.equal(calls[0].arg.requestId, calls[1].arg.requestId);
+    assert.equal(c.ended(), true);
+    assert.match(C.admissionsClosed, /does not prove that any process stopped/);
+  }
+});
+
+test("legacy ended has explicitly logical semantics", async () => {
+  const { c } = make({ end: [echo({ kind: "ended" })] });
+  await c.handle("end"); assert.deepEqual(await c.handle("yes"), [C.legacyEnded]);
+  assert.match(C.legacyEnded, /logical closure only/);
+});
+
+test("state supports four legacy fields or explicit live/revoked admissions without reconciling requests", async () => {
+  const base = { phase: "skeleton", revision: 1, reviewVersion: A, captureVersion: B };
+  for (const state of [base, { ...base, admissions: "live" }, { ...base, admissions: "revoked" }]) {
+    const { c } = make({ verify: [unavailable], state: [state] });
+    await c.handle("approve K7M2-QX9D"); const before = c.kept();
+    const out = await c.handle("status"); assert.match(out[0], /^Phase skeleton/);
+    assert.equal(out.includes(C.admissionsClosed), state.admissions === "revoked");
+    assert.deepEqual(c.kept(), before); assert.equal(c.ended(), false);
+  }
+  for (const state of [{ ...base, admissions: undefined }, { ...base, admissions: "ended" }, { ...base, extra: 1 },
+    Object.defineProperty({ ...base }, "admissions", { get() { throw Error("getter"); } }),
+    new Proxy(base, { ownKeys() { throw Error("trap"); } })]) {
+    const { c } = make({ state: [state] }); assert.match((await c.handle("status"))[0], /state is unknown/);
+  }
+  assert.doesNotMatch(C.locked["new-session"], /review round|strict session/);
+});
