@@ -24,7 +24,7 @@ export function createMockH3Authority({ projectId, sessionId, pair, key, maxAtte
     reviewVersion: selected.reviewVersion, captureVersion: selected.captureVersion,
     approvedVersion: approved?.reviewVersion ?? null, approvedCaptureVersion: approved?.captureVersion ?? null, revision,
   });
-  const at = () => clock().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const at = () => clock().toISOString(); // same .mmmZ shape the real authority sends
   const finish = (requestId, identity, body) => {
     const reply = Object.freeze({ requestId, ...body });
     journal.set(requestId, { identity, reply });

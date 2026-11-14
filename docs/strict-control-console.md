@@ -92,10 +92,17 @@ request.
 - **Mismatch.** The copy is generic. It shows the current prefixes, the
   revision and the attempts left. It never echoes the code and has no history
   oracle.
-- **End.** Once `end` is confirmed, the console refuses every command
-  except `end`, `status` and `help` until an `ended` reply arrives. It stays
-  that way while the outcome is unknown. After `ended`, only `status` and
-  `help` work.
+- **End.** `end` asks the authority to close new decision admission. The
+  reply, `admissions-revoked`, closes decisions only: it doesn't stop the
+  agent or prove any process exited. The launcher's own stop does that, and
+  no console line says the session or its processes ended.
+  - Once `end` is confirmed, the console refuses every command except `end`,
+    `status` and `help` until `admissions-revoked` arrives. It stays that way
+    while the outcome is unknown.
+  - A `journal-full` reply to `end` is definitive. The console says to stop
+    the session from the launcher, instead of asking for `end` again.
+  - After revocation, only `status` and `help` work. `status` shows
+    `admissions: revoked`.
 - **Prompts.** Any other command cancels a pending yes/no question,
   including `status`, `help` and a refused line.
 - **Resend mismatch and lock.** Under journal-first lookup, these would

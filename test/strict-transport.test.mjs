@@ -153,7 +153,7 @@ const COPY = {
   "revision-conflict": /after this page read it, so this request was refused and made no change\. The current state has been re-read/,
   "invalid-transition": /Approve skeleton isn't allowed while the skeleton is in the skeleton phase, so this request was refused and made no change\./,
   "unauthorized-channel": /didn't arrive through the protected human channel.*Copy\/Send feedback still work/,
-  "session-ended": /session this review belongs to has ended, so this request was refused and made no change\. That doesn't show whether an earlier request committed\. Decisions from this page are off/,
+  "session-ended": /New decisions are closed for the session this review belongs to, so this request was refused and made no change\. That doesn't show whether an earlier request committed\. Decisions from this page are off/,
   unavailable: /answered "unavailable", so whether the request for aaaaaaaaaaaa was recorded is unknown, and it is not shown as approved\. Retry sends the same request.*Re-read shows the current state, which can't show whether this request was recorded/,
   "request-reused": /already used for a different decision, so this request was refused and recorded nothing/,
 };
@@ -645,7 +645,7 @@ test("#77 R6: no decision string or rendered rejection claims a Re-read, reload 
   const code = DECISION.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "").replace(/([;,{}()\]])\s*\/\/.*$/gm, "$1");
   const literals = code.match(/"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`/g);
   assert.ok(literals.length > 40, "the scan found the module's strings");
-  for (const known of ["Couldn't confirm whether the decision was recorded", "The current state can't show whether", "has ended, so this request was refused", "this retry was refused"]) {
+  for (const known of ["Couldn't confirm whether the decision was recorded", "The current state can't show whether", "belongs to, so this request was refused", "this retry was refused"]) {
     assert.ok(literals.some((l) => l.includes(known)), `the scan covers: ${known}`);
   }
   // ... and every rejection's rendered copy, for both offered actions, fresh and resent.
