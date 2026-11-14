@@ -17,7 +17,7 @@ import { deriveHumanCode, humanCommandIdentity, parseHumanCommand } from "../../
 
 export function createMockH3Authority({ projectId, sessionId, pair, key, maxAttempts = 5, clock = () => new Date(Date.UTC(2026, 10, 14)) }) {
   let round = 1, revision = 0, phase = "skeleton", selected = { ...pair }, approved = null, pending = null;
-  let attempts = 0, locked = false, ended = false, dropNextReply = false, lastWireCode = null, codesOverride = null;
+  let attempts = 0, locked = false, ended = false, dropNextReply = false, lastWireCode = null, codesOverride = null, endEffects = 0;
   const journal = new Map(); // requestId -> { identity, reply }
   const authorityState = () => ({
     protocolVersion: 2, projectId, sessionId, reviewRoundId: `round-${round}`, phase,
@@ -89,7 +89,7 @@ export function createMockH3Authority({ projectId, sessionId, pair, key, maxAtte
       const identity = idOf("endSession", args);
       const prior = lookup(cmd.requestId, identity); // journal first: a reused id never replaces its entry
       if (prior) return prior;
-      ended = true;
+      ended = true; endEffects += 1;
       return finish(cmd.requestId, identity, { kind: "ended" });
     },
     async state() { return { phase, revision, reviewVersion: selected.reviewVersion, captureVersion: selected.captureVersion }; },
@@ -112,6 +112,8 @@ export function createMockH3Authority({ projectId, sessionId, pair, key, maxAtte
     /** Make issuance return arbitrary (possibly mis-bound) codes, to test the listener/page checks. */
     overrideCodes(fn) { codesOverride = fn; },
     lastWireCode: () => lastWireCode,
+    /** How many times endSession actually executed (an exact retry must not execute again). */
+    endEffects: () => endEffects,
     loseNextReply() { dropNextReply = true; },
   };
 }

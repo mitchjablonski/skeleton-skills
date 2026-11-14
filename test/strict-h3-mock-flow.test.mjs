@@ -134,7 +134,8 @@ lt("five wrong codes lock the round; recapture keeps the lock (candidate-no-reca
   const wrong = real.startsWith("0") ? "1111-1111" : "0000-0000";
   for (let i = 0; i < 4; i++) assert.match((await con.handle(`approve ${wrong}`))[0], /doesn't match/);
   // An unchanged recapture keeps the count: the fifth failure still locks.
-  await con.handle("recapture"); assert.match((await con.handle("yes"))[0], /unchanged/);
+  await con.handle("recapture"); assert.match((await con.handle("yes"))[0], /unchanged · revision 0\./);
+  assert.equal(authority.authorityState().revision, 0, "an unchanged recapture keeps the revision");
   assert.match((await con.handle(`approve ${wrong}`))[0], /doesn't match/);
   assert.deepEqual(await con.handle(`approve ${real}`), [C.locked["new-session"]]);
   // A changed recapture keeps the lock too, and the page's fresh code is still refused.
@@ -185,11 +186,17 @@ lt("journal identity includes the operation; a lost end reply retries exactly; n
   assert.deepEqual(await authority.endSession({ requestId: "x-1" }), { requestId: "x-1", kind: "rejected", code: "request-reused" });
   assert.deepEqual(await authority.recapture({ requestId: "x-1" }), { requestId: "x-1", kind: "rejected", code: "request-reused" });
   assert.deepEqual(await authority.verifyAndCommit({ action: "approve", code: wrong, requestId: "x-1" }), first, "original entry kept");
-  // A lost end reply, retried with the SAME id, returns the journaled answer (journal first).
+  // Recapture and end carry no action/code, so only the operation tells their identities apart.
+  const rec = await authority.recapture({ requestId: "y-1" });
+  assert.equal(rec.kind, "recaptured");
+  assert.deepEqual(await authority.endSession({ requestId: "y-1" }), { requestId: "y-1", kind: "rejected", code: "request-reused" });
+  // A lost end reply, retried with the SAME id, returns the journaled answer without executing again.
   authority.loseNextReply();
   await assert.rejects(authority.endSession({ requestId: "e-1" }), /reply lost/);
+  assert.equal(authority.endEffects(), 1);
   assert.deepEqual(await authority.endSession({ requestId: "e-1" }), { requestId: "e-1", kind: "ended" });
-  // Through the console: an unknown end blocks other requests; ending again (a new id) reports ended.
+  assert.equal(authority.endEffects(), 1, "the exact retry came from the journal");
+  // The console then sees the session as ended.
   await con.handle("end");
   assert.match((await con.handle("yes"))[0], /session has ended/);
   // After closure: no recapture effects (revision, selected capture, counters) and no decisions.
@@ -197,4 +204,17 @@ lt("journal identity includes the operation; a lost end reply retries exactly; n
   assert.deepEqual(await authority.recapture({ requestId: "x-2" }), { requestId: "x-2", kind: "rejected", code: "session-ended" });
   assert.equal((await authority.verifyAndCommit({ action: "approve", code, requestId: "x-3" })).code, "session-ended");
   assert.deepEqual(authority.authorityState(), before, "nothing mutated after end");
+});
+
+lt("reshape starts a new round with fresh attempt counters", async (t) => {
+  const { page, con } = await setup(t);
+  await con.handle(`approve ${(await page()).codes.approve.code}`);
+  const reshape = (await page()).codes.reshape.code;
+  const wrong = reshape.startsWith("0") ? "1111-1111" : "0000-0000";
+  assert.equal((await con.handle(`reshape ${wrong}`))[2], "4 attempts left in this review round.");
+  assert.equal((await con.handle(`reshape ${wrong}`))[2], "3 attempts left in this review round.");
+  assert.match((await con.handle(`reshape ${reshape}`))[0], /^Recorded: reshape/);
+  const fresh = (await page()).codes.approve.code;
+  const wrong2 = fresh.startsWith("0") ? "1111-1111" : "0000-0000";
+  assert.equal((await con.handle(`approve ${wrong2}`))[2], "4 attempts left in this review round.");
 });
