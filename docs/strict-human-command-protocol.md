@@ -2,6 +2,8 @@
 
 Status: **disabled prototype contract for review; H3 is NOT ADOPTED.** This specification and its pure codec/vectors authorize no authority I/O, launcher integration, real human authentication or strict activation. Possessing a code proves neither a human typed it nor that anyone read the capture. The boundary, protected control process, capture publication, integrity, antirollback and recovery gates remain open.
 
+The separate [pure human authority candidate](strict-human-authority.md) pins `candidate-no-recapture-reset-v1` for executable replay tests: neither changed nor unchanged Recapture resets failures or rotates its key. The possible Recapture reset and lifecycle envelope discussed below remain alternative design proposals, not the behavior of that candidate. No durable writer or console integration is implemented by the pure module.
+
 ## Ownership and proposed interface
 
 A future private adapter is enrolled for one immutable project/session context. That context is obtained from protected enrollment, never command input, URLs, workspace files or the browser. Its authority owns the current round, revision, selected and approved pairs, key epoch, request ledger and attempt counters. The agent cannot read or write its implementation, store, sockets, PTY or keys. This document does not establish that isolation.
