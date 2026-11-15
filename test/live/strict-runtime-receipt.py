@@ -77,7 +77,7 @@ def _run(argv):
             if child.returncode or len(data) > 65536:
                 raise ReceiptUnavailable('metadata command failed or exceeded bound')
             return data.decode('utf-8', errors='strict').strip()
-        except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
+        except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
             raise ReceiptUnavailable('metadata command unavailable') from exc
 
 def _read(path):
@@ -200,6 +200,18 @@ def self_test():
     finally:
         subprocess.Popen, os.killpg = old_popen, old_killpg
     assert waits == [5, 2] and signals == [(13579, signal.SIGKILL)]
+    try:
+        def failed_spawn(*args, **kwargs):
+            raise subprocess.SubprocessError('fixture preexec failure')
+        subprocess.Popen = failed_spawn
+        try:
+            _run(['fixed-metadata-fixture'])
+        except ReceiptUnavailable:
+            pass
+        else:
+            raise AssertionError('spawn setup failure escaped refusal')
+    finally:
+        subprocess.Popen = old_popen
     if platform.system() == 'Linux':
         import tempfile
         with tempfile.TemporaryDirectory(prefix='runtime-digest-test-') as directory:
