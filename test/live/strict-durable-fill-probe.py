@@ -92,7 +92,10 @@ def main():
   token=str(uuid.uuid4());(root/'.fixture-owner').write_text(token)
   receipt_module=load('durable_runtime_receipt','strict-runtime-receipt.py')
   if pathlib.Path(shutil.which('bwrap')).resolve()!=pathlib.Path('/usr/bin/bwrap').resolve():raise RuntimeError('runtime receipt tool mismatch')
-  receipt=receipt_module.capture_runtime_receipt(client,node,root)
+  try:receipt=receipt_module.capture_runtime_receipt(client,node,root)
+  except receipt_module.ReceiptCleanupFailed:
+   safe_cleanup=False
+   raise
   if receipt['descriptor']['client_sha256']!=chash or receipt['descriptor']['node_sha256']!=nhash:raise RuntimeError('runtime receipt pin changed')
   result.update(runtimeReceipt=receipt)
   source=root/'source';source.mkdir(mode=0o700)

@@ -12,6 +12,8 @@ from pathlib import Path
 SCHEMA = 'strict-runtime-receipt/v1'
 class ReceiptUnavailable(RuntimeError):
     pass
+class ReceiptCleanupFailed(ReceiptUnavailable):
+    pass
 
 FIELDS = ('platform', 'kernel_release', 'machine', 'uid', 'gid', 'client_role', 'client_entrypoint_sha256', 'client_sha256',
           'client_version', 'node_sha256', 'node_version', 'bwrap_sha256', 'bwrap_version',
@@ -63,7 +65,12 @@ def _run(argv):
                     os.killpg(child.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                child.wait()
+                except OSError as exc:
+                    raise ReceiptCleanupFailed('metadata helper signal failed') from exc
+                try:
+                    child.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    raise ReceiptCleanupFailed('metadata helper cleanup unproven') from exc
                 raise
             out.seek(0)
             data = out.read(65537)
@@ -97,15 +104,31 @@ def _clone_policy():
     except (OSError, UnicodeError) as exc:
         raise ReceiptUnavailable('clone policy metadata unreadable') from exc
 
+_DIGEST_HELPER = '''import hashlib,os,stat,sys
+limit=512*1024*1024
+fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW)
+try:
+ before=os.fstat(fd)
+ if not stat.S_ISREG(before.st_mode) or before.st_size>limit:raise ValueError('digest file bound')
+ h=hashlib.sha256();size=0
+ while True:
+  chunk=os.read(fd,1024*1024)
+  if not chunk:break
+  size+=len(chunk)
+  if size>limit:raise ValueError('digest file bound')
+  h.update(chunk)
+ after=os.fstat(fd)
+ if size!=before.st_size or any(getattr(before,k)!=getattr(after,k) for k in ('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns')):raise ValueError('digest file changed')
+ print(h.hexdigest())
+finally:os.close(fd)
+'''
+
 def _digest(path):
-    h = hashlib.sha256()
-    try:
-        with open(path, 'rb') as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b''):
-                h.update(chunk)
-    except OSError as exc:
-        raise ReceiptUnavailable('executable unavailable') from exc
-    return h.hexdigest()
+    # Hashing is also a bounded child operation, including open/read stalls.
+    digest = _run([sys.executable, '-I', '-c', _DIGEST_HELPER, str(path)])
+    if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+        raise ReceiptUnavailable('invalid executable digest')
+    return digest
 
 def capture_runtime_receipt(client, node, root, *, client_role='pinned-cli', client_entrypoint=None):
     if platform.system() != 'Linux':
@@ -156,6 +179,42 @@ def self_test():
             pass
         else:
             raise AssertionError('malformed observations accepted')
+    # Cleanup cannot turn a command timeout into an unbounded wait.
+    old_popen, old_killpg = subprocess.Popen, os.killpg
+    waits, signals = [], []
+    class Stuck:
+        pid = 13579
+        returncode = None
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            raise subprocess.TimeoutExpired('fixture', timeout)
+    try:
+        subprocess.Popen = lambda *a, **k: Stuck()
+        os.killpg = lambda pid, sig: signals.append((pid, sig))
+        try:
+            _run(['fixed-metadata-fixture'])
+        except ReceiptCleanupFailed:
+            pass
+        else:
+            raise AssertionError('unproven cleanup accepted')
+    finally:
+        subprocess.Popen, os.killpg = old_popen, old_killpg
+    assert waits == [5, 2] and signals == [(13579, signal.SIGKILL)]
+    if platform.system() == 'Linux':
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='runtime-digest-test-') as directory:
+            file = Path(directory) / 'sample'
+            file.write_bytes(b'abc')
+            assert _digest(file) == hashlib.sha256(b'abc').hexdigest()
+            with file.open('wb') as stream:
+                stream.truncate(512 * 1024 * 1024 + 1)
+            for target in (file, Path(directory)):
+                try:
+                    _digest(target)
+                except ReceiptUnavailable:
+                    pass
+                else:
+                    raise AssertionError('unbounded/nonregular digest input accepted')
     print('strict-runtime-receipt self-test passed')
 
 if __name__ == '__main__':
