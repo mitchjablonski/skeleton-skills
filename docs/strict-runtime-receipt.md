@@ -1,0 +1,15 @@
+# Strict runtime receipt
+
+`test/live/strict-runtime-receipt.py` exports `capture_runtime_receipt(client, node, root)` for invocation only after pin validation and owned fixture admission. It returns schema `strict-runtime-receipt/v1`, an exact descriptor, and `fingerprint_sha256`. `ReceiptUnavailable` means required observations could not be collected; callers must refuse that receipt rather than substitute a supported profile.
+
+The fingerprint is SHA-256 of ASCII JSON containing schema and descriptor, with sorted keys and compact separators. It binds Linux kernel release and machine, UID/GID, the client role and entrypoint hash, client/Node/Bubblewrap executable hashes and reported versions, filesystem type, hashed filesystem source and mount options, namespace names, and observed user namespace sysctl values. Every field is required; strings are bounded to 4096 UTF-8 bytes. Source paths are hashed rather than disclosed. The descriptor intentionally excludes credentials and personal configuration.
+
+Metadata commands use argument arrays, no shell, five-second deadlines and 64 KiB regular-file output limits. Tools are resolved from `/usr/bin:/bin` and receive a minimal environment. Timeout cleanup signals the still-unreaped helper process group before reaping it. Collection performs no network access, installation or host setting changes. Missing required metadata or unreadable sysctls makes collection unavailable. A kernel without the optional clone-policy file records exactly `not-exposed`; this is neither an enabled flag nor a support verdict. Namespace names and sysctl observations describe prerequisites; they do not prove namespace creation succeeds.
+
+This identifies an observed candidate configuration. It does not qualify runtime support, authenticate a receipt, establish active enforcement, or eliminate executable/mount/kernel TOCTOU changes. No production status integration is included.
+
+Run `python test/live/strict-runtime-receipt.py --self-test` for injected-observation schema, ordering, fingerprint sensitivity, malformed, missing, oversized and unsupported-platform checks.
+
+The default client role is `pinned-cli`. An inherited-channel fixture can explicitly use `node-channel-control` with its fixed worker entrypoint; it never labels that helper as the actual Claude CLI. The fingerprint covers these selected observations, not every library, mount, configuration or executable replacement race. The collector itself does not authenticate its inputs or return a support boolean.
+
+Observed on 2026-11-14: receipt self-tests and the pinned durable-fill fixture passed on the measured WSL2 Linux kernel/ext4 setup with Bubblewrap 0.9.0, Node 20.20.0 and CLI 2.1.323. This kernel's optional clone-policy file was not exposed and was recorded as such. Both fill cases still returned `strictState: unverified` and `completionVerified: false`.
