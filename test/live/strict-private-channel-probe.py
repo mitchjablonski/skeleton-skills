@@ -105,7 +105,11 @@ def main():
   spec=importlib.util.spec_from_file_location('private_runtime_receipt',HERE/'strict-runtime-receipt.py')
   receipt_module=importlib.util.module_from_spec(spec);spec.loader.exec_module(receipt_module)
   if pathlib.Path(shutil.which('bwrap')).resolve()!=pathlib.Path('/usr/bin/bwrap').resolve():raise RuntimeError('runtime receipt tool mismatch')
-  receipt=receipt_module.capture_runtime_receipt(node,node,root,client_role='node-channel-control',client_entrypoint=worker)
+  try:
+   receipt=receipt_module.capture_runtime_receipt(node,node,root,client_role='node-channel-control',client_entrypoint=worker)
+  except receipt_module.ReceiptCleanupFailed:
+   cleanup_ok=False;exit_code=1
+   raise
   if receipt['descriptor']['client_sha256']!=digest or receipt['descriptor']['node_sha256']!=digest:raise RuntimeError('runtime receipt pin changed')
   result['runtimeReceipt']=receipt
   exit_code=1;result['code']='runtime-failed'
