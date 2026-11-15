@@ -15,6 +15,7 @@ import uuid
 sys.dont_write_bytecode=True
 HERE=pathlib.Path(__file__).resolve().parent
 MAX=16384
+class HelperCleanupFailed(RuntimeError):pass
 def load(name,file):
  spec=importlib.util.spec_from_file_location(name,HERE/file)
  module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
@@ -33,7 +34,12 @@ def session_command(node,root,label,arguments):
   process=subprocess.Popen([str(node),str(HERE/'strict-durable-fill-worker.mjs'),*map(str,arguments)],stdin=subprocess.DEVNULL,stdout=out,stderr=err,env={},start_new_session=True,preexec_fn=limits)
   try:process.wait(timeout=20)
   except subprocess.TimeoutExpired:
-   os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=8)
+   try:
+    try:os.killpg(process.pid,signal.SIGKILL)
+    except ProcessLookupError:pass
+    process.wait(timeout=8)
+   except (OSError,subprocess.SubprocessError) as exc:
+    raise HelperCleanupFailed('durable helper cleanup unproven') from exc
    raise RuntimeError('durable session helper timeout')
  if process.returncode or output.stat().st_size>MAX or errors.stat().st_size>MAX:
   raise RuntimeError('durable session helper failed: '+output.read_text()[:1024]+errors.read_text()[:1024])
@@ -125,6 +131,9 @@ def main():
    if verification!=expected:raise RuntimeError('candidate outcome mismatch')
    rounds.append({**evidence,'case':case,'seed':seed,'verification':verification})
   result.update(ok=True,code='durable-fill-probe-passed',rounds=rounds);code=0
+ except HelperCleanupFailed as exc:
+  safe_cleanup=False;code=1
+  result.update(ok=False,code='cleanup-failed',error=str(exc))
  except (OSError,ValueError,KeyError,RuntimeError,subprocess.SubprocessError) as exc:
   result.update(ok=False,code='durable-fill-probe-failed' if code==1 else 'unsupported',error=str(exc)[:4096])
  finally:
@@ -133,7 +142,7 @@ def main():
    if safe_cleanup:
     try:fixture.cleanup(root,parent,token)
     except (OSError,RuntimeError) as exc:result.update(ok=False,code='cleanup-failed',error=str(exc)[:1024]);code=1
-   else:result.update(ok=False,retainedScratch=str(root));code=1
+   else:result.update(ok=False,code='cleanup-failed',retainedScratch=str(root));code=1
  return finish(result,code)
 
 def finish(result,code):
