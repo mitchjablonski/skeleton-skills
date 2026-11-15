@@ -87,7 +87,7 @@ status.
 | X12 | A published profile matrix (OS, filesystem, client, runtime, tools, MCP, network), with strict refused on anything unsupported | none | — | open |
 | X13 | Launch refusals: interop enabled, a `/mnt/*` mount other than the workspace, a visible session bus, browser openers | none | — | open |
 | X14 | Agent reach: the listener, internal sockets, loopback aliases (`0.0.0.0`, `[::ffff:127.0.0.1]`, a rebinding name) and the WSL host address are unreachable from every agent path, including the model egress | none | — | open |
-| X15 | Host git doesn't run agent-written `core.fsmonitor`, hooks or filters, including Windows git on `/mnt/c` | none | — | open |
+| X15 | Host git doesn't run agent-written `core.fsmonitor`, hooks or filters, including Windows git on `/mnt/c` | `test/live/strict-host-git-config-probe.py`, `docs/strict-host-git-config-probe.md` | live-fixture | fixed Linux Git 2.43.0 source-discovery fixture only: global/local helper positive controls, neutral membership comparison and no helper sentinels during discovery. Windows Git, mounted-path behavior and broader configuration mechanisms remain open |
 | X16 | The review forward is host-to-agent only and gives the agent no outbound path | none | — | open |
 | X17 | Protected host assets unchanged; cleanup and process shutdown verified after every run | `docs/strict-checkpoint-probe.md`, `docs/strict-capture-benchmark.md` | live-fixture | per-probe fixture cleanup only; a whole-run host-asset check is open |
 | X18 | Malformed evidence and forbidden fallback: the launcher never silently falls back to unconstrained mode | none | — | open |
