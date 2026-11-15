@@ -65,9 +65,11 @@ def _run(argv):
                     os.killpg(child.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except OSError as exc:
+                    raise ReceiptCleanupFailed('metadata helper signal failed') from exc
                 try:
                     child.wait(timeout=2)
-                except subprocess.TimeoutExpired as exc:
+                except (OSError, subprocess.TimeoutExpired) as exc:
                     raise ReceiptCleanupFailed('metadata helper cleanup unproven') from exc
                 raise
             out.seek(0)
