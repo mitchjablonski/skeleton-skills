@@ -262,7 +262,7 @@ nothing worked.
 | N1 | The agent can't reach the control PTY | **Compare terminal and namespace identities**, not paths: numeric `/dev/pts/N` names collide across private devpts instances. Then test **actual delivery**: bytes written from inside the agent to every terminal it can open never arrive at the control process. **Positive controls:** the agent can use its own terminal (and its procfs view of it), and host-side writes to the control PTY do arrive | C18 |
 | N2 | No `TIOCSTI` into the control PTY | The kernel refuses `TIOCSTI` unless the target is the caller's **controlling** terminal, or the caller has `CAP_SYS_ADMIN` in the initial namespace. So the defence is the separate session (`--new-session`; CVE-2017-5226) together with N1. **Record the actual ioctl outcome** on every terminal the agent can reach. Pass means it never reaches the control PTY; `TIOCSTI` on the agent's **own** PTY may legitimately succeed when `legacy_tiocsti=1`. A hardened kernel may refuse everywhere, so a refusal alone shows nothing about isolation. `strict-runtime-receipt/v1` does **not** record `dev.tty.legacy_tiocsti`: recording it needs a new reviewed receipt schema with vectors, or a separate fixture-only observation | C18 |
 | N3 | No inherited descriptors beyond the inspected allowlist | The agent enumerates `/proc/self/fd` at start, and the result is compared with the allowlist measured on the pinned runtime | C17, X14 |
-| N4 | No display, session-bus, WSLg, Wayland/X11 or WSL interop reach | The agent's environment has no `DISPLAY`, `WAYLAND_DISPLAY` or `DBUS_SESSION_BUS_ADDRESS`, and connecting to the **actual** sockets on the measured host fails, **including abstract sockets** (`@/tmp/.X11-unix/X0`, abstract D-Bus), which only the network namespace blocks. **WSL interop isn't gated by environment variables.** `WSLInterop` is registered in binfmt_misc with the F flag (`/init` preopened), and binfmt_misc isn't per-namespace. So the gate is the `/run/WSL/*_interop` socket: it must not be mounted, and **executing a Windows (MZ) file inside the sandbox must fail**. A review on this host ran `whoami.exe` from a sandbox once `/run/WSL` was bound in. Checks against synthetic socket paths aren't evidence of WSLg or clipboard denial | X13, C18 |
+| N4 | No display, session-bus, WSLg, Wayland/X11 or WSL interop reach | The agent's environment has no `DISPLAY`, `WAYLAND_DISPLAY` or `DBUS_SESSION_BUS_ADDRESS`, and connecting to the **actual** sockets on the measured host fails, **including abstract sockets** (`@/tmp/.X11-unix/X0`, abstract D-Bus), which only the network namespace blocks. **WSL interop isn't gated by environment variables.** On the measured WSL host (kernel 6.6), `WSLInterop` is registered in binfmt_misc with the F flag (`/init` preopened), and that registration isn't per-namespace there. So the gate to test is the `/run/WSL/*_interop` socket: it must not be mounted, and **executing a Windows (MZ) file inside the sandbox must fail**. *Unverified reviewer observation, to be reproduced by a fixture:* `bwrap --unshare-all --clearenv ... whoami.exe` failed without `/run/WSL` and printed the Windows user with `--ro-bind /run/WSL /run/WSL`. Checks against synthetic socket paths aren't evidence of WSLg or clipboard denial | X13, C18 |
 | N5 | No automation or debugging endpoints | No browser profile directories are mounted, and from the agent's network namespace, connecting to the host's CDP and WebDriver ports and to abstract sockets fails. Positive control: the host itself can reach them | C20, X14 |
 | N6 | No terminal control strings from the agent reach the human's terminal | An **allowlist** filter on the agent PTY output: drop **all** OSC, DCS, APC, PM and SOS strings (OSC 52 clipboard, OSC 0/1/2 title, OSC 8 links, OSC 9 and OSC 1337 notifications), and never pass DCS through (tmux DCS wraps OSC 52). It must be a stateful parser, tested for split reads, BEL and ST terminators and the C1 introducer bytes. A real terminal emulator still needs manual acceptance | C18 |
 | N7 | Pasted control bytes and multi-line pastes are refused atomically | **#151:** a streaming parser buffers each whole line or paste and validates it before any accepted event. The current console accepts an already assembled printable line and isn't streaming evidence | C6 |
@@ -278,8 +278,13 @@ covers the #145 socketpair, durable reconnect and a fixture worker's
 descriptor and path exclusion. It proves **neither** PTY isolation **nor**
 display, automation or browser isolation.
 
-**A future launcher fixture**, Codex's #149 terminal fixture and its
-successors, can establish N1–N5 and N9–N11 **for the measured profile only**,
+**Codex's #149 terminal fixture** measures only a private PTY/devpts, proc
+and descriptor access, `TIOCSTI` observations, synthetic path and environment
+exclusion, and supervised same-group cleanup. It is not itself N1–N11 or
+full-profile evidence.
+
+**A future launcher fixture** and its successors can establish N1–N5 and
+N9–N11 **for the measured profile only**,
 which the runtime receipt fingerprints. That still says nothing about other
 profiles, and the receipt grants no support.
 
@@ -314,11 +319,14 @@ The #145 channel framing is reused unchanged.
 
 1. **Control and agent windows.** Choose candidate A or B. Under A, how does
    the agent's display-only window appear on WSL: `wt.exe` through interop
-   (on for the launcher, since binfmt_misc isn't per-namespace; refused for
-   the sandbox by withholding `/run/WSL` and failing MZ execution, N4), or a
-   WSLg terminal? This conflicts with an X13 rule that refuses launch whenever
-   interop is enabled, so X13 must become "interop unreachable from the
-   sandbox".
+   (on for the launcher, since the binfmt_misc registration isn't
+   per-namespace on the measured host; refused for the sandbox by withholding
+   `/run/WSL` and failing MZ execution, N4), or a WSLg terminal? The `wt.exe`
+   route conflicts with X13 as written, which refuses launch whenever interop
+   is enabled. Choosing it would need an explicit maintainer decision to
+   rescope X13 to "interop unreachable from the sandbox" (#79). That is a
+   **proposed alternative**, not adopted; disabled fixtures don't need the
+   choice now.
 2. **Timeouts and reopens.** The idle timeout and reconnect values, and how
    many authority reopens to allow per session (proposed: one).
 3. **Stop or pause on control-window loss.** Is a physical stop the right
