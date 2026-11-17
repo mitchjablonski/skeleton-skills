@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
-import { createControlInput, CONTROL_INPUT_MAX_LINE, REJECT_REASONS } from "../lib/strict-control-input.mjs";
+import { createControlInput, CONTROL_INPUT_MAX_LINE, CONTROL_INPUT_MAX_CHUNK, CONTROL_INPUT_MAX_PASTE_DEPTH, REJECT_REASONS } from "../lib/strict-control-input.mjs";
 
 const PS = "\x1b[200~", PE = "\x1b[201~";
 const bytes = (s) => Buffer.from(s, "latin1");
@@ -55,7 +55,8 @@ test("an invalid byte anywhere rejects the line: no prefix is ever emitted first
 });
 
 test("malformed paste framing rejects the line", () => {
-  check(`${PS}a${PS}b${PE}\r`, [R("malformed-paste")]);
+  check(`${PS}a${PS}b${PE}\r`, []); // still inside the outer paste
+  check(`${PS}a${PS}b${PE}${PE}\r`, [R("malformed-paste")]);
   check(`a${PE}b\r`, [R("malformed-paste")]);
 });
 
@@ -112,8 +113,10 @@ test("events are frozen and exact, reasons are generic and never echo input", ()
 
 test("only real Uint8Arrays are accepted: no strings, coercion, proxies or getters", () => {
   const p = createControlInput();
-  for (const bad of ["status\r", [115, 13], { length: 1, 0: 13 }, null, 42, new Proxy(new Uint8Array([13]), {})])
+  for (const bad of ["status\r", [115, 13], { length: 1, 0: 13 }, null, 42, new Proxy(new Uint8Array([13]), {})]) {
     assert.throws(() => p.push(bad), TypeError);
+    p.reset();
+  }
   let touched = false;
   const sneaky = new Uint8Array([111, 107, 13]);
   Object.defineProperty(sneaky, "length", { get() { touched = true; return 0; } });
@@ -153,8 +156,10 @@ test("end() and reset() fully clear paste, CR and poison state", () => {
 
 test("other typed arrays and Uint8Array subclass overrides can't inject bytes", () => {
   const p = createControlInput();
-  for (const bad of [new Float64Array([111.9, 107.2, 13]), new Uint16Array([0x6f, 0x6b, 13]), new BigInt64Array([1n]), new Uint8ClampedArray([13]), new DataView(new ArrayBuffer(1))])
+  for (const bad of [new Float64Array([111.9, 107.2, 13]), new Uint16Array([0x6f, 0x6b, 13]), new BigInt64Array([1n]), new Uint8ClampedArray([13]), new DataView(new ArrayBuffer(1))]) {
     assert.throws(() => p.push(bad), TypeError);
+    p.reset();
+  }
   class Evil extends Uint8Array { *[Symbol.iterator]() { yield 0x6f; yield 13; yield 0x67; yield 0x6f; yield 13; } }
   assert.deepEqual([...p.push(new Evil([0x7a, 13]))], [L("z")]);
   let touched = false;
@@ -165,6 +170,49 @@ test("other typed arrays and Uint8Array subclass overrides can't inject bytes", 
   assert.deepEqual([...p.push(Buffer.from("hi\r"))], [L("hi")]);
   const big = new Uint8Array([0x78, 0x61, 0x62, 13, 0x79]);
   assert.deepEqual([...p.push(big.subarray(1, 4))], [L("ab")]);
+});
+
+test("nested pastes never let the outer remainder become commands", () => {
+  check(`${PS}a${PS}b${PE}\rapprove K7M2-QX9D\r${PE}\r`, [R("malformed-paste")]);
+  check(`\x1b${PS}junk\rapprove K7M2-QX9D\r${PE}\r`, [R("escape")]);
+  check(`${PS}${PS}${PS}x${PE}\r${PE}\x03go\r${PE}\rok\r`, [R("malformed-paste"), L("ok")]);
+  check(`${PS}\x1b[20${PS}x${PE}\rgo\r${PE}\r`, [R("paste-content")]);
+});
+
+test("nesting beyond the bound latches until end() or reset()", () => {
+  const p = createControlInput();
+  const deep = PS.repeat(CONTROL_INPUT_MAX_PASTE_DEPTH + 1) + PE.repeat(CONTROL_INPUT_MAX_PASTE_DEPTH + 5) + "\rgo\r\x03";
+  assert.deepEqual([...p.push(bytes(deep))], []);
+  assert.deepEqual([...p.end()], [R("incomplete")]);
+  assert.deepEqual([...p.push(bytes("ok\r"))], [L("ok")]);
+  p.push(bytes(PS.repeat(CONTROL_INPUT_MAX_PASTE_DEPTH + 1)));
+  p.reset();
+  assert.deepEqual([...p.push(bytes("ok\r"))], [L("ok")]);
+});
+
+test("API errors latch and discard a pending prefix; oversized chunks are refused before copying", () => {
+  const p = createControlInput();
+  p.push(bytes("approve K7M2"));
+  assert.throws(() => p.push("x"), TypeError);
+  assert.throws(() => p.push(bytes("-QX9D\r")), /reset/);
+  p.reset();
+  assert.deepEqual([...p.push(bytes("-QX9D\r"))], [L("-QX9D")]);
+  assert.deepEqual([...p.push(new Uint8Array(CONTROL_INPUT_MAX_CHUNK))], []);
+  p.push(bytes("\r"));
+  assert.throws(() => p.push(new Uint8Array(CONTROL_INPUT_MAX_CHUNK + 1)), RangeError);
+  assert.deepEqual([...p.end()], []);
+  const ab = new ArrayBuffer(4), u = new Uint8Array(ab);
+  structuredClone(ab, { transfer: [ab] });
+  assert.throws(() => p.push(u), TypeError);
+});
+
+test("options are exact: no getters, extra keys or coercion", () => {
+  let touched = false;
+  const g = {}; Object.defineProperty(g, "maxLine", { enumerable: true, get() { touched = true; return 5; } });
+  for (const bad of [g, { maxLine: 5, x: 1 }, Object.create({ maxLine: 5 }), null, 5, { maxLine: "5" }, { maxLine: 2.5 }])
+    assert.throws(() => createControlInput(bad));
+  assert.equal(touched, false);
+  createControlInput({}); createControlInput({ maxLine: 10 }); createControlInput();
 });
 
 test("prototype: imports nothing, and nothing in lib/bin loads it", () => {
