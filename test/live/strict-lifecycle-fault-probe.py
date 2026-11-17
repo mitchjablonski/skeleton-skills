@@ -156,17 +156,34 @@ def parent_of(pid):
         return None
 
 
+def zombie(pid):
+    """True only when the whole thread group has exited and awaits reaping.
+
+    A leader that called pthread_exit shows state Z while other threads run,
+    so every task must be Z or X. A task that vanishes mid-read counts as gone.
+    """
+    try:
+        tasks = os.listdir("/proc/%d/task" % pid)
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    for tid in tasks:
+        try:
+            with open("/proc/%d/task/%s/stat" % (pid, tid)) as source:
+                data = source.read(4096)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if data[data.rindex(")") + 2:].split()[0] not in ("Z", "X"):
+            return False
+    return True
+
+
 def scan(pid_ns, since):
     """Host PIDs of live (non-zombie) processes in the given pid namespace."""
     found = []
     for name in os.listdir("/proc"):
         if name.isdigit() and ns_of(int(name), since) == pid_ns:
-            try:
-                if stat_of(int(name))["state"] == "Z":
-                    continue  # exited, not yet reaped: its pidfd already reports exit
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            found.append(int(name))
+            if not zombie(int(name)):
+                found.append(int(name))
     return sorted(found)
 
 
