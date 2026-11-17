@@ -44,7 +44,14 @@ reaped; hostile descendants escaping sessions and lifecycle death cascades are
 outside this slice. The sleeping-descendant control covers only that supervised
 same-process-group case.
 
-No observed run is recorded yet. Linux namespace availability must be checked
+Observed on 2026-11-16: the fixture passed on WSL2 kernel
+`6.6.87.2-microsoft-standard-WSL2`, x86_64, system Python 3.12.3. Both host
+roundtrips, the own-terminal/procfs controls, distinct terminal identities,
+synthetic socket/environment exclusion and supervised descendant shutdown passed.
+The own-terminal TIOCSTI attempt returned errno 5; that is an observation, not
+evidence that isolation caused denial. An injected reap failure separately
+confirmed cleanup refusal and scratch retention. Strict remained `unverified`.
+Linux namespace availability must be checked
 on each WSL setup. Windows terminal ownership, broader ptrace/process-vm reach,
 actual CLI admission, browser profile C20, OSC filtering, raw-console policy,
 human bootstrap and supported-profile qualification remain open.
