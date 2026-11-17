@@ -127,6 +127,11 @@ fixtures:
   contract's table. They aren't an injected failure at each bootstrap step,
   so X18's "no fallback at every step" stays open.
 - The kill bound is 250 ms, so a shorter wait before the stop isn't caught.
+- The proof doesn't depend on how the stop is done. Killing the worker would
+  also cascade, because Bubblewrap's init exits with its main command. So
+  "the stop kills init by pidfd" is shown by the code, not measured. The
+  /proc scan's positive control is the negative control, where the scan
+  must still find the three survivors.
 - The inode scan sees live processes only. A zombie has already given up its
   namespaces, so zombies are caught by their pidfds, not the scan.
 - No hostile coverage of ptrace, cgroup escape or nested user namespaces.

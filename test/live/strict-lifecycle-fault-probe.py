@@ -394,6 +394,8 @@ def negative_selective_stop(run):
     else:
         raise RuntimeError("negative control: a selective child stop was accepted as a stop")
     assert survivors["alive"] == ["escapee", "init", "worker"], "negative control: unexpected survivors"
+    # Positive control for the /proc scan: it must see the three survivors too.
+    assert survivors["remaining"] == 3, "negative control: the namespace scan missed survivors"
     stop_namespace(namespace)
     prove_stopped(namespace, time.monotonic() + STOP_BOUND)
     return {"selectiveChildStopSurvivors": survivors["alive"], "detectedUnproven": True}
