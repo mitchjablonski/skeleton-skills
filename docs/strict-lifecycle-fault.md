@@ -30,23 +30,40 @@ each one, and then re-checks the inode and the `NSpid` mapping, so each handle
 is known to belong to a namespace member. It also checks the group and
 session layout described above.
 
-**The authority stub.** It receives an `endSession` request, confirms on a
-separate status pipe that the request is outstanding, and then blocks. It
-replies only after the host writes to a release pipe. Its reply carries the
-`CLOCK_MONOTONIC` time at which it was released.
+**The authority stub.** It receives an `endSession` request and confirms on a
+separate status pipe that the request is outstanding. Then it watches both
+the authority link and a release pipe, counting every byte that arrives on the
+link. It replies only after the host writes to the release pipe. The reply
+carries the byte count and its receive and release times.
 
-**Proven stop.** The host kills the namespace init through its pidfd and makes
-no authority call. A stop counts as proven only when every member's pidfd
-reports exit **and** a `/proc` scan finds no live process left in the
-namespace. All of this must happen within 2 seconds. An authority timeout or
-an `admissions-revoked` reply never counts as evidence of a stop.
+**Proven stop.** The host kills the namespace init through its pidfd. A stop
+counts as proven only when every member's pidfd reports exit **and** a `/proc`
+scan finds no live process left in the namespace. Both bounds are timed from
+the moment the fault is detected:
+- the kill must be issued within 50 ms;
+- the stop must be proven within 2 seconds.
+
+So any wait on the authority before stopping fails the run. An authority
+timeout or an `admissions-revoked` reply never counts as evidence of a stop.
+
+**No authority call, observed.** The stub, not the host's code, reports that
+it saw zero bytes on the authority link between the request and the release.
+The host requires that count to be zero. The release itself is written only
+after the proven stop, so "reply after stop" holds by construction. The real
+evidence is that the stub was still alive and silent when the stop was proven.
+
+**The scan and inaccessible processes.** Processes of other users, and older
+processes of our own that can't be inspected (such as the user's systemd
+manager), are skipped. One of our own processes that started after the
+namespace and still can't be inspected might be a member, so it makes the
+stop unproven.
 
 | Scenario | Fault | Also required |
 | --- | --- | --- |
-| Authority stall | The request is still unanswered 300 ms after it was sent | The stub is still alive and still hasn't replied after the proven stop. Its reply comes only after release, and its release time is later than the stop |
+| Authority stall | The request is still unanswered 300 ms after it was sent | The stub is still alive and silent after the proven stop, and it saw no bytes before release |
 | Authority exit | The stub is killed; the authority link reaches end of file | No reply is possible; the stop is proven anyway |
-| Control loss | The control stand-in hangs up; the control link reaches end of file | As for authority stall: the authority is held through the stop and replies only afterwards |
-| Launcher crash | A launcher stand-in that started Bubblewrap is killed with SIGKILL | The host does nothing else. The namespace, the outer Bubblewrap process and the stand-in must all exit through parent death alone |
+| Control loss | The control stand-in hangs up; the control link reaches end of file | As for authority stall |
+| Launcher crash | A launcher stand-in that started Bubblewrap is killed with SIGKILL | The host does nothing else. The outer Bubblewrap process and the namespace must exit through parent death alone, within 2 seconds of the kill |
 
 **Negative control.** Killing the agent's process group, which is what a
 launcher tracking only the agent's group might do, must **not** count as a
@@ -93,10 +110,16 @@ fixtures:
 
 Observed on 2026-11-17 on WSL2 kernel `6.6.87.2-microsoft-standard-WSL2`,
 x86_64, system Python 3.12.3:
-- **Normal runs:** all four scenarios passed, each proven stop taking 2.4 to
-  3.4 ms. The negative control named worker, init and escapee as survivors,
-  and five repeat runs passed.
+- **Normal runs:** all four scenarios passed. Each kill was issued at once
+  after the fault, and each stop was proven 2.7 to 3.7 ms after it. The
+  negative control named worker, init and escapee as survivors, and repeat
+  runs passed.
 - **Injected run:** reported `stop-unproven` and retained only stderr files.
 - **Leaks:** no helper process was left running after any run.
+- **Review mutations:** each of these now fails the run:
+  - waiting 1.5 s before the kill;
+  - writing to the authority link before the stop;
+  - releasing the stub before the stop;
+  - dropping `--die-with-parent`.
 
 Strict remained `unverified`.

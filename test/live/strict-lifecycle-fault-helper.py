@@ -13,6 +13,7 @@ Modes (fixed, no other arguments):
 """
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -68,13 +69,27 @@ def read_line(fd):
 
 def authority(sock, release, status):
     request = read_line(sock)
+    received_at = time.monotonic_ns()
     if request != b"endSession\n":
         raise SystemExit(4)
     os.write(status, b"held\n")  # the request is outstanding from here on
+    # Watch the authority link too: anything the host sends before release
+    # (a revoke, a retry, a second call) is counted and reported.
+    seen = 0
+    while True:
+        ready = select.select([sock, release], [], [])[0]
+        if sock in ready:
+            data = os.read(sock, 256)
+            if not data:
+                raise SystemExit(5)  # host gone: never reply
+            seen += len(data)
+        if release in ready:
+            break
     if os.read(release, 1) != b"R":
-        raise SystemExit(5)  # host gone: never reply
+        raise SystemExit(5)
     released_at = time.monotonic_ns()
-    reply = {"result": "admissions-revoked", "releasedAtNs": released_at}
+    reply = {"result": "admissions-revoked", "receivedAtNs": received_at,
+             "releasedAtNs": released_at, "bytesBeforeRelease": seen}
     os.write(sock, json.dumps(reply, sort_keys=True).encode() + b"\n")
 
 

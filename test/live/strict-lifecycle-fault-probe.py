@@ -29,7 +29,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 HELPER = HERE / "strict-lifecycle-fault-helper.py"
 MAX = 32768
 WALL_SECONDS = 60
-STOP_BOUND = 2.0      # seconds allowed for a proven namespace stop
+STOP_BOUND = 2.0      # seconds from fault detection to a proven namespace stop
+KILL_BOUND = 0.05     # seconds from fault detection to the kill being issued
 DEADLINE = 0.3        # the launcher's authority request deadline
 NEGATIVE_BOUND = 0.5  # how long the negative control waits before judging
 
@@ -55,6 +56,7 @@ def exited(fd, timeout=0):
 class Run:
     def __init__(self, root):
         self.root = root
+        self.recorded = False  # a namespace record arrived: later failures are fixture failures
         self.processes = []  # Popen objects, each in its own session
         self.fds = []
         self.inits = []      # pidfds of namespace inits
@@ -102,11 +104,32 @@ def read_record(fd, deadline):
     return json.loads(data)
 
 
-def ns_of(pid):
+def boot_ticks():
+    """Now, in the clock ticks /proc/<pid>/stat uses for start times."""
+    return int(time.clock_gettime(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK"))
+
+
+def started_at(pid):
+    with open("/proc/%d/stat" % pid) as source:
+        data = source.read(4096)
+    return int(data[data.rindex(")") + 2:].split()[19])
+
+
+def ns_of(pid, since=None):
     try:
         return os.readlink("/proc/%d/ns/pid" % pid)
-    except OSError:
+    except (FileNotFoundError, ProcessLookupError):
         return None  # gone, or a zombie that has released its namespaces
+    except PermissionError:
+        # Other users' processes, and our own older ones such as the user
+        # manager, are normal. One of ours that started after the namespace
+        # did could be a member we can't inspect, so the scan is unproven.
+        try:
+            if since is not None and os.stat("/proc/%d" % pid).st_uid == os.getuid() and started_at(pid) >= since:
+                raise Unproven({"inaccessible": 1})
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        return None
 
 
 def nspid_of(pid):
@@ -131,11 +154,11 @@ def parent_of(pid):
         return None
 
 
-def scan(pid_ns):
+def scan(pid_ns, since):
     """Host PIDs of live (non-zombie) processes in the given pid namespace."""
     found = []
     for name in os.listdir("/proc"):
-        if name.isdigit() and ns_of(int(name)) == pid_ns:
+        if name.isdigit() and ns_of(int(name), since) == pid_ns:
             found.append(int(name))
     return sorted(found)
 
@@ -144,6 +167,7 @@ def start_namespace(run, label, launcher=False):
     """Start the agent namespace, directly or under a launcher stand-in."""
     read_end, write_end = os.pipe()
     run.fd(read_end)
+    since = boot_ticks() - 1  # one tick of margin for rounding
     try:
         if launcher:
             argv = ["/usr/bin/python3", "-I", str(HELPER), "launcher", "--"] + bwrap_argv()
@@ -153,13 +177,14 @@ def start_namespace(run, label, launcher=False):
     finally:
         os.close(write_end)
     record = read_record(read_end, time.monotonic() + 5)
+    run.recorded = True
     pid_ns = record["pidNs"]
     assert isinstance(pid_ns, str) and pid_ns.startswith("pid:[") and len(pid_ns) < 64
     assert pid_ns != os.readlink("/proc/self/ns/pid")
     roles = {1: "init", record["worker"]: "worker", record["child"]: "child", record["escapee"]: "escapee"}
     assert len(roles) == 4
     members = {}
-    for pid in scan(pid_ns):
+    for pid in scan(pid_ns, since):
         fd = os.pidfd_open(pid)
         run.members.append(fd)
         # Re-check after opening, so the handle is the namespace member.
@@ -174,7 +199,7 @@ def start_namespace(run, label, launcher=False):
     worker, child, escapee = (stat_of(members[r]["pid"]) for r in ("worker", "child", "escapee"))
     assert child["pgrp"] == members["child"]["pid"] != worker["pgrp"], "agent group not separate"
     assert escapee["pgrp"] != child["pgrp"] and escapee["session"] not in (worker["session"], child["session"])
-    namespace = {"pidNs": pid_ns, "members": members, "process": process}
+    namespace = {"pidNs": pid_ns, "members": members, "process": process, "since": since}
     run.namespaces.append(namespace)
     return namespace
 
@@ -187,15 +212,14 @@ def stop_namespace(namespace):
         pass
 
 
-def prove_stopped(namespace, bound, extra=()):
-    """Every member (and any extra handle) has exited, and the namespace is empty."""
-    deadline = time.monotonic() + bound
+def prove_stopped(namespace, deadline, extra=()):
+    """By the deadline, every member (and any extra handle) has exited and the namespace is empty."""
     handles = [(role, m["fd"]) for role, m in namespace["members"].items()] + list(extra)
     alive = []
     for role, fd in handles:
         if not exited(fd, max(0, deadline - time.monotonic())):
             alive.append(role)
-    left = scan(namespace["pidNs"])
+    left = scan(namespace["pidNs"], namespace["since"])
     if alive or left:
         raise Unproven({"alive": sorted(alive), "remaining": len(left)})
 
@@ -204,17 +228,21 @@ def start_authority(run, label):
     host, stub = socket.socketpair()
     host_fd = run.fd(host.detach())
     release_r, release_w = os.pipe()
+    run.fd(release_w)
     status_r, status_w = os.pipe()
-    process = run.launch(["/usr/bin/python3", "-I", str(HELPER), "authority",
-                          str(stub.fileno()), str(release_r), str(status_w)],
-                         label, pass_fds=(stub.fileno(), release_r, status_w))
-    stub.close()  # the stub holds the only peer end, so its exit is EOF here
-    os.close(release_r)
-    os.close(status_w)
-    run.fds.extend([release_w, status_r])
+    run.fd(status_r)
+    try:
+        process = run.launch(["/usr/bin/python3", "-I", str(HELPER), "authority",
+                              str(stub.fileno()), str(release_r), str(status_w)],
+                             label, pass_fds=(stub.fileno(), release_r, status_w))
+    finally:
+        stub.close()  # the stub holds the only peer end, so its exit is EOF here
+        os.close(release_r)
+        os.close(status_w)
     authority = {"sock": host_fd, "release": release_w, "status": status_r,
                  "process": process, "fd": run.fd(os.pidfd_open(process.pid))}
     os.write(host_fd, b"endSession\n")
+    authority["sentAt"] = time.monotonic()
     assert read_record_raw(status_r, time.monotonic() + 5) == b"held\n", "authority did not hold"
     return authority
 
@@ -243,46 +271,59 @@ def release_and_reply(authority, stopped_ns):
     reply = read_record(authority["sock"], time.monotonic() + 5)
     assert reply["result"] == "admissions-revoked"
     assert isinstance(reply["releasedAtNs"], int) and reply["releasedAtNs"] > stopped_ns
+    # Observed by the stub, not read from our code: no byte reached it
+    # between the request and the release, so the stop made no authority call.
+    assert reply["bytesBeforeRelease"] == 0, "the launcher wrote to the authority before release"
     authority["process"].wait(timeout=5)
     assert authority["process"].returncode == 0
     return True
 
 
-def fault_stop(namespace, inject):
-    """The launcher's stop step; the injected failure replaces it with an agent-group kill."""
-    started = time.monotonic()
+def fault_stop(namespace, inject, fault_at):
+    """The launcher's stop step, timed from the moment the fault was detected.
+
+    The kill must be issued within KILL_BOUND and proven within STOP_BOUND of
+    fault_at, so any wait on the authority before stopping fails the run. The
+    injected failure replaces the stop with an agent-group kill.
+    """
     if inject:
         os.killpg(namespace["members"]["child"]["pid"], signal.SIGKILL)
     else:
         stop_namespace(namespace)
-    prove_stopped(namespace, STOP_BOUND)
-    return started, time.monotonic(), time.monotonic_ns()
+    killed = time.monotonic()
+    assert killed - fault_at <= KILL_BOUND, "stop was delayed after the fault"
+    prove_stopped(namespace, fault_at + STOP_BOUND)
+    return ms(killed - fault_at), ms(time.monotonic() - fault_at), time.monotonic_ns()
 
 
 def scenario_authority_stall(run, inject):
-    authority = start_authority(run, "stall-authority")
     namespace = start_namespace(run, "stall-agent")
+    authority = start_authority(run, "stall-authority")
     # The fault: the outstanding request passes its deadline unanswered.
-    assert not select.select([authority["sock"]], [], [], DEADLINE)[0]
-    started, stopped, stopped_ns = fault_stop(namespace, inject)
-    assert still_held(authority), "stop waited on the authority"
+    remaining = authority["sentAt"] + DEADLINE - time.monotonic()
+    assert not select.select([authority["sock"]], [], [], max(0, remaining))[0]
+    fault_at = time.monotonic()
+    kill_ms, stop_ms, stopped_ns = fault_stop(namespace, inject, fault_at)
+    assert still_held(authority), "authority replied or exited during the stop"
     release_and_reply(authority, stopped_ns)
-    return {"fault": "authority-deadline", "stopMs": ms(stopped - started),
-            "authorityHeldThroughStop": True, "replyAfterProvenStop": True}
+    return {"fault": "authority-deadline", "killMs": kill_ms, "stopMs": stop_ms,
+            "authorityHeldThroughStop": True, "authorityBytesBeforeRelease": 0}
 
 
 def scenario_authority_exit(run, inject):
-    authority = start_authority(run, "exit-authority")
     namespace = start_namespace(run, "exit-agent")
+    authority = start_authority(run, "exit-authority")
     signal.pidfd_send_signal(authority["fd"], signal.SIGKILL)
     # The fault: the authority link reaches end of file.
     assert select.select([authority["sock"]], [], [], 5)[0] and os.read(authority["sock"], 64) == b""
-    started, stopped, _ = fault_stop(namespace, inject)
+    fault_at = time.monotonic()
+    kill_ms, stop_ms, _ = fault_stop(namespace, inject, fault_at)
     authority["process"].wait(timeout=5)
-    return {"fault": "authority-exited", "stopMs": ms(stopped - started), "authorityReplied": False}
+    return {"fault": "authority-exited", "killMs": kill_ms, "stopMs": stop_ms, "authorityReplied": False}
 
 
 def scenario_control_loss(run, inject):
+    namespace = start_namespace(run, "control-agent")
     authority = start_authority(run, "control-authority")
     host, stub = socket.socketpair()
     control_fd = run.fd(host.detach())
@@ -291,16 +332,16 @@ def scenario_control_loss(run, inject):
                              "control", pass_fds=(stub.fileno(),))
     finally:
         stub.close()
-    namespace = start_namespace(run, "control-agent")
     os.write(control_fd, b"hangup\n")
     # The fault: the control link reaches end of file.
     assert select.select([control_fd], [], [], 5)[0] and os.read(control_fd, 64) == b""
-    started, stopped, stopped_ns = fault_stop(namespace, inject)
+    fault_at = time.monotonic()
+    kill_ms, stop_ms, stopped_ns = fault_stop(namespace, inject, fault_at)
     control.wait(timeout=5)
-    assert still_held(authority), "stop waited on the authority"
+    assert still_held(authority), "authority replied or exited during the stop"
     release_and_reply(authority, stopped_ns)
-    return {"fault": "control-link-closed", "stopMs": ms(stopped - started),
-            "authorityHeldThroughStop": True, "replyAfterProvenStop": True}
+    return {"fault": "control-link-closed", "killMs": kill_ms, "stopMs": stop_ms,
+            "authorityHeldThroughStop": True, "authorityBytesBeforeRelease": 0}
 
 
 def negative_group_kill(run):
@@ -308,14 +349,14 @@ def negative_group_kill(run):
     namespace = start_namespace(run, "negative-agent")
     os.killpg(namespace["members"]["child"]["pid"], signal.SIGKILL)
     try:
-        prove_stopped(namespace, NEGATIVE_BOUND)
+        prove_stopped(namespace, time.monotonic() + NEGATIVE_BOUND)
     except Unproven as detail:
         survivors = detail.args[0]
     else:
         raise RuntimeError("negative control: group kill was accepted as a stop")
     assert survivors["alive"] == ["escapee", "init", "worker"], "negative control: unexpected survivors"
     stop_namespace(namespace)
-    prove_stopped(namespace, STOP_BOUND)
+    prove_stopped(namespace, time.monotonic() + STOP_BOUND)
     return {"groupKillSurvivors": survivors["alive"], "detectedUnproven": True}
 
 
@@ -330,7 +371,7 @@ def scenario_launcher_crash(run):
     started = time.monotonic()
     signal.pidfd_send_signal(launcher_fd, signal.SIGKILL)
     # Nothing else is done: the namespace must die through parent-death alone.
-    prove_stopped(namespace, STOP_BOUND, extra=[("launcher", launcher_fd), ("bwrap", outer_fd)])
+    prove_stopped(namespace, started + STOP_BOUND, extra=[("launcher", launcher_fd), ("bwrap", outer_fd)])
     return {"fault": "launcher-killed", "stopMs": ms(time.monotonic() - started), "hostActions": "none"}
 
 
@@ -367,7 +408,7 @@ def main():
         exit_code = 1
         result["code"] = "fixture-failed"
         stop_namespace(probe)
-        prove_stopped(probe, STOP_BOUND)
+        prove_stopped(probe, time.monotonic() + STOP_BOUND)
         scenarios = {}
         try:
             scenarios["authorityStall"] = scenario_authority_stall(run, inject)
@@ -390,7 +431,9 @@ def main():
         exit_code = 0
     except (AssertionError, OSError, ValueError, TypeError, RuntimeError, KeyError, Unproven,
             subprocess.SubprocessError):
-        pass
+        if exit_code == 2 and run is not None and run.recorded:
+            exit_code = 1  # the namespace started: a layout or discovery failure is not "unsupported"
+            result["code"] = "fixture-failed"
     finally:
         signal.alarm(0)
         if run is not None:
@@ -417,7 +460,10 @@ def main():
                 except OSError:
                     cleanup = False
             for namespace in run.namespaces:
-                if scan(namespace["pidNs"]):
+                try:
+                    if scan(namespace["pidNs"], namespace["since"]):
+                        cleanup = False
+                except (OSError, Unproven):
                     cleanup = False
             for fd in run.fds + run.members:
                 try:
