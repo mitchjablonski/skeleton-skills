@@ -121,6 +121,52 @@ test("only real Uint8Arrays are accepted: no strings, coercion, proxies or gette
   assert.equal(touched, false, "the length getter is never consulted");
 });
 
+test("a lone Esc never swallows the next marker, Enter or Ctrl-C", () => {
+  check(`\x1b${PS}junk\rapprove K7M2-QX9D\r${PE}\r`, [R("escape")]);
+  check(`\x1b[${PS}x\rstatus\r${PE}\r`, [R("escape")]);
+  check(`\x1b${PS}ok${PE}\r`, [R("escape")]);
+  check("ok\x1b\rmore\r", [R("escape"), L("more")]);
+  check("x\x1b\x03ok\r", [INT, L("ok")]);
+  check(`${PS}ab\x1b${PE}\rnext\r`, [R("paste-content"), L("next")]);
+});
+
+test("inside a paste, Ctrl-C and Enter are content: they poison and never interrupt or submit", () => {
+  check(`${PS}a\x03b\rc${PE}\r`, [R("paste-content")]);
+});
+
+test("end() and reset() fully clear paste, CR and poison state", () => {
+  const p = createControlInput();
+  p.push(bytes(`${PS}half`));
+  const e = p.end();
+  assert.ok(Object.isFrozen(e));
+  assert.deepEqual([...e], [R("incomplete")]);
+  assert.deepEqual([...p.push(bytes("a\r"))], [L("a")]);
+  p.push(bytes("\x01"));
+  assert.deepEqual([...p.end()], [R("incomplete")]);
+  p.push(bytes("x\r"));
+  p.reset();
+  assert.deepEqual([...p.push(bytes("\n"))], [L("")]);
+  p.push(bytes(`${PS}x`)); p.reset();
+  assert.deepEqual([...p.push(bytes("b\r"))], [L("b")]);
+  check(`\r${PS}${PE}\n`, [L(""), L("")]);
+});
+
+test("other typed arrays and Uint8Array subclass overrides can't inject bytes", () => {
+  const p = createControlInput();
+  for (const bad of [new Float64Array([111.9, 107.2, 13]), new Uint16Array([0x6f, 0x6b, 13]), new BigInt64Array([1n]), new Uint8ClampedArray([13]), new DataView(new ArrayBuffer(1))])
+    assert.throws(() => p.push(bad), TypeError);
+  class Evil extends Uint8Array { *[Symbol.iterator]() { yield 0x6f; yield 13; yield 0x67; yield 0x6f; yield 13; } }
+  assert.deepEqual([...p.push(new Evil([0x7a, 13]))], [L("z")]);
+  let touched = false;
+  const u = new Uint8Array([0x6f, 0x6b, 13]);
+  Object.defineProperty(u, "constructor", { get() { touched = true; return Uint8Array; } });
+  assert.deepEqual([...p.push(u)], [L("ok")]);
+  assert.equal(touched, false);
+  assert.deepEqual([...p.push(Buffer.from("hi\r"))], [L("hi")]);
+  const big = new Uint8Array([0x78, 0x61, 0x62, 13, 0x79]);
+  assert.deepEqual([...p.push(big.subarray(1, 4))], [L("ab")]);
+});
+
 test("prototype: imports nothing, and nothing in lib/bin loads it", () => {
   const src = readFileSync(new URL("../lib/strict-control-input.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(src.replace(/^\s*\/\/.*$/gm, ""), /^import /m);

@@ -43,17 +43,25 @@ Reasons are generic and never contain input: `unsupported-byte`, `escape`,
   multi-line paste can never become several commands. **Pasting never
   submits;** an Enter typed outside the paste is required. A start marker
   inside a paste, or an end marker outside one, rejects the line.
-- **Unclosed paste.** Bytes are discarded, Enters included, until the end
-  marker, `end()` or `reset()`.
+- **Inside a paste, Enter and Ctrl-C are paste content.** They reject the line
+  and never submit or interrupt, because pasted bytes can't be trusted to
+  signal anything. A paste ends only at its end marker, `end()` or `reset()`.
+  Printable pasted bytes keep filling the line until it overflows. A host
+  should call `reset()` on its own timeout so an unclosed paste (including a
+  hand-typed start marker) can't leave the console stuck.
+- **Broken escape sequences.** A prefix that turns out not to be a paste
+  marker rejects the line and its bytes are dropped. The byte that broke it
+  is judged afresh: `ESC ESC[200~` still starts a paste, and Esc followed by
+  Enter or Ctrl-C still submits the rejection or interrupts.
 
 ## Limits
 
 | Item | Bound |
 | --- | --- |
 | Line buffer | at most `maxLine` characters (200, the console's limit); longer is `overflow` |
-| Escape buffer | at most 6 bytes (the marker length); a non-marker prefix is dropped at once |
+| Escape buffer | at most 6 bytes (the marker length); a non-marker prefix is dropped at once, and the byte that broke it is re-judged |
 | Unclosed paste | no buffering beyond the line limit; bytes are judged one at a time |
-| Chunk | any size; each push copies the bytes once through the intrinsic `Uint8Array` slot, so getters, proxies and array-likes are refused with `TypeError` |
+| Chunk | any size. Only a real `Uint8Array` (or Buffer) is accepted, checked by the intrinsic `Symbol.toStringTag` getter. Bytes are copied through intrinsic `buffer`/`byteOffset`/`byteLength` getters into a fresh array, without species, iterators, `constructor` or own-property lookups. Other typed arrays, proxies, array-likes and strings throw `TypeError` |
 
 ## Recovery
 
