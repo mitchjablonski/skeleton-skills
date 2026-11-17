@@ -151,6 +151,8 @@ test("end() and reset() fully clear paste, CR and poison state", () => {
   assert.deepEqual([...p.push(bytes("\n"))], [L("")]);
   p.push(bytes(`${PS}x`)); p.reset();
   assert.deepEqual([...p.push(bytes("b\r"))], [L("b")]);
+  p.push(bytes("\x1b[20")); p.reset();
+  assert.deepEqual([...p.push(bytes("0~ok\r"))], [L("0~ok")], "a pending escape prefix never survives reset()");
   check(`\r${PS}${PE}\n`, [L(""), L("")]);
 });
 
@@ -210,7 +212,7 @@ test("options are exact: no getters, extra keys or coercion", () => {
   let touched = false;
   const g = {}; Object.defineProperty(g, "maxLine", { enumerable: true, get() { touched = true; return 5; } });
   for (const bad of [g, { maxLine: 5, x: 1 }, Object.create({ maxLine: 5 }), null, 5, { maxLine: "5" }, { maxLine: 2.5 }])
-    assert.throws(() => createControlInput(bad));
+    assert.throws(() => createControlInput(bad), bad === g ? TypeError : Error);
   assert.equal(touched, false);
   createControlInput({}); createControlInput({ maxLine: 10 }); createControlInput();
 });

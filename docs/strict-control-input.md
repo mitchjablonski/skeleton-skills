@@ -31,7 +31,10 @@ Reasons are generic and never contain input: `unsupported-byte`, `escape`,
 **Trust assumption.** Bracketed-paste markers are framing supplied by a
 trusted terminal. They don't prove that a human pressed Enter, and the parser
 is no defence against synthetic input written to that terminal; that is the
-terminal-isolation gate's job.
+terminal-isolation gate's job. In particular, if the terminal doesn't filter a pasted
+`ESC[201~` out of the pasted text, the paste closes early and any pasted
+newlines after it submit lines. The trusted terminal must strip or refuse
+end markers inside pasted content.
 
 ## Rules
 
@@ -81,6 +84,8 @@ terminal-isolation gate's job.
   error.
 - **Options** must be omitted or a plain object whose only key is an own
   data property `maxLine`; anything else throws `TypeError` (no getters run).
+  A Proxy as options has its `getPrototypeOf` and `ownKeys` traps called;
+  options come from trusted host code, so this isn't treated as input.
 
 - After a rejected line, the next line starts clean.
 - Ctrl-U clears a poisoned line without a rejection event.
