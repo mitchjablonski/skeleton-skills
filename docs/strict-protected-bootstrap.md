@@ -72,7 +72,7 @@ between before implementation:
   example `xterm -S`). Few emulators support this, and none on the Windows
   side.
 
-Either way, a named endpoint is not an acceptable workaround.
+Either way, a named endpoint is not an acceptable workaround for the control side.
 
 **Namespace separation.** The required profile is:
 - PID, network, IPC (X11 MIT-SHM), mount and user namespaces;
