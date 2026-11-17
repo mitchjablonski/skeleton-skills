@@ -44,7 +44,9 @@ test("DCS quoted ESC and wrapped C1 ST stay inside the payload", () => {
     assertAcrossReads("before" + dcs + "tmux;" + payload + escapeST + "after", "beforeafter");
     assertAcrossReads("before" + dcs + "tmux;" + payload, "before");
     assertAcrossReads(dcs + ESC + ESC + "\\still hidden" + ST + "after", "after");
+    assertAcrossReads(dcs + "tmu" + ST + "after", "after");
   }
+  assertAcrossReads(ESC + "]hidden" + ESC + escapeST + "after", "after");
 });
 
 test("drops CSI, ordinary ESC sequences and incomplete controls", () => {
@@ -62,6 +64,7 @@ test("UTF-8 continuation bytes do not open or close control strings", () => {
   const bytes = Buffer.concat([raw("before" + ESC + "]"), Buffer.from("✅\u009c"), raw("hidden" + ST + "after")]);
   assertAcrossReads(bytes, "beforeafter");
   assertAcrossReads(raw("before\xe0\x9dhidden" + BEL + "after"), "beforeafter");
+  assertAcrossReads(raw("before" + ESC + "]\xe2A" + ST + "after"), "beforeafter");
 });
 
 test("accepts bounded chunks and returns text independent of the input storage", () => {
