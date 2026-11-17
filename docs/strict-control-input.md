@@ -82,10 +82,13 @@ end markers inside pasted content.
   a detached buffer throws, clears the line, and makes every later `push`
   throw until `end()` or `reset()`. A valid prefix is never kept across an
   error.
-- **Options** must be omitted or a plain object whose only key is an own
-  data property `maxLine`; anything else throws `TypeError` (no getters run).
-  A Proxy as options has its `getPrototypeOf` and `ownKeys` traps called;
-  options come from trusted host code, so this isn't treated as input.
+- **Options** must be omitted, an empty plain object `{}` (the default
+  limit), or a plain object whose only key is an own data property
+  `maxLine`; any other shape throws `TypeError` (no getters run). A
+  `maxLine` that isn't a safe integer from 1 to 200 throws `RangeError`.
+  A Proxy as options has its `getPrototypeOf`, `ownKeys` and
+  `getOwnPropertyDescriptor` traps called; options come from trusted host
+  code, so this isn't treated as input.
 
 - After a rejected line, the next line starts clean.
 - Ctrl-U clears a poisoned line without a rejection event.
