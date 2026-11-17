@@ -268,11 +268,11 @@ def main():
         assert all(r[1] == "socket" for r in positive_path["stat"]), "bound actual sockets not visible"
         # Synthetic listeners: the mount gate and the network-namespace gate.
         assert connect_result(strict, "synthetic-path") == "ENOENT" and connect_result(positive_path, "synthetic-path") == "connected"
-        assert connect_result(strict, "synthetic-abstract") != "connected" and connect_result(positive_net, "synthetic-abstract") == "connected"
+        assert connect_result(strict, "synthetic-abstract") == "ECONNREFUSED" and connect_result(positive_net, "synthetic-abstract") == "connected"
         # vsock: the host reached the port above (positive control); seccomp refuses the family.
         assert mitigated["vsock"] == {"create": "EAFNOSUPPORT", "connect": "EAFNOSUPPORT"} and mitigated["ioUringSetup"] == "ENOSYS", \
             "seccomp mitigation did not refuse vsock and io_uring"
-        assert all(r[1] == "ENOENT" for r in mitigated["stat"]) and connect_result(mitigated, "synthetic-abstract") != "connected"
+        assert all(r[1] == "ENOENT" for r in mitigated["stat"]) and connect_result(mitigated, "synthetic-abstract") == "ECONNREFUSED"
 
         result.update(
             ok=True, code="display-interop-fixture-passed",

@@ -84,7 +84,8 @@ Exit codes:
 - **Exit 1:** a gate or a positive control failed (the scratch path is
   reported).
 - **Exit 2:** unsupported: not WSL2 x86_64, optimized Python, or a missing
-  prerequisite.
+  prerequisite. That includes missing display sockets, and a host that can't
+  reach the vsock port, so there is no finding to measure.
 
 ## Limits
 
@@ -106,5 +107,8 @@ x86_64, system Python 3.12.3, with the stat-only version:
   reached, and seccomp refused both.
 - **WSLg log:** no new lines appeared in `/mnt/wslg/stderr.log` during the
   run.
+- **WSLg was down during this run** (weston had been crashed by the first
+  version). That doesn't affect the result: stat shows only that the socket
+  inodes exist and are visible, not that a server is running.
 
 Strict remained `unverified`.
