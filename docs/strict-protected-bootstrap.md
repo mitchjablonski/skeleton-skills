@@ -7,6 +7,8 @@ runtime verdict.**
   release.
 - **PTY isolation is an experimental candidate.** It narrows who can type
   into the control window. It does not prove that a human typed a decision.
+- **Nothing here is current evidence.** Every lifecycle fault and every
+  negative control below is a **requirement for tests still to be written**.
 - **No launcher yet.** Implementing the launcher is a separate, bounded
   follow-up after this contract is reviewed. Codex cross-reviews this
   document.
@@ -24,33 +26,110 @@ It builds on:
 | Part | Owner process | Created by | Reachable from the agent? |
 | --- | --- | --- | --- |
 | Launcher | the human's own login session, outside any sandbox | the human | no |
-| Private directory (authority store, capture store, key, scratch) | launcher | launcher; mode 0700, outside the workspace, never mounted into the agent | **no** |
+| **Durable history directory** (enrollment, authority record and journal, capture store) | launcher | launcher, on first enrollment; reopened on later launches; mode 0700, outside the workspace, never mounted into the agent | **no** |
+| **Scratch directory** (per-launch working files, sockets' bookkeeping, probe output) | launcher | launcher, **fresh for every launch**; an existing path is refused | **no** |
 | Authority process (durable human authority, one enrolled project and session) | launcher child | launcher | **no** |
-| Control process (console) with its **own controlling PTY** in a separate terminal window | launcher child, its own session leader | launcher | **no** |
+| Control process (console) with its **own controlling PTY** | launcher child, its own session leader | launcher (mechanism below: **open blocker**) | **no** |
 | Decision listener (127.0.0.1, protected origin) | launcher child, host network namespace | launcher | **no** |
-| Control↔authority and listener↔authority links | unnamed socketpairs (#145 framing) | launcher | **no** |
-| Agent sandbox (pinned CLI) | launcher child in its own namespaces | launcher | — |
+| Control↔authority link | an unnamed socketpair (#145 framing, exactly four methods) | launcher | **no** |
+| Launcher→console control link (hand over a fresh socketpair on reconnect or idle timeout) | **open**: not defined yet | launcher | **no** |
+| Launcher→authority link (for example `endSession` when the control window is lost) | **open**: not defined yet; it can't reuse the console's connection | launcher | **no** |
+| Listener↔authority code issuance | **open**: #145 has no issuance operation (below) | — | **no** |
+| Agent sandbox (pinned CLI) | launcher child in **separate PID, mount, user and network namespaces** | launcher | — |
 | Agent PTY | agent sandbox | launcher, with an output filter in between | the agent's own only |
 
-**What the agent receives, and nothing else:**
+**The control window mechanism is an open blocker.** A real terminal emulator
+creates its own PTY and is the console's parent. gnome-terminal's server and
+Windows Terminal don't inherit the launcher's descriptors, and `wt.exe` can't
+receive Linux descriptors at all. So "launcher child on a new PTY reached by
+socketpair" can't simply be a new emulator window. Two candidates to choose
+between before implementation:
+
+- **A (proposed). The launcher's own terminal is the control window.** The
+  human starts the launcher in a terminal; that terminal's PTY becomes the
+  control PTY, and the console runs in the foreground there. The agent's PTY
+  is launcher-created (`openpty`), and its output is shown in a second window
+  through a display-only relay. The agent's window is untrusted anyway. This
+  needs no descriptor passing into an emulator. Showing that second window on
+  WSL still needs a terminal (open question 1).
+- **B. A launcher-made PTY handed to an emulator that accepts one** (for
+  example `xterm -S`). Few emulators support this, and none on the Windows
+  side.
+
+Either way, a named endpoint is not an acceptable workaround.
+
+**Namespace separation.** The required profile is:
+- PID, network, IPC (X11 MIT-SHM), mount and user namespaces;
+- a new session (`--new-session`), so the agent's PTY is never the control
+  window's controlling terminal;
+- a **new devpts instance** (`--dev`). `--dev-bind /dev` is refused, because
+  under the host devpts the same uid could open the control window's
+  `/dev/pts/N`, write fake output and read what the human types;
+- `--die-with-parent`.
+
+PID and devpts isolation alone don't remove host loopback or abstract-socket
+reach. Only the network namespace does.
+
+**What the agent receives:**
 - its own PTY;
 - the workspace mount;
 - the model-relay descriptor (X4);
-- an explicit, minimal environment.
+- an explicit, minimal environment;
+- the descriptors its runtime itself opens (Node, for example, opens some at
+  startup).
+
+That last group is checked against an **inspected allowlist** measured on the
+pinned runtime. It isn't assumed to be stdio only. The control is
+launcher-side: descriptors are closed before exec (`close_range`). A check
+run inside the agent is a fixture probe of that, not the control itself.
 
 **What it never receives:**
-- any descriptor for the control PTY, the authority, the listener or the
-  private directory;
+- any descriptor for the control PTY, the authority, the listener, or either
+  directory;
 - the launcher's environment;
 - display, session-bus, WSLg, Wayland or X11 sockets or variables;
 - browser profiles.
 
-The descriptor allowlist is checked inside the agent at startup (N3).
+**Residual trust, unchanged from the H3 proposal and the decision page doc.**
+"Not reachable from the agent" assumes:
+- the human's own processes are trusted, including Windows-side processes on
+  WSL, which can reach the listener and read `\\wsl$`;
+- host git doesn't run agent-written config (X15). If it does, every negative
+  control below is bypassed.
+
+**Dependencies the agent can't influence.** The authority's protected
+dependencies (`captureStore`, `observeUnderLock`, its clock and entropy) live
+in the launcher's processes, outside anything the agent can reach.
+
+## Durable history versus scratch
+
+**Durable history** holds the enrollment, the authority record and journal,
+and the immutable captures.
+- **Restart and replay need it.** Same-id lookup after a lost reply depends
+  on it, so ordinary cleanup **never removes it**.
+- **Reopening it** must find the expected enrollment. Missing or corrupt
+  enrolled state refuses, and a new epoch is never started silently (#124).
+- **After a crash, reopen is expected to refuse.** A crash mid-operation leaves
+  the store's holder lock, and the store never expires or unlinks it on its
+  own. Recovery then goes through the outside-host recovery process in
+  [strict-human-authority-store.md](strict-human-authority-store.md), not
+  through an automatic reopen.
+- **Rollback isn't detected.** The store can't prove it wasn't rolled back to
+  an older copy. Anti-rollback is a separate external gate (X11), not a
+  current capability.
+
+**Scratch** is per-launch and disposable.
+- **Created fresh:** a path that already exists is refused.
+- **Cleanup:** removed after a clean shutdown. If cleanup can't be proven,
+  the scratch is **retained** and the launcher reports it. Durable history is
+  never touched by that cleanup.
 
 ## Enrollment and session metadata
 
-The launcher enrolls the authority with three things: the project id, the
-session id and the initial review round. Enrollment and session metadata
+Enrollment uses the store's real API: the full initial V2 `state` and
+`policy` that `createHumanAuthorityStore` requires. Its digests must match an
+initial capture already stored in the capture store, so bootstrap captures
+before it enrolls (step 3). Enrollment and session metadata
 **never** carry:
 
 - authority keys or key material;
@@ -62,8 +141,11 @@ The rest of the design depends on where each item lives:
 
 - **Keys** are generated inside the authority process (32 bytes from
   `crypto.randomBytes`, per #124) and never leave it.
-- **Codes** leave the authority only toward the listener, which serves them
-  to the bound tab. They never go to the console or the agent.
+- **Codes** reach the listener through a **separate issuance capability that
+  doesn't exist yet**. #145 supports exactly `verifyAndCommit`, `recapture`,
+  `endSession` and `state`, so issuance can't be expressed as an existing
+  #145 call. Its operation and schema stay **open**, and need independent
+  vectors and cross-review before implementation.
 - **The console** never sees a code except the one the human types.
 
 ## Bootstrap sequence
@@ -71,60 +153,77 @@ The rest of the design depends on where each item lives:
 Each step either succeeds or refuses the whole launch.
 
 1. **Preflight.** Collect a runtime receipt (#144) and check the prerequisite
-   observations. Receipt unavailable, or a prerequisite missing, means refuse
-   (X12, X13).
-2. **Private directory.** Create it fresh: 0700, owned by the user, on a
-   supported local filesystem, outside the workspace. An existing path is
-   refused, never reused.
-3. **Authority.** Start it, then create or reopen the store and enroll it.
-   Missing, corrupt or rolled-back enrolled state refuses. It never silently
-   starts a new epoch (#124).
-4. **Control process.** Start it on a **new** PTY, as its own session leader
-   with that PTY as its controlling terminal, in a separate terminal window
-   that shows the fixed `SKELETON STRICT CONTROL` banner.
+   observations. Receipt unavailable, or a prerequisite missing, means
+   refuse. A receipt identifies an observed configuration. It grants no
+   support (X12, X13).
+2. **Directories.** Reopen the durable history directory, or create it on
+   first enrollment, checking ownership, mode and filesystem. Then create a
+   **fresh** scratch directory; an existing scratch path is refused.
+3. **Initial capture and authority.** Capture the workspace into the capture
+   store (the first capture may be empty or partial; the first real review is
+   a human Recapture, per the decision page doc). Then start the authority and
+   open, or create and enroll, the store with the full state and policy, under
+   the reopen rules above.
+4. **Control process.** Start the console on the control PTY, using candidate
+   A or B above.
 5. **Readiness.** Over the control↔authority socketpair, the console's
    `state()` must answer. Any failure refuses.
-6. **Listener.** Start it, and mint the first navigation. The control window
-   shows the URL, or opens a fresh, launcher-owned browser profile (C20).
-7. **Agent.** Only now start the agent sandbox, with the descriptor
-   allowlist, the filtered PTY and the minimal environment.
+6. **Listener.** Start it and check that it answers. Then open the page in a
+   **fresh, launcher-owned browser profile** (C20). Merely printing the URL for
+   the human to paste into their normal browser isn't offered in protected
+   mode: it would be a fallback that defeats C20. Code issuance stays open.
+7. **Agent.** Only once the authority, console and listener are all ready,
+   start the agent sandbox with the required profile, the inspected
+   descriptor allowlist, the filtered PTY and the minimal environment.
 
 **No fallback (X18).** If any step fails:
 - the launcher reports the failure on the control window, or on its own
   stderr if no control window exists yet;
-- it stops everything it started, then retains or cleans up the private
-  directory under the cleanup rule below;
+- it stops everything it started, under the stop rules below;
+- it retains or removes the scratch directory under the cleanup rule, and
+  never touches durable history;
 - it **never** starts the agent in default or unconstrained mode as a
   fallback.
 
-## Connection lifetime and supervision
+## Connection lifetime
 
 **Channel bounds** come from #145, as prototype values rather than adopted
 policy: 128 calls per connection, one in flight, a 1000 ms request deadline,
 and a 4096-byte frame.
 - **On connection loss** the console reports an unknown outcome and keeps
-  the request.
+  the request. It keeps it **in memory only** (see control crash, below).
 - **Reconnecting** gives the console a fresh socketpair from the launcher.
   It never gets a named endpoint.
-- **A retry after reconnecting** uses the **same request id**, so the
-  journal returns the original result (evidence:
-  `test/strict-human-channel.test.mjs`, `test/strict-control-store.test.mjs`).
+- **A retry after reconnecting** uses the **same request id**, so the journal
+  returns the original result. Tested in `test/strict-human-channel.test.mjs`
+  and `test/strict-control-store.test.mjs`, for the channel and store in
+  isolation, not under a launcher.
 
 **Idle timeout (proposal):** close the control↔authority connection after 10
 minutes idle, and reconnect on the next command. The value is to be agreed.
 It is not a security control.
 
-**Supervision** goes through pidfds and process groups that stay unreaped
-until cleanup, as in the existing probes:
+## Supervision and stop
+
+**Physical stop comes first and is independent.** On any authority or control
+fault, the launcher stops the agent's whole namespace straight away, without
+waiting for the authority to answer, recover or revoke admissions.
+- **A blocked `endSession`** never delays the stop or quiescence.
+- **Admissions stay unknown** until revocation is confirmed.
+- **Stop means namespace teardown.** As in the #102 probe, every namespace
+  member must be confirmed exited. The existing private-channel probe keeps
+  helpers unreaped with `waitid(WNOWAIT)` until group cleanup. That prevents
+  process-group id reuse, but a group kill alone doesn't prove that detached
+  writers inside the namespace are gone.
 
 | Event | Required behavior |
 | --- | --- |
-| Authority process exits or stops answering | Console: unknown outcome, the request kept, no new decisions. Launcher: reopen the authority from the durable store **once**, with the same enrollment. If reopen fails, stop the agent and end the session |
-| Control process or its terminal exits | Launcher stops the agent (physical stop), revokes admissions (`endSession`), keeps the authority store. No decision can be made without the control window |
-| Listener exits | Decisions are unaffected (they travel through the console). The control window offers to reopen it with a fresh listener and nonce |
+| Authority process exits or stops answering | The launcher **stops the agent immediately**. The console reports unknown and accepts no new decisions. The launcher may try to reopen the authority from durable history **once**, but only to resolve a same-id result. After a crash that reopen is expected to refuse (leftover holder lock), and recovery goes through the outside-host process. A reopen can't clear a broken gate, doesn't imply that resuming is safe, and never restarts the agent by itself |
+| Control process or its terminal exits | The launcher **stops the agent immediately** and asks the authority to revoke admissions (best effort; their state stays unknown until confirmed). Any kept request in the console is **lost**, because the console holds it only in memory. Durable pending records and lookup-by-id across a control restart are separate, unadopted design choices. A new decision is never a substitute for recovering the old one |
+| Listener exits | Decisions are unaffected, because they travel through the console. Reopening it with a fresh listener and nonce needs a new console command or launcher control, which **doesn't exist yet** |
 | Agent exits | Normal end of a run. Admissions stay open until the human ends the session |
-| Launcher exits or crashes | Every child dies with it (parent-death signal plus a pidfd watchdog). A later launcher run sees the durable store and refuses to auto-resume. It requires an explicit human restart |
-| Cleanup can't be proven (a helper can't be reaped, a namespace member still alive) | Retain the private scratch, report "cleanup unproven", and never report success |
+| Launcher exits or crashes | Required: nothing it started keeps running. A parent-death signal reaches **direct children only**, and no watchdog survives the launcher itself, so the agent namespace must die through `--die-with-parent` on its own PID 1. The authority, console and listener each need their own parent-death handling. Under candidate A the console runs in the human's terminal, which isn't a child at all. A later launcher run finds durable history and refuses to resume automatically; it needs an explicit human restart. This cascade is a **test to implement**, not current evidence |
+| Cleanup can't be proven (a helper can't be reaped, a namespace member is still alive) | Retain the scratch, report "cleanup unproven", and never report success. Durable history is never touched |
 
 ## End and restart
 
@@ -132,48 +231,54 @@ until cleanup, as in the existing probes:
   answered with `admissions-revoked` (decisions closed), and the launcher's
   separate **physical stop** of the agent. Neither proves the other. The
   console never says the session ended because of revocation (#138).
-- **Restart after a checkpoint (#99).** The launcher stops the agent's
+- **Restart after a checkpoint (#99).** The launcher tears down the agent's
   namespace, captures, and restarts a fresh agent from the approved capture.
   The control process and the authority persist across that restart. The
   agent never inherits them.
 
 ## Negative controls (required before any claim)
 
-| ID | Control | How it is tested | Fixture can prove? | Matrix |
-| --- | --- | --- | --- | --- |
-| N1 | The agent can't open the control PTY | The agent sandbox gets its own devpts instance, and from inside it, opening each `/dev/pts/*` and the launcher's PTY path fails | yes, for the measured profile | C18 |
-| N2 | No `TIOCSTI` into the control PTY | The control PTY can't be reached (N1). The receipt also records `dev.tty.legacy_tiocsti` and a probe attempts `TIOCSTI` on every reachable tty | yes | C18 |
-| N3 | No inherited descriptors beyond the allowlist | The agent enumerates `/proc/self/fd` at start and compares it with the allowlist | yes | C17, X14 |
-| N4 | No display, session-bus, WSLg or Wayland/X11 reach | The agent's environment has no `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` or `WSL_*` interop variables, and connecting to `/tmp/.X11-unix/*`, `/mnt/wslg/*`, Wayland and bus sockets fails | yes (paths and variables); the terminal side needs manual checks | X13, C18 |
-| N5 | No automation or debugging endpoints | No browser profile directories are mounted, and connecting to CDP/WebDriver ports in the host namespace fails from the agent namespace | yes | C20, X14 |
-| N6 | OSC 52 (clipboard) and OSC 0/1/2 (title) never reach the human's terminal from the agent | A stateful output filter on the agent PTY. Tests cover split reads, BEL and ST terminators, the C1 OSC byte and DCS passthrough | yes (the filter); a real terminal needs manual checks | C18 |
-| N7 | Pasted control bytes and multi-line pastes are refused in the console | Console input policy (#122) | yes (unit) | C6 |
-| N8 | The agent can't spoof the control window | The banner only appears in the control window. Title escapes are filtered (N6). The human is told nothing counts unless the bannered window echoes it | partly; human judgment | C17 |
-| N9 | The agent can't reach the authority or listener links or the private directory | No named endpoints exist, the socketpairs aren't inherited, the private directory isn't mounted, and access attempts fail | yes (an existing probe covers a fixture worker) | X14 |
-| N10 | No fallback | An injected failure at each bootstrap step must leave no agent running, unconstrained or otherwise | yes | X18 |
-| N11 | Enrollment and session metadata hold no keys or codes | A static schema check plus a fixture that dumps the metadata | yes | C17 |
+Each control needs a positive control, so a probe can't pass merely because
+nothing worked.
 
-## What the fixtures prove, and what stays manual
+| ID | Control | How it is to be tested | Matrix |
+| --- | --- | --- | --- |
+| N1 | The agent can't reach the control PTY | **Compare terminal and namespace identities**, not paths: numeric `/dev/pts/N` names collide across private devpts instances. Then test **actual delivery**: bytes written from inside the agent to every terminal it can open never arrive at the control process. **Positive controls:** the agent can use its own terminal (and its procfs view of it), and host-side writes to the control PTY do arrive | C18 |
+| N2 | No `TIOCSTI` into the control PTY | The kernel refuses `TIOCSTI` unless the target is the caller's **controlling** terminal, or the caller has `CAP_SYS_ADMIN` in the initial namespace. So the defence is the separate session (`--new-session`; CVE-2017-5226) together with N1. **Record the actual ioctl outcome** on every terminal the agent can reach. Pass means it never reaches the control PTY; `TIOCSTI` on the agent's **own** PTY may legitimately succeed when `legacy_tiocsti=1`. A hardened kernel may refuse everywhere, so a refusal alone shows nothing about isolation. `strict-runtime-receipt/v1` does **not** record `dev.tty.legacy_tiocsti`: recording it needs a new reviewed receipt schema with vectors, or a separate fixture-only observation | C18 |
+| N3 | No inherited descriptors beyond the inspected allowlist | The agent enumerates `/proc/self/fd` at start, and the result is compared with the allowlist measured on the pinned runtime | C17, X14 |
+| N4 | No display, session-bus, WSLg, Wayland/X11 or WSL interop reach | The agent's environment has no `DISPLAY`, `WAYLAND_DISPLAY` or `DBUS_SESSION_BUS_ADDRESS`, and connecting to the **actual** sockets on the measured host fails, **including abstract sockets** (`@/tmp/.X11-unix/X0`, abstract D-Bus), which only the network namespace blocks. **WSL interop isn't gated by environment variables.** `WSLInterop` is registered in binfmt_misc with the F flag (`/init` preopened), and binfmt_misc isn't per-namespace. So the gate is the `/run/WSL/*_interop` socket: it must not be mounted, and **executing a Windows (MZ) file inside the sandbox must fail**. A review on this host ran `whoami.exe` from a sandbox once `/run/WSL` was bound in. Checks against synthetic socket paths aren't evidence of WSLg or clipboard denial | X13, C18 |
+| N5 | No automation or debugging endpoints | No browser profile directories are mounted, and from the agent's network namespace, connecting to the host's CDP and WebDriver ports and to abstract sockets fails. Positive control: the host itself can reach them | C20, X14 |
+| N6 | No terminal control strings from the agent reach the human's terminal | An **allowlist** filter on the agent PTY output: drop **all** OSC, DCS, APC, PM and SOS strings (OSC 52 clipboard, OSC 0/1/2 title, OSC 8 links, OSC 9 and OSC 1337 notifications), and never pass DCS through (tmux DCS wraps OSC 52). It must be a stateful parser, tested for split reads, BEL and ST terminators and the C1 introducer bytes. A real terminal emulator still needs manual acceptance | C18 |
+| N7 | Pasted control bytes and multi-line pastes are refused atomically | **#151:** a streaming parser buffers each whole line or paste and validates it before any accepted event. The current console accepts an already assembled printable line and isn't streaming evidence | C6 |
+| N8 | The agent can't pass itself off as the control window | A banner is forgeable text, so this needs protected ownership of the window (the launcher opens it), the title filter (N6), and manual acceptance on each terminal. The human is told that nothing counts unless the launcher-opened window echoes it | C17 |
+| N9 | The agent can't reach the authority or listener links or either directory | No named endpoints exist, the socketpairs aren't inherited, neither directory is mounted, and access attempts fail. Positive control: the launcher's own processes reach them | X14 |
+| N10 | No fallback | An injected failure at each bootstrap step must leave no agent running, unconstrained or otherwise | X18 |
+| N11 | Enrollment and session metadata hold no keys or codes | A static schema check plus a fixture that dumps the metadata | C17 |
 
-**The fixtures** are Bubblewrap with socketpairs and pinned binaries, as in
-`test/live/strict-private-channel-probe.py`. They can establish N1–N5, N9,
-N10 and N11 **for the measured profile**, which the runtime receipt
-fingerprints. They don't establish that profile for anyone else, and the
-receipt grants no support.
+## What fixtures can and can't establish
+
+**The current private-channel probe** (`test/live/strict-private-channel-probe.py`)
+covers the #145 socketpair, durable reconnect and a fixture worker's
+descriptor and path exclusion. It proves **neither** PTY isolation **nor**
+display, automation or browser isolation.
+
+**A future launcher fixture**, Codex's #149 terminal fixture and its
+successors, can establish N1–N5 and N9–N11 **for the measured profile only**,
+which the runtime receipt fingerprints. That still says nothing about other
+profiles, and the receipt grants no support.
 
 **Manual human and profile acceptance** is still needed, per supported
 terminal and OS:
-- that the launcher actually opens a separate terminal window, and that only
-  it shows the banner;
-- that the real terminal emulator ignores filtered OSC sequences and
-  doesn't expose its own clipboard or title channels;
+- that the launcher actually opens and owns a separate terminal window;
+- that the real terminal emulator ignores filtered OSC sequences and doesn't
+  expose its own clipboard or title channels;
 - that the human's browser profile is separate and fresh;
-- on WSL, how the outside launcher opens a Windows-side terminal and
-  browser (see the open questions) without giving the agent interop.
+- on WSL, how the outside launcher opens a Windows-side terminal and browser
+  without giving the agent interop.
 
-**Browser fixtures** (`test/live/strict-browser-matrix.mjs`) cover the
-decision page's request rules and rendering (C1–C5). They don't cover the
-human's own browser or its isolation.
+**Browser fixtures** (`test/live/strict-browser-matrix.mjs`) cover the decision
+page's request rules and rendering (C1–C5). They don't cover the human's own
+browser or its isolation.
 
 ## Before implementation
 
@@ -181,20 +286,30 @@ Any bootstrap framing or schema needs **independent vectors and Codex
 cross-review** before code. That covers:
 - the enrollment message;
 - the readiness handshake;
-- the launcher↔listener issuance link;
-- the descriptor allowlist format.
+- the listener↔authority issuance capability;
+- the launcher→console control link;
+- the launcher→authority link;
+- the descriptor allowlist format;
+- any extended runtime receipt.
 
 The #145 channel framing is reused unchanged.
 
 ## Open questions
 
-1. **WSL control window.** Can the outside launcher start a Windows terminal
-   (for example `wt.exe`) through interop while the agent sandbox has
-   interop refused? Or must v1 require a Linux terminal emulator (WSLg)?
-2. **Idle timeout and reconnect limits.** Values to agree, plus how many
-   authority reopens to allow per session (proposed: one).
-3. **Physical stop on control-window loss.** Is stopping the agent the right
-   default, or should the agent be paused (SIGSTOP of the namespace) until
-   the human reopens the control window?
+1. **Control and agent windows.** Choose candidate A or B. Under A, how does
+   the agent's display-only window appear on WSL: `wt.exe` through interop
+   (on for the launcher, since binfmt_misc isn't per-namespace; refused for
+   the sandbox by withholding `/run/WSL` and failing MZ execution, N4), or a
+   WSLg terminal? This conflicts with an X13 rule that refuses launch whenever
+   interop is enabled, so X13 must become "interop unreachable from the
+   sandbox".
+2. **Timeouts and reopens.** The idle timeout and reconnect values, and how
+   many authority reopens to allow per session (proposed: one).
+3. **Stop or pause on control-window loss.** Is a physical stop the right
+   default? Pausing the namespace (SIGSTOP) would still have to meet the same
+   independence rule.
 4. **Where to filter the agent PTY.** The launcher, or a dedicated filter
    process. Either way, the filter must be a stateful parser (N6).
+5. **Durable pending requests.** Should kept console requests survive a
+   control crash, through a protected pending record or lookup-by-id? That
+   would be a separate design. Neither is adopted.
