@@ -25,9 +25,16 @@ authority.**
 - a fixed child that leads its own process group (the agent group);
 - an escapee that double-forks into a new session, outside that group.
 
-The host finds every member by its pid-namespace inode, opens a pidfd on
-each one, and then re-checks the inode and the `NSpid` mapping, so each handle
-is known to belong to a namespace member. It also checks the group and
+**Finding the members.** The host anchors the namespace from its own side:
+1. The outer Bubblewrap process is the one it launched, or the launcher
+   stand-in's only child.
+2. Init is that process's only child, and it is namespace PID 1.
+3. The namespace identity is read from that verified init. The record the
+   worker sends from inside must agree with it.
+
+The host then finds the other members by that pid-namespace inode. It opens a
+pidfd on each one and re-checks the inode and the `NSpid` mapping, so each
+handle is known to belong to a namespace member. It also checks the group and
 session layout described above.
 
 **The authority stub.** It receives an `endSession` request and confirms on a
@@ -39,16 +46,23 @@ carries the byte count and its receive and release times.
 **Proven stop.** The host kills the namespace init through its pidfd. A stop
 counts as proven only when every member's pidfd reports exit **and** a `/proc`
 scan finds no live process left in the namespace. Both bounds are timed from
-the moment the fault is detected:
-- the kill must be issued within 50 ms;
-- the stop must be proven within 2 seconds.
+when the fault objectively happened, not from when the host noticed it:
+- the request deadline, for a stall;
+- the moment the host killed the authority or told the control stand-in to
+  hang up, for the other faults.
 
-So any wait on the authority before stopping fails the run. An authority
+The kill must be issued within 250 ms of the fault, and the stop must be
+proven within 2 seconds, including the scan. So a wait of more than 250 ms
+anywhere between the fault and the kill fails the run, including a wait for
+the authority's reply. Just before the kill, every member must still be
+alive. An authority
 timeout or an `admissions-revoked` reply never counts as evidence of a stop.
 
 **No authority call, observed.** The stub, not the host's code, reports that
 it saw zero bytes on the authority link between the request and the release.
-The host requires that count to be zero. The release itself is written only
+The host requires that count to be zero. This applies to the stall and
+control-loss scenarios. In the authority-exit scenario the stub is dead, so
+"no authority call" there rests on reading the code. The release itself is written only
 after the proven stop, so "reply after stop" holds by construction. The real
 evidence is that the stub was still alive and silent when the stop was proven.
 
@@ -56,7 +70,9 @@ evidence is that the stub was still alive and silent when the stop was proven.
 processes of our own that can't be inspected (such as the user's systemd
 manager), are skipped. One of our own processes that started after the
 namespace and still can't be inspected might be a member, so it makes the
-stop unproven.
+stop unproven. No run currently produces such a process, so this path has no
+positive control yet. It could also fail a run if an unrelated process of
+ours that can't be inspected starts during it.
 
 | Scenario | Fault | Also required |
 | --- | --- | --- |
@@ -65,13 +81,19 @@ stop unproven.
 | Control loss | The control stand-in hangs up; the control link reaches end of file | As for authority stall |
 | Launcher crash | A launcher stand-in that started Bubblewrap is killed with SIGKILL | The host does nothing else. The outer Bubblewrap process and the namespace must exit through parent death alone, within 2 seconds of the kill |
 
-**Negative control.** Killing the agent's process group, which is what a
-launcher tracking only the agent's group might do, must **not** count as a
-stop. The fixture requires the check to fail, naming the worker, init and the
-escapee as survivors. It then stops the namespace properly.
+**Negative control.** A selective stop of the agent-group child, which is
+alone in its group, must **not** count as a stop. It is sent through the
+child's pidfd, never as a numeric group signal. This is what a launcher
+tracking only the agent's group might do. The fixture requires the check to
+fail, naming the worker, init and the escapee as survivors. It then stops the
+namespace properly.
+
+**No-fault control.** With a held request and no fault, for 600 ms (twice the
+deadline), every member stays alive, the namespace stays intact and the
+authority stays held. So the stops above are caused by the faults.
 
 **Injected failure.** `--inject-unproven` replaces the launcher's stop step
-with that same group kill. The run must report `stop-unproven`, name the
+with that same selective child stop. The run must report `stop-unproven`, name the
 survivors, exit 1 and retain the scratch directory. The retained directory
 holds only helper stderr files. There is no durable history in this fixture.
 
@@ -90,16 +112,21 @@ fixtures:
 - Each record and status read has a deadline.
 - The whole run is bounded at 60 seconds.
 
-**Cleanup:**
-1. Kill every namespace init and every helper's session.
-2. Require every pidfd that was opened to report exit.
-3. Rescan each namespace inode and require it to be empty.
+**Cleanup** runs under one shared 10-second deadline:
+1. Kill every namespace init through its pidfd.
+2. Kill the session of every helper that hasn't been reaped yet. Its PID and
+   group are still reserved until it is reaped. An already reaped helper is
+   never signalled, because its number may have been reused.
+3. Require every pidfd that was opened to report exit, including the outer
+   Bubblewrap process.
+4. Rescan each namespace inode and require it to be empty.
 
 ## Limits
 
 - A stand-in, not a launcher. The faults are the stand-in events in the
   contract's table. They aren't an injected failure at each bootstrap step,
   so X18's "no fallback at every step" stays open.
+- The kill bound is 250 ms, so a shorter wait before the stop isn't caught.
 - The inode scan sees live processes only. A zombie has already given up its
   namespaces, so zombies are caught by their pidfds, not the scan.
 - No hostile coverage of ptrace, cgroup escape or nested user namespaces.
@@ -110,14 +137,17 @@ fixtures:
 
 Observed on 2026-11-17 on WSL2 kernel `6.6.87.2-microsoft-standard-WSL2`,
 x86_64, system Python 3.12.3:
-- **Normal runs:** all four scenarios passed. Each kill was issued at once
-  after the fault, and each stop was proven 2.7 to 3.7 ms after it. The
+- **Normal runs:** all four scenarios passed. Kills were issued 1.8 to
+  2.8 ms after the fault (about 23 ms for control loss, which includes the
+  stand-in's exit). Stops were proven within 26 ms. The no-fault control
+  held for 600 ms. The
   negative control named worker, init and escapee as survivors, and repeat
   runs passed.
 - **Injected run:** reported `stop-unproven` and retained only stderr files.
 - **Leaks:** no helper process was left running after any run.
 - **Review mutations:** each of these now fails the run:
-  - waiting 1.5 s before the kill;
+  - waiting 1.5 s before the kill, whether inside the stop step, for the
+    authority's reply after the deadline, or after either end of file;
   - writing to the authority link before the stop;
   - releasing the stub before the stop;
   - dropping `--die-with-parent`.

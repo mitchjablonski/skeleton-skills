@@ -29,8 +29,9 @@ HERE = pathlib.Path(__file__).resolve().parent
 HELPER = HERE / "strict-lifecycle-fault-helper.py"
 MAX = 32768
 WALL_SECONDS = 60
-STOP_BOUND = 2.0      # seconds from fault detection to a proven namespace stop
-KILL_BOUND = 0.05     # seconds from fault detection to the kill being issued
+STOP_BOUND = 2.0      # seconds from the fault to a proven namespace stop (scan included)
+KILL_BOUND = 0.25     # seconds from the fault to the kill being issued
+CLEANUP_BOUND = 10.0  # one shared deadline for all cleanup
 DEADLINE = 0.3        # the launcher's authority request deadline
 NEGATIVE_BOUND = 0.5  # how long the negative control waits before judging
 
@@ -60,6 +61,7 @@ class Run:
         self.processes = []  # Popen objects, each in its own session
         self.fds = []
         self.inits = []      # pidfds of namespace inits
+        self.extras = []     # other pidfds whose exit cleanup must confirm
         self.members = []    # every member pidfd ever opened
         self.namespaces = []
 
@@ -178,13 +180,34 @@ def start_namespace(run, label, launcher=False):
         os.close(write_end)
     record = read_record(read_end, time.monotonic() + 5)
     run.recorded = True
-    pid_ns = record["pidNs"]
+    # Anchor the namespace from the host: the outer Bubblewrap process is the
+    # one we launched (or the launcher stand-in's only child), and init is its
+    # only child. The namespace identity comes from that verified init, and
+    # the record from inside must agree with it.
+    procs = [int(n) for n in os.listdir("/proc") if n.isdigit()]
+    outer = process.pid
+    if launcher:
+        kids = [pid for pid in procs if parent_of(pid) == process.pid]
+        assert len(kids) == 1, "launcher stand-in should have one child"
+        outer = kids[0]
+    outer_fd = run.fd(os.pidfd_open(outer))
+    run.extras.append(outer_fd)
+    assert parent_of(outer) == (process.pid if launcher else os.getpid()) and not exited(outer_fd)
+    inits = [pid for pid in procs if parent_of(pid) == outer]
+    assert len(inits) == 1, "bubblewrap should have one child, the namespace init"
+    init_fd = os.pidfd_open(inits[0])
+    run.members.append(init_fd)
+    pid_ns = ns_of(inits[0])
+    assert parent_of(inits[0]) == outer and not exited(init_fd), "init changed while opening it"
+    assert nspid_of(inits[0])[-1] == 1, "bubblewrap's child is not namespace PID 1"
     assert isinstance(pid_ns, str) and pid_ns.startswith("pid:[") and len(pid_ns) < 64
-    assert pid_ns != os.readlink("/proc/self/ns/pid")
+    assert pid_ns != os.readlink("/proc/self/ns/pid") and record["pidNs"] == pid_ns
     roles = {1: "init", record["worker"]: "worker", record["child"]: "child", record["escapee"]: "escapee"}
     assert len(roles) == 4
-    members = {}
+    members = {"init": {"pid": inits[0], "fd": init_fd}}
     for pid in scan(pid_ns, since):
+        if pid == inits[0]:
+            continue
         fd = os.pidfd_open(pid)
         run.members.append(fd)
         # Re-check after opening, so the handle is the namespace member.
@@ -199,7 +222,8 @@ def start_namespace(run, label, launcher=False):
     worker, child, escapee = (stat_of(members[r]["pid"]) for r in ("worker", "child", "escapee"))
     assert child["pgrp"] == members["child"]["pid"] != worker["pgrp"], "agent group not separate"
     assert escapee["pgrp"] != child["pgrp"] and escapee["session"] not in (worker["session"], child["session"])
-    namespace = {"pidNs": pid_ns, "members": members, "process": process, "since": since}
+    namespace = {"pidNs": pid_ns, "members": members, "process": process, "since": since,
+                 "outer": outer, "outerFd": outer_fd}
     run.namespaces.append(namespace)
     return namespace
 
@@ -222,6 +246,8 @@ def prove_stopped(namespace, deadline, extra=()):
     left = scan(namespace["pidNs"], namespace["since"])
     if alive or left:
         raise Unproven({"alive": sorted(alive), "remaining": len(left)})
+    if time.monotonic() > deadline:
+        raise Unproven({"late": True})  # the proof, scan included, overran the bound
 
 
 def start_authority(run, label):
@@ -279,15 +305,29 @@ def release_and_reply(authority, stopped_ns):
     return True
 
 
-def fault_stop(namespace, inject, fault_at):
-    """The launcher's stop step, timed from the moment the fault was detected.
+def alive_at_fault(namespace):
+    """No-fault observation: until the fault, every member is alive and the namespace is intact."""
+    dead = [role for role, m in namespace["members"].items() if exited(m["fd"])]
+    assert not dead and len(scan(namespace["pidNs"], namespace["since"])) == 4, "namespace changed before the fault"
 
-    The kill must be issued within KILL_BOUND and proven within STOP_BOUND of
-    fault_at, so any wait on the authority before stopping fails the run. The
-    injected failure replaces the stop with an agent-group kill.
+
+def selective_child_stop(namespace):
+    """Stop only the agent-group child, through its pidfd (it is alone in its group)."""
+    signal.pidfd_send_signal(namespace["members"]["child"]["fd"], signal.SIGKILL)
+
+
+def fault_stop(namespace, inject, fault_at):
+    """The launcher's stop step, timed from the fault itself.
+
+    fault_at is when the fault objectively happened (the request deadline, or
+    the moment the host caused the exit or hangup), not when the host noticed.
+    The kill must be issued within KILL_BOUND and proven, scan included,
+    within STOP_BOUND of it, so a wait on the authority before stopping fails
+    the run. The injected failure replaces the stop with a selective child stop.
     """
+    alive_at_fault(namespace)
     if inject:
-        os.killpg(namespace["members"]["child"]["pid"], signal.SIGKILL)
+        selective_child_stop(namespace)
     else:
         stop_namespace(namespace)
     killed = time.monotonic()
@@ -300,9 +340,8 @@ def scenario_authority_stall(run, inject):
     namespace = start_namespace(run, "stall-agent")
     authority = start_authority(run, "stall-authority")
     # The fault: the outstanding request passes its deadline unanswered.
-    remaining = authority["sentAt"] + DEADLINE - time.monotonic()
-    assert not select.select([authority["sock"]], [], [], max(0, remaining))[0]
-    fault_at = time.monotonic()
+    fault_at = authority["sentAt"] + DEADLINE
+    assert not select.select([authority["sock"]], [], [], max(0, fault_at - time.monotonic()))[0]
     kill_ms, stop_ms, stopped_ns = fault_stop(namespace, inject, fault_at)
     assert still_held(authority), "authority replied or exited during the stop"
     release_and_reply(authority, stopped_ns)
@@ -313,10 +352,10 @@ def scenario_authority_stall(run, inject):
 def scenario_authority_exit(run, inject):
     namespace = start_namespace(run, "exit-agent")
     authority = start_authority(run, "exit-authority")
+    fault_at = time.monotonic()  # the fault: the authority is killed
     signal.pidfd_send_signal(authority["fd"], signal.SIGKILL)
-    # The fault: the authority link reaches end of file.
+    # Detected when the authority link reaches end of file.
     assert select.select([authority["sock"]], [], [], 5)[0] and os.read(authority["sock"], 64) == b""
-    fault_at = time.monotonic()
     kill_ms, stop_ms, _ = fault_stop(namespace, inject, fault_at)
     authority["process"].wait(timeout=5)
     return {"fault": "authority-exited", "killMs": kill_ms, "stopMs": stop_ms, "authorityReplied": False}
@@ -332,10 +371,10 @@ def scenario_control_loss(run, inject):
                              "control", pass_fds=(stub.fileno(),))
     finally:
         stub.close()
+    fault_at = time.monotonic()  # the fault: the control stand-in is told to hang up
     os.write(control_fd, b"hangup\n")
-    # The fault: the control link reaches end of file.
+    # Detected when the control link reaches end of file.
     assert select.select([control_fd], [], [], 5)[0] and os.read(control_fd, 64) == b""
-    fault_at = time.monotonic()
     kill_ms, stop_ms, stopped_ns = fault_stop(namespace, inject, fault_at)
     control.wait(timeout=5)
     assert still_held(authority), "authority replied or exited during the stop"
@@ -344,29 +383,41 @@ def scenario_control_loss(run, inject):
             "authorityHeldThroughStop": True, "authorityBytesBeforeRelease": 0}
 
 
-def negative_group_kill(run):
-    """Killing the agent's process group is not a namespace stop."""
+def negative_selective_stop(run):
+    """A selective stop of the agent-group child is not a namespace stop."""
     namespace = start_namespace(run, "negative-agent")
-    os.killpg(namespace["members"]["child"]["pid"], signal.SIGKILL)
+    selective_child_stop(namespace)
     try:
         prove_stopped(namespace, time.monotonic() + NEGATIVE_BOUND)
     except Unproven as detail:
         survivors = detail.args[0]
     else:
-        raise RuntimeError("negative control: group kill was accepted as a stop")
+        raise RuntimeError("negative control: a selective child stop was accepted as a stop")
     assert survivors["alive"] == ["escapee", "init", "worker"], "negative control: unexpected survivors"
     stop_namespace(namespace)
     prove_stopped(namespace, time.monotonic() + STOP_BOUND)
-    return {"groupKillSurvivors": survivors["alive"], "detectedUnproven": True}
+    return {"selectiveChildStopSurvivors": survivors["alive"], "detectedUnproven": True}
+
+
+def no_fault_control(run):
+    """Without a fault nothing stops: the namespace stays intact and the authority stays held."""
+    namespace = start_namespace(run, "nofault-agent")
+    authority = start_authority(run, "nofault-authority")
+    held_until = time.monotonic() + 2 * DEADLINE
+    while time.monotonic() < held_until:
+        alive_at_fault(namespace)
+        assert still_held(authority), "authority replied or exited with no fault"
+        time.sleep(0.05)
+    stop_namespace(namespace)
+    prove_stopped(namespace, time.monotonic() + STOP_BOUND)
+    release_and_reply(authority, time.monotonic_ns())
+    return {"heldMs": ms(2 * DEADLINE), "namespaceIntact": True, "authorityHeld": True}
 
 
 def scenario_launcher_crash(run):
     namespace = start_namespace(run, "launcher-crash", launcher=True)
     launcher = namespace["process"]
-    outer = [pid for pid in (int(n) for n in os.listdir("/proc") if n.isdigit()) if parent_of(pid) == launcher.pid]
-    assert len(outer) == 1, "launcher stand-in should have one child"
-    outer_fd = run.fd(os.pidfd_open(outer[0]))
-    assert stat_of(outer[0])["ppid"] == launcher.pid and not exited(outer_fd)
+    outer_fd = namespace["outerFd"]
     launcher_fd = run.fd(os.pidfd_open(launcher.pid))
     started = time.monotonic()
     signal.pidfd_send_signal(launcher_fd, signal.SIGKILL)
@@ -419,9 +470,10 @@ def main():
             result.update(code="stop-unproven", stopUnproven=detail.args[0], injected=inject)
             raise
         scenarios["launcherCrash"] = scenario_launcher_crash(run)
-        negative = negative_group_kill(run)
+        negative = negative_selective_stop(run)
+        no_fault = no_fault_control(run)
         result.update(ok=True, code="lifecycle-fault-fixture-passed", scenarios=scenarios,
-                      negativeControl=negative, platform=observations,
+                      negativeControl=negative, noFaultControl=no_fault, platform=observations,
                       boundary="bubblewrap PID namespace init; pidfds on init, worker, child and a "
                                "session-escaping descendant; /proc pid-ns inode scan",
                       limitations=["synthetic fixture only", "no real authority, console, listener or launcher",
@@ -436,6 +488,8 @@ def main():
             result["code"] = "fixture-failed"
     finally:
         signal.alarm(0)
+        cleanup_deadline = time.monotonic() + CLEANUP_BOUND
+        left = lambda: max(0.0, cleanup_deadline - time.monotonic())
         if run is not None:
             for fd in run.inits:
                 try:
@@ -445,17 +499,20 @@ def main():
                 except OSError:
                     cleanup = False
             for process in run.processes:
+                if process.returncode is not None:
+                    continue  # already reaped: its numeric PID/PGID may be reused, never signal it
                 try:
+                    # Unreaped, so the PID and its group stay reserved until wait().
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    process.wait(timeout=5)
+                    process.wait(timeout=left())
                 except (OSError, subprocess.SubprocessError):
                     cleanup = False
-            for fd in run.members:
+            for fd in run.members + run.extras:
                 try:
-                    if not exited(fd, 5):
+                    if not exited(fd, left()):
                         cleanup = False
                 except OSError:
                     cleanup = False
@@ -465,7 +522,7 @@ def main():
                         cleanup = False
                 except (OSError, Unproven):
                     cleanup = False
-            for fd in run.fds + run.members:
+            for fd in set(run.fds + run.members):
                 try:
                     os.close(fd)
                 except OSError:
