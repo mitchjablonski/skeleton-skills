@@ -161,6 +161,11 @@ def scan(pid_ns, since):
     found = []
     for name in os.listdir("/proc"):
         if name.isdigit() and ns_of(int(name), since) == pid_ns:
+            try:
+                if stat_of(int(name))["state"] == "Z":
+                    continue  # exited, not yet reaped: its pidfd already reports exit
+            except (FileNotFoundError, ProcessLookupError):
+                continue
             found.append(int(name))
     return sorted(found)
 
@@ -481,7 +486,7 @@ def main():
                       limitations=["synthetic fixture only", "no real authority, console, listener or launcher",
                                    "stand-in faults, not every bootstrap step",
                                    "no hostile ptrace, cgroup escape or user-namespace nesting coverage",
-                                   "zombies are reported by pidfd, not by the inode scan"])
+                                   "the inode scan skips zombies; their pidfds report exit"])
         exit_code = 0
     except (AssertionError, OSError, ValueError, TypeError, RuntimeError, KeyError, Unproven,
             subprocess.SubprocessError):

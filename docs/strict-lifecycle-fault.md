@@ -132,8 +132,9 @@ fixtures:
   "the stop kills init by pidfd" is shown by the code, not measured. The
   /proc scan's positive control is the negative control, where the scan
   must still find the three survivors.
-- The inode scan sees live processes only. A zombie has already given up its
-  namespaces, so zombies are caught by their pidfds, not the scan.
+- The inode scan counts live processes only. A zombie can still show its
+  namespace link, so the scan skips anything in state Z. Zombies are judged
+  by their pidfds, which report exit.
 - No hostile coverage of ptrace, cgroup escape or nested user namespaces.
   Parent-death handling for a real authority, console or listener isn't
   covered either. Under candidate A the console isn't a child at all.
