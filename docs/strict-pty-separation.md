@@ -27,12 +27,15 @@ Control remains alive, has no extra bytes, and repeats its host-only roundtrip.
 Three throwaway Unix listeners stand in for display/session endpoints. Host
 connections are positive controls; agent pathname connections must fail. Six
 synthetic display/WSL environment entries supplied to Bubblewrap must disappear
-after its explicit environment clearing. This is pathname/environment fixture
+after its explicit environment clearing; a separate positive control without
+clearing first proves the entries reach the worker namespace. This is pathname/environment fixture
 evidence, not actual X11, Wayland, WSLg, clipboard or automation isolation.
 
 Output is bounded public JSON. Exit 2 means unsupported arguments/prerequisites;
 exit 1 means an attempted fixture or cleanup failed; exit 0 means this bounded
-fixture passed. Helpers have CPU/file/wall bounds. Leaders remain unreaped with
+fixture passed. Helpers have CPU/file/wall bounds.
+Optimized Python is refused before admission, so assertions cannot silently
+disappear under `-O` or an inherited optimization setting. Leaders remain unreaped with
 `waitid(WNOWAIT)` until process-group SIGKILL, then bounded reaping. A deliberate
 same-group sleeping descendant survives its leader's exit; the host opens its
 pidfd and requires it alive before group cleanup and stopped afterward, with a

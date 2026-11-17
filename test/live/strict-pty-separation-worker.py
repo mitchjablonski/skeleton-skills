@@ -35,6 +35,7 @@ def devpts_mounts():
  return lines
 
 def main():
+ if sys.flags.optimize: raise RuntimeError('optimized interpreter unsupported')
  mode=sys.argv[1]
  if mode=='group-descendant':
   child=subprocess.Popen(['/usr/bin/python3','-I','-c','import time; time.sleep(60)'],stdin=subprocess.DEVNULL,env={},close_fds=True)

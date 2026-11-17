@@ -64,6 +64,7 @@ def main():
  result={'ok':False,'strictState':'unverified','code':'unsupported'};exit_code=2
  root=None;processes=[];fds=[];sockets=[];cleanup=True;descendant_pidfd=None;descendant_started=False
  try:
+  if sys.flags.optimize: raise RuntimeError('optimized interpreter unsupported')
   assert len(sys.argv)==1 and sys.platform.startswith('linux')
   assert pathlib.Path(sys.executable).resolve()==pathlib.Path('/usr/bin/python3').resolve()
   assert pathlib.Path('/usr/bin/bwrap').is_file()
@@ -99,6 +100,9 @@ def main():
    with socket.socket(socket.AF_UNIX) as client:
     client.connect(pathname);accepted,_=listener.accept();accepted.close()
   environment={name:'synthetic-fixture-sentinel' for name in ('DISPLAY','WAYLAND_DISPLAY','XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS','WSL_INTEROP','WSLENV')}
+  environment_control='import os,json; keys='+repr(tuple(environment))+'; assert all(os.environ.get(key)=="synthetic-fixture-sentinel" for key in keys); print(json.dumps({"ok":True}))'
+  positive=launch([arg for arg in base if arg!='--clearenv']+['--','/usr/bin/python3','-I','-c',environment_control],root,'environment-positive',processes,environment=environment)
+  result_of(positive,root,'environment-positive')
   agent=launch(base+['--ro-bind',str(worker),'/worker.py','--','/usr/bin/python3','-I','/worker.py','agent',json.dumps(target),*paths],root,'agent',processes,environment=environment)
   evidence=result_of(agent,root,'agent')
   assert observed(control) is None
@@ -112,9 +116,10 @@ def main():
   descendant=json.loads(descendant_record.read_bytes())
   assert descendant['pgid']==group_leader.pid==group_result['leaderPgid']
   descendant_pidfd=os.pidfd_open(descendant['pid'])
+  assert os.getpgid(descendant['pid'])==group_leader.pid, 'descendant group mismatch'
   assert not select.select([descendant_pidfd],[],[],0)[0], 'descendant not alive before cleanup'
-  result.update(ok=True,code='pty-separation-fixture-passed',controlRoundtrips=2,controlStayedAlive=True,controlNoExtraBytes=True,syntheticSocketPositiveControls=3,agent=evidence,hostDevptsMounts=host_mounts,platform=observations,limitations=['synthetic fixture only','TIOCSTI outcome does not establish causal denial when kernel disables it','no actual WSLg clipboard automation or human bootstrap evidence','no lifecycle death-cascade or hostile session-escaping descendant coverage']);exit_code=0
- except (AssertionError,OSError,ValueError,RuntimeError,KeyError,subprocess.SubprocessError): pass
+  result.update(ok=True,code='pty-separation-fixture-passed',controlRoundtrips=2,controlStayedAlive=True,controlNoExtraBytes=True,syntheticSocketPositiveControls=3,syntheticEnvironmentPositiveControl=True,agent=evidence,hostDevptsMounts=host_mounts,platform=observations,limitations=['synthetic fixture only','TIOCSTI outcome does not establish causal denial when kernel disables it','no actual WSLg clipboard automation or human bootstrap evidence','no lifecycle death-cascade or hostile session-escaping descendant coverage']);exit_code=0
+ except (AssertionError,OSError,ValueError,TypeError,RuntimeError,KeyError,subprocess.SubprocessError): pass
  finally:
   for process,label in processes:
    try:
@@ -129,11 +134,15 @@ def main():
     if not select.select([descendant_pidfd],[],[],5)[0]: cleanup=False
     else: result['supervisedDescendantStopped']=True
    except OSError: cleanup=False
-   finally: os.close(descendant_pidfd)
+   finally:
+    try: os.close(descendant_pidfd)
+    except OSError: cleanup=False
   for fd in fds:
    try: os.close(fd)
    except OSError: cleanup=False
-  for sock in sockets: sock.close()
+  for sock in sockets:
+   try: sock.close()
+   except OSError: cleanup=False
   if root is not None and cleanup:
    try:
     assert root.parent==pathlib.Path(tempfile.gettempdir()).resolve() and root.name.startswith('strict-pty-separation-') and not root.is_symlink()
