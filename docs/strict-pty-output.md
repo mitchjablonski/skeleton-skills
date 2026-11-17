@@ -1,0 +1,13 @@
+# Strict PTY output prototype
+
+The N6 prototype in [lib/strict-pty-output.mjs](../lib/strict-pty-output.mjs) accepts raw bytes from one agent PTY stream and returns plain text. It is disabled and has no launcher or terminal integration. The only emitted characters are ASCII space through tilde and LF. CR, tabs, non-ASCII characters, and formatting are discarded. CRLF becomes LF. This lossy output is suitable for a plain transcript. It cannot reproduce an interactive TUI, cursor position, or inline progress updates that depend on CR.
+
+Use a fresh `createStrictPtyOutput()` instance for each stream. Each `push(chunk)` accepts up to 16 KiB in a `Uint8Array` or Node.js `Buffer` and returns an independent string of at most that many characters. The filter snapshots each accepted byte view, keeps only fixed-size parser state across reads, and never buffers a pending control string. Invalid input closes the instance and throws. Subsequent pushes throw even if the input is corrected. `end()` closes the instance, discards unfinished framing, and returns an empty string.
+
+- OSC ends at BEL or ST. DCS, APC, PM and SOS end at ST. Each introducer can use the ESC sequence or the raw C1 byte. ST can be ESC followed by backslash or a raw C1 ST. Inside DCS, doubled ESC is consumed as a pair. A DCS beginning with `tmux;` discards raw C1 ST as wrapped content and waits for the outer ESC-backslash terminator.
+- CSI is discarded through its final byte in the range 0x40–0x7E. Ordinary ESC sequences are discarded through a final byte in the range 0x30–0x7E. While either is pending, unsupported bytes are discarded and a new recognized introducer takes precedence. An unfinished string continues to discard through EOF if its terminator is missing. CAN and SUB do not end a string.
+- UTF-8 prefix state distinguishes continuation bytes from raw C1 bytes, including across reads. A byte in a recognized continuation position is discarded as Unicode. A byte that breaks the continuation is classified afresh. For example, UTF-8 encoding of U+009D is discarded as a character. Since it does not open an OSC string, printable bytes following it can appear. Ambiguous or malformed input may also hide adjacent text. Do not use this filter to redact content.
+
+This filter treats plain ASCII as data and makes no claims about the text's origin or trustworthiness. N6 still requires manual acceptance in each real terminal emulator before deployment. That acceptance must cover the full output path and confirm that downstream rendering treats the result as plain text.
+
+Run the focused tests with `node --test test/strict-pty-output.test.mjs`.
