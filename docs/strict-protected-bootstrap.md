@@ -29,7 +29,7 @@ It builds on:
 | **Durable history directory** (enrollment, authority record and journal, capture store) | launcher | launcher, on first enrollment; reopened on later launches; mode 0700, outside the workspace, never mounted into the agent | **no** |
 | **Scratch directory** (per-launch working files, sockets' bookkeeping, probe output) | launcher | launcher, **fresh for every launch**; an existing path is refused | **no** |
 | Authority process (durable human authority, one enrolled project and session) | launcher child | launcher | **no** |
-| Control process (console) with its **own controlling PTY** | launcher child, its own session leader | launcher (mechanism below: **open blocker**) | **no** |
+| Control process (console) and the control PTY | **depends on the candidate below** (open blocker). Under B: a launcher child and session leader on a launcher-made PTY. Under A: the console runs in the human's existing terminal; that PTY predates the launcher and is shared with the human's shell session | the human's terminal (A) or the launcher (B) | **no** |
 | Decision listener (127.0.0.1, protected origin) | launcher child, host network namespace | launcher | **no** |
 | Control↔authority link | an unnamed socketpair (#145 framing, exactly four methods) | launcher | **no** |
 | Launcher→console control link (hand over a fresh socketpair on reconnect or idle timeout) | **open**: not defined yet | launcher | **no** |
@@ -47,11 +47,27 @@ between before implementation:
 
 - **A (proposed). The launcher's own terminal is the control window.** The
   human starts the launcher in a terminal; that terminal's PTY becomes the
-  control PTY, and the console runs in the foreground there. The agent's PTY
-  is launcher-created (`openpty`), and its output is shown in a second window
-  through a display-only relay. The agent's window is untrusted anyway. This
-  needs no descriptor passing into an emulator. Showing that second window on
-  WSL still needs a terminal (open question 1).
+  control PTY, and the console runs in the foreground there.
+  - **The agent's window.** The agent's PTY is launcher-created (`openpty`).
+    It is shown in a second window through a relay that carries **both**
+    output and the human's input to the agent, so it isn't display-only. That
+    second window is a new emulator too, and hits the same descriptor-handoff
+    problem. Because the agent's window is untrusted, its relay may use a
+    named or otherwise less protected endpoint. The rule against named
+    endpoints applies to the control side only.
+  - **Departure from H3.** This differs from the H3 assumption of "a fresh
+    terminal or window that only the launcher owns". The control PTY was
+    created by the emulator before the launcher started.
+  - **Prerequisites and residuals.** Every process in that terminal session
+    shares the controlling terminal, so it could `TIOCSTI` into it or read
+    from it: earlier background jobs, and anything started from that shell.
+    Under the residual-trust rule these are trusted human processes, so this
+    isn't a hole, but A requires starting from a **clean terminal** with no
+    other jobs. Running the launcher inside tmux, screen or an IDE terminal
+    adds those programs to the trusted set (they can read and inject); either
+    refuse it or record it as a residual per profile.
+  - **WSL.** Showing the agent's window on WSL still needs a terminal (open
+    question 1).
 - **B. A launcher-made PTY handed to an emulator that accepts one** (for
   example `xterm -S`). Few emulators support this, and none on the Windows
   side.
@@ -195,9 +211,9 @@ and a 4096-byte frame.
 - **Reconnecting** gives the console a fresh socketpair from the launcher.
   It never gets a named endpoint.
 - **A retry after reconnecting** uses the **same request id**, so the journal
-  returns the original result. Tested in `test/strict-human-channel.test.mjs`
-  and `test/strict-control-store.test.mjs`, for the channel and store in
-  isolation, not under a launcher.
+  returns the original result. Tested pairwise in
+  `test/strict-human-channel.test.mjs`, `test/strict-control-store.test.mjs`
+  and `test/live/strict-private-channel-probe.py`, not under a launcher.
 
 **Idle timeout (proposal):** close the control↔authority connection after 10
 minutes idle, and reconnect on the next command. The value is to be agreed.
@@ -219,7 +235,7 @@ waiting for the authority to answer, recover or revoke admissions.
 | Event | Required behavior |
 | --- | --- |
 | Authority process exits or stops answering | The launcher **stops the agent immediately**. The console reports unknown and accepts no new decisions. The launcher may try to reopen the authority from durable history **once**, but only to resolve a same-id result. After a crash that reopen is expected to refuse (leftover holder lock), and recovery goes through the outside-host process. A reopen can't clear a broken gate, doesn't imply that resuming is safe, and never restarts the agent by itself |
-| Control process or its terminal exits | The launcher **stops the agent immediately** and asks the authority to revoke admissions (best effort; their state stays unknown until confirmed). Any kept request in the console is **lost**, because the console holds it only in memory. Durable pending records and lookup-by-id across a control restart are separate, unadopted design choices. A new decision is never a substitute for recovering the old one |
+| Control process or its terminal exits (under A, closing the control terminal hangs up the launcher too, so the row below applies) | The launcher **stops the agent immediately** and asks the authority to revoke admissions (best effort; their state stays unknown until confirmed). Any kept request in the console is **lost**, because the console holds it only in memory. Durable pending records and lookup-by-id across a control restart are separate, unadopted design choices. A new decision is never a substitute for recovering the old one |
 | Listener exits | Decisions are unaffected, because they travel through the console. Reopening it with a fresh listener and nonce needs a new console command or launcher control, which **doesn't exist yet** |
 | Agent exits | Normal end of a run. Admissions stay open until the human ends the session |
 | Launcher exits or crashes | Required: nothing it started keeps running. A parent-death signal reaches **direct children only**, and no watchdog survives the launcher itself, so the agent namespace must die through `--die-with-parent` on its own PID 1. The authority, console and listener each need their own parent-death handling. Under candidate A the console runs in the human's terminal, which isn't a child at all. A later launcher run finds durable history and refuses to resume automatically; it needs an explicit human restart. This cascade is a **test to implement**, not current evidence |
