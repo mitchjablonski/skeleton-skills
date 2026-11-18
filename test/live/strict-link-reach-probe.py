@@ -4,8 +4,8 @@ links, or the durable history or scratch directories; the launcher can.
 
 Everything is synthetic and owned by the fixture: two directories, an
 authority-link socketpair, a loopback TCP listener standing in for the
-decision-page listener, and a pathname socket standing in for any named
-endpoint. Never connects to anything it didn't create. Each gate has a
+decision-page listener, and a pathname and an abstract socket standing in
+for named endpoints. Never connects to anything it didn't create. Each gate has a
 positive control that removes only that gate. Never human proof.
 
 Exit 0: passed. Exit 1: a check or positive control failed. Exit 2: unsupported.
@@ -57,7 +57,7 @@ for n in sorted(os.listdir(listing), key=int):
         continue
     kind = ("socket" if target.startswith("socket:") else "pipe" if target.startswith("pipe:")
             else "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "other")
-    out["fds"].append([fd, kind, st.st_ino])
+    out["fds"].append([fd, kind, st.st_ino, st.st_dev])
 os.close(listing)
 if plan.get("authorityFd") is not None:
     import select
@@ -158,7 +158,7 @@ def main():
         plan = {"dirs": [["durable", str(durable)], ["scratch", str(scratch)]], "port": port, "unix": named_path,
                 "abstract": abstract_name}
         # A leaked descriptor of any type to either directory would bypass the mount gate.
-        dir_inodes = {os.stat(durable).st_ino, os.stat(scratch).st_ino}
+        dir_ids = {(os.stat(d).st_ino, os.stat(d).st_dev) for d in (durable, scratch)}
 
         # The agent: a sandbox given none of it.
         agent = run(root, "agent", bwrap_argv() + ["--"], plan)
@@ -215,14 +215,15 @@ def main():
         others_hold(shared, {"tcp", "abstract"})
         # Descriptor gate: passing the authority end makes it visible as a socket.
         passed = run(root, "passed-fd", bwrap_argv() + ["--"], plan, pass_fds=(authority_end.fileno(),))
-        assert passed["fds"] == [[authority_end.fileno(), "socket", os.fstat(authority_end.fileno()).st_ino]], \
+        link = os.fstat(authority_end.fileno())
+        assert passed["fds"] == [[authority_end.fileno(), "socket", link.st_ino, link.st_dev]], \
             "descriptor positive control failed"
         others_hold(passed, {"fds"})
         # A leaked directory descriptor is reported too, as that directory.
         dir_fd = os.open(str(durable), os.O_RDONLY | os.O_DIRECTORY)
         closers.append(_Fd(dir_fd))
         leaked_dir = run(root, "passed-dirfd", bwrap_argv() + ["--"], plan, pass_fds=(dir_fd,))
-        assert [(f[0], f[1]) for f in leaked_dir["fds"]] == [(dir_fd, "directory")] and leaked_dir["fds"][0][2] in dir_inodes, \
+        assert [(f[0], f[1]) for f in leaked_dir["fds"]] == [(dir_fd, "directory")] and tuple(leaked_dir["fds"][0][2:]) in dir_ids, \
             "a leaked directory descriptor was not detected"
         others_hold(leaked_dir, {"fds"})
 
