@@ -19,16 +19,22 @@ Chrome**:
 - a loopback remote-debugging endpoint (`--remote-debugging-address=127.0.0.1
   --remote-debugging-port=0`), with the port read from `DevToolsActivePort`.
 
-The browser gets no display variables, so it never touches WSLg. The fixture
-never connects to anything it didn't create. Chrome's own sandbox is
-preferred. `--no-sandbox` is used only if the browser can't start with it,
-and the choice is recorded.
+The browser gets no display variables, so it never touches WSLg. It runs
+with `--disable-crash-reporter --disable-breakpad
+--disable-background-networking`: Chrome's crash handler setsids out of the
+browser session and is configured with an upload URL, so it is turned off.
+The fixture itself connects only to the endpoint it created.
+
+Chrome's own sandbox is preferred. `--no-sandbox` is used only if the
+sandboxed browser can't start, and both the choice and the reason are
+recorded.
 
 **Endpoint identity is pinned:**
 - the 127.0.0.1 listener's socket inode must be held by a process in the
   browser's own session, at the start and again at the end;
-- `/json/version` must report the same browser both times, with a
-  `webSocketDebuggerUrl` on that exact address and port.
+- `/json/version` must report the same browser both times;
+- its `webSocketDebuggerUrl` must equal the address, port and path recorded
+  in `DevToolsActivePort`.
 
 | Gate | Agent (Bubblewrap sandbox) | Positive control (opens only that gate) |
 | --- | --- | --- |
@@ -36,11 +42,12 @@ and the choice is recorded.
 | Browser profile (mount) | `ENOENT` | Profile bound read-only: the marker reads back, and the endpoint stays `ECONNREFUSED` |
 | Both | — | The launcher itself reaches the endpoint and reads the marker |
 
-**Cleanup.** The browser's session gets SIGTERM, then SIGKILL. A pass needs
-both of these to hold:
-- no process remains in that session;
-- no process still names the profile on its command line, which catches a
-  helper that left the session.
+**Cleanup.** Every browser session the fixture launched, including a failed
+sandboxed attempt, gets SIGTERM, then SIGKILL. A pass needs both of these to
+hold:
+- no live process remains in any of those sessions;
+- no process names anything under the scratch root on its command line,
+  which catches a helper that left the session.
 
 A process that outlives cleanup fails the run (exit 1) and keeps the
 scratch directory.
@@ -72,8 +79,10 @@ Observed on 2026-11-17 on WSL2 kernel `6.6.87.2-microsoft-standard-WSL2`,
 x86_64, system Python 3.12.3, Chrome 143.0.7499.192 with its sandbox on:
 - the agent reached neither the endpoint nor the profile;
 - each control opened exactly its own gate;
-- the endpoint stayed held by the browser session throughout;
-- no browser process survived cleanup;
+- the endpoint was held by the browser session at the start and at the end;
+- no browser process survived cleanup, and no crash handler appeared;
+- a mutation that made the sandboxed attempt exit at once fell back to
+  `--no-sandbox` and recorded why;
 - `/mnt/wslg/stderr.log` gained no lines.
 
 Strict remained `unverified`.

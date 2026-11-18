@@ -74,22 +74,28 @@ def run_worker(root, label, prefix, plan):
 
 
 def session_pids(sid):
+    """Live (non-zombie) processes in a session."""
     pids = []
     for name in os.listdir("/proc"):
         if name.isdigit():
             try:
                 with open("/proc/%s/stat" % name) as f:
                     data = f.read(4096)
-                if int(data[data.rindex(")") + 2:].split()[3]) == sid:
+                fields = data[data.rindex(")") + 2:].split()
+                if int(fields[3]) == sid and fields[0] != "Z":
                     pids.append(int(name))
             except (OSError, ValueError, IndexError):
                 pass
     return pids
 
 
-def profile_users(profile):
-    """Processes whose command line names our profile: catches a helper that left the session."""
-    needle = ("--user-data-dir=" + str(profile)).encode()
+def root_users(root):
+    """Processes whose command line names anything under our scratch root.
+
+    Catches a helper that left the browser session (Chrome's crash handler
+    setsids and names only a database path under HOME, which is the root).
+    """
+    needle = str(root).encode()
     found = []
     for name in os.listdir("/proc"):
         if name.isdigit() and int(name) != os.getpid():
@@ -144,7 +150,8 @@ def version(port):
 
 def launch_browser(chrome, profile, sandbox):
     args = [chrome, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-            "--disable-extensions", "--disable-background-networking", "--user-data-dir=" + str(profile),
+            "--disable-extensions", "--disable-background-networking", "--disable-crash-reporter",
+            "--disable-breakpad", "--user-data-dir=" + str(profile),
             "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"]
     if not sandbox:
         args.append("--no-sandbox")
@@ -154,14 +161,16 @@ def launch_browser(chrome, profile, sandbox):
 
 
 def wait_port(profile, process, deadline):
+    """(port, browser websocket path) from DevToolsActivePort."""
     path = profile / "DevToolsActivePort"
     while time.monotonic() < deadline:
-        assert process.poll() is None, "browser exited before opening its endpoint"
+        if process.poll() is not None:
+            raise RuntimeError("browser exited before opening its endpoint")
         try:
-            first = path.read_text()[:256].splitlines()[0]
-            port = int(first)
-            if 0 < port < 65536:
-                return port
+            lines = path.read_text()[:512].splitlines()
+            port = int(lines[0])
+            if 0 < port < 65536 and len(lines) > 1 and lines[1].startswith("/devtools/browser/"):
+                return port, lines[1]
         except (OSError, ValueError, IndexError):
             pass
         time.sleep(0.05)
@@ -173,7 +182,7 @@ def main():
     exit_code = 2
     root = None
     browser = None
-    profile = None
+    sessions = []  # every browser session ever launched, checked in cleanup
     cleanup = True
     try:
         if sys.flags.optimize:
@@ -196,14 +205,20 @@ def main():
         # Prefer the browser's own sandbox; fall back to --no-sandbox only if it can't start, and record which.
         sandbox = True
         port = None
+        fallback_reason = None
         for attempt in (True, False):
             browser = launch_browser(chrome, profile, attempt)
+            sessions.append(browser.pid)
             try:
-                port = wait_port(profile, browser, time.monotonic() + 20)
+                port, ws_path = wait_port(profile, browser, time.monotonic() + 20)
                 sandbox = attempt
                 break
-            except (AssertionError, RuntimeError):
-                os.killpg(browser.pid, signal.SIGKILL)
+            except RuntimeError as error:
+                fallback_reason = str(error)[:80]
+                try:
+                    os.killpg(browser.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # the whole group already exited
                 browser.wait(timeout=10)
                 browser = None
                 (profile / "DevToolsActivePort").unlink(missing_ok=True)
@@ -216,7 +231,8 @@ def main():
         assert inode, "no loopback listener on the reported port"
         assert holders(inode, session_pids(browser.pid)), "listener not held by the browser session"
         before = version(port)
-        assert isinstance(before.get("Browser"), str) and before.get("webSocketDebuggerUrl", "").startswith("ws://127.0.0.1:%d/" % port)
+        assert isinstance(before.get("Browser"), str) and before.get("webSocketDebuggerUrl") == "ws://127.0.0.1:%d%s" % (port, ws_path), \
+            "debugger URL does not match DevToolsActivePort"
 
         # Launcher side: reaches the endpoint and reads the profile marker.
         assert (profile / MARKER).read_text() == value
@@ -235,7 +251,9 @@ def main():
         assert holders(inode, session_pids(browser.pid)), "listener no longer held by the browser session"
 
         result.update(ok=True, code="browser-endpoint-fixture-passed",
-                      browser={"product": before["Browser"][:64], "chromeSandbox": sandbox},
+                      browser={"product": before["Browser"][:64], "chromeSandbox": sandbox,
+                               "sandboxFallbackReason": None if sandbox else fallback_reason,
+                               "crashReporter": "disabled"},
                       endpoint={"address": "127.0.0.1", "kind": "remote-debugging-port", "ownedByBrowserSession": True},
                       agent=agent, positiveControls={"launcher": {"endpoint": "connected", "profile": "marker"},
                                                      "sharedNet": shared, "boundProfile": bound},
@@ -250,30 +268,36 @@ def main():
             http.client.HTTPException):
         pass
     finally:
-        if browser is not None:
-            sid = browser.pid
-            try:
-                os.killpg(sid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        if sessions:
+            for sid in sessions:
+                try:
+                    os.killpg(sid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
             deadline = time.monotonic() + 10
-            while (session_pids(sid) or profile_users(profile)) and time.monotonic() < deadline:
+            while time.monotonic() < deadline:
+                if browser is not None:
+                    browser.poll()  # reap the lead so it stops counting
+                if not any(session_pids(sid) for sid in sessions) and not root_users(root):
+                    break
                 time.sleep(0.1)
-            try:
-                os.killpg(sid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                browser.wait(timeout=5)
-            except subprocess.SubprocessError:
-                cleanup = False
-            for pid in profile_users(profile):  # a helper outside the session: kill, then fail
+            for sid in sessions:
+                try:
+                    os.killpg(sid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if browser is not None:
+                try:
+                    browser.wait(timeout=5)
+                except subprocess.SubprocessError:
+                    cleanup = False
+            for pid in root_users(root):  # a helper outside the session: kill, then fail
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 cleanup = False
-            if session_pids(sid):
+            if any(session_pids(sid) for sid in sessions):
                 cleanup = False  # a browser process outlived cleanup
         if root is not None and cleanup and exit_code != 1:
             try:
