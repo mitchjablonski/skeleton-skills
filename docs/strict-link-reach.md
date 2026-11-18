@@ -26,13 +26,14 @@ It never connects to anything it didn't create.
 | Directories (mount) | Both `ENOENT` | Bind-mounted: both list |
 | Pathname endpoint (mount) | `ENOENT` | Bind-mounted: it connects |
 | Listener and abstract endpoint (network namespace) | Both `ECONNREFUSED` | With the network namespace shared: both connect |
-| Descriptors | None beyond stdio, of any type | The authority socket passed in deliberately is reported as that socket (same inode). A leaked directory descriptor is reported as that directory |
+| Descriptors | None beyond stdio, of any type | The authority socket passed in deliberately is reported as that socket (same inode). A leaked directory descriptor is reported as exactly that directory (same inode and device) |
 | All of the above | — | The launcher's own unsandboxed process lists both directories, connects to the listener and both endpoints, and completes a bounded request/reply on the authority link |
 
 Each positive control also asserts that **every other gate still holds**, so
 it removes exactly one gate. The descriptor scan follows the N3 fixture:
 - every descriptor beyond stdio is reported, by type and inode;
-- only CPython's `listdir` duplicate may vanish;
+- only CPython's `listdir` transient may vanish, in the lowest free slot,
+  which the worker samples first;
 - anything else that can't be inspected is a violation.
 
 ## Output and bounds

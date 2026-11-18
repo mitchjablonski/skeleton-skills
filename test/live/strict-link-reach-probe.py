@@ -47,13 +47,16 @@ for key, addr in (("unix", plan["unix"]), ("abstract", "\0" + plan["abstract"][1
 # (as in the N3 fixture). Only listing + 1, CPython's listdir dup, may vanish.
 import stat
 listing = os.open("/proc/self/fd", os.O_RDONLY | os.O_DIRECTORY)
+transient = os.dup(listing)  # the lowest free slot, where listdir's own dup will land
+os.close(transient)
 for n in sorted(os.listdir(listing), key=int):
     fd = int(n)
     if fd == listing or fd <= 2 or fd == plan.get("authorityFd"): continue
     try:
         target = os.readlink("/proc/self/fd/%d" % fd); st = os.fstat(fd)
-    except OSError:
-        if fd != listing + 1: out["fds"].append([fd, "uninspectable", 0])
+    except OSError as e:
+        if not (fd == transient and e.errno in (errno.ENOENT, errno.EBADF)):
+            out["fds"].append([fd, "uninspectable", 0, 0])
         continue
     kind = ("socket" if target.startswith("socket:") else "pipe" if target.startswith("pipe:")
             else "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "other")
@@ -158,7 +161,6 @@ def main():
         plan = {"dirs": [["durable", str(durable)], ["scratch", str(scratch)]], "port": port, "unix": named_path,
                 "abstract": abstract_name}
         # A leaked descriptor of any type to either directory would bypass the mount gate.
-        dir_ids = {(os.stat(d).st_ino, os.stat(d).st_dev) for d in (durable, scratch)}
 
         # The agent: a sandbox given none of it.
         agent = run(root, "agent", bwrap_argv() + ["--"], plan)
@@ -223,7 +225,8 @@ def main():
         dir_fd = os.open(str(durable), os.O_RDONLY | os.O_DIRECTORY)
         closers.append(_Fd(dir_fd))
         leaked_dir = run(root, "passed-dirfd", bwrap_argv() + ["--"], plan, pass_fds=(dir_fd,))
-        assert [(f[0], f[1]) for f in leaked_dir["fds"]] == [(dir_fd, "directory")] and tuple(leaked_dir["fds"][0][2:]) in dir_ids, \
+        expected_dir = os.fstat(dir_fd)
+        assert leaked_dir["fds"] == [[dir_fd, "directory", expected_dir.st_ino, expected_dir.st_dev]], \
             "a leaked directory descriptor was not detected"
         others_hold(leaked_dir, {"fds"})
 
