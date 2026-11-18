@@ -110,10 +110,14 @@ fixtures:
 **Bounds:**
 - Helpers get CPU and file-size limits.
 - Each record and status read has a deadline.
-- The whole run is bounded at 60 seconds.
+- A 60-second alarm covers the scenarios. Cleanup gets a separate 10-second
+  budget for reaping and verification.
 
-**Cleanup** runs under one shared 10-second deadline:
-1. Kill every namespace init through its pidfd.
+**Cleanup** uses one shared deadline rather than giving each helper its own
+timeout. A scan overrun makes cleanup unproven. Scratch removal happens only
+after successful verification and has no separate I/O timeout.
+1. Signal each validated namespace init through its pidfd. Also signal the
+   verified Bubblewrap child of the launcher stand-in if it is still alive.
 2. Kill the session of every helper that hasn't been reaped yet. Its PID and
    group are still reserved until it is reaped. An already reaped helper is
    never signalled, because its number may have been reused.
@@ -132,11 +136,10 @@ fixtures:
   "the stop kills init by pidfd" is shown by the code, not measured. The
   /proc scan's positive control is the negative control, where the scan
   must still find the three survivors.
-- The inode scan counts live processes only. A zombie can still show its
-  namespace link, so the scan skips a process only when every one of its
-  threads is in state Z or X. A leader that called `pthread_exit` shows Z
-  while its other threads still run, and is still counted. Zombies are judged
-  by their pidfds, which report exit.
+- The inode scan corroborates the pidfd evidence for the fixed fixture
+  members. For entries with a readable namespace link, it checks the entire
+  thread group before excluding a zombie. The scan does not establish
+  coverage for a group whose leader no longer exposes that link.
 - No hostile coverage of ptrace, cgroup escape or nested user namespaces.
   Parent-death handling for a real authority, console or listener isn't
   covered either. Under candidate A the console isn't a child at all.
