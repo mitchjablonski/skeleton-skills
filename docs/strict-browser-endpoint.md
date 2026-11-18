@@ -20,10 +20,14 @@ Chrome**:
   --remote-debugging-port=0`), with the port read from `DevToolsActivePort`.
 
 The browser gets no display variables, so it never touches WSLg. It runs
-with `--disable-crash-reporter --disable-breakpad
---disable-background-networking`: Chrome's crash handler setsids out of the
-browser session and is configured with an upload URL, so it is turned off.
-The fixture itself connects only to the endpoint it created.
+with `--disable-background-networking`, and the fixture itself connects only
+to the endpoint it created.
+
+**Chrome's crash handlers do start** (Chrome 143 headless), each in its own
+session. Their database is under HOME, which is the scratch root, and they
+are configured with Chrome's crash-upload URL. No crash occurs in a passing
+run, but the fixture doesn't block or observe their network traffic. The
+output records how many were seen, and cleanup must reap them (below).
 
 Chrome's own sandbox is preferred. `--no-sandbox` is used only if the
 sandboxed browser can't start, and both the choice and the reason are
@@ -46,8 +50,12 @@ recorded.
 sandboxed attempt, gets SIGTERM, then SIGKILL. A pass needs both of these to
 hold:
 - no live process remains in any of those sessions;
-- no process names anything under the scratch root on its command line,
-  which catches a helper that left the session.
+- no process names anything under the scratch root on its command line.
+  That catches the crash handlers and any other helper that left the
+  session.
+
+A session with nothing left alive isn't signalled again, because its
+number may already belong to someone else.
 
 A process that outlives cleanup fails the run (exit 1) and keeps the
 scratch directory.
@@ -80,7 +88,7 @@ x86_64, system Python 3.12.3, Chrome 143.0.7499.192 with its sandbox on:
 - the agent reached neither the endpoint nor the profile;
 - each control opened exactly its own gate;
 - the endpoint was held by the browser session at the start and at the end;
-- no browser process survived cleanup, and no crash handler appeared;
+- no browser process or crash handler survived cleanup;
 - a mutation that made the sandboxed attempt exit at once fell back to
   `--no-sandbox` and recorded why;
 - `/mnt/wslg/stderr.log` gained no lines.

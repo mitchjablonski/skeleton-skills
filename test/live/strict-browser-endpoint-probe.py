@@ -108,6 +108,20 @@ def root_users(root):
     return found
 
 
+def crash_handlers(root):
+    """Chrome crash handlers for this run: they setsid out of the browser session
+    and name only a database under HOME (the scratch root)."""
+    found = 0
+    for pid in root_users(root):
+        try:
+            with open("/proc/%d/comm" % pid) as f:
+                if f.read(64).startswith("chrome_crashpad"):
+                    found += 1
+        except OSError:
+            pass
+    return found
+
+
 def listening_inode(port):
     """Inode of the 127.0.0.1:<port> TCP listener in our network namespace, or None."""
     want = "0100007F:%04X" % port
@@ -150,8 +164,7 @@ def version(port):
 
 def launch_browser(chrome, profile, sandbox):
     args = [chrome, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-            "--disable-extensions", "--disable-background-networking", "--disable-crash-reporter",
-            "--disable-breakpad", "--user-data-dir=" + str(profile),
+            "--disable-extensions", "--disable-background-networking", "--user-data-dir=" + str(profile),
             "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"]
     if not sandbox:
         args.append("--no-sandbox")
@@ -230,6 +243,7 @@ def main():
         inode = listening_inode(port)
         assert inode, "no loopback listener on the reported port"
         assert holders(inode, session_pids(browser.pid)), "listener not held by the browser session"
+        handlers_seen = crash_handlers(root)  # observed, not assumed: cleanup must reap them
         before = version(port)
         assert isinstance(before.get("Browser"), str) and before.get("webSocketDebuggerUrl") == "ws://127.0.0.1:%d%s" % (port, ws_path), \
             "debugger URL does not match DevToolsActivePort"
@@ -253,7 +267,7 @@ def main():
         result.update(ok=True, code="browser-endpoint-fixture-passed",
                       browser={"product": before["Browser"][:64], "chromeSandbox": sandbox,
                                "sandboxFallbackReason": None if sandbox else fallback_reason,
-                               "crashReporter": "disabled"},
+                               "crashHandlersSeen": handlers_seen},
                       endpoint={"address": "127.0.0.1", "kind": "remote-debugging-port", "ownedByBrowserSession": True},
                       agent=agent, positiveControls={"launcher": {"endpoint": "connected", "profile": "marker"},
                                                      "sharedNet": shared, "boundProfile": bound},
@@ -270,6 +284,8 @@ def main():
     finally:
         if sessions:
             for sid in sessions:
+                if not session_pids(sid):
+                    continue  # nothing live in it: its number may already be reused
                 try:
                     os.killpg(sid, signal.SIGTERM)
                 except ProcessLookupError:
@@ -282,6 +298,8 @@ def main():
                     break
                 time.sleep(0.1)
             for sid in sessions:
+                if not session_pids(sid):
+                    continue
                 try:
                     os.killpg(sid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -297,8 +315,8 @@ def main():
                 except ProcessLookupError:
                     pass
                 cleanup = False
-            if any(session_pids(sid) for sid in sessions):
-                cleanup = False  # a browser process outlived cleanup
+            if any(session_pids(sid) for sid in sessions) or root_users(root):
+                cleanup = False  # a browser process or crash handler outlived cleanup
         if root is not None and cleanup and exit_code != 1:
             try:
                 assert root.parent == pathlib.Path(tempfile.gettempdir()).resolve()
