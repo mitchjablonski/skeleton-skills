@@ -61,6 +61,7 @@ class Run:
         self.processes = []  # Popen objects, each in its own session
         self.fds = []
         self.inits = []      # pidfds of namespace inits
+        self.launcher_children = []  # validated Bubblewrap children of a stand-in
         self.extras = []     # other pidfds whose exit cleanup must confirm
         self.members = []    # every member pidfd ever opened
         self.namespaces = []
@@ -213,17 +214,21 @@ def start_namespace(run, label, launcher=False):
         assert len(kids) == 1, "launcher stand-in should have one child"
         outer = kids[0]
     outer_fd = run.fd(os.pidfd_open(outer))
-    run.extras.append(outer_fd)
     assert parent_of(outer) == (process.pid if launcher else os.getpid()) and not exited(outer_fd)
+    run.extras.append(outer_fd)
+    if launcher:
+        run.launcher_children.append(outer_fd)
     inits = [pid for pid in procs if parent_of(pid) == outer]
     assert len(inits) == 1, "bubblewrap should have one child, the namespace init"
     init_fd = os.pidfd_open(inits[0])
     run.members.append(init_fd)
     pid_ns = ns_of(inits[0])
-    assert parent_of(inits[0]) == outer and not exited(init_fd), "init changed while opening it"
+    assert parent_of(inits[0]) == outer and not exited(outer_fd) and not exited(init_fd), "init changed while opening it"
     assert nspid_of(inits[0])[-1] == 1, "bubblewrap's child is not namespace PID 1"
     assert isinstance(pid_ns, str) and pid_ns.startswith("pid:[") and len(pid_ns) < 64
-    assert pid_ns != os.readlink("/proc/self/ns/pid") and record["pidNs"] == pid_ns
+    assert pid_ns != os.readlink("/proc/self/ns/pid")
+    run.inits.append(init_fd)
+    assert record["pidNs"] == pid_ns
     roles = {1: "init", record["worker"]: "worker", record["child"]: "child", record["escapee"]: "escapee"}
     assert len(roles) == 4
     members = {"init": {"pid": inits[0], "fd": init_fd}}
@@ -240,7 +245,6 @@ def start_namespace(run, label, launcher=False):
         assert role and role not in members, "unexpected namespace member"
         members[role] = {"pid": pid, "fd": fd}
     assert set(members) == set(roles.values()), "namespace members missing"
-    run.inits.append(members["init"]["fd"])
     worker, child, escapee = (stat_of(members[r]["pid"]) for r in ("worker", "child", "escapee"))
     assert child["pgrp"] == members["child"]["pid"] != worker["pgrp"], "agent group not separate"
     assert escapee["pgrp"] != child["pgrp"] and escapee["session"] not in (worker["session"], child["session"])
@@ -515,7 +519,7 @@ def main():
         cleanup_deadline = time.monotonic() + CLEANUP_BOUND
         left = lambda: max(0.0, cleanup_deadline - time.monotonic())
         if run is not None:
-            for fd in run.inits:
+            for fd in run.inits + run.launcher_children:
                 try:
                     signal.pidfd_send_signal(fd, signal.SIGKILL)
                 except ProcessLookupError:
@@ -541,16 +545,21 @@ def main():
                 except OSError:
                     cleanup = False
             for namespace in run.namespaces:
+                if not left():
+                    cleanup = False
+                    break
                 try:
                     if scan(namespace["pidNs"], namespace["since"]):
                         cleanup = False
-                except (OSError, Unproven):
+                except (OSError, Unproven, ValueError, IndexError):
                     cleanup = False
             for fd in set(run.fds + run.members):
                 try:
                     os.close(fd)
                 except OSError:
                     pass  # already closed by its owner
+            if not left():
+                cleanup = False
         if not cleanup:
             retain = True
             result.update(ok=False, code="cleanup-failed", cleanupFailed=True)
