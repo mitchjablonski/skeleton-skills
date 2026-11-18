@@ -29,7 +29,7 @@ WORKER = r'''
 import errno, json, os, socket, sys
 plan = json.loads(sys.argv[1])
 def name(e): return errno.errorcode.get(e.errno, "E?") if isinstance(e, OSError) and e.errno else type(e).__name__
-out = {"dirs": {}, "tcp": None, "unix": None, "fds": [], "authority": None}
+out = {"dirs": {}, "tcp": None, "unix": None, "abstract": None, "fds": [], "authority": None}
 for label, path in plan["dirs"]:
     try:
         os.listdir(path); out["dirs"][label] = "listed"
@@ -38,24 +38,49 @@ s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1)
 try: s.connect(("127.0.0.1", plan["port"])); out["tcp"] = "connected"
 except OSError as e: out["tcp"] = name(e)
 finally: s.close()
-u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); u.settimeout(1)
-try: u.connect(plan["unix"]); out["unix"] = "connected"
-except OSError as e: out["unix"] = name(e)
-finally: u.close()
+for key, addr in (("unix", plan["unix"]), ("abstract", "\0" + plan["abstract"][1:])):
+    u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); u.settimeout(1)
+    try: u.connect(addr); out[key] = "connected"
+    except OSError as e: out[key] = name(e)
+    finally: u.close()
+# Every descriptor except stdio and the listing one, by type and identity
+# (as in the N3 fixture). Only listing + 1, CPython's listdir dup, may vanish.
+import stat
 listing = os.open("/proc/self/fd", os.O_RDONLY | os.O_DIRECTORY)
 for n in sorted(os.listdir(listing), key=int):
     fd = int(n)
-    if fd in (listing, listing + 1): continue
-    try: target = os.readlink("/proc/self/fd/%d" % fd)
-    except OSError: out["fds"].append([fd, "uninspectable"]); continue
-    if target.startswith("socket:"): out["fds"].append([fd, "socket"])
+    if fd == listing or fd <= 2 or fd == plan.get("authorityFd"): continue
+    try:
+        target = os.readlink("/proc/self/fd/%d" % fd); st = os.fstat(fd)
+    except OSError:
+        if fd != listing + 1: out["fds"].append([fd, "uninspectable", 0])
+        continue
+    kind = ("socket" if target.startswith("socket:") else "pipe" if target.startswith("pipe:")
+            else "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "other")
+    out["fds"].append([fd, kind, st.st_ino])
 os.close(listing)
 if plan.get("authorityFd") is not None:
+    import select
+    fd = plan["authorityFd"]
     try:
-        os.write(plan["authorityFd"], b"state\n"); out["authority"] = os.read(plan["authorityFd"], 64).decode()
-    except OSError as e: out["authority"] = name(e)
+        os.write(fd, b"state\n"); reply = b""
+        while not reply.endswith(b"\n"):
+            if not select.select([fd], [], [], 5)[0]: raise TimeoutError("authority reply timeout")
+            chunk = os.read(fd, 64)
+            if not chunk or len(reply) + len(chunk) > 64: raise ValueError("authority reply malformed")
+            reply += chunk
+        out["authority"] = reply.decode().strip()
+    except (OSError, ValueError) as e: out["authority"] = name(e)
 print(json.dumps(out, sort_keys=True))
 '''
+
+
+class _Fd:
+    def __init__(self, fd):
+        self.fd = fd
+
+    def close(self):
+        os.close(self.fd)
 
 
 def limits():
@@ -121,55 +146,94 @@ def main():
         named_path = str(scratch / "named.sock")
         named.bind(named_path)
         named.listen(16)
+        abstract = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        closers.append(abstract)
+        abstract_name = "@strict-link-reach-" + os.urandom(8).hex()
+        abstract.bind("\0" + abstract_name[1:])
+        abstract.listen(16)
         # Authority link stand-in: the launcher keeps one end and never passes it to the agent.
         launcher_end, authority_end = socket.socketpair()
         closers += [launcher_end, authority_end]
 
-        plan = {"dirs": [["durable", str(durable)], ["scratch", str(scratch)]], "port": port, "unix": named_path}
+        plan = {"dirs": [["durable", str(durable)], ["scratch", str(scratch)]], "port": port, "unix": named_path,
+                "abstract": abstract_name}
+        # A leaked descriptor of any type to either directory would bypass the mount gate.
+        dir_inodes = {os.stat(durable).st_ino, os.stat(scratch).st_ino}
 
         # The agent: a sandbox given none of it.
         agent = run(root, "agent", bwrap_argv() + ["--"], plan)
         assert agent["dirs"] == {"durable": "ENOENT", "scratch": "ENOENT"}, "a directory is visible to the agent"
         assert agent["tcp"] == "ECONNREFUSED", "the listener is reachable from the agent"
         assert agent["unix"] == "ENOENT", "a named endpoint is reachable from the agent"
-        assert agent["fds"] == [], "a socket descriptor reached the agent"
+        assert agent["abstract"] == "ECONNREFUSED", "an abstract endpoint is reachable from the agent"
+        assert agent["fds"] == [], "a descriptor beyond stdio reached the agent"
+        closed = {"dirs": {"durable": "ENOENT", "scratch": "ENOENT"}, "tcp": "ECONNREFUSED", "unix": "ENOENT",
+                  "abstract": "ECONNREFUSED", "fds": []}
+
+        def others_hold(run_result, opened):
+            """Every gate except the opened ones still holds."""
+            for key, value in closed.items():
+                if key not in opened:
+                    assert run_result[key] == value, f"{key} changed when only {opened} was opened"
 
         # Positive controls, each removing one gate.
         # The launcher's own (unsandboxed) process reaches everything, including the authority link.
-        def serve_authority():
-            if select.select([authority_end], [], [], 5)[0]:
-                if authority_end.recv(64) == b"state\n":
-                    authority_end.sendall(b"ok")
+        def serve_authority(deadline):
+            request = b""
+            while not request.endswith(b"\n"):
+                remaining = deadline - time.monotonic()
+                assert remaining > 0 and select.select([authority_end], [], [], remaining)[0], "authority request timeout"
+                chunk = authority_end.recv(64)
+                assert chunk and len(request) + len(chunk) <= 64, "authority request malformed"
+                request += chunk
+            assert request == b"state\n"
+            authority_end.sendall(b"ok\n")
         launcher_fd = launcher_end.fileno()
-        os.set_inheritable(launcher_fd, True)
         process = subprocess.Popen(["/usr/bin/python3", "-I", "-c", WORKER, json.dumps(dict(plan, authorityFd=launcher_fd))],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    env={}, pass_fds=(launcher_fd,), preexec_fn=limits)
-        serve_authority()
-        out, _ = process.communicate(timeout=30)
-        os.set_inheritable(launcher_fd, False)
+        try:
+            serve_authority(time.monotonic() + 10)
+            out, _ = process.communicate(timeout=30)
+        finally:
+            if process.poll() is None:
+                process.kill()  # never leave the launcher-side worker behind
+                process.wait(timeout=5)
         assert process.returncode == 0 and len(out) <= MAX
         host = json.loads(out)
         assert host["dirs"] == {"durable": "listed", "scratch": "listed"} and host["tcp"] == "connected"
-        assert host["unix"] == "connected" and host["authority"] == "ok", "launcher-side positive control failed"
+        assert host["unix"] == "connected" and host["abstract"] == "connected" and host["authority"] == "ok", \
+            "launcher-side positive control failed"
         # Mount gate: binding the directories makes them visible and the named endpoint reachable.
         bound = run(root, "bound", bwrap_argv(extra=["--bind", str(durable), str(durable),
                                                     "--bind", str(scratch), str(scratch)]) + ["--"], plan)
         assert bound["dirs"] == {"durable": "listed", "scratch": "listed"} and bound["unix"] == "connected", "mount positive control failed"
+        others_hold(bound, {"dirs", "unix"})
         # Network gate: sharing the network namespace makes the loopback listener reachable.
         shared = run(root, "shared-net", bwrap_argv(net=False) + ["--"], plan)
-        assert shared["tcp"] == "connected", "network positive control failed"
+        assert shared["tcp"] == "connected" and shared["abstract"] == "connected", "network positive control failed"
+        others_hold(shared, {"tcp", "abstract"})
         # Descriptor gate: passing the authority end makes it visible as a socket.
         passed = run(root, "passed-fd", bwrap_argv() + ["--"], plan, pass_fds=(authority_end.fileno(),))
-        assert passed["fds"] == [[authority_end.fileno(), "socket"]], "descriptor positive control failed"
+        assert passed["fds"] == [[authority_end.fileno(), "socket", os.fstat(authority_end.fileno()).st_ino]], \
+            "descriptor positive control failed"
+        others_hold(passed, {"fds"})
+        # A leaked directory descriptor is reported too, as that directory.
+        dir_fd = os.open(str(durable), os.O_RDONLY | os.O_DIRECTORY)
+        closers.append(_Fd(dir_fd))
+        leaked_dir = run(root, "passed-dirfd", bwrap_argv() + ["--"], plan, pass_fds=(dir_fd,))
+        assert [(f[0], f[1]) for f in leaked_dir["fds"]] == [(dir_fd, "directory")] and leaked_dir["fds"][0][2] in dir_inodes, \
+            "a leaked directory descriptor was not detected"
+        others_hold(leaked_dir, {"fds"})
 
         result.update(ok=True, code="link-reach-fixture-passed",
                       agent={"dirs": agent["dirs"], "listener": agent["tcp"], "namedEndpoint": agent["unix"],
-                             "socketDescriptors": len(agent["fds"])},
+                             "abstractEndpoint": agent["abstract"], "extraDescriptors": len(agent["fds"])},
                       positiveControls={"launcher": {"dirs": host["dirs"], "listener": host["tcp"],
                                                      "namedEndpoint": host["unix"], "authorityLink": host["authority"]},
                                         "boundDirs": bound["dirs"], "boundNamedEndpoint": bound["unix"],
-                                        "sharedNetListener": shared["tcp"], "passedAuthorityFd": len(passed["fds"])},
+                                        "sharedNetListener": shared["tcp"], "sharedNetAbstract": shared["abstract"],
+                                        "passedAuthorityFd": "same inode", "passedDirectoryFd": "detected"},
                       platform={"kernelRelease": platform.release()[:256], "machine": platform.machine(),
                                 "pythonVersion": platform.python_version()},
                       limitations=["synthetic directories, listener and links, not the real launcher",

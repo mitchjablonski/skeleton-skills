@@ -17,30 +17,39 @@ synthetic and owned by the fixture:
 - a durable-history directory and a scratch directory;
 - an authority-link socketpair;
 - a loopback TCP listener standing in for the decision-page listener;
-- a pathname socket standing in for any named endpoint.
+- a pathname socket and an abstract socket, standing in for named endpoints.
 
 It never connects to anything it didn't create.
 
 | Gate | Agent (Bubblewrap sandbox) | Positive control (removes only that gate) |
 | --- | --- | --- |
 | Directories (mount) | Both `ENOENT` | Bind-mounted: both list |
-| Named endpoint (mount) | `ENOENT` | Bind-mounted: it connects |
-| Listener (network namespace) | `ECONNREFUSED` | With the network namespace shared: it connects |
-| Authority link (descriptors) | No socket descriptor in the sandbox | Passed in deliberately: seen as exactly that socket |
-| All of the above | — | The launcher's own unsandboxed process lists both directories, connects to the listener and the named endpoint, and completes a request/reply on the authority link |
+| Pathname endpoint (mount) | `ENOENT` | Bind-mounted: it connects |
+| Listener and abstract endpoint (network namespace) | Both `ECONNREFUSED` | With the network namespace shared: both connect |
+| Descriptors | None beyond stdio, of any type | The authority socket passed in deliberately is reported as that socket (same inode). A leaked directory descriptor is reported as that directory |
+| All of the above | — | The launcher's own unsandboxed process lists both directories, connects to the listener and both endpoints, and completes a bounded request/reply on the authority link |
+
+Each positive control also asserts that **every other gate still holds**, so
+it removes exactly one gate. The descriptor scan follows the N3 fixture:
+- every descriptor beyond stdio is reported, by type and inode;
+- only CPython's `listdir` duplicate may vanish;
+- anything else that can't be inspected is a violation.
 
 ## Output and bounds
 
 The output is bounded public JSON, with errno names and counts only. The exit
 codes are the same as the other fixtures:
 - **Exit 0:** passed.
-- **Exit 1:** a check or positive control failed.
+- **Exit 1:** a check or positive control failed. The scratch directory is
+  retained, and its path reported.
 - **Exit 2:** unsupported. Capability is established by a plain
   `bwrap … /usr/bin/true` run first.
 
 ## Limits
 
 - Synthetic stand-ins, not the real launcher, authority or listener.
+- Fixture-owned endpoints only. The absence of every named endpoint on a
+  real host isn't enumerated.
 - Loopback TCP only. The other listener addresses (`0.0.0.0`,
   `[::ffff:127.0.0.1]`, a rebinding name, the WSL host address) and model
   egress are X14 and remain open.
