@@ -30,6 +30,19 @@ import errno, json, socket, sys
 plan = json.loads(sys.argv[1])
 def name(e): return errno.errorcode.get(e.errno, "E?") if isinstance(e, OSError) and e.errno else type(e).__name__
 out = {}
+if plan.get("routes"):
+    # Default routes visible here, read from the kernel tables; nothing is sent.
+    with open("/proc/net/route") as f:
+        v4 = sum(1 for r in f.read(65536).splitlines()[1:] if len(r.split()) > 1 and r.split()[1] == "00000000")
+    try:
+        with open("/proc/net/ipv6_route") as f:
+            # ::/0 entries flagged RTF_REJECT (0x0200) are the kernel's own
+            # unreachable routes on lo; they block traffic, so they don't count.
+            v6 = sum(1 for r in f.read(65536).splitlines()
+                     if r.split()[:2] == ["0" * 32, "00"] and not int(r.split()[8], 16) & 0x0200)
+    except OSError:
+        v6 = 0
+    out["defaultRoutes"] = v4 + v6
 for label, family, addr, port in plan["targets"]:
     s = socket.socket(socket.AF_INET6 if family == 6 else socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1)
     try: s.connect((addr, port)); out[label] = "connected"
@@ -68,7 +81,7 @@ def run(root, label, prefix, plan):
 
 
 def global_ipv4():
-    """The host's first global IPv4 address (from the default route's interface)."""
+    """The default-route interface's IPv4 address (often a private address on WSL NAT)."""
     with open("/proc/net/route") as f:
         rows = [r.split() for r in f.read(65536).splitlines()[1:]]
     default = next((r for r in rows if len(r) > 2 and r[1] == "00000000"), None)
@@ -90,13 +103,14 @@ def main():
     root = None
     cleanup = True
     listeners = []
+    failed = None
     try:
         if sys.flags.optimize:
             raise RuntimeError("optimized interpreter unsupported")
         assert sys.argv[1:] == [] and sys.platform.startswith("linux")
         assert pathlib.Path(sys.executable).resolve() == pathlib.Path("/usr/bin/python3").resolve()
         assert pathlib.Path("/usr/bin/bwrap").is_file() and socket.has_ipv6
-        address, gateway = global_ipv4()
+        address, _gateway = global_ipv4()
         root = pathlib.Path(tempfile.mkdtemp(prefix="strict-listener-address-")).resolve()
         os.chmod(root, 0o700)
         capability = subprocess.run(bwrap_argv() + ["--", "/usr/bin/true"], stdin=subprocess.DEVNULL,
@@ -118,23 +132,52 @@ def main():
         result["code"] = "fixture-failed"
 
         targets = [["any4-via-loopback", 4, "127.0.0.1", port4],
+                   ["any4-via-unspecified", 4, "0.0.0.0", port4],
                    ["any4-via-host-address", 4, address, port4],
                    ["dual-via-ipv6-loopback", 6, "::1", port6],
+                   ["dual-via-unspecified", 6, "::", port6],
                    ["dual-via-mapped-loopback", 6, "::ffff:127.0.0.1", port6]]
+        # Exact expectations per label: loopback-local addresses are refused by
+        # the sandbox's own empty loopback; the host address has no route there.
+        expected = {"any4-via-loopback": "ECONNREFUSED", "any4-via-unspecified": "ECONNREFUSED",
+                    "any4-via-host-address": "ENETUNREACH", "dual-via-ipv6-loopback": "ECONNREFUSED",
+                    "dual-via-unspecified": "ECONNREFUSED", "dual-via-mapped-loopback": "ECONNREFUSED"}
         plan = {"targets": targets}
-        # The sandbox's route to the gateway: one connect to the discard port, no route expected.
-        route_plan = {"targets": [["gateway-route", 4, gateway, 9]]}
 
+        # The sandbox's routes are read from its kernel tables first, so a
+        # partly broken isolation can't send anything toward the gateway.
+        routes = run(root, "agent-routes", bwrap_argv(), {"targets": [], "routes": True})
+        failed = "sandbox has a default route"
+        assert routes == {"defaultRoutes": 0}, failed
+        # Positive control for the route reader: the shared namespace sees the host's default route.
+        host_routes = run(root, "shared-routes", bwrap_argv(net=False), {"targets": [], "routes": True})
+        failed = "route reader positive control saw no default route"
+        assert host_routes["defaultRoutes"] >= 1, failed
         agent = run(root, "agent", bwrap_argv(), plan)
-        assert all(v in ("ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "EADDRNOTAVAIL") for v in agent.values()) \
-            and len(agent) == len(targets), "a fixture listener is reachable from the sandbox"
-        route = run(root, "agent-route", bwrap_argv(), route_plan)
-        assert route["gateway-route"] in ("ENETUNREACH", "EHOSTUNREACH"), "the sandbox has a route to the host gateway"
+        failed = "a fixture listener answered or failed unexpectedly in the sandbox"
+        assert agent == expected, failed
         shared = run(root, "shared-net", bwrap_argv(net=False), plan)
-        assert shared == {t[0]: "connected" for t in targets}, "shared-netns positive control failed"
+        failed = "shared-netns positive control failed"
+        assert shared == {t[0]: "connected" for t in targets}, failed
+        # And the fixture's own listeners took exactly those connections.
+        accepted = {}
+        for listener, label in ((any4, "any4"), (dual, "dual")):
+            listener.setblocking(False)
+            count = 0
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except BlockingIOError:
+                    break
+                conn.close()
+                count += 1
+            accepted[label] = count
+        failed = "the fixture listeners did not take exactly the positive-control connections"
+        assert accepted == {"any4": 3, "dual": 3}, failed
+        failed = None
 
         result.update(ok=True, code="listener-address-fixture-passed", agent=agent,
-                      agentGatewayRoute=route["gateway-route"], positiveSharedNet=shared,
+                      agentDefaultRoutes=0, positiveSharedNet=shared, acceptedByFixtureListeners=accepted,
                       platform={"kernelRelease": platform.release()[:256], "machine": platform.machine(),
                                 "pythonVersion": platform.python_version()},
                       limitations=["fixture-owned listeners only, not the real decision listener",
@@ -142,7 +185,9 @@ def main():
                                    "model egress and AF_VSOCK (#160) are separate",
                                    "measured host only"])
         exit_code = 0
-    except (AssertionError, OSError, ValueError, TypeError, KeyError, RuntimeError, StopIteration,
+    except AssertionError as error:
+        result["failedCheck"] = str(error)[:120] or "assertion"
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, StopIteration,
             subprocess.SubprocessError):
         pass
     finally:

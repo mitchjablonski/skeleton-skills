@@ -12,23 +12,31 @@ It makes no support claim, and strict remains `unverified` after a pass.
 This follows the N9 fixture, which covered a loopback listener only. Every
 listener here is owned by the fixture:
 
-| Address (label) | Sandbox (`--unshare-net`) | Shared network namespace (positive control) |
+| Address (label) | Sandbox (`--unshare-net`), exact | Shared network namespace (positive control) |
 | --- | --- | --- |
-| `0.0.0.0` listener via `127.0.0.1` | refused | connects |
-| `0.0.0.0` listener via the host's own global IPv4 address | no route | connects |
-| Dual-stack `[::]` listener via `[::1]` | refused | connects |
-| Dual-stack `[::]` listener via `[::ffff:127.0.0.1]` | refused | connects |
-| Route to the host gateway (one connect to the discard port) | no route | not attempted |
+| `0.0.0.0` listener via `127.0.0.1` | `ECONNREFUSED` | connects |
+| `0.0.0.0` listener via `0.0.0.0` | `ECONNREFUSED` | connects |
+| `0.0.0.0` listener via the default-route interface's address | `ENETUNREACH` | connects |
+| Dual-stack `[::]` listener via `[::1]` | `ECONNREFUSED` | connects |
+| Dual-stack `[::]` listener via `[::]` | `ECONNREFUSED` | connects |
+| Dual-stack `[::]` listener via `[::ffff:127.0.0.1]` | `ECONNREFUSED` | connects |
 
-**What reaches the gateway.** Nothing is sent to the gateway or to any
-Windows service. The host-side address lookup uses a UDP `connect`, which
-only picks a source address. The sandbox's single TCP attempt fails for lack
-of a route before any packet leaves.
+**Who answered the positive controls.** The fixture's own listeners must
+have accepted exactly those connections: three each.
+
+**Routes.** The sandbox's IPv4 and IPv6 route tables are read first, and must
+show no default route. The kernel's own unreachable `::/0` entries on `lo`,
+flagged `RTF_REJECT`, block traffic, so they don't count. As a positive
+control, the same reader in the shared namespace must see the host's default
+route. So even if isolation were only partly broken, nothing
+is ever sent toward the gateway or a Windows service. The host-side
+address lookup uses a UDP `connect`, which only picks a source address.
 
 The output uses address **labels**, never raw IPs. The exit codes are the
 same as the other fixtures:
 - **Exit 0:** passed.
-- **Exit 1:** a check or positive control failed (scratch is retained).
+- **Exit 1:** a check or positive control failed. The output names the
+  failed check, and scratch is retained.
 - **Exit 2:** unsupported: no default route, no IPv6, or Bubblewrap can't
   start a sandbox.
 
@@ -42,9 +50,9 @@ same as the other fixtures:
 
 Observed on 2026-11-17 on WSL2 kernel `6.6.87.2-microsoft-standard-WSL2`,
 x86_64, system Python 3.12.3:
-- **Sandbox:** the loopback, IPv6-loopback and mapped addresses were
-  refused, and the host address had no route.
-- **Gateway:** the sandbox had no route to it.
-- **Shared network namespace:** all four addresses connected.
+- **Sandbox:** no default route. Every loopback-local address was refused,
+  and the interface address had no route.
+- **Shared network namespace:** all six addresses connected, and the
+  fixture's listeners accepted exactly those connections.
 
 Strict remained `unverified`.
