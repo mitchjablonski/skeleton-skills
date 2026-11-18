@@ -163,6 +163,12 @@ The rest of the design depends on where each item lives:
   #145 call. Its operation and schema stay **open**, and need independent
   vectors and cross-review before implementation.
 - **The console** never sees a code except the one the human types.
+- **The authority's durable record is private history, not metadata.** Its
+  record file keeps every epoch key and, in the command ledger, the codes the
+  human typed, so a same-id retry returns the original result. It lives in
+  the durable history directory, which only the authority may open (N9).
+  That directory's lock and temporary files count as private history too.
+  `test/strict-metadata-secrets.test.mjs` checks the metadata side (N11).
 
 ## Bootstrap sequence
 
