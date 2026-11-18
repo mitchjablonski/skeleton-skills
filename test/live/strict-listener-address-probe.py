@@ -2,12 +2,13 @@
 """Opt-in Linux X14 fixture (#169): fixture-owned listeners on other addresses
 are unreachable from a network-namespaced sandbox.
 
-Listeners (all owned by the fixture): one on 0.0.0.0, reached via 127.0.0.1
-and via the host's own global IPv4 address; one dual-stack [::], reached via
-[::1] and [::ffff:127.0.0.1]. The sandbox must reach none. With the network
-namespace shared, all connect (positive control). The sandbox's route to the
-host gateway is recorded with one connect to the discard port, which must
-fail for lack of a route; nothing is ever sent to a host or Windows service.
+Listeners (all owned by the fixture): one on 0.0.0.0, reached via 127.0.0.1,
+0.0.0.0 and the default-route interface's address; one dual-stack [::],
+reached via [::1], [::] and [::ffff:127.0.0.1]. Each label has an exact
+expected errno in the sandbox. With the network namespace shared, all
+connect, and the fixture's listeners must accept exactly those connections.
+Before any connect, the sandbox's route tables must show no default route
+(read from /proc, so a sandbox with one is stopped before anything is sent).
 Output uses address labels, never raw IPs. Never human proof.
 
 Exit 0: passed. Exit 1: a check or positive control failed. Exit 2: unsupported.
@@ -80,7 +81,7 @@ def run(root, label, prefix, plan):
     return json.loads(data)
 
 
-def global_ipv4():
+def interface_ipv4():
     """The default-route interface's IPv4 address (often a private address on WSL NAT)."""
     with open("/proc/net/route") as f:
         rows = [r.split() for r in f.read(65536).splitlines()[1:]]
@@ -93,7 +94,7 @@ def global_ipv4():
         address = probe.getsockname()[0]
     finally:
         probe.close()
-    assert not address.startswith("127."), "no global IPv4 address"
+    assert not address.startswith("127."), "no default-route interface address"
     return address, gateway
 
 
@@ -110,7 +111,7 @@ def main():
         assert sys.argv[1:] == [] and sys.platform.startswith("linux")
         assert pathlib.Path(sys.executable).resolve() == pathlib.Path("/usr/bin/python3").resolve()
         assert pathlib.Path("/usr/bin/bwrap").is_file() and socket.has_ipv6
-        address, _gateway = global_ipv4()
+        address, _gateway = interface_ipv4()
         root = pathlib.Path(tempfile.mkdtemp(prefix="strict-listener-address-")).resolve()
         os.chmod(root, 0o700)
         capability = subprocess.run(bwrap_argv() + ["--", "/usr/bin/true"], stdin=subprocess.DEVNULL,
@@ -145,7 +146,7 @@ def main():
         plan = {"targets": targets}
 
         # The sandbox's routes are read from its kernel tables first, so a
-        # partly broken isolation can't send anything toward the gateway.
+        # sandbox with a default route is stopped before any connect.
         routes = run(root, "agent-routes", bwrap_argv(), {"targets": [], "routes": True})
         failed = "sandbox has a default route"
         assert routes == {"defaultRoutes": 0}, failed

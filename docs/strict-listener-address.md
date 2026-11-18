@@ -28,8 +28,10 @@ have accepted exactly those connections: three each.
 show no default route. The kernel's own unreachable `::/0` entries on `lo`,
 flagged `RTF_REJECT`, block traffic, so they don't count. As a positive
 control, the same reader in the shared namespace must see the host's default
-route. So even if isolation were only partly broken, nothing
-is ever sent toward the gateway or a Windows service. The host-side
+route. A sandbox with a default route is stopped before any connect. A
+sandbox with only a subnet-specific route would pass this check, and its
+interface-address connect could then reach the fixture's own WSL listener,
+but not the gateway or Windows. The host-side
 address lookup uses a UDP `connect`, which only picks a source address.
 
 The output uses address **labels**, never raw IPs. The exit codes are the
