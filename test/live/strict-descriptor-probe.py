@@ -10,6 +10,7 @@ never a support claim. Touches only pipes, sockets and files it creates.
 
 Exit 0: passed. Exit 1: a check or a positive control failed. Exit 2: unsupported.
 """
+import errno
 import json
 import os
 import pathlib
@@ -28,8 +29,13 @@ NULL_RDEV = (1, 3)  # /dev/null
 NR_UNAME = 63       # x86_64
 
 WORKER = r'''
-import json, os, stat, sys
+import errno, json, os, stat, sys
 listing = os.open("/proc/self/fd", os.O_RDONLY | os.O_DIRECTORY)
+# CPython's os.listdir(fd) works on a dup of `listing`, which takes the lowest
+# free descriptor and is closed before returning. Sample that slot (this
+# worker is single-threaded, so the next dup lands in the same place).
+transient = os.dup(listing)
+os.close(transient)
 names = sorted(os.listdir(listing), key=int)
 out = {}
 for name in names:
@@ -39,11 +45,10 @@ for name in names:
     try:
         target = os.readlink("/proc/self/fd/%d" % fd)
         st = os.fstat(fd)
-    except OSError:
-        # CPython's os.listdir(fd) works on a dup of `listing` and closes it
-        # before returning, so exactly listing + 1 vanishes. Anything else is
-        # a descriptor we could not inspect, which counts as a violation.
-        out[name] = {"kind": "vanished" if fd == listing + 1 else "uninspectable"}
+    except OSError as e:
+        # Only the sampled transient slot may vanish, and only as ENOENT/EBADF.
+        # Anything else is a descriptor we could not inspect: a violation.
+        out[name] = {"kind": "vanished" if fd == transient and e.errno in (errno.ENOENT, errno.EBADF) else "uninspectable"}
         continue
     mode = st.st_mode
     entry = {}
@@ -55,8 +60,9 @@ for name in names:
     elif stat.S_ISREG(mode): entry = {"kind": "file"}
     else: entry = {"kind": "other"}
     out[name] = entry
-uname = "ok"
+uname = "not-run"
 if len(sys.argv) > 1 and sys.argv[1] == "uname":
+    uname = "ok"
     try: os.uname()
     except OSError as e: uname = "denied-%d" % e.errno
 print(json.dumps({"fds": out, "uname": uname}, sort_keys=True))
@@ -80,14 +86,18 @@ def bwrap_argv(extra=()):
 def read_both(fds, deadline):
     """Drain both pipes together until EOF, bounded in size and time."""
     data = {fd: b"" for fd in fds}
-    open_fds = list(fds)
+    poller = select.poll()  # poll, not select: descriptor numbers may exceed FD_SETSIZE
+    for fd in fds:
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    open_fds = set(fds)
     while open_fds:
         remaining = deadline - time.monotonic()
         assert remaining > 0, "worker output timeout"
-        for fd in select.select(open_fds, [], [], remaining)[0]:
+        for fd, _events in poller.poll(int(remaining * 1000) + 1):
             chunk = os.read(fd, 65536)
             if not chunk:
-                open_fds.remove(fd)
+                open_fds.discard(fd)
+                poller.unregister(fd)
                 continue
             data[fd] += chunk
             assert len(data[fd]) <= MAX, "worker output too large"
@@ -124,9 +134,12 @@ def run(root, label, extra=(), pass_fds=(), close_fds=True, stdout_file=False, w
         result = json.loads(output)
         return result["fds"], result["uname"], pipes
     finally:
-        if process is not None and process.poll() is None:
-            process.kill()  # never leave a worker behind on an error path
-            process.wait(timeout=5)
+        try:
+            if process is not None and process.poll() is None:
+                process.kill()  # never leave a worker behind on an error path
+                process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass  # descriptors below are still closed; --die-with-parent bounds the rest
         for fd in (out_r, err_r, out_w, err_w):
             if fd is not None:
                 try:
@@ -178,15 +191,25 @@ def main():
         # Restrict our own descriptor set first: nothing ambient from the
         # calling process may ride along into the careless-launcher control.
         ambient = 0
-        for name in os.listdir("/proc/self/fd"):
-            fd = int(name)
-            if fd > 2:
+        listing = os.open("/proc/self/fd", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            transient = os.dup(listing)
+            os.close(transient)
+            for name in os.listdir(listing):
+                fd = int(name)
+                if fd <= 2 or fd == listing:
+                    continue
                 try:
-                    if os.get_inheritable(fd):
-                        os.set_inheritable(fd, False)
-                        ambient += 1
-                except OSError:
-                    pass  # the listing descriptor itself, already closed
+                    inheritable = os.get_inheritable(fd)
+                except OSError as error:
+                    if fd == transient and error.errno == errno.EBADF:
+                        continue  # CPython's listdir dup, already closed
+                    raise RuntimeError("ambient descriptor could not be inspected") from error
+                if inheritable:
+                    os.set_inheritable(fd, False)
+                    ambient += 1
+        finally:
+            os.close(listing)
         root = pathlib.Path(tempfile.mkdtemp(prefix="strict-descriptor-")).resolve()
         os.chmod(root, 0o700)
         # Capability only: Bubblewrap can start a sandbox here. A failing or
@@ -196,7 +219,8 @@ def main():
         assert capability.returncode == 0, "bubblewrap cannot start a sandbox"
         exit_code = 1
         result["code"] = "fixture-failed"
-        strict, _, pipes = run(root, "strict")
+        strict, strict_uname, pipes = run(root, "strict", worker_args=["uname"])
+        assert strict_uname == "ok", "unfiltered baseline: uname did not run and succeed"
 
         # Strict launch: exactly the allowlist, by type and identity.
         assert violations(strict, pipes) == {}, "strict launch does not match the allowlist"
@@ -256,7 +280,8 @@ def main():
                       positiveControls={"passedPipe": leak_pipe, "passedSocket": leak_socket,
                                         "regularFileOnStdout": stdout_file, "carelessLauncher": careless,
                                         "carefulLauncher": careful},
-                      seccomp={"programLoaded": True, "descriptorViolations": seccomp},
+                      seccomp={"baselineUname": strict_uname, "filteredUname": uname, "programLoaded": True,
+                               "descriptorViolations": seccomp},
                       ambientInheritableMadePrivate=ambient,
                       platform={"kernelRelease": platform.release()[:256], "machine": platform.machine(),
                                 "pythonVersion": platform.python_version(), "bwrap": bwrap_version},

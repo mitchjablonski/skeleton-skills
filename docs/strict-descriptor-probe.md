@@ -25,9 +25,11 @@ So a real writable file on fd 1, or another char device on fd 0, is a
 violation even though those numbers are allowed.
 
 **Descriptors that can't be inspected count as violations.** The one
-exception is the descriptor right after the worker's listing descriptor:
-CPython's `os.listdir(fd)` works on a duplicate of it and closes that before
-returning. More than one such descriptor also counts as a violation.
+exception is CPython's own transient: `os.listdir(fd)` works on a duplicate
+of the listing descriptor, which takes the **lowest free** slot and is
+closed before returning. The worker finds that slot first, by duplicating
+and closing once (it is single-threaded). It then ignores only that slot,
+and only when inspecting it fails with `ENOENT` or `EBADF`.
 
 | Check | Required |
 | --- | --- |
@@ -36,7 +38,7 @@ returning. More than one such descriptor also counts as a violation.
 | Passed socketpair end (positive control) | Exactly that descriptor flagged, as a socket |
 | Regular file on stdout (positive control) | fd 1 flagged as a file |
 | Careless launcher (positive control) | With `close_fds=False`, an inheritable directory descriptor is the only violation. With `close_fds=True`, there are none |
-| `--seccomp` program descriptor | The program is loaded, shown by a denied `uname()`, and its descriptor never reaches the sandbox |
+| `--seccomp` program descriptor | The unfiltered baseline runs `uname()` successfully. Under the program the same call is denied, which shows it loaded. The program's descriptor never reaches the sandbox |
 
 **Finding (Bubblewrap 0.9.0):** Bubblewrap passes inherited descriptors
 through at the same number, except the ones named in its own options, which
@@ -64,7 +66,12 @@ same as the other fixtures:
   startup, must be measured separately once it is chosen.
 - **Ambient descriptors:** before any launch, the fixture makes its own extra
   inheritable descriptors non-inheritable, and counts them. So the
-  careless-launcher control carries only the one descriptor it planted.
+  careless-launcher control carries only the one descriptor it planted. A
+  descriptor it can't inspect, other than CPython's listing transient, fails
+  the run.
+- **A snapshot:** each result is one listing at one moment, after startup.
+  It shows those descriptors were absent then, not that none could ever be
+  opened later.
 - **Capability first:** a plain `bwrap … /usr/bin/true` run establishes
   capability. A failing or malformed worker after that is exit 1, not
   "unsupported".
