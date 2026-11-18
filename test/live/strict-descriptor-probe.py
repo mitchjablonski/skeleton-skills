@@ -175,11 +175,28 @@ def main():
         assert pathlib.Path("/usr/bin/bwrap").is_file()
         version = subprocess.run(["/usr/bin/bwrap", "--version"], capture_output=True, timeout=10, env={})
         bwrap_version = version.stdout.decode("ascii", "replace").strip()[:64]
+        # Restrict our own descriptor set first: nothing ambient from the
+        # calling process may ride along into the careless-launcher control.
+        ambient = 0
+        for name in os.listdir("/proc/self/fd"):
+            fd = int(name)
+            if fd > 2:
+                try:
+                    if os.get_inheritable(fd):
+                        os.set_inheritable(fd, False)
+                        ambient += 1
+                except OSError:
+                    pass  # the listing descriptor itself, already closed
         root = pathlib.Path(tempfile.mkdtemp(prefix="strict-descriptor-")).resolve()
         os.chmod(root, 0o700)
-        strict, _, pipes = run(root, "strict")
+        # Capability only: Bubblewrap can start a sandbox here. A failing or
+        # malformed worker after this point is a fixture failure (exit 1).
+        capability = subprocess.run(bwrap_argv() + ["--", "/usr/bin/true"], stdin=subprocess.DEVNULL,
+                                    capture_output=True, env={}, timeout=30, preexec_fn=limits)
+        assert capability.returncode == 0, "bubblewrap cannot start a sandbox"
         exit_code = 1
         result["code"] = "fixture-failed"
+        strict, _, pipes = run(root, "strict")
 
         # Strict launch: exactly the allowlist, by type and identity.
         assert violations(strict, pipes) == {}, "strict launch does not match the allowlist"
@@ -240,9 +257,12 @@ def main():
                                         "regularFileOnStdout": stdout_file, "carelessLauncher": careless,
                                         "carefulLauncher": careful},
                       seccomp={"programLoaded": True, "descriptorViolations": seccomp},
+                      ambientInheritableMadePrivate=ambient,
                       platform={"kernelRelease": platform.release()[:256], "machine": platform.machine(),
                                 "pythonVersion": platform.python_version(), "bwrap": bwrap_version},
-                      limitations=["synthetic launcher, not the real one", "types and identities only, no paths",
+                      limitations=["synthetic launcher, not the real one",
+                                   "a CPython worker's descriptor snapshot after interpreter startup; a pinned agent runtime (Node) must be measured itself",
+                                   "types and identities only, no paths",
                                    "authority and listener socketpairs are N9", "measured host only"])
         exit_code = 0
     except (AssertionError, OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.SubprocessError):

@@ -58,6 +58,17 @@ same as the other fixtures:
 
 ## Limits
 
+- **What is measured:** a CPython worker's descriptor snapshot, taken after
+  interpreter startup and including the seccomp result. The pinned agent
+  runtime (Node), and the descriptors it opens or inherits at its own
+  startup, must be measured separately once it is chosen.
+- **Ambient descriptors:** before any launch, the fixture makes its own extra
+  inheritable descriptors non-inheritable, and counts them. So the
+  careless-launcher control carries only the one descriptor it planted.
+- **Capability first:** a plain `bwrap … /usr/bin/true` run establishes
+  capability. A failing or malformed worker after that is exit 1, not
+  "unsupported".
+
 - The launcher is synthetic. A real launcher's descriptor set, including the
   filtered agent PTY and any channel socketpairs, must be measured on the
   pinned runtime when it exists.
