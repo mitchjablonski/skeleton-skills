@@ -40,11 +40,13 @@ function fixture(t) {
   const state = {protocolVersion: 2, projectId: 'p', sessionId: 's', reviewRoundId: 'r1', phase: 'skeleton', revision: 0,
     reviewVersion: capture.shapeVersion, captureVersion: capture.captureVersion, approvedVersion: null, approvedCaptureVersion: null};
   const policy = {policyVersion: HUMAN_AUTHORITY_POLICY, roundMismatchCap: 2, sessionMismatchCap: 4, commandCap: 20, authorityCap: 10};
-  const deps = {captureStore: captures, observeUnderLock: observe};
+  const issued = [];  // every timestamp the authority was handed; `at` must be one of them
+  const clock = () => { const at = new Date(Date.UTC(2026, 10, 17, 0, 0, issued.length)).toISOString(); issued.push(at); return at; };
+  const deps = {captureStore: captures, observeUnderLock: observe, clock};
   const dir = path.join(base, 'authority');
   const store = createHumanAuthorityStore(dir, {state, policy}, deps);
   const record = () => JSON.parse(fs.readFileSync(path.join(dir, 'human-authority.json'), 'utf8'));
-  return {base, dir, file, capturesDir, store, record, state, policy, deps};
+  return {base, dir, file, capturesDir, store, record, state, policy, deps, issued};
 }
 
 /** Encodings a secret could plausibly leak in. Codes also in case-folded and undashed forms. */
@@ -91,8 +93,11 @@ function checkSchema(value, kind, known) {
       case 'action': assert.ok(['approve', 'reshape'].includes(v)); break;
       case 'reviewVersion': assert.ok(known.shapes.has(v), `${kind}.reviewVersion not a stored capture`); break;
       case 'captureVersion': assert.ok(known.captures.has(v), `${kind}.captureVersion not a stored capture`); break;
-      case 'revision': case 'attemptsLeft': assert.ok(Number.isSafeInteger(v) && v >= 0, `${kind}.${key}`); break;
-      case 'at': assert.match(v, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/); break;
+      // Numbers and times are pinned to exact expected values: a number field
+      // could otherwise carry up to 53 bits of a key or code.
+      case 'revision': assert.equal(v, known.expect.revision, `${kind}.revision`); break;
+      case 'attemptsLeft': assert.equal(v, known.expect.attemptsLeft, `${kind}.attemptsLeft`); break;
+      case 'at': assert.ok(known.issued.includes(v), `${kind}.at not a timestamp the authority was given`); break;
       case 'changed': assert.equal(typeof v, 'boolean'); break;
       case 'phase': assert.ok(['skeleton', 'fill', 'done'].includes(v), `phase ${v}`); break;
       case 'admissions': assert.ok(['live', 'revoked'].includes(v), `admissions ${v}`); break;
@@ -109,7 +114,12 @@ linux('N11: channel results, state() and the capture store never carry keys or c
   const codes = [];         // codes, as derived
   const submitted = [];     // codes actually typed
   const requestIds = new Set();
-  const call = (value, kind = value.kind) => { seen.push([kind, value]); return value; };
+  // Expected numbers per output, from the private record right after the call
+  // (the core state's revision, which a result leak would not change).
+  const call = (value, kind = value.kind, expect = {}) => {
+    seen.push([kind, value, {revision: f.record().authority.state.revision, ...expect}]);
+    return value;
+  };
   const codeFor = (action) => {
     const r = f.record();
     const key = Buffer.from(r.epochs.at(-1).keyHex, 'hex');
@@ -118,14 +128,20 @@ linux('N11: channel results, state() and the capture store never carry keys or c
     codes.push(code);
     return code;
   };
-  const send = (method, args) => { requestIds.add(args.requestId); if (args.code) submitted.push(args.code); return call(f.store[method](args)); };
+  const send = (method, args, expect) => {
+    requestIds.add(args.requestId); if (args.code) submitted.push(args.code);
+    const value = f.store[method](args);
+    return call(value, value.kind, expect);
+  };
 
   call(f.store.state(), 'state');
   const approveCode = codeFor('approve');
   const wrong = approveCode === '0000-0000' ? '1111-1111' : '0000-0000';
-  assert.equal(send('verifyAndCommit', {requestId: 'w', action: 'approve', code: wrong}).kind, 'mismatch');
+  // roundMismatchCap 2: one wrong guess leaves exactly one attempt.
+  assert.equal(send('verifyAndCommit', {requestId: 'w', action: 'approve', code: wrong}, {attemptsLeft: 1}).kind, 'mismatch');
   assert.equal(send('verifyAndCommit', {requestId: 'a', action: 'approve', code: approveCode}).kind, 'committed');
-  send('verifyAndCommit', {requestId: 'a', action: 'approve', code: approveCode}); // same-id replay
+  const approvedAt = f.record().authority.state.revision;
+  send('verifyAndCommit', {requestId: 'a', action: 'approve', code: approveCode}, {revision: approvedAt}); // same-id replay
   call(f.store.state(), 'state');
   assert.equal(send('verifyAndCommit', {requestId: 'r', action: 'reshape', code: codeFor('reshape')}).kind, 'committed');
   fs.writeFileSync(f.file, SKEL('return 2;'));
@@ -144,11 +160,13 @@ linux('N11: channel results, state() and the capture store never carry keys or c
   const known = {requestIds, shapes: new Set(stored.map((c) => c.shapeVersion)), captures: new Set(stored.map((c) => c.captureVersion))};
   assert.ok(known.captures.size >= 2, 'recapture published a second capture');
   assert.deepEqual(new Set(seen.map(([kind]) => kind)), new Set(Object.keys(SCHEMA)), 'every metadata kind was exercised');
-  for (const [kind, value] of seen) checkSchema(value, kind, known);
+  for (const [kind, value, expect] of seen) checkSchema(value, kind, {...known, expect, issued: f.issued});
 
   // 2. Backstop scan: results, state() and every capture-store byte.
   const needles = [...new Set([...keys, ...codes].flatMap(encodings))];
   const surface = JSON.stringify(seen.map(([, v]) => v));
+  // Backstop: every number that left the authority is small.
+  for (const [, value] of seen) for (const v of Object.values(value)) if (typeof v === 'number') assert.ok(v < 1000, 'large number in metadata');
   for (const needle of needles) assert.equal(surface.includes(needle), false, 'a key or code left the authority');
   const captureFiles = filesUnder(f.capturesDir);
   for (const file of captureFiles) {
