@@ -14,12 +14,14 @@ import json
 import os
 import pathlib
 import platform
+import select
 import shutil
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 MAX = 32768
 NULL_RDEV = (1, 3)  # /dev/null
@@ -75,14 +77,21 @@ def bwrap_argv(extra=()):
     return argv + ["--symlink", "usr/bin", "/bin", "--proc", "/proc", "--dev", "/dev"] + list(extra)
 
 
-def read_all(fd):
-    data = b""
-    while True:
-        chunk = os.read(fd, 65536)
-        if not chunk:
-            return data
-        data += chunk
-        assert len(data) <= MAX, "worker output too large"
+def read_both(fds, deadline):
+    """Drain both pipes together until EOF, bounded in size and time."""
+    data = {fd: b"" for fd in fds}
+    open_fds = list(fds)
+    while open_fds:
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "worker output timeout"
+        for fd in select.select(open_fds, [], [], remaining)[0]:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                open_fds.remove(fd)
+                continue
+            data[fd] += chunk
+            assert len(data[fd]) <= MAX, "worker output too large"
+    return data
 
 
 def run(root, label, extra=(), pass_fds=(), close_fds=True, stdout_file=False, worker_args=()):
@@ -92,6 +101,7 @@ def run(root, label, extra=(), pass_fds=(), close_fds=True, stdout_file=False, w
     err_r, err_w = os.pipe()
     pipes = {"1": os.fstat(out_r).st_ino, "2": os.fstat(err_r).st_ino}
     out_file = None
+    process = None
     try:
         if stdout_file:
             out_file = (root / (label + ".out")).open("wb+")
@@ -103,9 +113,10 @@ def run(root, label, extra=(), pass_fds=(), close_fds=True, stdout_file=False, w
         os.close(out_w)
         os.close(err_w)
         out_w = err_w = None
-        output = b"" if stdout_file else read_all(out_r)
-        read_all(err_r)
-        assert process.wait(timeout=30) == 0, label + " worker failed"
+        deadline = time.monotonic() + 30
+        drained = read_both([err_r] if stdout_file else [out_r, err_r], deadline)
+        output = b"" if stdout_file else drained[out_r]
+        assert process.wait(timeout=max(0.1, deadline - time.monotonic())) == 0, label + " worker failed"
         if stdout_file:
             out_file.seek(0)
             output = out_file.read(MAX + 1)
@@ -113,6 +124,9 @@ def run(root, label, extra=(), pass_fds=(), close_fds=True, stdout_file=False, w
         result = json.loads(output)
         return result["fds"], result["uname"], pipes
     finally:
+        if process is not None and process.poll() is None:
+            process.kill()  # never leave a worker behind on an error path
+            process.wait(timeout=5)
         for fd in (out_r, err_r, out_w, err_w):
             if fd is not None:
                 try:
