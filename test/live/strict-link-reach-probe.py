@@ -44,7 +44,7 @@ for key, addr in (("unix", plan["unix"]), ("abstract", "\0" + plan["abstract"][1
     except OSError as e: out[key] = name(e)
     finally: u.close()
 # Every descriptor except stdio and the listing one, by type and identity
-# (as in the N3 fixture). Only listing + 1, CPython's listdir dup, may vanish.
+# (as in the N3 fixture). Only the sampled transient slot (CPython's listdir dup) may vanish.
 import stat
 listing = os.open("/proc/self/fd", os.O_RDONLY | os.O_DIRECTORY)
 transient = os.dup(listing)  # the lowest free slot, where listdir's own dup will land
