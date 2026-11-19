@@ -56,6 +56,20 @@ def err(): return errno.errorcode.get(ctypes.get_errno(), "EUNKNOWN")
 def judge(data):  # the worker only knows the secret's hash
     return "read-secret" if hashlib.sha256(data).hexdigest() == digest else "read-other"
 out = {"visible": os.path.exists("/proc/%d" % pid)}
+if plan.get("visibilityOnly"):
+    # In a private pid namespace the host number may alias a different, local
+    # process: only report visibility, and never address whatever it names.
+    print(json.dumps(out, sort_keys=True))
+    raise SystemExit(0)
+# Before any process-specific operation, confirm the number still names the
+# owned process: its cmdline must carry the fixture's (non-secret) token.
+try:
+    with open("/proc/%d/cmdline" % pid, "rb") as f:
+        if plan["token"].encode() not in f.read(1 << 16):
+            print(json.dumps({"visible": out["visible"], "identity": "mismatch"}, sort_keys=True)); raise SystemExit(0)
+except OSError:
+    print(json.dumps({"visible": out["visible"], "identity": "unverified"}, sort_keys=True)); raise SystemExit(0)
+out["identity"] = "verified"
 text_only = plan.get("textOnly", False)  # a control that owns only its own /proc text
 class iovec(ctypes.Structure): _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
 dst = ctypes.create_string_buffer(length)
@@ -174,7 +188,8 @@ def main():
         assert capability.returncode == 0, "bubblewrap cannot start a sandbox"
 
         secret = os.urandom(32).hex()
-        standin = subprocess.Popen(["/usr/bin/python3", "-I", "-c", STANDIN], stdin=subprocess.PIPE,
+        token = "strict-standin-" + os.urandom(8).hex()  # identity, not a secret
+        standin = subprocess.Popen(["/usr/bin/python3", "-I", "-c", STANDIN, token], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, preexec_fn=limits)
         standin.stdin.write((secret + "\n").encode())  # the secret travels over stdin only
         standin.stdin.close()
@@ -184,7 +199,7 @@ def main():
         # Workers get only the secret's hash, plus the hex to search /proc text
         # for. The hex is in a worker's own argv, never in the stand-in's.
         plan = {"pid": standin.pid, "addr": record["addr"], "length": record["length"], "fd": record["fd"],
-                "digest": hashlib.sha256(bytes.fromhex(secret)).hexdigest(), "secretHex": secret}
+                "digest": hashlib.sha256(bytes.fromhex(secret)).hexdigest(), "secretHex": secret, "token": token}
 
         # A sibling worker outside any sandbox: recorded only (Yama scope decides).
         launcher = run(root, "launcher", [], plan)
@@ -211,14 +226,15 @@ def main():
             os.close(pidfd)
 
         # The agent, with a pid namespace: the stand-in isn't even visible.
-        agent = run(root, "agent", bwrap_argv() + ["--"], plan)
-        assert agent == {"visible": False, "processVmReadv": "ESRCH", "ptraceAttach": "ESRCH", "procMem": "ENOENT",
-                         "pidfdOpen": "ESRCH", "pidfdGetfd": "not-attempted", "procCmdline": "ENOENT",
-                         "procEnviron": "ENOENT"}, "the agent reached the stand-in"
+        # Visibility only: the agent's namespace must not show the number at all.
+        # If it does, that may be a different local process, so refuse rather than probe it.
+        agent = run(root, "agent", bwrap_argv() + ["--"], dict(plan, visibilityOnly=True))
+        assert agent == {"visible": False}, "the stand-in's host pid number is visible in the agent's namespace (uncertain identity)"
         # Visibility control: without a pid namespace the pid is visible, and
         # every access must still be refused (credentials and Yama, not hiding).
         visible = run(root, "no-pidns", bwrap_argv(pidns=False) + ["--"], plan)
-        assert visible["visible"] is True, "visibility control: the stand-in should be visible without a pid namespace"
+        assert visible["visible"] is True and visible.get("identity") == "verified", \
+            "visibility control: the stand-in should be visible, and verified by its token, without a pid namespace"
         assert visible["pidfdOpen"] == "ok", "visibility control: pidfd_open should succeed, so pidfd_getfd is really attempted"
         # Allowlist: every access attempt must be a real errno; cmdline/environ may
         # be readable but must not contain the secret.
@@ -230,7 +246,8 @@ def main():
 
         # Positive control for the /proc text check: a stand-in that does carry the
         # secret on its command line must be caught.
-        leaky = subprocess.Popen(["/usr/bin/python3", "-I", "-c", "import time\nwhile True: time.sleep(1)", secret],
+        leaky_token = "strict-leaky-" + os.urandom(8).hex()
+        leaky = subprocess.Popen(["/usr/bin/python3", "-I", "-c", "import time\nwhile True: time.sleep(1)", secret, leaky_token],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  env={"S": secret}, preexec_fn=limits)
         try:
@@ -238,11 +255,11 @@ def main():
             # Its own plan: only the pid and the text to search for, nothing from the first stand-in.
             caught = run(root, "cmdline-control", bwrap_argv(pidns=False) + ["--"],
                          {"pid": leaky.pid, "addr": 0, "length": 1, "fd": -1, "digest": plan["digest"],
-                          "secretHex": secret, "textOnly": True})
+                          "secretHex": secret, "textOnly": True, "token": leaky_token})
         finally:
             leaky.kill()
             leaky.wait(timeout=5)
-        assert caught["procCmdline"] == "contains-secret", "cmdline check positive control failed"
+        assert caught.get("identity") == "verified" and caught["procCmdline"] == "contains-secret", "cmdline check positive control failed"
         # environ is refused under Yama here; if it is readable, the search must find the secret.
         assert caught["procEnviron"] in ("contains-secret", "EPERM", "EACCES"), \
             "environ check positive control failed"

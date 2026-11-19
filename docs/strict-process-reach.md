@@ -29,19 +29,26 @@ agent targets the stand-in's **host** pid with:
 
 | Sandbox | Visible | Attach | `process_vm_readv` | `/proc/<pid>/mem` | `pidfd_open` / `pidfd_getfd` | cmdline / environ |
 | --- | --- | --- | --- | --- | --- | --- |
-| With a pid namespace (the agent) | no | `ESRCH` | `ESRCH` | `ENOENT` | `ESRCH` / — | `ENOENT` |
+| With a pid namespace (the agent) | no | not attempted | not attempted | not attempted | not attempted | not attempted |
 | Without a pid namespace (visibility control) | yes | refused | refused | refused | must succeed / refused | readable without the secret, or refused |
 
 **What each run shows:**
-1. **With a pid namespace:** the stand-in's host pid number names no process
-   there, so the attempts fail with `ESRCH` or `ENOENT`. That shows the
-   number doesn't reach it. It isn't a refusal by the stand-in.
-2. **Without a pid namespace:** the stand-in is visible, and every access
+1. **With a pid namespace:** a **visibility-only** check. The stand-in's
+   host pid number must not be visible in the agent's namespace. If it were,
+   it could name a different, namespace-local process. So the fixture
+   refuses on that uncertainty rather than addressing whatever the number
+   names. No process-specific operation is attempted there.
+2. **Without a pid namespace:** before any operation, the worker confirms
+   the number still names the owned stand-in. Its cmdline must carry a
+   random, non-secret token passed at launch; otherwise the worker refuses.
+   Then the stand-in is visible, and every access
    must be an observed **permission refusal** (`EPERM` or `EACCES`). A
    generic or partial result fails the run. `pidfd_open` must succeed there,
-   so that `pidfd_getfd` is really attempted. The Yama scope is recorded
-   (here 1). The fixture describes this measured configuration only, and
-   doesn't attribute the refusals to Yama or predict other hosts.
+   so that `pidfd_getfd` is really attempted. The stand-in's `/proc` text can
+   be readable here: cmdline is, and it holds no secret. The Yama scope is
+   recorded (here 1), but an observed refusal doesn't establish Yama as its
+   cause. The fixture describes this measured configuration only and
+   doesn't predict other hosts.
 
 **Positive control for the /proc text check.** It has its own plan: only its
 pid and the text to search for, with no memory address or descriptor
@@ -73,7 +80,7 @@ same as the other fixtures:
 
 Observed on 2026-11-18 on WSL2 kernel `6.6.87.2-microsoft-standard-WSL2`,
 x86_64, system Python 3.12.3, with Yama `ptrace_scope` = 1:
-- **With a pid namespace:** every attempt failed with `ESRCH` or `ENOENT`.
+- **With a pid namespace:** the stand-in's number wasn't visible.
 - **Without one:** the stand-in was visible, but attach, `process_vm_readv`
   and `pidfd_getfd` were refused with `EPERM`. `/proc/<pid>/mem` and
   `environ` were refused with `EACCES`, and `cmdline` held no secret.
