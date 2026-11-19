@@ -33,6 +33,36 @@ linux('fixed human namespace, redacted handle and reopen preserve durable approv
  assert.equal(fs.existsSync(path.join(f.dir,'authority.json')),false);assert.throws(()=>createHumanAuthorityStore(f.dir,f.enrollment,f.deps));assert.throws(()=>openHumanAuthorityStore(f.dir,{projectId:'other',sessionId:'s'},f.deps));
  fs.writeFileSync(path.join(f.dir,'authority.json'),'{}');assert.throws(()=>openHumanAuthorityStore(f.dir,f.context,f.deps));
 });
+linux('matching public readiness state does not substitute for enrolled context',t=>{
+ const f=fixture(t);
+ const expectedState=f.store.state();
+ const recordFile=path.join(f.dir,'human-authority.json');
+ const originalBytes=fs.readFileSync(recordFile);
+ for(const [name,otherContext] of [
+  ['project',{...f.context,projectId:'other-project'}],
+  ['session',{...f.context,sessionId:'other-session'}],
+ ]){
+  const dir=path.join(f.base,'other-'+name);
+  createHumanAuthorityStore(dir,{...f.enrollment,state:{...f.enrollment.state,...otherContext}},f.deps);
+  const otherFile=path.join(dir,'human-authority.json');
+  const otherBytes=fs.readFileSync(otherFile);
+  const counters={...f.count};
+
+  // Public fields deliberately coincide across independent enrollments.
+  const other=openHumanAuthorityStore(dir,otherContext,f.deps);
+  assert.deepEqual(other.state(),expectedState);
+  assert.throws(()=>openHumanAuthorityStore(dir,f.context,f.deps),/context mismatch/);
+  assert.deepEqual(fs.readFileSync(otherFile),otherBytes);
+
+  // Simulate a protected-host record replacement between open and state().
+  fs.copyFileSync(otherFile,recordFile);
+  assert.deepEqual(f.store.state(),{kind:'rejected',code:'unavailable'});
+  assert.deepEqual(fs.readFileSync(recordFile),otherBytes);
+  assert.deepEqual(f.count,counters);
+  fs.writeFileSync(recordFile,originalBytes);
+  assert.deepEqual(f.store.state(),expectedState);
+ }
+});
 linux('mismatch, lockout, end and full ledger replay without observation or entropy',t=>{
  const f=fixture(t,{commandCap:4});const good=f.command('wrong');const wrong={...good,code:good.code==='0000-0000'?'1111-1111':'0000-0000'};
  const mismatch=f.store.verifyAndCommit(wrong);assert.equal(mismatch.kind,'mismatch');assert.equal(f.store.verifyAndCommit({...wrong,requestId:'wrong2'}).kind,'mismatch');assert.equal(f.store.verifyAndCommit(f.command('locked')).kind,'locked');
