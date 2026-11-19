@@ -45,6 +45,8 @@ capture digest or revision. The silent peer must receive a request. The
 malformed, revoked and mismatch controls vary the public response without
 mutating the store.
 The fixture verifies that readiness leaves the durable record bytes unchanged.
+The summary counts readiness connections under `readiness.socketpairs`; the
+top-level count still refers to the approval and replay connections.
 
 This exercises one bootstrap gate with a real inherited channel. The public
 state omits the project and session IDs, so matching it cannot establish

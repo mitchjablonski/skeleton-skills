@@ -115,7 +115,7 @@ def readiness(node,worker,root,processes):
    if server is not None and reap(server,root)['stateCalls']!=1:raise RuntimeError('readiness state missing')
   if snapshot()!=before:raise RuntimeError('readiness changed durable bytes')
   starts+=started;results[case]=True
- return {**results,'durableBytesUnchanged':True,'sentinelStarts':starts}
+ return {**results,'durableBytesUnchanged':True,'sentinelStarts':starts,'socketpairs':len(results)}
 
 
 def main():
