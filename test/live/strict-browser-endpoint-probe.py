@@ -29,6 +29,7 @@ import time
 MAX = 32768
 CANDIDATES = ("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser")
 MARKER = "strict-n5-marker"
+WAIT_ALL_CHILDREN = 0x40000000  # Linux __WALL includes children using non-SIGCHLD exit signals.
 
 
 class BrowserStartupError(RuntimeError):
@@ -112,14 +113,14 @@ def root_users(root):
 
 def enable_child_supervision():
     """Own and reap orphaned browser helpers, even if they left its session."""
+    if not hasattr(os, "pidfd_open") or not hasattr(os, "P_PIDFD") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError("pidfd wait or signaling unavailable")
     try:
-        os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT | WAIT_ALL_CHILDREN)
     except ChildProcessError:
         pass
     else:
         raise RuntimeError("fixture needs a process with no existing children")
-    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-        raise RuntimeError("pidfds unavailable")
     libc = ctypes.CDLL(None, use_errno=True)
     pr_set_child_subreaper = 36
     if libc.prctl(pr_set_child_subreaper, 1, 0, 0, 0) != 0:
@@ -140,7 +141,7 @@ def signal_direct_children(signum):
             continue
         try:
             # Verify this is still our child after opening the stable handle.
-            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT | WAIT_ALL_CHILDREN)
             signal.pidfd_send_signal(fd, signum)
         except (ChildProcessError, ProcessLookupError, PermissionError):
             # A child we cannot stop leaves the final reaping proof unproven.
@@ -157,7 +158,7 @@ def stop_owned_children(browser):
         while time.monotonic() < deadline:
             while time.monotonic() < deadline:
                 try:
-                    pid, status = os.waitpid(-1, os.WNOHANG)
+                    pid, status = os.waitpid(-1, os.WNOHANG | WAIT_ALL_CHILDREN)
                 except ChildProcessError:
                     return True
                 if pid == 0:
