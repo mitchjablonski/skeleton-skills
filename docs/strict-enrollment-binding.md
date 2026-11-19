@@ -89,12 +89,16 @@ Latch any authority or console fault for this run. Invalidate every
 outstanding handoff for the failed peer and reject delayed ready reports.
 Stop independently of revocation, keep admissions unknown until confirmed
 and preserve durable history. No automatic failover or fallback starts an
-agent. After authority loss the launcher may attempt one protected reopen
-for **history-only reconciliation** of an exact retained request against the
-same enrollment. Re-establish the child, pair and successful open. Observe a
-readable `state()` from the bound peer before considering reconciliation.
-Revoked admissions still forbid launch. In a future guarded history-only
-path, revocation can be consistent with an existing recorded result.
+agent. With the current four methods, keep a lost result unknown after
+authority loss, even if it was committed. Use outside-host reconciliation
+without sending the command again.
+
+Once an independently reviewed **history-only guard** exists, the launcher
+may attempt one protected reopen to reconcile the exact retained request
+against the same enrollment. Re-establish the child, pair and successful
+open. Observe a readable `state()` from the bound peer before considering
+reconciliation. Revoked admissions still forbid launch but can coexist
+with an existing recorded result.
 
 The authority must resolve only a committed entry matching the original
 operation, arguments and request ID, under the authority's protection.
@@ -142,8 +146,9 @@ The fixture does not yet verify launcher provenance.
 | Counterfeit peer answers correctly without opening the intended store | No admission even with well-formed live state. Independently inject open failure into the designated child and verify it never serves. |
 | Correct child returns unavailable, malformed, mismatched or revoked state, or never answers | No agent starts. No mutation or fresh enrollment occurs. |
 | Exit either peer before readiness, after reply before admission, or racing agent start | Old handoffs become unusable. Observed pre-admission loss yields no start. In the race, any started agent's namespace is stopped and all members accounted for. |
-| Lose a committed reply, then reconnect for recovery with the original request | The exact retained request returns the original result without new observation, key, timestamp or journal entry. A leftover holder lock or invalid history refuses reconciliation. Neither outcome resumes the agent. |
-| Lose the authority before commit, then reopen for the retained request | Missing committed history refuses. No ordinary retry is sent. The request stays unknown, with no new observation, key, timestamp or journal entry. |
+| Lose the authority before or after commit, with the current four methods | No protected command retry in either case. The result stays unknown and the agent stays stopped. The outside-host recovery path is required. |
+| Future history-only guard: committed reply is lost before the authority fails | The exact retained request resolves only its recorded result, without new observation, key, timestamp or journal entry. The agent stays stopped. |
+| Future history-only guard: authority fails before commit, or history is mismatched, invalid or locked | Reconciliation refuses. The result stays unknown, with no new observation, key, timestamp or journal entry. |
 | Healthy checkpoint with different live-workspace and stored approved bytes | After proven teardown only the stored approved bytes seed the fresh namespace. Original authority and console persist. A replacement pair must pass fresh checks. Breaking any gate prevents restart. |
 | Missing, mixed, corrupt or wrong-context durable state, or cleanup failure | No overwrite, automatic repair or key regeneration. Preserve history and report unproven cleanup. Inspect exported metadata for secret leakage. |
 
