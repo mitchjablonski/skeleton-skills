@@ -58,4 +58,23 @@ Changed and unchanged Recapture retain round/key/counters. Approve also retains 
 
 A leftover holder lock always refuses writers. There is no expiry, automatic unlink, temp promotion, repair, journal eviction or key regeneration. Stop writers, reconcile unknown outcomes and inspect storage health through the protected outside-host recovery process before deliberate cleanup. Never reenroll an existing directory to bypass refusal. A successful later fsync is not proof that earlier writeback errors were harmless.
 
+`openHumanAuthorityHistory(directory, expectedContext, {captureStore, storageOperations})`
+opens a separate trusted host capability with one `lookup(operation, args)`
+method. It uses the existing command input codec and requires the original
+operation, arguments and request ID to match a committed entry. A lookup
+takes the same holder lock, rereads the record and checks its enrolled
+context. It validates referenced stored captures and completes durability
+barriers before returning the retained result. A missing or mismatched entry,
+held lock, unreadable record or failed barrier returns fixed unavailable.
+The adapter may create and release its own holder lock. It never changes
+journal or capture bytes, observes the workspace, obtains a new timestamp
+or samples protected entropy.
+
+The history reader has no channel method or production caller. A protected
+launcher still has to bind and supervise the authority and restrict the
+recovery path to this capability. Until then, follow the
+[authority-loss refusal](strict-enrollment-binding.md#peer-loss-recovery-and-planned-restart).
+Sending an ordinary same-ID command after an authority fault can commit
+a request that has no history.
+
 Only Linux local-filesystem directory-fsync behavior is supported by this candidate. Tests of injected failures and process reopen are not power-loss or storage-device qualification. Hostile same-user path swaps, rollback/integrity protection, protected channel/enrollment, real capture quiescence, supervisor evidence and production storage recovery remain separate gates. No real credentials, network admission, publication or strict activation follows from this adapter.
