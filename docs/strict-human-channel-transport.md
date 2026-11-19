@@ -30,6 +30,30 @@ The Python host creates an unnamed socketpair and passes one descriptor to each 
 
 While a real channel is live in the host, a separate minimal Bubblewrap worker receives only stdio and a public read control. It must have no extra descriptors, cannot read/create files in the private bootstrap/store/capture paths, and cannot connect to a named endpoint (none exists). These tests cover that bounded fixture configuration, not every path in the actual CLI profile. Neither endpoint is a protected human terminal. Runtime receipts identify selected observations only; the channel client role is explicitly `node-channel-control`, not the pinned Claude CLI.
 
+### Bootstrap readiness check
+
+The same fixture checks readiness before the approval replay. The host prepares
+an enrolled store and records the expected public phase, revision, shape and
+capture digests. A fresh unnamed socketpair carries the existing `state()` call.
+Only a matching reply with live admissions permits the host to start a fixed
+Node sentinel. The sentinel stands in for an agent start and exits immediately.
+The host checks for the marker written by the sentinel itself.
+
+The refusal cases cover malformed authority state, a peer that stays open
+without replying, revoked admissions, and valid replies that disagree on the
+capture digest or revision. The silent peer must receive a request. The
+malformed, revoked and mismatch controls vary the public response without
+mutating the store.
+The fixture verifies that readiness leaves the durable record bytes unchanged.
+The summary counts readiness connections under `readiness.socketpairs`; the
+top-level count still refers to the approval and replay connections.
+
+This exercises one bootstrap gate with a real inherited channel. The public
+state omits the project and session IDs, so matching it cannot establish
+which enrolled authority owns a descriptor. That binding, ongoing liveness,
+launcher-to-console readiness reporting, and the real agent start still
+belong to the protected launcher contract.
+
 Helpers remain unreaped through `waitid(...WNOWAIT)` until group cleanup, avoiding numeric process-group reuse before signalling. Cleanup failure refuses success and retains scratch. Exit 2 means invalid arguments/pins/prerequisites; exit 1 means an attempted fixture or cleanup failed; exit 0 means the bounded fixture passed. Output contains bounded public metadata, never private keys or injected codes.
 
 Observed on 2026-11-14: the socketpair/durable-reconnect fixture passed, including lost-reply recovery, one protected observation, unchanged history and separate-worker descriptor/path exclusion. Strict remained `unverified`. Protected control/PTY bootstrap, display/clipboard/automation isolation, general process admission, external integrity/antirollback and supported-profile qualification remain open.
