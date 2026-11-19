@@ -24,8 +24,11 @@ listener here is owned by the fixture:
 **Who answered the positive controls.** The fixture's own listeners must
 have accepted exactly those connections: three each.
 
-**Routes.** The sandbox's IPv4 and IPv6 route tables are read first, and must
-show no default route. The kernel's own unreachable `::/0` entries on `lo`,
+**Routes.** The **same sandbox worker** that makes the connections first reads
+its own IPv4 and IPv6 route tables, and connects only if neither shows a
+default route. So the route prerequisite gates exactly those attempts, in
+the same namespace. An unreadable, truncated or malformed table makes the
+worker refuse (the run fails); it never counts as "no routes". The kernel's own unreachable `::/0` entries on `lo`,
 flagged `RTF_REJECT`, block traffic, so they don't count. As a positive
 control, the same reader in the shared namespace must see the host's default
 route. A sandbox with a default route is stopped before any connect. A
