@@ -12,27 +12,36 @@ It makes no support claim, and strict remains `unverified` after a pass.
 #152 left broader ptrace and process-vm reach open. This fixture measures it.
 
 **The stand-in.** A host-side process stands in for the console or the
-authority. It holds a random 32-byte secret in memory and a private pipe
-descriptor.
+authority. It holds a random 32-byte secret in memory, received over stdin
+and **never on its command line**, and a private pipe descriptor. The
+workers get only the secret's SHA-256 to compare against.
 
 **The attempts.** From a Bubblewrap sandbox running under the same uid, the
 agent targets the stand-in's **host** pid with:
 - `ptrace(PTRACE_ATTACH)`;
 - `process_vm_readv`;
 - reading `/proc/<pid>/mem`;
-- `pidfd_open`, then `pidfd_getfd`.
+- `pidfd_open`, then `pidfd_getfd`;
+- reading `/proc/<pid>/cmdline` and `/proc/<pid>/environ`, which must not
+  contain the secret.
 
-| Sandbox | Visible | Attach | `process_vm_readv` | `/proc/<pid>/mem` | `pidfd_open` / `pidfd_getfd` |
-| --- | --- | --- | --- | --- | --- |
-| With a pid namespace (the agent) | no | `ESRCH` | `ESRCH` | `ENOENT` | `ESRCH` / — |
-| Without a pid namespace (visibility control) | yes | refused | refused | refused | allowed / refused |
+| Sandbox | Visible | Attach | `process_vm_readv` | `/proc/<pid>/mem` | `pidfd_open` / `pidfd_getfd` | cmdline / environ |
+| --- | --- | --- | --- | --- | --- | --- |
+| With a pid namespace (the agent) | no | `ESRCH` | `ESRCH` | `ENOENT` | `ESRCH` / — | `ENOENT` |
+| Without a pid namespace (visibility control) | yes | refused | refused | refused | must succeed / refused | readable without the secret, or refused |
 
 **Two layers:**
 1. **The pid namespace** hides the process entirely.
 2. **Credentials and Yama** (here `ptrace_scope` = 1, recorded in the output)
-   still refuse every access once the process is visible. The fixture
-   requires that no visible-stand-in access succeeds. It records the exact
-   errnos rather than pinning them, because they depend on the Yama scope.
+   still refuse every access once the process is visible. Each access must
+   return a real errno name, so an unexpected or partial result fails the
+   run. `pidfd_open` must succeed there, so that `pidfd_getfd` is really
+   attempted. The errnos are recorded rather than pinned, because they
+   depend on the Yama scope.
+
+**Positive control for the /proc text check.** A second stand-in that does
+carry the secret on its command line must be reported as
+`contains-secret`.
 
 **Positive control for the access paths.** The probe itself, as the
 stand-in's parent, reads the secret with `process_vm_readv` and takes the
@@ -50,16 +59,17 @@ same as the other fixtures:
 
 - A stand-in process, not the real console or authority.
 - The access refusals depend on the measured kernel's Yama scope and LSMs.
-  A host with `ptrace_scope` = 0 would rely on the pid namespace alone.
-- No hostile coverage beyond these syscalls, such as `/proc/<pid>/environ`
-  or `kcmp`.
+  On a host with `ptrace_scope` = 0, the visible-stand-in check would fail
+  (exit 1), because same-uid access is then allowed. There, only the pid
+  namespace protects the process.
+- No hostile coverage beyond these paths, such as `kcmp`.
 
 Observed on 2026-11-18 on WSL2 kernel `6.6.87.2-microsoft-standard-WSL2`,
 x86_64, system Python 3.12.3, with Yama `ptrace_scope` = 1:
 - **With a pid namespace:** every attempt failed with `ESRCH` or `ENOENT`.
 - **Without one:** the stand-in was visible, but attach, `process_vm_readv`
-  and `pidfd_getfd` were refused with `EPERM`, and `/proc/<pid>/mem` with
-  `EACCES`.
+  and `pidfd_getfd` were refused with `EPERM`. `/proc/<pid>/mem` and
+  `environ` were refused with `EACCES`, and `cmdline` held no secret.
 - **The parent** read the secret and took the descriptor.
 
 Strict remained `unverified`.

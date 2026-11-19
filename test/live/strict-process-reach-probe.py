@@ -16,10 +16,12 @@ Exit 0: passed. Exit 1: a check or positive control failed. Exit 2: unsupported.
 """
 import ctypes
 import errno
+import hashlib
 import json
 import os
 import pathlib
 import platform
+import re
 import select
 import shutil
 import subprocess
@@ -33,7 +35,7 @@ PTRACE_ATTACH, PTRACE_DETACH = 16, 17
 
 STANDIN = r'''
 import ctypes, json, os, sys, time
-secret = bytes.fromhex(sys.argv[1])
+secret = bytes.fromhex(sys.stdin.readline().strip())  # never on the command line
 buf = ctypes.create_string_buffer(secret, len(secret))
 r, w = os.pipe()
 os.write(w, b"private")
@@ -44,18 +46,25 @@ while True: time.sleep(1)
 # Runs in the sandbox (and, for the controls, outside it).
 WORKER = r'''
 import ctypes, errno, json, os, sys
+import hashlib
 plan = json.loads(sys.argv[1])
 libc = ctypes.CDLL(None, use_errno=True)
-pid, addr, length, fd, secret = plan["pid"], plan["addr"], plan["length"], plan["fd"], bytes.fromhex(plan["secret"])
-def err(): return errno.errorcode.get(ctypes.get_errno(), "E?")
+pid, addr, length, fd, digest = plan["pid"], plan["addr"], plan["length"], plan["fd"], plan["digest"]
+def err(): return errno.errorcode.get(ctypes.get_errno(), "EUNKNOWN")
+def judge(data):  # the worker only knows the secret's hash
+    return "read-secret" if hashlib.sha256(data).hexdigest() == digest else "read-other"
 out = {"visible": os.path.exists("/proc/%d" % pid)}
 class iovec(ctypes.Structure): _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
 dst = ctypes.create_string_buffer(length)
 local, remote = iovec(ctypes.addressof(dst), length), iovec(addr, length)
 libc.process_vm_readv.restype = ctypes.c_ssize_t
+libc.process_vm_readv.argtypes = [ctypes.c_int, ctypes.POINTER(iovec), ctypes.c_ulong, ctypes.POINTER(iovec), ctypes.c_ulong, ctypes.c_ulong]
+ctypes.set_errno(0)
 n = libc.process_vm_readv(pid, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
-out["processVmReadv"] = ("read-secret" if dst.raw == secret else "read-other") if n == length else err()
+out["processVmReadv"] = judge(dst.raw) if n == length else ("read-partial" if n > 0 else err())
 libc.ptrace.restype = ctypes.c_long
+libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+libc.syscall.restype = ctypes.c_long
 rc = libc.ptrace(16, pid, None, None)
 if rc == 0:
     out["ptraceAttach"] = "attached"
@@ -66,12 +75,12 @@ else:
     out["ptraceAttach"] = err()
 try:
     with open("/proc/%d/mem" % pid, "rb", buffering=0) as m:
-        m.seek(addr); out["procMem"] = "read-secret" if m.read(length) == secret else "read-other"
+        m.seek(addr); data = m.read(length); out["procMem"] = judge(data) if data else "read-empty"
 except OSError as e:
     out["procMem"] = errno.errorcode.get(e.errno, "E?")
 try:
     pidfd = os.pidfd_open(pid); out["pidfdOpen"] = "ok"
-    got = libc.syscall(438, pidfd, fd, 0)
+    got = libc.syscall(ctypes.c_long(438), ctypes.c_long(pidfd), ctypes.c_long(fd), ctypes.c_long(0))
     if got >= 0:
         out["pidfdGetfd"] = "took-descriptor" if os.read(got, 16) == b"private" else "took-other"; os.close(got)
     else:
@@ -79,6 +88,14 @@ try:
     os.close(pidfd)
 except OSError as e:
     out["pidfdOpen"] = errno.errorcode.get(e.errno, "E?"); out["pidfdGetfd"] = "not-attempted"
+# Other per-process files a same-uid process might read: the secret must not be in them.
+for key, name in (("procCmdline", "cmdline"), ("procEnviron", "environ")):
+    try:
+        with open("/proc/%d/%s" % (pid, name), "rb") as f: data = f.read(1 << 16)
+        needles = (plan["secretHex"].encode(), digest.encode())
+        out[key] = "contains-secret" if any(x in data for x in needles) else "no-secret"
+    except OSError as e:
+        out[key] = errno.errorcode.get(e.errno, "EUNKNOWN")
 print(json.dumps(out, sort_keys=True))
 '''
 
@@ -145,12 +162,17 @@ def main():
         assert capability.returncode == 0, "bubblewrap cannot start a sandbox"
 
         secret = os.urandom(32).hex()
-        standin = subprocess.Popen(["/usr/bin/python3", "-I", "-c", STANDIN, secret], stdin=subprocess.DEVNULL,
+        standin = subprocess.Popen(["/usr/bin/python3", "-I", "-c", STANDIN], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, preexec_fn=limits)
+        standin.stdin.write((secret + "\n").encode())  # the secret travels over stdin only
+        standin.stdin.close()
         record = read_line(standin.stdout.fileno(), time.monotonic() + 10)
         exit_code = 1
         result["code"] = "fixture-failed"
-        plan = {"pid": standin.pid, "addr": record["addr"], "length": record["length"], "fd": record["fd"], "secret": secret}
+        # Workers get only the secret's hash, plus the hex to search /proc text
+        # for. The hex is in a worker's own argv, never in the stand-in's.
+        plan = {"pid": standin.pid, "addr": record["addr"], "length": record["length"], "fd": record["fd"],
+                "digest": hashlib.sha256(bytes.fromhex(secret)).hexdigest(), "secretHex": secret}
 
         # A sibling worker outside any sandbox: recorded only (Yama scope decides).
         launcher = run(root, "launcher", [], plan)
@@ -178,16 +200,36 @@ def main():
         # The agent, with a pid namespace: the stand-in isn't even visible.
         agent = run(root, "agent", bwrap_argv() + ["--"], plan)
         assert agent == {"visible": False, "processVmReadv": "ESRCH", "ptraceAttach": "ESRCH", "procMem": "ENOENT",
-                         "pidfdOpen": "ESRCH", "pidfdGetfd": "not-attempted"}, "the agent reached the stand-in"
+                         "pidfdOpen": "ESRCH", "pidfdGetfd": "not-attempted", "procCmdline": "ENOENT",
+                         "procEnviron": "ENOENT"}, "the agent reached the stand-in"
         # Visibility control: without a pid namespace the pid is visible, and
         # every access must still be refused (credentials and Yama, not hiding).
         visible = run(root, "no-pidns", bwrap_argv(pidns=False) + ["--"], plan)
         assert visible["visible"] is True, "visibility control: the stand-in should be visible without a pid namespace"
-        leaked = [k for k, v in visible.items() if v in ("read-secret", "read-other", "attached", "took-descriptor", "took-other")]
-        assert not leaked, "a visible stand-in was accessed from the sandbox"
+        assert visible["pidfdOpen"] == "ok", "visibility control: pidfd_open should succeed, so pidfd_getfd is really attempted"
+        # Allowlist: every access attempt must be a real errno; cmdline/environ may
+        # be readable but must not contain the secret.
+        for key in ("processVmReadv", "ptraceAttach", "procMem", "pidfdGetfd"):
+            assert re.fullmatch(r"E[A-Z0-9]+", visible[key]) and visible[key] != "EUNKNOWN", f"visible stand-in: {key} was not refused"
+        for key in ("procCmdline", "procEnviron"):
+            assert visible[key] == "no-secret" or re.fullmatch(r"E[A-Z0-9]+", visible[key]), f"visible stand-in: {key} exposed the secret"
+
+        # Positive control for the /proc text check: a stand-in that does carry the
+        # secret on its command line must be caught.
+        leaky = subprocess.Popen(["/usr/bin/python3", "-I", "-c", "import time\nwhile True: time.sleep(1)", secret],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 env={}, preexec_fn=limits)
+        try:
+            time.sleep(0.2)
+            caught = run(root, "cmdline-control", bwrap_argv(pidns=False) + ["--"], dict(plan, pid=leaky.pid))
+        finally:
+            leaky.kill()
+            leaky.wait(timeout=5)
+        assert caught["procCmdline"] == "contains-secret", "cmdline check positive control failed"
 
         result.update(ok=True, code="process-reach-fixture-passed", yamaPtraceScope=yama,
                       parentPositiveControl={"processVmReadv": "read-secret", "pidfdGetfd": "took-descriptor"},
+                      cmdlineCheckControl=caught["procCmdline"],
                       launcherSiblingWorker=launcher, agent=agent, noPidNamespace=visible,
                       platform={"kernelRelease": platform.release()[:256], "machine": platform.machine(),
                                 "pythonVersion": platform.python_version()},
