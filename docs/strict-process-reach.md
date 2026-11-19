@@ -13,8 +13,10 @@ It makes no support claim, and strict remains `unverified` after a pass.
 
 **The stand-in.** A host-side process stands in for the console or the
 authority. It holds a random 32-byte secret in memory, received over stdin
-and **never on its command line**, and a private pipe descriptor. The
-workers get only the secret's SHA-256 to compare against.
+and **never on its command line**, and a private pipe descriptor. Each
+worker gets the secret's SHA-256 to compare reads against, plus the hex for
+searching `/proc` text. Those arrive in the worker's own argv, never the
+stand-in's.
 
 **The attempts.** From a Bubblewrap sandbox running under the same uid, the
 agent targets the stand-in's **host** pid with:
@@ -40,8 +42,9 @@ agent targets the stand-in's **host** pid with:
    depend on the Yama scope.
 
 **Positive control for the /proc text check.** A second stand-in that does
-carry the secret on its command line must be reported as
-`contains-secret`.
+carry the secret on its command line, and in its environment, must have its
+cmdline reported as `contains-secret`. Its environ must be either
+`contains-secret` or refused; here it is refused under Yama.
 
 **Positive control for the access paths.** The probe itself, as the
 stand-in's parent, reads the secret with `process_vm_readv` and takes the

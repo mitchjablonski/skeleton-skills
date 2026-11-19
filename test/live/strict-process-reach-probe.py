@@ -218,7 +218,7 @@ def main():
         # secret on its command line must be caught.
         leaky = subprocess.Popen(["/usr/bin/python3", "-I", "-c", "import time\nwhile True: time.sleep(1)", secret],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 env={}, preexec_fn=limits)
+                                 env={"S": secret}, preexec_fn=limits)
         try:
             time.sleep(0.2)
             caught = run(root, "cmdline-control", bwrap_argv(pidns=False) + ["--"], dict(plan, pid=leaky.pid))
@@ -226,10 +226,13 @@ def main():
             leaky.kill()
             leaky.wait(timeout=5)
         assert caught["procCmdline"] == "contains-secret", "cmdline check positive control failed"
+        # environ is refused under Yama here; if it is readable, the search must find the secret.
+        assert caught["procEnviron"] == "contains-secret" or re.fullmatch(r"E[A-Z0-9]+", caught["procEnviron"]), \
+            "environ check positive control failed"
 
         result.update(ok=True, code="process-reach-fixture-passed", yamaPtraceScope=yama,
                       parentPositiveControl={"processVmReadv": "read-secret", "pidfdGetfd": "took-descriptor"},
-                      cmdlineCheckControl=caught["procCmdline"],
+                      cmdlineCheckControl=caught["procCmdline"], environCheckControl=caught["procEnviron"],
                       launcherSiblingWorker=launcher, agent=agent, noPidNamespace=visible,
                       platform={"kernelRelease": platform.release()[:256], "machine": platform.machine(),
                                 "pythonVersion": platform.python_version()},
