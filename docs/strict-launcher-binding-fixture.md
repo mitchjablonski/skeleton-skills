@@ -21,7 +21,7 @@ The launcher compares the report origin with its current generation, consumes th
 | A's context, different saved capture | Both children are alive. The revision, review version, and admission state match, but the capture version differs. The state check refuses. |
 | Replace the original A generation | Both original peers are still alive and the replacement returns identical state. The old report fails the generation check. |
 | Revoked enrollment | A separately prepared durable store reports revoked admissions. |
-| Authority or console exits after reporting | The harness waits for the selected child to exit before admission. Both cases leave their markers absent. |
+| Authority or console exits after reporting | The harness waits for the selected child to exit and checks that the other stays alive throughout the admission decision. Both cases leave their markers absent. |
 
 All helpers are fixed leaf processes running under the same trusted Linux user. The harness kills and waits for its children on exit and retains scratch if it cannot confirm cleanup. The pipe is a local fixture reporting mechanism. The existing command protocol and durable store format are unchanged.
 

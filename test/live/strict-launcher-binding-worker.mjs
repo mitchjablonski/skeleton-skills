@@ -18,6 +18,11 @@ function endpoint() {
   return new net.Socket({fd: Number(fd), readable: true, writable: true});
 }
 
+function boundFixtureLifetime(stream) {
+  // An endpoint closing must not end both child processes in a lost-peer case.
+  setTimeout(() => { stream.destroy(); process.exitCode = 1; }, 12000);
+}
+
 if (role === 'prepare') {
   const candidate = path.join(directory, 'candidate');
   fs.mkdirSync(candidate, {mode: 0o700});
@@ -46,16 +51,16 @@ if (role === 'prepare') {
   } catch {
     process.exit(23);
   }
-  createHumanCommandServer(endpoint(), store);
+  const stream = endpoint();
+  boundFixtureLifetime(stream);
+  createHumanCommandServer(stream, store);
 } else if (role === 'console') {
   const stream = endpoint();
+  boundFixtureLifetime(stream);
   const client = createHumanCommandClient(stream);
   const state = await client.state();
   fs.writeFileSync(Number(reportFd), JSON.stringify(state));
   fs.closeSync(Number(reportFd));
-  // Keep the original staged client alive through the launcher's admission decision.
-  const guard = setTimeout(() => { stream.destroy(); process.exitCode = 1; }, 12000);
-  stream.once('close', () => clearTimeout(guard));
 } else {
   throw Error('unknown worker role');
 }

@@ -167,16 +167,21 @@ def exercise(launcher):
             replacement = launcher.stage(selected)
             assert replacement.report().state == report.state
             assert active.console.poll() is None and active.authority.poll() is None
+            assert replacement.console.poll() is None and replacement.authority.poll() is None
         if case.startswith('lost-'):
-            child = active.authority if case == 'lost-authority' else active.console
+            child, survivor = (active.authority, active.console) if case == 'lost-authority' else (
+                active.console, active.authority)
             child.kill()
             child.wait(TIMEOUT)
+            assert survivor.poll() is None
         marker = launcher.scratch / ('marker-' + case)
         if case == 'consumed':
             initial = launcher.scratch / 'marker-first-consumption'
             assert launcher.admit(selected, report, initial) and initial.read_bytes() == b'started\n'
         assert launcher.admit(selected, report, marker) == (case == 'live')
         assert (marker.read_bytes() if marker.exists() else None) == (b'started\n' if case == 'live' else None)
+        if case.startswith('lost-'):
+            assert survivor.poll() is None
         launcher.cleanup()
         assert snapshot(enrollments) == before
     return cases
