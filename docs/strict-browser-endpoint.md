@@ -3,7 +3,8 @@
 Status: opt-in development fixture only. No production entrypoint imports it.
 It makes no support claim, and strict remains `unverified` after a pass.
 
-Run on Linux or WSL2 with system Python, Bubblewrap and Chrome or Chromium:
+Run on Linux or WSL2 with system Python, pidfds, Bubblewrap and Chrome or
+Chromium:
 
 ```sh
 /usr/bin/python3 -I test/live/strict-browser-endpoint-probe.py
@@ -17,7 +18,8 @@ Contract negative control N5: no automation or debugging endpoints.
 Chrome**:
 - a fresh scratch profile holding a random marker file;
 - a loopback remote-debugging endpoint (`--remote-debugging-address=127.0.0.1
-  --remote-debugging-port=0`), with the port read from `DevToolsActivePort`.
+  --remote-debugging-port=0`), with the port read from a bounded
+  `DevToolsActivePort` file.
 
 The browser gets no display variables, so it never touches WSLg. It runs
 with `--disable-background-networking`, and the fixture itself connects only
@@ -25,9 +27,8 @@ to the endpoint it created.
 
 **Chrome's crash handlers do start** (Chrome 143 headless), each in its own
 session. Their database is under HOME, which is the scratch root, and they
-are configured with Chrome's crash-upload URL. No crash occurs in a passing
-run, but the fixture doesn't block or observe their network traffic. The
-output records how many were seen, and cleanup must reap them (below).
+are configured with Chrome's crash-upload URL. The fixture records how many
+handlers it sees. It does not monitor browser crashes or handler traffic.
 
 Chrome's own sandbox is preferred. `--no-sandbox` is used only if the
 sandboxed browser can't start, and both the choice and the reason are
@@ -46,19 +47,16 @@ recorded.
 | Browser profile (mount) | `ENOENT` | Profile bound read-only: the marker reads back, and the endpoint stays `ECONNREFUSED` |
 | Both | — | The launcher itself reaches the endpoint and reads the marker |
 
-**Cleanup.** Every browser session the fixture launched, including a failed
-sandboxed attempt, gets SIGTERM, then SIGKILL. A pass needs both of these to
-hold:
-- no live process remains in any of those sessions;
-- no process names anything under the scratch root on its command line.
-  That catches the crash handlers and any other helper that left the
-  session.
+**Cleanup.** The standalone fixture starts with no children and becomes a
+Linux child subreaper before launching anything. When browser helpers are
+orphaned, the kernel reparents them to the fixture even if they changed
+sessions. Cleanup sends SIGTERM, then SIGKILL as needed, through pidfds
+after checking that each recipient is a current child. It reaps children
+until the kernel reports none remain, including after a failed sandboxed
+attempt. A command line mentioning the scratch directory can make the run
+fail and retain scratch, but never authorizes a signal.
 
-A session with nothing left alive isn't signalled again, because its
-number may already belong to someone else.
-
-A process that outlives cleanup fails the run (exit 1) and keeps the
-scratch directory.
+If the fixture cannot prove cleanup, it exits 1 and retains scratch.
 
 ## Output and bounds
 
@@ -71,8 +69,8 @@ The output is bounded public JSON:
 Exit codes:
 - **Exit 0:** passed.
 - **Exit 1:** a check, positive control or cleanup failed.
-- **Exit 2:** unsupported: no Chrome, Chromium or Bubblewrap, the browser
-  can't start, or Bubblewrap can't start a sandbox.
+- **Exit 2:** unsupported: missing dependencies, unavailable child
+  supervision, the browser cannot start, or Bubblewrap cannot start a sandbox.
 
 ## Limits
 
