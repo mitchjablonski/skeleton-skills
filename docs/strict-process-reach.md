@@ -32,23 +32,28 @@ agent targets the stand-in's **host** pid with:
 | With a pid namespace (the agent) | no | `ESRCH` | `ESRCH` | `ENOENT` | `ESRCH` / — | `ENOENT` |
 | Without a pid namespace (visibility control) | yes | refused | refused | refused | must succeed / refused | readable without the secret, or refused |
 
-**Two layers:**
-1. **The pid namespace** hides the process entirely.
-2. **Credentials and Yama** (here `ptrace_scope` = 1, recorded in the output)
-   still refuse every access once the process is visible. Each access must
-   return a real errno name, so an unexpected or partial result fails the
-   run. `pidfd_open` must succeed there, so that `pidfd_getfd` is really
-   attempted. The errnos are recorded rather than pinned, because they
-   depend on the Yama scope.
+**What each run shows:**
+1. **With a pid namespace:** the stand-in's host pid number names no process
+   there, so the attempts fail with `ESRCH` or `ENOENT`. That shows the
+   number doesn't reach it. It isn't a refusal by the stand-in.
+2. **Without a pid namespace:** the stand-in is visible, and every access
+   must be an observed **permission refusal** (`EPERM` or `EACCES`). A
+   generic or partial result fails the run. `pidfd_open` must succeed there,
+   so that `pidfd_getfd` is really attempted. The Yama scope is recorded
+   (here 1). The fixture describes this measured configuration only, and
+   doesn't attribute the refusals to Yama or predict other hosts.
 
-**Positive control for the /proc text check.** A second stand-in that does
+**Positive control for the /proc text check.** It has its own plan: only its
+pid and the text to search for, with no memory address or descriptor
+borrowed from the first stand-in. A second stand-in that does
 carry the secret on its command line, and in its environment, must have its
 cmdline reported as `contains-secret`. Its environ must be either
 `contains-secret` or refused; here it is refused under Yama.
 
 **Positive control for the access paths.** The probe itself, as the
 stand-in's parent, reads the secret with `process_vm_readv` and takes the
-descriptor with `pidfd_getfd`. A sibling worker outside the sandbox is
+descriptor with `pidfd_getfd`. Every descriptor read is bounded in time, so
+an empty pipe can't hang the run. A sibling worker outside the sandbox is
 refused under Yama scope 1, which is recorded as an observation.
 
 The output has errno names only, never the secret. The exit codes are the
@@ -61,10 +66,9 @@ same as the other fixtures:
 ## Limits
 
 - A stand-in process, not the real console or authority.
-- The access refusals depend on the measured kernel's Yama scope and LSMs.
-  On a host with `ptrace_scope` = 0, the visible-stand-in check would fail
-  (exit 1), because same-uid access is then allowed. There, only the pid
-  namespace protects the process.
+- The refusals are observed on this configuration only. A host with
+  different ptrace policy, for example Yama `ptrace_scope` = 0, may allow
+  same-uid access. The visible-stand-in check would then fail (exit 1).
 - No hostile coverage beyond these paths, such as `kcmp`.
 
 Observed on 2026-11-18 on WSL2 kernel `6.6.87.2-microsoft-standard-WSL2`,

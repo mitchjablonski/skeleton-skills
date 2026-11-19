@@ -46,27 +46,33 @@ while True: time.sleep(1)
 # Runs in the sandbox (and, for the controls, outside it).
 WORKER = r'''
 import ctypes, errno, json, os, sys
-import hashlib
+import hashlib, select
 plan = json.loads(sys.argv[1])
+def bounded_read(fd):  # never block on a descriptor that turns out empty
+    return os.read(fd, 16) if select.select([fd], [], [], 1)[0] else b""
 libc = ctypes.CDLL(None, use_errno=True)
 pid, addr, length, fd, digest = plan["pid"], plan["addr"], plan["length"], plan["fd"], plan["digest"]
 def err(): return errno.errorcode.get(ctypes.get_errno(), "EUNKNOWN")
 def judge(data):  # the worker only knows the secret's hash
     return "read-secret" if hashlib.sha256(data).hexdigest() == digest else "read-other"
 out = {"visible": os.path.exists("/proc/%d" % pid)}
+text_only = plan.get("textOnly", False)  # a control that owns only its own /proc text
 class iovec(ctypes.Structure): _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
 dst = ctypes.create_string_buffer(length)
 local, remote = iovec(ctypes.addressof(dst), length), iovec(addr, length)
 libc.process_vm_readv.restype = ctypes.c_ssize_t
 libc.process_vm_readv.argtypes = [ctypes.c_int, ctypes.POINTER(iovec), ctypes.c_ulong, ctypes.POINTER(iovec), ctypes.c_ulong, ctypes.c_ulong]
 ctypes.set_errno(0)
-n = libc.process_vm_readv(pid, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
-out["processVmReadv"] = judge(dst.raw) if n == length else ("read-partial" if n > 0 else err())
+n = -1 if text_only else libc.process_vm_readv(pid, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
+if not text_only:
+    out["processVmReadv"] = judge(dst.raw) if n == length else ("read-partial" if n > 0 else err())
 libc.ptrace.restype = ctypes.c_long
 libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 libc.syscall.restype = ctypes.c_long
-rc = libc.ptrace(16, pid, None, None)
-if rc == 0:
+rc = None if text_only else libc.ptrace(16, pid, None, None)
+if rc is None:
+    pass
+elif rc == 0:
     out["ptraceAttach"] = "attached"
     try: os.waitpid(pid, 0)  # a tracer may wait for its tracee to stop
     except OSError: pass
@@ -74,20 +80,26 @@ if rc == 0:
 else:
     out["ptraceAttach"] = err()
 try:
+    if text_only: raise StopIteration
     with open("/proc/%d/mem" % pid, "rb", buffering=0) as m:
         m.seek(addr); data = m.read(length); out["procMem"] = judge(data) if data else "read-empty"
+except StopIteration:
+    pass
 except OSError as e:
-    out["procMem"] = errno.errorcode.get(e.errno, "E?")
+    out["procMem"] = errno.errorcode.get(e.errno, "EUNKNOWN")
 try:
+    if text_only: raise StopIteration
     pidfd = os.pidfd_open(pid); out["pidfdOpen"] = "ok"
     got = libc.syscall(ctypes.c_long(438), ctypes.c_long(pidfd), ctypes.c_long(fd), ctypes.c_long(0))
     if got >= 0:
-        out["pidfdGetfd"] = "took-descriptor" if os.read(got, 16) == b"private" else "took-other"; os.close(got)
+        out["pidfdGetfd"] = "took-descriptor" if bounded_read(got) == b"private" else "took-other"; os.close(got)
     else:
         out["pidfdGetfd"] = err()
     os.close(pidfd)
+except StopIteration:
+    pass
 except OSError as e:
-    out["pidfdOpen"] = errno.errorcode.get(e.errno, "E?"); out["pidfdGetfd"] = "not-attempted"
+    out["pidfdOpen"] = errno.errorcode.get(e.errno, "EUNKNOWN"); out["pidfdGetfd"] = "not-attempted"
 # Other per-process files a same-uid process might read: the secret must not be in them.
 for key, name in (("procCmdline", "cmdline"), ("procEnviron", "environ")):
     try:
@@ -191,7 +203,8 @@ def main():
             got = libc.syscall(NR_PIDFD_GETFD, pidfd, record["fd"], 0)
             assert got >= 0, "parent could not take the stand-in's descriptor (positive control)"
             try:
-                assert os.read(got, 16) == b"private"
+                assert select.select([got], [], [], 5)[0] and os.read(got, 16) == b"private", \
+                    "parent took a descriptor without the stand-in's marker"
             finally:
                 os.close(got)
         finally:
@@ -209,10 +222,11 @@ def main():
         assert visible["pidfdOpen"] == "ok", "visibility control: pidfd_open should succeed, so pidfd_getfd is really attempted"
         # Allowlist: every access attempt must be a real errno; cmdline/environ may
         # be readable but must not contain the secret.
+        # Observed permission refusals, specifically (not a generic error).
         for key in ("processVmReadv", "ptraceAttach", "procMem", "pidfdGetfd"):
-            assert re.fullmatch(r"E[A-Z0-9]+", visible[key]) and visible[key] != "EUNKNOWN", f"visible stand-in: {key} was not refused"
+            assert visible[key] in ("EPERM", "EACCES"), f"visible stand-in: {key} was not a permission refusal"
         for key in ("procCmdline", "procEnviron"):
-            assert visible[key] == "no-secret" or re.fullmatch(r"E[A-Z0-9]+", visible[key]), f"visible stand-in: {key} exposed the secret"
+            assert visible[key] in ("no-secret", "EPERM", "EACCES"), f"visible stand-in: {key} exposed the secret"
 
         # Positive control for the /proc text check: a stand-in that does carry the
         # secret on its command line must be caught.
@@ -221,13 +235,16 @@ def main():
                                  env={"S": secret}, preexec_fn=limits)
         try:
             time.sleep(0.2)
-            caught = run(root, "cmdline-control", bwrap_argv(pidns=False) + ["--"], dict(plan, pid=leaky.pid))
+            # Its own plan: only the pid and the text to search for, nothing from the first stand-in.
+            caught = run(root, "cmdline-control", bwrap_argv(pidns=False) + ["--"],
+                         {"pid": leaky.pid, "addr": 0, "length": 1, "fd": -1, "digest": plan["digest"],
+                          "secretHex": secret, "textOnly": True})
         finally:
             leaky.kill()
             leaky.wait(timeout=5)
         assert caught["procCmdline"] == "contains-secret", "cmdline check positive control failed"
         # environ is refused under Yama here; if it is readable, the search must find the secret.
-        assert caught["procEnviron"] == "contains-secret" or re.fullmatch(r"E[A-Z0-9]+", caught["procEnviron"]), \
+        assert caught["procEnviron"] in ("contains-secret", "EPERM", "EACCES"), \
             "environ check positive control failed"
 
         result.update(ok=True, code="process-reach-fixture-passed", yamaPtraceScope=yama,
@@ -237,7 +254,8 @@ def main():
                       platform={"kernelRelease": platform.release()[:256], "machine": platform.machine(),
                                 "pythonVersion": platform.python_version()},
                       limitations=["a stand-in process, not the real console or authority",
-                                   "the sibling result depends on the Yama scope, which is recorded",
+                                   "results describe this measured configuration only; the Yama scope is recorded, not inferred as the cause",
+                                   "inside a pid namespace the host pid number names no process; ESRCH there is not a refusal by the stand-in",
                                    "hardened kernels and LSMs beyond the measured host are not covered",
                                    "measured host only"])
         exit_code = 0
