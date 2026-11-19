@@ -152,10 +152,9 @@ def main():
         result["code"] = "fixture-failed"
         plan = {"pid": standin.pid, "addr": record["addr"], "length": record["length"], "fd": record["fd"], "secret": secret}
 
-        # Positive control for the access paths: the launcher (the stand-in's parent).
+        # A sibling worker outside any sandbox: recorded only (Yama scope decides).
         launcher = run(root, "launcher", [], plan)
-        # Note: the launcher-side worker is a child of the probe, a sibling of the
-        # stand-in, so Yama scope 1 may refuse it; the probe itself is the parent.
+        # Positive control for the access paths: the probe itself, the stand-in's parent.
         libc = ctypes.CDLL(None, use_errno=True)
 
         class iovec(ctypes.Structure):
