@@ -91,9 +91,37 @@ print(json.dumps({'ok':True,'onlyStdioInherited':True,'publicControlReadable':Tr
  command+=['--symlink','usr/bin','/bin','--proc','/proc','--dev','/dev','--ro-bind',str(public),'/public','--',sys.executable,'-I','-c',script,str(root/'bootstrap.json'),str(root/'authority'/'human-authority.json'),str(root/'captures')]
  item=launch(command,root,'negative');processes.append(item);return reap(item,root)
 
+def readiness(node,worker,root,processes):
+ def snapshot():
+  return {file:file.read_bytes() for directory in ('authority','captures') for file in (root/directory).iterdir()}
+ before=snapshot();results={};starts=0
+ for case in ('live','malformed','noReply','revoked','captureMismatch','revisionMismatch'):
+  left,right=socket.socketpair(socket.AF_UNIX,socket.SOCK_STREAM)
+  with left,right:
+   server=None
+   if case!='noReply':
+    server=launch([node,worker,'readiness-server',root,left.fileno(),case],root,'readiness-server-'+case,(left.fileno(),));processes.append(server)
+    left.close()
+   # For noReply the parent holds the peer open without reading or writing.
+   client=launch([node,worker,'readiness-client',root,right.fileno(),case],root,'readiness-client-'+case,(right.fileno(),));processes.append(client)
+   right.close()
+   started=reap(client,root)['sentinelStarted']
+   marker=root/('sentinel-'+case)
+   if started is not (case=='live') or marker.exists()!=started:raise RuntimeError('unexpected sentinel result')
+   if started and marker.read_bytes()!=b'started\n':raise RuntimeError('invalid sentinel marker')
+   if case=='noReply':
+    left.settimeout(1)
+    if not left.recv(MAX):raise RuntimeError('readiness request was not sent')
+   if server is not None and reap(server,root)['stateCalls']!=1:raise RuntimeError('readiness state missing')
+  if snapshot()!=before:raise RuntimeError('readiness changed durable bytes')
+  starts+=started;results[case]=True
+ return {**results,'durableBytesUnchanged':True,'sentinelStarts':starts}
+
+
 def main():
  result={'ok':False,'strictState':'unverified','code':'unsupported'};root=None;processes=[];cleanup_ok=True;exit_code=2
  try:
+  if sys.flags.optimize:raise RuntimeError('optimized interpreter unsupported')
   parser=ArgumentParser(add_help=False);parser.add_argument('--node',required=True);parser.add_argument('--node-sha256',required=True);args=parser.parse_args()
   if not sys.platform.startswith('linux') or not str(pathlib.Path(sys.executable).resolve()).startswith('/usr/') or not shutil.which('bwrap') or not all(hasattr(os,name) for name in ('waitid','P_PID','WEXITED','WNOHANG','WNOWAIT','CLD_EXITED')):raise RuntimeError('unsupported platform')
   pin=load();result['code']='pin-invalid'
@@ -116,6 +144,7 @@ def main():
   def run(mode,label):
    item=launch([node,worker,mode,root],root,label);processes.append(item);return reap(item,root)
   prepared=run('prepare','prepare')
+  result['readiness']=readiness(node,worker,root,processes)
   evidence=[]
   for number,round_name in enumerate(('first','replay')):
    left,right=socket.socketpair(socket.AF_UNIX,socket.SOCK_STREAM)
