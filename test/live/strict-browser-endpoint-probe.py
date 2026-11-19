@@ -30,6 +30,11 @@ MAX = 32768
 CANDIDATES = ("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser")
 MARKER = "strict-n5-marker"
 
+
+class BrowserStartupError(RuntimeError):
+    """The browser never published an endpoint file."""
+
+
 WORKER = r'''
 import errno, json, os, socket, sys
 plan = json.loads(sys.argv[1])
@@ -235,22 +240,28 @@ def launch_browser(chrome, profile, sandbox):
 def wait_port(profile, process, deadline):
     """(port, browser websocket path) from DevToolsActivePort."""
     path = profile / "DevToolsActivePort"
+    seen = False
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError("browser exited before opening its endpoint")
+            if seen or path.exists():
+                raise RuntimeError("browser exited after publishing an endpoint file")
+            raise BrowserStartupError("browser exited before opening its endpoint")
         try:
             with path.open("rb") as source:
                 raw = source.read(513)
+            seen = True
             if len(raw) > 512:
                 raise RuntimeError("browser port file exceeds limit")
             lines = raw.decode("ascii").splitlines()
             port = int(lines[0])
             if 0 < port < 65536 and len(lines) > 1 and lines[1].startswith("/devtools/browser/"):
                 return port, lines[1]
-        except (OSError, ValueError, IndexError):
+        except (FileNotFoundError, ValueError, IndexError):
             pass
         time.sleep(0.05)
-    raise RuntimeError("browser endpoint timeout")
+    if seen:
+        raise RuntimeError("browser published an invalid endpoint file")
+    raise BrowserStartupError("browser endpoint timeout")
 
 
 def main():
@@ -286,17 +297,21 @@ def main():
         fallback_reason = None
         for attempt in (True, False):
             browser = launch_browser(chrome, profile, attempt)
+            exit_code = 1
+            result["code"] = "fixture-failed"
             try:
                 port, ws_path = wait_port(profile, browser, time.monotonic() + 20)
                 sandbox = attempt
                 break
-            except RuntimeError as error:
+            except BrowserStartupError as error:
                 fallback_reason = str(error)[:80]
                 if not stop_owned_children(browser) or root_users(root):
                     cleanup = False
                     raise RuntimeError("first browser attempt cleanup unproven") from error
                 browser = None
                 (profile / "DevToolsActivePort").unlink(missing_ok=True)
+                exit_code = 2
+                result["code"] = "unsupported"
         assert browser is not None and port, "browser cannot start"
         exit_code = 1
         result["code"] = "fixture-failed"

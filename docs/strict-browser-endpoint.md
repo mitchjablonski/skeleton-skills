@@ -31,8 +31,9 @@ are configured with Chrome's crash-upload URL. The fixture records how many
 handlers it sees. It does not monitor browser crashes or handler traffic.
 
 Chrome's own sandbox is preferred. `--no-sandbox` is used only if the
-sandboxed browser can't start, and both the choice and the reason are
-recorded.
+sandboxed browser fails to publish an endpoint file and its processes are
+proven stopped. The fixture fails on malformed endpoint evidence and records
+the sandbox choice and any fallback reason.
 
 **Endpoint identity is pinned:**
 - the 127.0.0.1 listener's socket inode must be held by a process in the
