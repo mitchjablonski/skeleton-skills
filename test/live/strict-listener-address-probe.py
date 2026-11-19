@@ -197,7 +197,8 @@ def main():
                  "v6-reject": (header4, v6_reject, {"ipv4": 0, "ipv6": 0}),
                  "v4-default": (header4 + v4_default, "", {"ipv4": 1, "ipv6": 0}),
                  "v6-short": (header4, f"{zero} 00 {zero}\n", None),
-                 "v4-short": (header4 + "eth0\t00000000\n", "", None)}
+                 "v4-short": (header4 + "eth0\t00000000\n", "", None),
+                 "v4-bad-hex": (header4 + v4_default.replace("00000000", "ZZZZZZZZ", 1), "", None)}
         for name, (t4, t6, want) in cases.items():
             (synthetic / (name + ".v4")).write_text(t4)
             (synthetic / (name + ".v6")).write_text(t6)

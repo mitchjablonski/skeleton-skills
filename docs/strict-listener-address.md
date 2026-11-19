@@ -35,7 +35,7 @@ worker refuse (the run fails); it never counts as "no routes".
   namespace, must stop before connecting, reporting only its routes.
 - **Parser controls:** synthetic tables are fed to the same reader. A real
   IPv6 `::/0` must count 1, a reject `::/0` must count 0, and an IPv4
-  default must count 1. A short IPv6 or IPv4 row must refuse.
+  default must count 1. A short IPv6 or IPv4 row, or an IPv4 row with a non-hex field, must refuse.
 
 `/proc/net/route` shows only the main IPv4 table. A default route in
 another table, selected by an `ip rule`, wouldn't be seen. That is low risk
