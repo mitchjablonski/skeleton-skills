@@ -11,8 +11,9 @@ gate has a positive control that opens only that gate. Every browser process
 must be proven gone before a pass. Never human proof, never a support claim.
 
 Exit 0: passed. Exit 1: a check, positive control or cleanup failed.
-Exit 2: unsupported (no Chrome/Chromium, no Bubblewrap, or the browser can't start).
+Exit 2: unsupported (missing prerequisites or the browser can't start).
 """
+import ctypes
 import http.client
 import json
 import os
@@ -28,6 +29,12 @@ import time
 MAX = 32768
 CANDIDATES = ("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser")
 MARKER = "strict-n5-marker"
+WAIT_ALL_CHILDREN = 0x40000000  # Linux __WALL includes children using non-SIGCHLD exit signals.
+
+
+class BrowserStartupError(RuntimeError):
+    """The browser never published an endpoint file."""
+
 
 WORKER = r'''
 import errno, json, os, socket, sys
@@ -90,11 +97,7 @@ def session_pids(sid):
 
 
 def root_users(root):
-    """Processes whose command line names anything under our scratch root.
-
-    Catches a helper that left the browser session (Chrome's crash handler
-    setsids and names only a database path under HOME, which is the root).
-    """
+    """Corroborating scratch use only. A path match never authorizes a signal."""
     needle = str(root).encode()
     found = []
     for name in os.listdir("/proc"):
@@ -106,6 +109,73 @@ def root_users(root):
             except OSError:
                 pass
     return found
+
+
+def enable_child_supervision():
+    """Own and reap orphaned browser helpers, even if they left its session."""
+    if not hasattr(os, "pidfd_open") or not hasattr(os, "P_PIDFD") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError("pidfd wait or signaling unavailable")
+    if direct_child_pids():
+        raise RuntimeError("fixture needs a process with no existing children")
+    try:
+        os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT | WAIT_ALL_CHILDREN)
+    except ChildProcessError:
+        pass
+    else:
+        raise RuntimeError("fixture needs a process with no existing children")
+    libc = ctypes.CDLL(None, use_errno=True)
+    pr_set_child_subreaper = 36
+    if libc.prctl(pr_set_child_subreaper, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "could not enable child supervision")
+
+
+def direct_child_pids():
+    pid_path = "/proc/self/task/%d/children" % os.getpid()
+    with open(pid_path, "rb") as source:
+        entries = source.read(MAX + 1)
+    if len(entries) > MAX:
+        raise RuntimeError("child list too large")
+    return [int(entry) for entry in entries.split()]
+
+
+def signal_direct_children(signum):
+    for pid in direct_child_pids():
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            continue
+        try:
+            # Verify this is still our child after opening the stable handle.
+            os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT | WAIT_ALL_CHILDREN)
+            signal.pidfd_send_signal(fd, signum)
+        except (ChildProcessError, ProcessLookupError, PermissionError):
+            # A child we cannot stop leaves the final reaping proof unproven.
+            continue
+        finally:
+            os.close(fd)
+
+
+def stop_owned_children(browser):
+    """Return success only when the kernel has no direct children left."""
+    started = time.monotonic()
+    deadline = started + 10
+    try:
+        while time.monotonic() < deadline:
+            while time.monotonic() < deadline:
+                try:
+                    pid, status = os.waitpid(-1, os.WNOHANG | WAIT_ALL_CHILDREN)
+                except ChildProcessError:
+                    return True
+                if pid == 0:
+                    break
+                if browser is not None and browser.pid == pid:
+                    browser.returncode = os.waitstatus_to_exitcode(status)
+            signum = signal.SIGTERM if time.monotonic() < started + 2 else signal.SIGKILL
+            signal_direct_children(signum)
+            time.sleep(0.05)
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return False
 
 
 def crash_handlers(root):
@@ -157,7 +227,9 @@ def version(port):
         response = conn.getresponse()
         body = response.read(MAX + 1)
         assert response.status == 200 and len(body) <= MAX
-        return json.loads(body)
+        document = json.loads(body)
+        assert isinstance(document, dict), "unexpected browser version response"
+        return document
     finally:
         conn.close()
 
@@ -176,18 +248,28 @@ def launch_browser(chrome, profile, sandbox):
 def wait_port(profile, process, deadline):
     """(port, browser websocket path) from DevToolsActivePort."""
     path = profile / "DevToolsActivePort"
+    seen = False
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError("browser exited before opening its endpoint")
+            if seen or path.exists():
+                raise RuntimeError("browser exited after publishing an endpoint file")
+            raise BrowserStartupError("browser exited before opening its endpoint")
         try:
-            lines = path.read_text()[:512].splitlines()
+            with path.open("rb") as source:
+                raw = source.read(513)
+            seen = True
+            if len(raw) > 512:
+                raise RuntimeError("browser port file exceeds limit")
+            lines = raw.decode("ascii").splitlines()
             port = int(lines[0])
             if 0 < port < 65536 and len(lines) > 1 and lines[1].startswith("/devtools/browser/"):
                 return port, lines[1]
-        except (OSError, ValueError, IndexError):
+        except (FileNotFoundError, ValueError, IndexError):
             pass
         time.sleep(0.05)
-    raise RuntimeError("browser endpoint timeout")
+    if seen or path.exists():
+        raise RuntimeError("browser published an invalid endpoint file")
+    raise BrowserStartupError("browser endpoint timeout")
 
 
 def main():
@@ -195,7 +277,7 @@ def main():
     exit_code = 2
     root = None
     browser = None
-    sessions = []  # every browser session ever launched, checked in cleanup
+    supervise = False
     cleanup = True
     try:
         if sys.flags.optimize:
@@ -205,6 +287,8 @@ def main():
         assert pathlib.Path("/usr/bin/bwrap").is_file()
         chrome = next((c for c in CANDIDATES if pathlib.Path(c).exists()), None)
         assert chrome, "no Chrome/Chromium"
+        enable_child_supervision()
+        supervise = True
         root = pathlib.Path(tempfile.mkdtemp(prefix="strict-browser-endpoint-")).resolve()
         os.chmod(root, 0o700)
         capability = subprocess.run(bwrap_argv() + ["--", "/usr/bin/true"], stdin=subprocess.DEVNULL,
@@ -221,20 +305,21 @@ def main():
         fallback_reason = None
         for attempt in (True, False):
             browser = launch_browser(chrome, profile, attempt)
-            sessions.append(browser.pid)
+            exit_code = 1
+            result["code"] = "fixture-failed"
             try:
                 port, ws_path = wait_port(profile, browser, time.monotonic() + 20)
                 sandbox = attempt
                 break
-            except RuntimeError as error:
+            except BrowserStartupError as error:
                 fallback_reason = str(error)[:80]
-                try:
-                    os.killpg(browser.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass  # the whole group already exited
-                browser.wait(timeout=10)
+                if not stop_owned_children(browser) or root_users(root):
+                    cleanup = False
+                    raise RuntimeError("first browser attempt cleanup unproven") from error
                 browser = None
                 (profile / "DevToolsActivePort").unlink(missing_ok=True)
+                exit_code = 2
+                result["code"] = "unsupported"
         assert browser is not None and port, "browser cannot start"
         exit_code = 1
         result["code"] = "fixture-failed"
@@ -260,8 +345,11 @@ def main():
         assert bound == {"endpoint": "ECONNREFUSED", "profile": "marker"}, "profile control did not open exactly the profile"
 
         # Same endpoint, same browser, at the end of the observations.
+        assert listening_inode(port) == inode and holders(inode, session_pids(browser.pid)), "listener ownership changed"
         after = version(port)
-        assert after.get("Browser") == before["Browser"] and listening_inode(port) == inode, "endpoint changed during the run"
+        assert after.get("Browser") == before["Browser"], "browser product changed during the run"
+        assert after.get("webSocketDebuggerUrl") == before["webSocketDebuggerUrl"], "debugger URL changed during the run"
+        assert listening_inode(port) == inode, "listener inode changed"
         assert holders(inode, session_pids(browser.pid)), "listener no longer held by the browser session"
 
         result.update(ok=True, code="browser-endpoint-fixture-passed",
@@ -282,41 +370,12 @@ def main():
             http.client.HTTPException):
         pass
     finally:
-        if sessions:
-            for sid in sessions:
-                if not session_pids(sid):
-                    continue  # nothing live in it: its number may already be reused
-                try:
-                    os.killpg(sid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                if browser is not None:
-                    browser.poll()  # reap the lead so it stops counting
-                if not any(session_pids(sid) for sid in sessions) and not root_users(root):
-                    break
-                time.sleep(0.1)
-            for sid in sessions:
-                if not session_pids(sid):
-                    continue
-                try:
-                    os.killpg(sid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            if browser is not None:
-                try:
-                    browser.wait(timeout=5)
-                except subprocess.SubprocessError:
+        if supervise:
+            try:
+                if not stop_owned_children(browser) or (root is not None and root_users(root)):
                     cleanup = False
-            for pid in root_users(root):  # a helper outside the session: kill, then fail
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            except OSError:
                 cleanup = False
-            if any(session_pids(sid) for sid in sessions) or root_users(root):
-                cleanup = False  # a browser process or crash handler outlived cleanup
         if root is not None and cleanup and exit_code != 1:
             try:
                 assert root.parent == pathlib.Path(tempfile.gettempdir()).resolve()
