@@ -31,19 +31,49 @@ import errno, json, socket, sys
 plan = json.loads(sys.argv[1])
 def name(e): return errno.errorcode.get(e.errno, "E?") if isinstance(e, OSError) and e.errno else type(e).__name__
 out = {}
-if plan.get("routes"):
-    # Default routes visible here, read from the kernel tables; nothing is sent.
-    with open("/proc/net/route") as f:
-        v4 = sum(1 for r in f.read(65536).splitlines()[1:] if len(r.split()) > 1 and r.split()[1] == "00000000")
-    try:
-        with open("/proc/net/ipv6_route") as f:
-            # ::/0 entries flagged RTF_REJECT (0x0200) are the kernel's own
-            # unreachable routes on lo; they block traffic, so they don't count.
-            v6 = sum(1 for r in f.read(65536).splitlines()
-                     if r.split()[:2] == ["0" * 32, "00"] and not int(r.split()[8], 16) & 0x0200)
-    except OSError:
-        v6 = 0
-    out["defaultRoutes"] = v4 + v6
+LIMIT = 1 << 20
+def read_table(path):
+    # Read to EOF; an error or a table over LIMIT refuses rather than reading as "no routes".
+    with open(path, "rb") as f:
+        data = f.read(LIMIT + 1)
+    if len(data) > LIMIT:
+        raise SystemExit(3)
+    return data.decode("ascii").splitlines()
+# Default routes visible in THIS namespace, read before any connect; nothing is sent.
+tables = plan.get("routeTables") or {"v4": "/proc/net/route", "v6": "/proc/net/ipv6_route"}
+try:
+    rows4 = read_table(tables["v4"])
+    rows6 = read_table(tables["v6"])
+except (OSError, UnicodeDecodeError):
+    raise SystemExit(3)
+if not rows4 or not rows4[0].startswith("Iface"):
+    raise SystemExit(3)
+def hexes(fields):
+    try: [int(x, 16) for x in fields]
+    except ValueError: raise SystemExit(3)
+v4 = 0
+for r in rows4[1:]:
+    f4 = r.split()
+    if len(f4) != 11:
+        raise SystemExit(3)  # a cut-off or malformed row refuses
+    hexes(f4[1:4] + f4[7:8])
+    if f4[1] == "00000000":
+        v4 += 1
+v6 = 0
+for r in rows6:
+    f6 = r.split()
+    if len(f6) != 10:
+        raise SystemExit(3)
+    hexes(f6[:9])
+    # ::/0 entries flagged RTF_REJECT (0x0200) are the kernel's own unreachable
+    # routes on lo; they block traffic, so they don't count.
+    if f6[:2] == ["0" * 32, "00"] and not int(f6[8], 16) & 0x0200:
+        v6 += 1
+out["defaultRoutes"] = {"ipv4": v4, "ipv6": v6}
+# The route prerequisite gates this worker's own connects.
+if plan["requireNoRoute"] and (v4 or v6):
+    print(json.dumps(out, sort_keys=True))
+    raise SystemExit(0)
 for label, family, addr, port in plan["targets"]:
     s = socket.socket(socket.AF_INET6 if family == 6 else socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1)
     try: s.connect((addr, port)); out[label] = "connected"
@@ -75,7 +105,7 @@ def run(root, label, prefix, plan):
     with (root / (label + ".out")).open("wb") as out, (root / (label + ".err")).open("wb") as err:
         process = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env={},
                                  preexec_fn=limits, timeout=60)
-    assert process.returncode == 0, label + " worker failed"
+    assert process.returncode == 0, label + " worker failed or refused to read its route tables"
     data = (root / (label + ".out")).read_bytes()
     assert len(data) <= MAX
     return json.loads(data)
@@ -143,21 +173,50 @@ def main():
         expected = {"any4-via-loopback": "ECONNREFUSED", "any4-via-unspecified": "ECONNREFUSED",
                     "any4-via-host-address": "ENETUNREACH", "dual-via-ipv6-loopback": "ECONNREFUSED",
                     "dual-via-unspecified": "ECONNREFUSED", "dual-via-mapped-loopback": "ECONNREFUSED"}
-        plan = {"targets": targets}
-
-        # The sandbox's routes are read from its kernel tables first, so a
-        # sandbox with a default route is stopped before any connect.
-        routes = run(root, "agent-routes", bwrap_argv(), {"targets": [], "routes": True})
+        # The sandbox worker reads its own route tables and connects only if it
+        # has no default route, in the same namespace and process.
+        agent = run(root, "agent", bwrap_argv(), {"targets": targets, "requireNoRoute": True})
         failed = "sandbox has a default route"
-        assert routes == {"defaultRoutes": 0}, failed
-        # Positive control for the route reader: the shared namespace sees the host's default route.
-        host_routes = run(root, "shared-routes", bwrap_argv(net=False), {"targets": [], "routes": True})
-        failed = "route reader positive control saw no default route"
-        assert host_routes["defaultRoutes"] >= 1, failed
-        agent = run(root, "agent", bwrap_argv(), plan)
+        assert agent.pop("defaultRoutes") == {"ipv4": 0, "ipv6": 0}, failed
         failed = "a fixture listener answered or failed unexpectedly in the sandbox"
         assert agent == expected, failed
-        shared = run(root, "shared-net", bwrap_argv(net=False), plan)
+        # Gate control: a worker that does see a default route (shared namespace)
+        # must stop before connecting, reporting only its routes.
+        gated = run(root, "gate-control", bwrap_argv(net=False), {"targets": targets, "requireNoRoute": True})
+        failed = "gate control: a worker with a default route went on to connect"
+        assert list(gated) == ["defaultRoutes"] and sum(gated["defaultRoutes"].values()) >= 1, failed
+        # Parser controls on synthetic tables (run directly, no sandbox).
+        synthetic = root / "tables"
+        synthetic.mkdir()
+        header4 = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+        zero = "0" * 32
+        v6_real = f"{zero} 00 {zero} 00 {'fe80' + '0' * 28} 00000400 00000001 00000000 00000003 eth0\n"
+        v6_reject = f"{zero} 00 {zero} 00 {zero} ffffffff 00000001 00000000 00200200 lo\n"
+        v4_default = "eth0\t00000000\t0150A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+        cases = {"v6-real": (header4, v6_real, {"ipv4": 0, "ipv6": 1}),
+                 "v6-reject": (header4, v6_reject, {"ipv4": 0, "ipv6": 0}),
+                 "v4-default": (header4 + v4_default, "", {"ipv4": 1, "ipv6": 0}),
+                 "v6-short": (header4, f"{zero} 00 {zero}\n", None),
+                 "v4-short": (header4 + "eth0\t00000000\n", "", None),
+                 "v4-bad-hex": (header4 + v4_default.replace("00000000", "ZZZZZZZZ", 1), "", None)}
+        for name, (t4, t6, want) in cases.items():
+            (synthetic / (name + ".v4")).write_text(t4)
+            (synthetic / (name + ".v6")).write_text(t6)
+            tables = {"v4": str(synthetic / (name + ".v4")), "v6": str(synthetic / (name + ".v6"))}
+            proc = subprocess.run(["/usr/bin/python3", "-I", "-c", WORKER,
+                                   json.dumps({"targets": [], "requireNoRoute": True, "routeTables": tables})],
+                                  stdin=subprocess.DEVNULL, capture_output=True, env={}, timeout=30, preexec_fn=limits)
+            failed = f"route parser control {name}"
+            if want is None:
+                assert proc.returncode == 3, failed
+            else:
+                assert proc.returncode == 0 and json.loads(proc.stdout)["defaultRoutes"] == want, failed
+        # Positive controls: the same reader in the shared namespace sees the
+        # host's default route, and every fixture listener connects.
+        shared = run(root, "shared-net", bwrap_argv(net=False), {"targets": targets, "requireNoRoute": False})
+        host_routes = shared.pop("defaultRoutes")
+        failed = "route reader positive control saw no default route"
+        assert host_routes["ipv4"] + host_routes["ipv6"] >= 1, failed
         failed = "shared-netns positive control failed"
         assert shared == {t[0]: "connected" for t in targets}, failed
         # And the fixture's own listeners took exactly those connections.
