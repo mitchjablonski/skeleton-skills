@@ -189,7 +189,9 @@ Each step either succeeds or refuses the whole launch.
 4. **Control process.** Start the console on the control PTY, using candidate
    A or B above.
 5. **Readiness.** Over the control↔authority socketpair, the console's
-   `state()` must answer. Any failure refuses.
+   `state()` must answer. Any failure refuses. The
+   [enrollment binding proposal](strict-enrollment-binding.md) distinguishes
+   the launcher's binding from the state observation and defines its test cases.
 6. **Listener.** Start it and check that it answers. Then open the page in a
    **fresh, launcher-owned browser profile** (C20). Merely printing the URL for
    the human to paste into their normal browser isn't offered in protected
