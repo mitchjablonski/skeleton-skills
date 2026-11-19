@@ -11,7 +11,7 @@ gate has a positive control that opens only that gate. Every browser process
 must be proven gone before a pass. Never human proof, never a support claim.
 
 Exit 0: passed. Exit 1: a check, positive control or cleanup failed.
-Exit 2: unsupported (no Chrome/Chromium, no Bubblewrap, or the browser can't start).
+Exit 2: unsupported (missing prerequisites or the browser can't start).
 """
 import ctypes
 import http.client
@@ -115,6 +115,8 @@ def enable_child_supervision():
     """Own and reap orphaned browser helpers, even if they left its session."""
     if not hasattr(os, "pidfd_open") or not hasattr(os, "P_PIDFD") or not hasattr(signal, "pidfd_send_signal"):
         raise RuntimeError("pidfd wait or signaling unavailable")
+    if direct_child_pids():
+        raise RuntimeError("fixture needs a process with no existing children")
     try:
         os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT | WAIT_ALL_CHILDREN)
     except ChildProcessError:
@@ -127,14 +129,17 @@ def enable_child_supervision():
         raise OSError(ctypes.get_errno(), "could not enable child supervision")
 
 
-def signal_direct_children(signum):
+def direct_child_pids():
     pid_path = "/proc/self/task/%d/children" % os.getpid()
     with open(pid_path, "rb") as source:
         entries = source.read(MAX + 1)
     if len(entries) > MAX:
         raise RuntimeError("child list too large")
-    for entry in entries.split():
-        pid = int(entry)
+    return [int(entry) for entry in entries.split()]
+
+
+def signal_direct_children(signum):
+    for pid in direct_child_pids():
         try:
             fd = os.pidfd_open(pid)
         except ProcessLookupError:
@@ -222,7 +227,9 @@ def version(port):
         response = conn.getresponse()
         body = response.read(MAX + 1)
         assert response.status == 200 and len(body) <= MAX
-        return json.loads(body)
+        document = json.loads(body)
+        assert isinstance(document, dict), "unexpected browser version response"
+        return document
     finally:
         conn.close()
 
@@ -260,7 +267,7 @@ def wait_port(profile, process, deadline):
         except (FileNotFoundError, ValueError, IndexError):
             pass
         time.sleep(0.05)
-    if seen:
+    if seen or path.exists():
         raise RuntimeError("browser published an invalid endpoint file")
     raise BrowserStartupError("browser endpoint timeout")
 
