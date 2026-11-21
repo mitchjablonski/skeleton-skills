@@ -14,3 +14,21 @@ The default client role is `pinned-cli`. An inherited-channel fixture can explic
 
 Observed on 2026-11-14: receipt self-tests and the pinned durable-fill fixture passed on the measured WSL2 Linux kernel/ext4 setup with Bubblewrap 0.9.0, Node 20.20.0 and CLI 2.1.323. This kernel's optional clone-policy file was not exposed and was recorded as such. Both fill cases still returned `strictState: unverified` and `completionVerified: false`.
 A metadata helper that cannot be reaped after timeout raises ReceiptCleanupFailed; the integrated fixture reports unproven cleanup and retains its scratch rather than claiming cleanup succeeded. These deadlines bound the direct helper; they do not establish descendant quiescence. The collector issues no network requests itself, but executes pinned binaries' version commands unsandboxed. These bounds apply to receipt collection, not to every earlier prerequisite check or later fixture action.
+
+## Launcher selection policy (#193)
+
+The disabled `select_runtime(expected, observe)` helper in
+`test/live/strict-runtime-selection.py` compares a trusted, preselected full
+receipt with one current observation. It validates both receipts by
+recomputing their canonical fingerprints. The selector passes the four
+client, entrypoint, Node and Bubblewrap digests from the selected receipt to
+the trusted observer, which must check them before running version commands.
+An invalid selection skips observation. A changed, invalid or unavailable
+observation yields a fixed refusal. A separate cleanup-unproven refusal
+tells the launcher to preserve scratch when helper cleanup is uncertain.
+
+An exact match returns the selected fingerprint and leaves process creation
+to the launcher. The launcher must source the expected receipt from its
+trusted profile configuration and must collect a fresh observation on each
+attempt. The synthetic self-test covers this decision boundary. The pinned
+live observer and supported-runtime integration remain open.
