@@ -6,13 +6,16 @@ Modes (fixed, no other arguments):
                              (Bubblewrap's main command), a fixed child that
                              leads its own process group (the agent group),
                              and a descendant that escapes into a new session
+  agent-capture              same roles, with digests of the two fixture files
   authority SOCK REL STATUS  authority stub: hold one request, reply only
                              after the host writes to REL
   control SOCK               control stand-in: exit when told to hang up
   launcher -- ARGV...        launcher stand-in: start ARGV, then wait forever
 """
+import hashlib
 import json
 import os
+import pathlib
 import select
 import subprocess
 import sys
@@ -26,7 +29,12 @@ def sleep_forever():
         time.sleep(1)
 
 
-def agent():
+def agent(capture=False):
+    digests = {}
+    if capture:
+        stage = pathlib.Path("/fixture-stage")
+        for name in ("context.txt", "plan.js"):
+            digests[name] = hashlib.sha256((stage / name).read_bytes()).hexdigest()
     child = os.fork()
     if child == 0:
         os.setpgid(0, 0)
@@ -52,6 +60,8 @@ def agent():
         "child": child,
         "escapee": escapee,
     }
+    if capture:
+        record["digests"] = digests
     sys.stdout.write(json.dumps(record, sort_keys=True) + "\n")
     sys.stdout.flush()
     sleep_forever()
@@ -109,6 +119,8 @@ def main():
     args = sys.argv[1:]
     if args == ["agent"]:
         agent()
+    elif args == ["agent-capture"]:
+        agent(capture=True)
     elif len(args) == 4 and args[0] == "authority":
         authority(int(args[1]), int(args[2]), int(args[3]))
     elif len(args) == 2 and args[0] == "control":

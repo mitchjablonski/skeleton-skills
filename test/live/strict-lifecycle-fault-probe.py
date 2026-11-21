@@ -84,14 +84,17 @@ class Run:
         return process
 
 
-def bwrap_argv():
+def bwrap_argv(stage=None):
     argv = ["/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
             "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib"]
     if pathlib.Path("/lib64").exists():
         argv += ["--ro-bind", "/lib64", "/lib64"]
-    return argv + ["--symlink", "usr/bin", "/bin", "--proc", "/proc", "--dev", "/dev",
-                   "--ro-bind", str(HELPER), "/helper.py",
-                   "--", "/usr/bin/python3", "-I", "/helper.py", "agent"]
+    argv += ["--symlink", "usr/bin", "/bin", "--proc", "/proc", "--dev", "/dev",
+             "--ro-bind", str(HELPER), "/helper.py"]
+    if stage is not None:
+        argv += ["--ro-bind", str(stage), "/fixture-stage"]
+    mode = "agent-capture" if stage is not None else "agent"
+    return argv + ["--", "/usr/bin/python3", "-I", "/helper.py", mode]
 
 
 def read_record(fd, deadline):
@@ -188,16 +191,15 @@ def scan(pid_ns, since):
     return sorted(found)
 
 
-def start_namespace(run, label, launcher=False):
+def start_namespace(run, label, launcher=False, *, stage=None):
     """Start the agent namespace, directly or under a launcher stand-in."""
     read_end, write_end = os.pipe()
     run.fd(read_end)
     since = boot_ticks() - 1  # one tick of margin for rounding
     try:
+        argv = bwrap_argv(stage)
         if launcher:
-            argv = ["/usr/bin/python3", "-I", str(HELPER), "launcher", "--"] + bwrap_argv()
-        else:
-            argv = bwrap_argv()
+            argv = ["/usr/bin/python3", "-I", str(HELPER), "launcher", "--"] + argv
         process = run.launch(argv, label, stdout=write_end)
     finally:
         os.close(write_end)
@@ -251,6 +253,13 @@ def start_namespace(run, label, launcher=False):
     namespace = {"pidNs": pid_ns, "members": members, "process": process, "since": since,
                  "outer": outer, "outerFd": outer_fd}
     run.namespaces.append(namespace)
+    if stage is not None:
+        digests = record["digests"]
+        assert isinstance(digests, dict) and digests.keys() == {"context.txt", "plan.js"}
+        assert all(isinstance(value, str) and len(value) == 64
+                   and all(ch in "0123456789abcdef" for ch in value)
+                   for value in digests.values())
+        namespace["digests"] = digests
     return namespace
 
 
@@ -454,12 +463,60 @@ def scenario_launcher_crash(run):
     return {"fault": "launcher-killed", "stopMs": ms(time.monotonic() - started), "hostActions": "none"}
 
 
+def cleanup_run(run):
+    """Stop and reap owned processes, then confirm the namespace census is empty."""
+    cleanup = True
+    cleanup_deadline = time.monotonic() + CLEANUP_BOUND
+    left = lambda: max(0.0, cleanup_deadline - time.monotonic())
+    for fd in run.inits + run.launcher_children:
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            cleanup = False
+    for process in run.processes:
+        if process.returncode is not None:
+            continue  # already reaped: its numeric PID/PGID may be reused, never signal it
+        try:
+            # Unreaped, so the PID and its group stay reserved until wait().
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=left())
+        except (OSError, subprocess.SubprocessError):
+            cleanup = False
+    for fd in run.members + run.extras:
+        try:
+            if not exited(fd, left()):
+                cleanup = False
+        except OSError:
+            cleanup = False
+    for namespace in run.namespaces:
+        if not left():
+            cleanup = False
+            break
+        try:
+            if scan(namespace["pidNs"], namespace["since"]):
+                cleanup = False
+        except (OSError, Unproven, ValueError, IndexError):
+            cleanup = False
+    for fd in set(run.fds + run.members):
+        try:
+            os.close(fd)
+        except OSError:
+            pass  # already closed by its owner
+    if not left():
+        cleanup = False
+    return cleanup
+
+
 def main():
     result = {"ok": False, "strictState": "unverified", "code": "unsupported"}
     exit_code = 2
     root = None
     run = None
-    cleanup = True
     retain = False
 
     def wall(signum, frame):
@@ -516,51 +573,7 @@ def main():
             result["code"] = "fixture-failed"
     finally:
         signal.alarm(0)
-        cleanup_deadline = time.monotonic() + CLEANUP_BOUND
-        left = lambda: max(0.0, cleanup_deadline - time.monotonic())
-        if run is not None:
-            for fd in run.inits + run.launcher_children:
-                try:
-                    signal.pidfd_send_signal(fd, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except OSError:
-                    cleanup = False
-            for process in run.processes:
-                if process.returncode is not None:
-                    continue  # already reaped: its numeric PID/PGID may be reused, never signal it
-                try:
-                    # Unreaped, so the PID and its group stay reserved until wait().
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait(timeout=left())
-                except (OSError, subprocess.SubprocessError):
-                    cleanup = False
-            for fd in run.members + run.extras:
-                try:
-                    if not exited(fd, left()):
-                        cleanup = False
-                except OSError:
-                    cleanup = False
-            for namespace in run.namespaces:
-                if not left():
-                    cleanup = False
-                    break
-                try:
-                    if scan(namespace["pidNs"], namespace["since"]):
-                        cleanup = False
-                except (OSError, Unproven, ValueError, IndexError):
-                    cleanup = False
-            for fd in set(run.fds + run.members):
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass  # already closed by its owner
-            if not left():
-                cleanup = False
-        if not cleanup:
+        if run is not None and not cleanup_run(run):
             retain = True
             result.update(ok=False, code="cleanup-failed", cleanupFailed=True)
             exit_code = 1
