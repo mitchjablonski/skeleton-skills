@@ -27,9 +27,11 @@ leaf sees the approved bytes in independently created files.
 
 The cases refuse a different enrollment with identical public state, missing
 or corrupt stored bytes, a live predecessor with missing or borrowed exit
-evidence, reuse of the first report, an unavailable fresh state, and a genuine
-history lookup result used as restart evidence. Refusal starts no additional
-leaf and preserves the authority and capture bytes present at admission.
+evidence, and an unrelated exit receipt after the predecessor has exited.
+Other cases refuse reuse of the first report, an unavailable fresh state,
+retry with a report already consumed during a failed materialization, and
+a genuine history result used as restart evidence. Refusal starts no
+additional leaf and preserves the authority and capture bytes.
 
 This opt-in fixture covers fixed, owned leaf processes. Namespace teardown,
 production admission and the check-to-spawn race remain open. Strict stays

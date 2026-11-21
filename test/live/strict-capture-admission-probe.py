@@ -151,7 +151,10 @@ def exercise_case(node, scratch, case):
             elif case != 'missing-stop':
                 first.lifetime.close()
                 stop = launcher.observe_stop(first.child)
-                if case == 'recovery-result':
+                if case == 'borrowed-stop-after-exit':
+                    unrelated = launcher.spawn([sys.executable, '-I', '-c', 'pass'])
+                    stop = launcher.observe_stop(unrelated)
+                elif case == 'recovery-result':
                     history = json.loads((directory / 'recovery.json').read_bytes())
                     stop = launcher.recover(selected, encode_request(history['request']))
                     assert stop == history['result']
@@ -163,6 +166,14 @@ def exercise_case(node, scratch, case):
             assert fresh.state == (UNAVAILABLE if case == 'unreadable-after-stop' else initial.state)
             assert launcher.peers_live(generation)
             next_stage = directory / 'stage-restart'
+            if case == 'consumed-report':
+                retained_blob = directory / 'retained-capture.json'
+                blob.rename(retained_blob)
+                try:
+                    assert launcher.admit_capture(selected, fresh, next_stage, stop) is None
+                    assert not next_stage.exists()
+                finally:
+                    retained_blob.rename(blob)
             observed = launcher.admit_capture(selected, initial if case == 'stale-report' else fresh, next_stage, stop)
             if case == 'restart':
                 assert observed == expected and len(launcher.fills) == 2
@@ -197,7 +208,8 @@ def main():
         parser.error('invalid Node pin')
     scratch = Path(tempfile.mkdtemp(prefix='strict-capture-admission-')).resolve()
     cases = ('restart', 'wrong-enrollment', 'missing-capture', 'corrupt-capture',
-             'missing-stop', 'borrowed-stop', 'stale-report', 'unreadable-after-stop', 'recovery-result')
+             'missing-stop', 'borrowed-stop', 'borrowed-stop-after-exit', 'stale-report',
+             'unreadable-after-stop', 'consumed-report', 'recovery-result')
     try:
         for case in cases:
             exercise_case(node, scratch, case)
