@@ -82,7 +82,7 @@ function copy(source, destination) {
   }
   return capture(destination);
 }
-function materialize(store, pair, root) {
+export function materialize(store, pair, root) {
   let approved;
   try { approved = validateStoredCapture(store.get(pair.captureVersion)); }
   catch { check(false,'FIXTURE_CAPTURE_PAIR'); }

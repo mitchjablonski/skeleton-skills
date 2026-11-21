@@ -56,17 +56,32 @@ class Generation:
     reader: object
     descriptors: frozenset
     consumed: bool = False
+    refresh_reader: object = None
+    refresh_request: object = None
 
     def report(self):
         # Only the designated console inherited this pipe's single writing end.
         with self.reader:
             return Report(self, read_json(self.reader))
 
+    def fresh_report(self):
+        # The same console owns a distinct pipe for its second state observation.
+        with self.refresh_request:
+            self.refresh_request.write(b'R')
+        with self.refresh_reader:
+            return Report(self, read_json(self.refresh_reader), sequence=1)
+
+    def close_reports(self):
+        for pipe in (self.reader, self.refresh_reader, self.refresh_request):
+            if pipe is not None:
+                pipe.close()
+
 
 @dataclass(frozen=True)
 class Report:
     origin: Generation
     state: dict
+    sequence: int = 0
 
 
 def snapshot(enrollments):
@@ -96,27 +111,39 @@ class Launcher:
             raise RuntimeError('enrollment failed')
         return Enrollment(directory, identity, json.loads((directory / 'expected.json').read_bytes()))
 
-    def stage(self, enrollment, directory=None):
+    def stage(self, enrollment, directory=None, *, approved=False):
+        if self.current is not None:
+            self.current.close_reports()
         self.current = None
-        with ExitStack() as stack:
+        with ExitStack() as stack, ExitStack() as held:
             left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             stack.enter_context(left)
             stack.enter_context(right)
             ordinary_descriptors = {os.readlink(f'/proc/self/fd/{endpoint.fileno()}') for endpoint in (left, right)}
-            authority = self.spawn([self.node, WORKER, 'authority', directory or enrollment.directory,
+            authority_role = 'managed-authority' if approved else 'authority'
+            authority = self.spawn([self.node, WORKER, authority_role, directory or enrollment.directory,
                                     enrollment.identity, str(left.fileno())], (left.fileno(),))
             left.close()
             read, write = os.pipe()
-            reader = os.fdopen(read, 'rb', buffering=0)
-            try:
-                with os.fdopen(write, 'wb', buffering=0):
-                    ordinary_descriptors.add(os.readlink(f'/proc/self/fd/{read}'))
-                    console = self.spawn([self.node, WORKER, 'console', enrollment.directory, enrollment.identity,
-                                          str(right.fileno()), str(write)], (right.fileno(), write))
-            except BaseException:
-                reader.close()
-                raise
-        self.current = Generation(enrollment, authority, console, reader, frozenset(ordinary_descriptors))
+            reader = held.enter_context(os.fdopen(read, 'rb', buffering=0))
+            stack.enter_context(os.fdopen(write, 'wb', buffering=0))
+            console_role = 'restart-console' if approved else 'console'
+            console_fds = [right.fileno(), write]
+            refresh_reader = refresh_request = None
+            if approved:
+                signal_read, signal_write = os.pipe()
+                stack.enter_context(os.fdopen(signal_read, 'rb', buffering=0))
+                refresh_request = held.enter_context(os.fdopen(signal_write, 'wb', buffering=0))
+                refresh_read, refresh_write = os.pipe()
+                refresh_reader = held.enter_context(os.fdopen(refresh_read, 'rb', buffering=0))
+                stack.enter_context(os.fdopen(refresh_write, 'wb', buffering=0))
+                console_fds.extend((signal_read, refresh_write))
+            ordinary_descriptors.update(os.readlink(f'/proc/self/fd/{fd}') for fd in console_fds)
+            console = self.spawn([self.node, WORKER, console_role, enrollment.directory, enrollment.identity,
+                                  *map(str, console_fds)], tuple(console_fds))
+            self.current = Generation(enrollment, authority, console, reader, frozenset(ordinary_descriptors),
+                                      refresh_reader=refresh_reader, refresh_request=refresh_request)
+            held.pop_all()  # Generation owns the parent ends after successful setup.
         return self.current
 
     def recover(self, enrollment, request, *, identity=None, close_request=True, ordinary=None):
@@ -170,8 +197,8 @@ class Launcher:
         return True
 
     def cleanup(self):
-        if self.current and not self.current.reader.closed:
-            self.current.reader.close()
+        if self.current:
+            self.current.close_reports()
         for child in reversed(self.children):
             if child.poll() is None:
                 child.kill()
