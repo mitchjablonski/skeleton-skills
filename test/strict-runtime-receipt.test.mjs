@@ -19,3 +19,9 @@ test('host launch admission binds and consumes ready state before spawning', {sk
  assert.equal(run.status,0,run.error?.message??run.stderr);
  assert.match(run.stdout,/strict launch admission checks passed/);
 });
+
+test('supervisor handoff requires an exact, fresh, one-use stop receipt', {skip:process.platform!=='linux'},()=>{
+ const run=spawnSync('/usr/bin/python3',['-I',fileURLToPath(new URL('./live/strict-supervisor-handoff-check.py',import.meta.url))],{encoding:'utf8',timeout:10000,maxBuffer:16384,env:{}});
+ assert.equal(run.status,0,run.error?.message??run.stderr);
+ assert.match(run.stdout,/strict supervisor handoff checks passed/);
+});

@@ -18,6 +18,7 @@ HERE = Path(__file__).resolve().parent
 capture = runpy.run_path(str(HERE / 'strict-capture-admission-probe.py'))
 lifecycle = runpy.run_path(str(HERE / 'strict-lifecycle-fault-probe.py'))
 CaptureLauncher = capture['CaptureLauncher']
+StopHandoff = runpy.run_path(str(HERE.parent.parent / 'lib' / 'strict-supervisor-handoff.py'))['StopHandoff']
 MAX_RECEIPT_BYTES = 512 * 1024
 
 
@@ -62,23 +63,26 @@ class NamespaceFill:
     namespace: dict
 
 
-@dataclass(eq=False, frozen=True)
-class NamespaceStop:
-    proved_at: int
-
-
 class NamespaceLauncher(CaptureLauncher):
     def __init__(self, node, scratch, check_runtime):
         super().__init__(node, scratch)
         self.run = lifecycle['Run'](scratch)
         self.check_runtime = check_runtime
+        self.supervisor = StopHandoff(lifecycle['stop_namespace'], self.prove_stopped, lifecycle['STOP_BOUND'])
+
+    @staticmethod
+    def prove_stopped(namespace, deadline):
+        lifecycle['prove_stopped'](namespace, deadline, extra=[('wrapper', namespace['outerFd'])])
+        return True
 
     def start_owned_namespace(self, generation, label, *, stage=None):
         if self.check_runtime is not None:
             self.check_runtime()
             if not self.peers_live(generation):
                 return None
-        return lifecycle['start_namespace'](self.run, label, stage=stage)
+        namespace = lifecycle['start_namespace'](self.run, label, stage=stage)
+        self.supervisor.own(namespace, namespace['process'])
+        return namespace
 
     def start_fill(self, generation, stage):
         namespace = self.start_owned_namespace(generation, stage.name, stage=stage)
@@ -89,29 +93,8 @@ class NamespaceLauncher(CaptureLauncher):
         self.fills.append(self.active)
         return namespace['digests']
 
-    def prove_namespace_exit(self, namespace, deadline):
-        process = namespace['process']
-        assert any(item is namespace for item in self.run.namespaces) and process not in self.stopped
-        lifecycle['prove_stopped'](namespace, deadline, extra=[('wrapper', namespace['outerFd'])])
-        process.wait(timeout=max(0, deadline - time.monotonic()))
-        if time.monotonic() > deadline:
-            raise lifecycle['Unproven']({'late': True})
-        receipt = NamespaceStop(time.monotonic_ns())
-        self.stopped[process] = receipt
-        return receipt
-
-    def stop(self, namespace):
-        assert any(item is namespace for item in self.run.namespaces)
-        deadline = time.monotonic() + lifecycle['STOP_BOUND']
-        lifecycle['stop_namespace'](namespace)
-        return self.prove_namespace_exit(namespace, deadline)
-
-    def admit_capture(self, selected, report, stage, stop=None):
-        if self.active is not None and (
-                not isinstance(stop, NamespaceStop) or report.requested_at is None
-                or report.requested_at <= stop.proved_at):
-            return None
-        return super().admit_capture(selected, report, stage, stop)
+    def restart_proved(self, previous, report, stop):
+        return self.supervisor.consume_restart(previous.namespace, stop, report.requested_at)
 
     def cleanup(self):
         if self.admission is not None:
@@ -148,24 +131,23 @@ def exercise(node, scratch, case, check_runtime=None):
             lifecycle['selective_child_stop'](namespace)
             assert lifecycle['exited'](namespace['members']['child']['fd'], 0.5)
             try:
-                launcher.prove_namespace_exit(namespace, time.monotonic() + 0.1)
+                launcher.supervisor.confirm(namespace, time.monotonic() + 0.1)
             except lifecycle['Unproven'] as error:
                 assert {'init', 'worker', 'escapee'}.issubset(error.args[0]['alive'])
                 assert error.args[0]['remaining'] >= 3
             else:
                 raise AssertionError('partial stop minted a restart receipt')
-            assert first.child not in launcher.stopped
             stop = None
         else:
             if case == 'report-before-stop':
                 fresh = generation.fresh_report()
                 assert first.child.poll() is None
-            stop = launcher.stop(namespace)
+            stop = launcher.supervisor.stop(namespace)
             (first_stage / 'plan.js').write_bytes(b'changed previous stage\n')
             if case == 'borrowed-namespace-stop':
                 unrelated = launcher.start_owned_namespace(generation, 'unrelated')
                 assert unrelated is not None
-                stop = launcher.stop(unrelated)
+                stop = launcher.supervisor.stop(unrelated)
 
         if fresh is None:
             fresh = generation.fresh_report()
@@ -179,7 +161,7 @@ def exercise(node, scratch, case, check_runtime=None):
             assert launcher.peers_live(generation)
             for name in capture['MEMBERS']:
                 assert not os.path.samefile(first_stage / name, next_stage / name)
-            launcher.stop(second.namespace)
+            launcher.supervisor.stop(second.namespace)
         else:
             count = len(launcher.run.namespaces)
             assert launcher.admit_capture(selected, fresh, next_stage, stop) is None
@@ -187,7 +169,6 @@ def exercise(node, scratch, case, check_runtime=None):
             assert not next_stage.exists()
             if case == 'partial-stop':
                 assert not lifecycle['exited'](namespace['members']['escapee']['fd'])
-                launcher.stop(namespace)
         assert capture['snapshot']((selected,)) == before
     finally:
         launcher.cleanup()
