@@ -17,8 +17,10 @@ import time
 HERE = Path(__file__).resolve().parent
 capture = runpy.run_path(str(HERE / 'strict-capture-admission-probe.py'))
 lifecycle = runpy.run_path(str(HERE / 'strict-lifecycle-fault-probe.py'))
+request_stop = runpy.run_path(str(HERE / 'strict-graceful-stop-probe.py'))['request_stop']
 CaptureLauncher = capture['CaptureLauncher']
-StopHandoff = runpy.run_path(str(HERE.parent.parent / 'lib' / 'strict-supervisor-handoff.py'))['StopHandoff']
+handoff = runpy.run_path(str(HERE.parent.parent / 'lib' / 'strict-supervisor-handoff.py'))
+StopHandoff, StopUnproven = handoff['StopHandoff'], handoff['StopUnproven']
 MAX_RECEIPT_BYTES = 512 * 1024
 
 
@@ -64,10 +66,11 @@ class NamespaceFill:
 
 
 class NamespaceLauncher(CaptureLauncher):
-    def __init__(self, node, scratch, check_runtime):
+    def __init__(self, node, scratch, check_runtime, stop_mode=None):
         super().__init__(node, scratch)
         self.run = lifecycle['Run'](scratch)
         self.check_runtime = check_runtime
+        self.stop_mode = stop_mode
         self.supervisor = StopHandoff(lifecycle['stop_namespace'], self.prove_stopped, lifecycle['STOP_BOUND'])
 
     @staticmethod
@@ -80,7 +83,8 @@ class NamespaceLauncher(CaptureLauncher):
             self.check_runtime()
             if not self.peers_live(generation):
                 return None
-        namespace = lifecycle['start_namespace'](self.run, label, stage=stage)
+        namespace = lifecycle['start_namespace'](self.run, label, stage=stage,
+                                                 stop_mode=self.stop_mode if stage is not None else None)
         self.supervisor.own(namespace, namespace['process'])
         return namespace
 
@@ -99,6 +103,18 @@ class NamespaceLauncher(CaptureLauncher):
     def restart_proved(self, previous, report, stop):
         return self.supervisor.consume_restart(previous.namespace, stop, report.requested_at)
 
+    def stop_planned(self, namespace, *, expire_before_proof=False):
+        observation = None
+
+        def request(owned, started, deadline):
+            nonlocal observation
+            observation = request_stop(lifecycle, owned, started, deadline)
+            if expire_before_proof:
+                time.sleep(max(0, deadline - time.monotonic()))
+
+        receipt = self.supervisor.stop_planned(namespace, request)
+        return receipt, observation
+
     def cleanup(self):
         if self.admission is not None:
             self.admission.invalidate()
@@ -110,6 +126,8 @@ class NamespaceLauncher(CaptureLauncher):
 
 
 ENROLLMENT_REFUSALS = ('wrong-enrollment', 'stale-generation', 'lost-authority', 'lost-console')
+PLANNED_STOPS = {'graceful-restart': 'cooperative', 'forced-restart': 'stubborn',
+                 'planned-proof-too-late': 'cooperative'}
 
 
 class PeerLossLauncher(NamespaceLauncher):
@@ -159,7 +177,8 @@ def exercise(node, scratch, case, check_runtime=None):
     if check_runtime is not None:
         check_runtime()
     launcher_type = PeerLossLauncher if case == 'peer-loss-during-start' else NamespaceLauncher
-    launcher = launcher_type(node, scratch, check_runtime)
+    stop_mode = PLANNED_STOPS.get(case)
+    launcher = launcher_type(node, scratch, check_runtime, stop_mode)
     try:
         selected = launcher.prepare_approved(case, 'selected')
         directory = selected.directory.parent
@@ -178,6 +197,7 @@ def exercise(node, scratch, case, check_runtime=None):
         admitted = launcher.admit_capture(selected, initial, first_stage)
         if case == 'peer-loss-during-start':
             assert admitted is None and not launcher.fills and launcher.active is None
+            assert generation.authority.poll() is None and first_stage.is_dir()
             owned, = launcher.run.namespaces
             assert owned['process'].poll() is not None
             assert launcher.prove_stopped(owned, time.monotonic() + lifecycle['STOP_BOUND'])
@@ -188,7 +208,22 @@ def exercise(node, scratch, case, check_runtime=None):
         namespace = first.namespace
         fresh = None
 
-        if case == 'partial-stop':
+        if case == 'planned-proof-too-late':
+            try:
+                launcher.stop_planned(namespace, expire_before_proof=True)
+            except StopUnproven as error:
+                assert str(error) == 'stop-deadline-unavailable'
+            else:
+                raise AssertionError('late planned stop minted a restart receipt')
+            stop = None
+        elif stop_mode is not None:
+            stop, observation = launcher.stop_planned(namespace)
+            if stop_mode == 'cooperative':
+                assert observation['stopPath'] == 'graceful' and observation['workerAcknowledgedTerm']
+            else:
+                assert observation['stopPath'] == 'forced' and observation['workerAliveAtGraceEnd']
+            (first_stage / 'plan.js').write_bytes(b'changed previous stage\n')
+        elif case == 'partial-stop':
             lifecycle['selective_child_stop'](namespace)
             assert lifecycle['exited'](namespace['members']['child']['fd'], 0.5)
             try:
@@ -214,7 +249,7 @@ def exercise(node, scratch, case, check_runtime=None):
             fresh = generation.fresh_report()
         assert fresh.state == selected.expected and launcher.peers_live(generation)
         next_stage = directory / 'stage-restart'
-        if case == 'restart':
+        if case in ('restart', 'graceful-restart', 'forced-restart'):
             assert launcher.admit_capture(selected, fresh, next_stage, stop) == expected
             second = launcher.active
             assert len(launcher.fills) == 2 and second.generation is generation
@@ -265,7 +300,7 @@ def main():
     check_runtime = runtime_check(selection, node, scratch) if args.runtime_receipt is not None else None
     cases = ('restart', 'partial-stop', 'borrowed-namespace-stop', 'report-before-stop')
     if args.protected_launcher:
-        cases += ENROLLMENT_REFUSALS + ('peer-loss-during-start',)
+        cases += ENROLLMENT_REFUSALS + ('peer-loss-during-start',) + tuple(PLANNED_STOPS)
     try:
         for case in cases:
             exercise(node, scratch, case, check_runtime)

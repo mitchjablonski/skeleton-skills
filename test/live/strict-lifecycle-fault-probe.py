@@ -95,8 +95,8 @@ def bwrap_argv(stage=None, *, stop_mode=None, silent_child=False):
         argv += ["--ro-bind", str(stage), "/fixture-stage"]
     mode = "agent-capture" if stage is not None else "agent"
     if stop_mode is not None:
-        assert stage is None and stop_mode in ("cooperative", "stubborn")
-        mode = "agent-" + stop_mode
+        assert stop_mode in ("cooperative", "stubborn")
+        mode += "-" + stop_mode
     if silent_child:
         assert stage is None and stop_mode is None
         mode = "agent-silent-child"
