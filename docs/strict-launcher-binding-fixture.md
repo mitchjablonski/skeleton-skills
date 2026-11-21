@@ -17,6 +17,7 @@ The launcher compares the report origin with its current generation, consumes th
 | Live A | One marker child starts. |
 | Repeat A's consumed report | The first admission starts one child. The repeated admission leaves its marker absent. |
 | A's context, B's store | Open fails in the authority. The console receives unavailable. |
+| Capture store exists, authority store absent | Open fails. The console receives unavailable, the authority path stays absent, and no marker starts. |
 | Correctly opened B, admission requests A | Both children are alive and B returns identical public state. The enrollment-object check refuses. |
 | A's context, different saved capture | Both children are alive. The revision, review version, and admission state match, but the capture version differs. The state check refuses. |
 | Replace the original A generation | Both original peers are still alive and the replacement returns identical state. The old report fails the generation check. |
@@ -24,5 +25,7 @@ The launcher compares the report origin with its current generation, consumes th
 | Authority or console exits after reporting | The harness waits for the selected child to exit and checks that the other stays alive throughout the admission decision. Both cases leave their markers absent. |
 
 All helpers are fixed leaf processes running under the same trusted Linux user. The harness kills and waits for its children on exit and retains scratch if it cannot confirm cleanup. The pipe is a local fixture reporting mechanism. The existing command protocol and durable store format are unchanged.
+
+The authority worker delegates serving to the [authority-child adapter](strict-authority-child.md). The same harness invokes a separate recovery child with its own inherited request and reply descriptors. It checks exact committed history, refusal controls, unchanged durable bytes and absence of a new launch marker.
 
 The fixture leaves strict mode unverified. A real terminal, protected enrollment selection and storage, listener gates, the check-to-spawn race, termination of a running namespace and its descendants, and checkpoint or restart supervision still require independent evidence. The peer replacement case checks only report freshness. See the [enrollment binding design](strict-enrollment-binding.md).
