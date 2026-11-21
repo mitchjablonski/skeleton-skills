@@ -125,6 +125,25 @@ def check():
     expect_unproven(lambda: gate.stop(namespace))
     assert events == stopped
 
+    def planned(candidate, started, deadline):
+        assert candidate is namespace
+        events.append(('planned', started, deadline))
+        clock.now += delay
+
+    gate, namespace, events, _ = setup()
+    delay = 12
+    receipt = gate.stop_planned(namespace, planned)
+    assert events == [('planned', 100, 130), ('prove', 130), ('wait', 13)]
+    assert gate.consume_restart(namespace, receipt, receipt.proved_at + 1)
+    assert not gate.consume_restart(namespace, receipt, receipt.proved_at + 1)
+
+    gate, namespace, events, _ = setup()
+    delay = 30
+    expect_unproven(lambda: gate.stop_planned(namespace, planned))
+    expect_unproven(lambda: gate.stop(namespace))
+    expect_unproven(lambda: gate.confirm(namespace, 200))
+    assert events == [('planned', 100, 130)]
+
     print('strict supervisor handoff checks passed')
 
 

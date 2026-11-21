@@ -9,6 +9,8 @@ Modes (fixed, no other arguments):
   agent-capture              same roles, with digests of the two fixture files
   agent-cooperative          report SIGTERM and exit the worker
   agent-stubborn             ignore SIGTERM in the worker
+  agent-capture-cooperative  staged digests and cooperative SIGTERM
+  agent-capture-stubborn     staged digests and ignored SIGTERM
   agent-silent-child         fork one additional child without reporting its ID
   authority SOCK REL STATUS  authority stub: hold one request, reply only
                              after the host writes to REL
@@ -141,6 +143,10 @@ def main():
         agent(stop_mode="cooperative")
     elif args == ["agent-stubborn"]:
         agent(stop_mode="stubborn")
+    elif args == ["agent-capture-cooperative"]:
+        agent(capture=True, stop_mode="cooperative")
+    elif args == ["agent-capture-stubborn"]:
+        agent(capture=True, stop_mode="stubborn")
     elif args == ["agent-silent-child"]:
         agent(silent_child=True)
     elif len(args) == 4 and args[0] == "authority":

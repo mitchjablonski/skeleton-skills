@@ -75,6 +75,14 @@ class StopHandoff:
         self._terminate(namespace)
         return self._finish(owned, deadline)
 
+    def stop_planned(self, namespace, request_stop):
+        """Let the supervisor perform bounded graceful escalation before proving stop."""
+        owned = self._begin(namespace)
+        started = time.monotonic()
+        deadline = started + self._stop_seconds
+        request_stop(namespace, started, deadline)
+        return self._finish(owned, deadline)
+
     def confirm(self, namespace, deadline):
         owned = self._begin(namespace)
         if type(deadline) not in (int, float) or not math.isfinite(deadline):

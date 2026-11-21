@@ -24,67 +24,74 @@ def load_lifecycle():
     return module
 
 
-def bounded_stop(lifecycle, namespace, *, expire_before_proof=False):
-    """Return observations only after exact stop proof within one total bound."""
-    lifecycle.alive_at_fault(namespace)
+def request_stop(lifecycle, namespace, started, stop_deadline):
+    """Request graceful shutdown and escalate within the supervisor's deadline."""
+    lifecycle['alive_at_fault'](namespace)
+    unproven = lifecycle['Unproven']
+    exited = lifecycle['exited']
     worker_fd = namespace["members"]["worker"]["fd"]
-    started = time.monotonic()
-    grace_deadline = started + GRACE_SECONDS
-    stop_deadline = started + lifecycle.STOP_BOUND
+    grace_deadline = min(started + GRACE_SECONDS, stop_deadline)
+    if time.monotonic() >= grace_deadline:
+        raise unproven({"termLate": True})
     signal.pidfd_send_signal(worker_fd, signal.SIGTERM)
     term_sent_at = time.monotonic()
     if term_sent_at >= grace_deadline:
-        raise lifecycle.Unproven({"termLate": True})
+        raise unproven({"termLate": True})
 
     forced_at = None
     worker_alive_at_grace_end = None
-    wrapper_exited = lifecycle.exited(namespace["outerFd"], max(0, grace_deadline - time.monotonic()))
+    wrapper_exited = exited(namespace["outerFd"], max(0, grace_deadline - time.monotonic()))
     observed_at = time.monotonic()
     if wrapper_exited:
         if observed_at > grace_deadline:
-            raise lifecycle.Unproven({"graceObservationLate": True})
+            raise unproven({"graceObservationLate": True})
     else:
         if observed_at < grace_deadline:
-            raise lifecycle.Unproven({"graceIncomplete": True})
-        worker_alive_at_grace_end = not lifecycle.exited(worker_fd)
+            raise unproven({"graceIncomplete": True})
+        worker_alive_at_grace_end = not exited(worker_fd)
         if time.monotonic() >= stop_deadline:
-            raise lifecycle.Unproven({"forceLate": True})
+            raise unproven({"forceLate": True})
         try:
             signal.pidfd_send_signal(namespace["members"]["init"]["fd"], signal.SIGKILL)
         except ProcessLookupError as exc:
-            raise lifecycle.Unproven({"forceNotConfirmed": True}) from exc
+            raise unproven({"forceNotConfirmed": True}) from exc
         forced_at = time.monotonic()
 
+    observation = {
+        "stopPath": "forced" if forced_at is not None else "graceful",
+        "termMs": lifecycle['ms'](term_sent_at - started),
+    }
+    if forced_at is None:
+        try:
+            worker_status = lifecycle['read_record_raw'](namespace["workerStatus"], stop_deadline)
+        except RuntimeError as exc:
+            raise unproven({"workerGracefulExitUnproven": True}) from exc
+        if worker_status != b"worker-term\n" or namespace["process"].poll() != 0:
+            raise unproven({"workerGracefulExitUnproven": True})
+        observation["workerAcknowledgedTerm"] = True
+    else:
+        observation.update(forceMs=lifecycle['ms'](forced_at - started),
+                           workerAliveAtGraceEnd=worker_alive_at_grace_end)
+    return observation
+
+
+def bounded_stop(lifecycle, namespace, *, expire_before_proof=False):
+    """Return observations only after exact stop proof within one total bound."""
+    started = time.monotonic()
+    stop_deadline = started + lifecycle.STOP_BOUND
+    observation = request_stop(vars(lifecycle), namespace, started, stop_deadline)
     try:
-        return_code = namespace["process"].wait(timeout=max(0, stop_deadline - time.monotonic()))
+        namespace["process"].wait(timeout=max(0, stop_deadline - time.monotonic()))
     except subprocess.TimeoutExpired as exc:
         raise lifecycle.Unproven({"wrapperWaitTimedOut": True}) from exc
     if expire_before_proof:
         # Exercise the same proof gate after the exact wrapper has exited.
-        # The real shared deadline expires before the census starts.
         time.sleep(max(0, stop_deadline - time.monotonic()))
     lifecycle.prove_stopped(namespace, stop_deadline, extra=[("bwrap", namespace["outerFd"])])
-    observation = {
-        "stopPath": "forced" if forced_at is not None else "graceful",
-        "termMs": lifecycle.ms(term_sent_at - started),
-        "wrapperReaped": True,
-        "namespaceEmpty": True,
-    }
-    if forced_at is None:
-        try:
-            worker_status = lifecycle.read_record_raw(namespace["workerStatus"], stop_deadline)
-        except RuntimeError as exc:
-            raise lifecycle.Unproven({"workerGracefulExitUnproven": True}) from exc
-        if worker_status != b"worker-term\n" or return_code != 0:
-            raise lifecycle.Unproven({"workerGracefulExitUnproven": True})
-        observation["workerAcknowledgedTerm"] = True
-    else:
-        observation.update(forceMs=lifecycle.ms(forced_at - started),
-                           workerAliveAtGraceEnd=worker_alive_at_grace_end)
     stopped_at = time.monotonic()
     if stopped_at > stop_deadline:
         raise lifecycle.Unproven({"late": True})
-    observation["stopMs"] = lifecycle.ms(stopped_at - started)
+    observation.update(stopMs=lifecycle.ms(stopped_at - started), wrapperReaped=True, namespaceEmpty=True)
     return observation
 
 

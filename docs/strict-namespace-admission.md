@@ -65,7 +65,12 @@ that no materialization worker or namespace starts and durable bytes stay
 unchanged. A separate case loses the console during namespace startup and
 requires full teardown and wrapper reaping before admission returns.
 
+Planned restart cases exercise a cooperative shutdown and bounded forced
+escalation of the fixed staged worker. The graceful request, escalation,
+independent namespace proof and wrapper reap share one deadline. A proof
+attempt after that deadline cannot authorize another namespace. Faults and
+peer loss continue to use the immediate owned stop.
+
 This fixture uses explicitly pinned binaries and a fixed, owned workload.
 It leaves strict disabled and unverified. The supported-runtime profile,
-graceful-stop escalation, listener gates, and production launcher ownership
-remain open.
+listener gates, and production launcher ownership remain open.
