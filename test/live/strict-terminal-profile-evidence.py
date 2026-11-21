@@ -4,12 +4,14 @@
 import argparse
 import json
 import platform
+import stat
 import sys
 from pathlib import Path
 
 
 SYSCTL_NAME = 'dev.tty.legacy_tiocsti'
 SYSCTL_PATH = Path('/proc/sys/dev/tty/legacy_tiocsti')
+PROC_RELEASE = Path('/proc/sys/kernel/osrelease')
 
 
 def read_legacy_tiocsti(path):
@@ -17,7 +19,12 @@ def read_legacy_tiocsti(path):
         with path.open('rb') as source:
             raw = source.read(3)
     except FileNotFoundError:
-        return 'not-exposed'
+        try:
+            if stat.S_ISDIR(path.parent.stat().st_mode):
+                return 'not-exposed'
+        except OSError:
+            pass
+        return 'tty-sysctl-unavailable'
     except PermissionError:
         return 'permission-denied'
     except OSError:
@@ -30,6 +37,16 @@ def read_legacy_tiocsti(path):
     return 'invalid-value'
 
 
+def procfs_matches(path, kernel_release):
+    try:
+        release = kernel_release.encode('ascii')
+        with path.open('rb') as source:
+            raw = source.read(len(release) + 2)
+        return raw in (release, release + b'\n')
+    except (OSError, UnicodeError):
+        return False
+
+
 def collect():
     result = {'ok': False, 'strictState': 'unverified'}
     if platform.system() != 'Linux':
@@ -39,6 +56,8 @@ def collect():
     machine = platform.machine()
     if any(not value or len(value) > 256 for value in (kernel_release, machine)):
         return dict(result, code='invalid-platform-metadata')
+    if not procfs_matches(PROC_RELEASE, kernel_release):
+        return dict(result, code='procfs-unavailable')
 
     value = read_legacy_tiocsti(SYSCTL_PATH)
     result.update(platform='Linux', kernel_release=kernel_release, machine=machine)
@@ -56,6 +75,14 @@ def self_test():
     with TemporaryDirectory() as directory:
         path = Path(directory) / 'legacy_tiocsti'
         assert read_legacy_tiocsti(path) == 'not-exposed'
+        assert read_legacy_tiocsti(path.parent / 'missing' / path.name) == 'tty-sysctl-unavailable'
+        release = path.with_name('osrelease')
+        assert not procfs_matches(release, 'sample-release')
+        release.write_bytes(b'sample-release\n')
+        assert procfs_matches(release, 'sample-release')
+        assert not procfs_matches(release, 'other-release')
+        release.write_bytes(b'sample-release\nX')
+        assert not procfs_matches(release, 'sample-release')
         for raw, expected in (
             (b'0\n', '0'), (b'1\n', '1'), (b'0', '0'), (b'1', '1'),
             (b'', 'invalid-value'), (b'2\n', 'invalid-value'),
@@ -72,13 +99,17 @@ def self_test():
     with patch.object(platform, 'system', return_value='Linux'), \
          patch.object(platform, 'release', return_value='test-release'), \
          patch.object(platform, 'machine', return_value='test-machine'), \
+         patch(__name__ + '.procfs_matches', return_value=False) as matches, \
          patch(__name__ + '.read_legacy_tiocsti') as read:
         base = {'strictState': 'unverified', 'platform': 'Linux',
                 'kernel_release': 'test-release', 'machine': 'test-machine'}
+        assert collect() == {'ok': False, 'strictState': 'unverified', 'code': 'procfs-unavailable'}
+        read.assert_not_called()
+        matches.return_value = True
         for value in ('0', '1', 'not-exposed'):
             read.return_value = value
             assert collect() == dict(base, ok=True, **{SYSCTL_NAME: value})
-        for code in ('permission-denied', 'read-failed', 'invalid-value'):
+        for code in ('permission-denied', 'read-failed', 'invalid-value', 'tty-sysctl-unavailable'):
             read.return_value = code
             assert collect() == dict(base, ok=False, code=code)
 

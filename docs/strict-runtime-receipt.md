@@ -48,7 +48,11 @@ Run `/usr/bin/python3 -I test/live/strict-terminal-profile-evidence.py` on
 the Linux host that supplies the receipt. Record the result as a separate
 observation alongside the receipt for that run. The helper reads
 `dev.tty.legacy_tiocsti` without terminal input or a settings change. It
-reports `0`, `1` or `not-exposed`. An unreadable or malformed value refuses.
+reports `0` (legacy behavior disabled), `1` (legacy behavior enabled) or
+`not-exposed` (the active procfs view exposes no setting). A missing setting
+leaves the effective behavior unknown. The helper checks that procfs reports
+the running kernel and requires the terminal sysctl directory to exist before
+recording absence. An unavailable, unreadable or malformed value refuses.
 Run the same command with `--self-test` for synthetic value, absence and
 read-failure checks. This leaves the v1 receipt and selected fingerprint
 unchanged.
