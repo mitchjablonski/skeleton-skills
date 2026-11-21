@@ -90,6 +90,9 @@ class CaptureLauncher(Launcher):
         assert status == 0
         if not self.peers_live(current):
             return None
+        return self.start_fill(current, stage)
+
+    def start_fill(self, generation, stage):
         read, write = os.pipe()
         lifetime_read, lifetime_write = os.pipe()
         with os.fdopen(read, 'rb', buffering=0) as observation:
@@ -98,7 +101,7 @@ class CaptureLauncher(Launcher):
                 with os.fdopen(write, 'wb', buffering=0), os.fdopen(lifetime_read, 'rb', buffering=0):
                     child = self.spawn([sys.executable, '-I', '-c', LEAF, stage, str(write), str(lifetime_read)],
                                        (write, lifetime_read))
-                self.active = Fill(current, child, stage, lifetime)
+                self.active = Fill(generation, child, stage, lifetime)
                 self.fills.append(self.active)
             except BaseException:
                 lifetime.close()

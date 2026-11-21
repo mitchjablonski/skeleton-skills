@@ -66,10 +66,11 @@ class Generation:
 
     def fresh_report(self):
         # The same console owns a distinct pipe for its second state observation.
+        requested_at = time.monotonic_ns()
         with self.refresh_request:
             self.refresh_request.write(b'R')
         with self.refresh_reader:
-            return Report(self, read_json(self.refresh_reader), sequence=1)
+            return Report(self, read_json(self.refresh_reader), sequence=1, requested_at=requested_at)
 
     def close_reports(self):
         for pipe in (self.reader, self.refresh_reader, self.refresh_request):
@@ -82,6 +83,7 @@ class Report:
     origin: Generation
     state: dict
     sequence: int = 0
+    requested_at: int | None = None
 
 
 def snapshot(enrollments):
