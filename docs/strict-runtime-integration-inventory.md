@@ -30,7 +30,7 @@ contract's "Who owns what":
 | 2 Directories | L | stores open given paths: `strict-capture-store`, `strict-authority-store`, `strict-human-authority-store` | prototypes | A **directory manager**: create or reopen durable history (owner, mode, filesystem checks), and create **fresh** scratch, refusing an existing path |
 | 3 Capture + authority | L, then A | `strict-capture`, `strict-enumeration`, `strict-capture-store`; `strict-human-authority(-store)`, `strict-authority(-store)`, `strict-protocol` | pure, prototypes | An authority **process** host. The enrollment message and its binding (`docs/strict-enrollment-binding.md`, a proposal; #178 open) |
 | 4 Control process | L, then C | `strict-control-console` (text), `strict-control-input` (N7 parser), composed in `test/strict-control-input-console.test.mjs` | prototypes | The **control-process host**: PTY, raw mode, session leadership, and candidate A vs B (open). The launcher→console link |
-| 5 Readiness | L (association, report, start decision); C ↔ A (state exchange) | `strict-human-channel` (#145 framing); `test/live/strict-private-channel-probe.py` (the #182 report gate: a parent-owned report pipe, generation, selected enrollment, exact capture and peer liveness, with refusal before the marker child) | prototypes, fixture | The runtime piece in which the **launcher** associates the socketpair with the enrolled authority, hands the endpoint to C, receives C's private readiness report (from the existing `state` call; no new protocol) and decides whether to start. Today this exists only as the #182 fixture |
+| 5 Readiness | L (association, report, start decision); C ↔ A (state exchange) | `strict-human-channel` (#145 framing); `test/live/strict-launcher-binding-probe.py` (the #182 report gate: a parent-owned report pipe, generation, selected enrollment, exact capture and peer liveness, with refusal before the marker child) | prototypes, fixture | The runtime piece in which the **launcher** associates the socketpair with the enrolled authority, hands the endpoint to C, receives C's private readiness report (from the existing `state` call; no new protocol) and decides whether to start. Today this exists only as the #182 fixture |
 | 6 Listener + browser | L, then Ls | `strict-decision-listener`, `-app`, `-codes`, the capture-view modules; `strict-browser-matrix.mjs` | mock only | The **issuance capability** (listener↔authority; not a #145 call). **Browser launch** with a fresh launcher-owned profile (C20). Listener restart (the contract says it doesn't exist yet) |
 | 7 Agent | L, then Ag | Fixtures only: descriptors (N3, #163), display/interop/vsock (N4, #160), browser endpoint (N5, #168), links (N9, #164), listener addresses and PID visibility (X14, #170, #174), PTY separation (#152) | fixtures | The **agent sandbox profile**: the namespace set, devpts, `--new-session`, `--die-with-parent`, a measured descriptor allowlist format and a minimal environment. A **syscall policy** (AF_VSOCK, io_uring; only a fixture BPF exists, #160). The agent **PTY relay** hosting `strict-pty-output` (N6). Model egress via `strict-model-broker` / `-policy` (mock, lab) |
 
@@ -65,7 +65,9 @@ These are what each missing piece needs first, read from the contract:
 6. **Issuance capability** and **browser launch**: needed by step 6, with
    code issuance still open.
 7. **Checkpoint supervisor**: builds on 1, 4 and 5. **Fault recovery**
-   builds on 1 and 2 plus the #183 history guard.
+   builds on 1, 2 (including the step-5 launcher readiness gate) and 5 (the
+   supervisor's proven physical stop, which must come first), plus the #183
+   history guard.
 8. **Launcher** sequencing steps 1–7 with no fallback: built last, on all
    of the above.
 
