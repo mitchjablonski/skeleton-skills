@@ -84,7 +84,7 @@ class Run:
         return process
 
 
-def bwrap_argv(stage=None):
+def bwrap_argv(stage=None, *, stop_mode=None):
     argv = ["/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
             "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib"]
     if pathlib.Path("/lib64").exists():
@@ -94,6 +94,9 @@ def bwrap_argv(stage=None):
     if stage is not None:
         argv += ["--ro-bind", str(stage), "/fixture-stage"]
     mode = "agent-capture" if stage is not None else "agent"
+    if stop_mode is not None:
+        assert stage is None and stop_mode in ("cooperative", "stubborn")
+        mode = "agent-" + stop_mode
     return argv + ["--", "/usr/bin/python3", "-I", "/helper.py", mode]
 
 
@@ -191,13 +194,13 @@ def scan(pid_ns, since):
     return sorted(found)
 
 
-def start_namespace(run, label, launcher=False, *, stage=None):
+def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None):
     """Start the agent namespace, directly or under a launcher stand-in."""
     read_end, write_end = os.pipe()
     run.fd(read_end)
     since = boot_ticks() - 1  # one tick of margin for rounding
     try:
-        argv = bwrap_argv(stage)
+        argv = bwrap_argv(stage, stop_mode=stop_mode)
         if launcher:
             argv = ["/usr/bin/python3", "-I", str(HELPER), "launcher", "--"] + argv
         process = run.launch(argv, label, stdout=write_end)
@@ -253,6 +256,8 @@ def start_namespace(run, label, launcher=False, *, stage=None):
     namespace = {"pidNs": pid_ns, "members": members, "process": process, "since": since,
                  "outer": outer, "outerFd": outer_fd}
     run.namespaces.append(namespace)
+    if stop_mode is not None:
+        namespace["workerStatus"] = read_end
     if stage is not None:
         digests = record["digests"]
         assert isinstance(digests, dict) and digests.keys() == {"context.txt", "plan.js"}
