@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in Linux harness for host-owned readiness binding. All children are fixed leaf programs."""
+"""Opt-in Linux harness for host-owned readiness binding and one-shot recovery."""
 import argparse
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -18,7 +18,27 @@ import time
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / 'strict-launcher-binding-worker.mjs'
 MAX_REPORT = 512
+MAX_RECOVERY_REQUEST = 1024
 TIMEOUT = 6
+UNAVAILABLE = {'kind': 'rejected', 'code': 'unavailable'}
+
+
+def read_json(reader):
+    data = bytearray()
+    deadline = time.monotonic() + TIMEOUT
+    while True:
+        if not select.select([reader], [], [], max(0, deadline - time.monotonic()))[0]:
+            raise RuntimeError('missing report EOF')
+        chunk = os.read(reader.fileno(), MAX_REPORT + 1 - len(data))
+        if not chunk:
+            return json.loads(data)
+        data.extend(chunk)
+        if len(data) > MAX_REPORT:
+            raise RuntimeError('oversize report')
+
+
+def encode_request(request):
+    return json.dumps(request, separators=(',', ':')).encode()
 
 
 @dataclass(eq=False, frozen=True)
@@ -34,24 +54,13 @@ class Generation:
     authority: subprocess.Popen
     console: subprocess.Popen
     reader: object
+    descriptors: frozenset
     consumed: bool = False
 
     def report(self):
         # Only the designated console inherited this pipe's single writing end.
-        data = bytearray()
-        deadline = time.monotonic() + TIMEOUT
-        try:
-            while True:
-                if not select.select([self.reader], [], [], max(0, deadline - time.monotonic()))[0]:
-                    raise RuntimeError('missing report EOF')
-                chunk = os.read(self.reader.fileno(), MAX_REPORT + 1 - len(data))
-                if not chunk:
-                    return Report(self, json.loads(data))
-                data.extend(chunk)
-                if len(data) > MAX_REPORT:
-                    raise RuntimeError('oversize report')
-        finally:
-            self.reader.close()
+        with self.reader:
+            return Report(self, read_json(self.reader))
 
 
 @dataclass(frozen=True)
@@ -93,6 +102,7 @@ class Launcher:
             left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             stack.enter_context(left)
             stack.enter_context(right)
+            ordinary_descriptors = {os.readlink(f'/proc/self/fd/{endpoint.fileno()}') for endpoint in (left, right)}
             authority = self.spawn([self.node, WORKER, 'authority', directory or enrollment.directory,
                                     enrollment.identity, str(left.fileno())], (left.fileno(),))
             left.close()
@@ -100,13 +110,46 @@ class Launcher:
             reader = os.fdopen(read, 'rb', buffering=0)
             try:
                 with os.fdopen(write, 'wb', buffering=0):
+                    ordinary_descriptors.add(os.readlink(f'/proc/self/fd/{read}'))
                     console = self.spawn([self.node, WORKER, 'console', enrollment.directory, enrollment.identity,
                                           str(right.fileno()), str(write)], (right.fileno(), write))
             except BaseException:
                 reader.close()
                 raise
-        self.current = Generation(enrollment, authority, console, reader)
+        self.current = Generation(enrollment, authority, console, reader, frozenset(ordinary_descriptors))
         return self.current
+
+    def recover(self, enrollment, request, *, identity=None, close_request=True, ordinary=None):
+        with ExitStack() as stack:
+            parent, request_reader = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            stack.enter_context(parent)
+            stack.enter_context(request_reader)
+            parent.settimeout(TIMEOUT)
+            read, write = os.pipe()
+            response = stack.enter_context(os.fdopen(read, 'rb', buffering=0))
+            recovery_descriptors = {os.readlink(f'/proc/self/fd/{fd}') for fd in (request_reader.fileno(), write)}
+            with os.fdopen(write, 'wb', buffering=0):
+                child = self.spawn([self.node, WORKER, 'recover', enrollment.directory,
+                                    identity or enrollment.identity, str(request_reader.fileno()), str(write)],
+                                   (request_reader.fileno(), write))
+            request_reader.close()
+            parent.sendall(request)
+            if close_request:
+                parent.shutdown(socket.SHUT_WR)
+            if ordinary is not None:
+                # The unclosed request leaves the child alive while we inspect its descriptors.
+                descriptors = Path(f'/proc/{child.pid}/fd')
+                inherited = set()
+                for descriptor in descriptors.iterdir():
+                    try:
+                        inherited.add(os.readlink(descriptor))
+                    except FileNotFoundError:
+                        continue  # Node can close its own short-lived descriptors.
+                assert recovery_descriptors <= inherited
+                assert inherited.isdisjoint(ordinary.descriptors)
+            result = read_json(response)
+            assert child.wait(TIMEOUT) == 0
+            return result
 
     def admit(self, enrollment, report, marker):
         current = self.current
@@ -136,24 +179,28 @@ class Launcher:
             child.wait(TIMEOUT)
 
 
-def exercise(launcher):
-    a, b, revoked = [launcher.prepare(identity) for identity in ('a', 'b', 'revoked')]
-    different = launcher.prepare('a', different_capture=True)
+def exercise_readiness(launcher, a, b, revoked, different):
     assert a.expected == b.expected == revoked.expected
     assert different.expected['captureVersion'] != a.expected['captureVersion']
     assert {**different.expected, 'captureVersion': a.expected['captureVersion']} == a.expected
-    enrollments = (a, b, revoked, different)
+    missing = launcher.scratch / 'missing-authority'
+    missing.mkdir(mode=0o700)
+    shutil.copytree(a.directory / 'captures', missing / 'captures')
+    enrollments = (a, b, revoked, different, Enrollment(missing, a.identity, a.expected))
     before = snapshot(enrollments)
     cases = ('live', 'consumed', 'wrong-open', 'wrong-generation', 'wrong-capture', 'stale', 'revoked',
-             'lost-authority', 'lost-console')
+             'lost-authority', 'lost-console', 'missing-store')
     for case in cases:
         selected = revoked if case == 'revoked' else a
-        alternate_store = {'wrong-open': b.directory, 'wrong-capture': different.directory}.get(case)
+        alternate_store = {'wrong-open': b.directory, 'wrong-capture': different.directory,
+                           'missing-store': missing}.get(case)
         active = launcher.stage(b if case == 'wrong-generation' else selected, alternate_store)
         report = active.report()
-        if case == 'wrong-open':
+        if case in ('wrong-open', 'missing-store'):
             assert active.authority.wait(TIMEOUT) == 23
-            assert report.state == {'kind': 'rejected', 'code': 'unavailable'}
+            assert report.state == UNAVAILABLE
+            if case == 'missing-store':
+                assert not (missing / 'authority').exists()
         elif case == 'revoked':
             assert report.state == {**selected.expected, 'admissions': 'revoked'}
         elif case == 'wrong-capture':
@@ -185,6 +232,55 @@ def exercise(launcher):
         launcher.cleanup()
         assert snapshot(enrollments) == before
     return cases
+
+
+def exercise_recovery(launcher, live, retained):
+    fixture = json.loads((retained.directory / 'recovery.json').read_bytes())
+    request = fixture['request']
+    encoded = encode_request(request)
+    code = request['args']['code']
+    mismatched_code = ('1' if code[0] == '0' else '0') + code[1:]
+    mismatched = {**request, 'args': {**request['args'], 'code': mismatched_code}}
+    absent = {'operation': 'endSession', 'args': {'requestId': 'uncommitted-end'}}
+    before = snapshot((live, retained))
+    markers = set(launcher.scratch.glob('marker-*'))
+    cases = (
+        ('recovery-after-revocation', retained, encoded, fixture['result'], {}),
+        ('recovery-before-commit', live, encode_request(absent), UNAVAILABLE, {}),
+        ('recovery-mismatched-args', retained, encode_request(mismatched), UNAVAILABLE, {}),
+        ('recovery-wrong-context', retained, encoded, UNAVAILABLE, {'identity': live.identity}),
+        ('recovery-malformed', retained, b'{', UNAVAILABLE, {}),
+        ('recovery-repeated', retained, encoded + b'\n' + encoded, UNAVAILABLE, {}),
+        ('recovery-oversized', retained, encoded.ljust(MAX_RECOVERY_REQUEST + 1, b' '), UNAVAILABLE,
+         {'close_request': False}),
+        ('recovery-unclosed', retained, encoded, UNAVAILABLE, {'close_request': False}),
+        ('recovery-held-lock', retained, encoded, UNAVAILABLE, {}),
+    )
+    for case, enrollment, payload, expected, options in cases:
+        lock = retained.directory / 'authority' / '.authority-lock'
+        if case == 'recovery-held-lock':
+            lock.mkdir(mode=0o700)
+        ordinary = launcher.stage(live) if case == 'recovery-unclosed' else None
+        child_count = len(launcher.children)
+        assert launcher.recover(enrollment, payload, ordinary=ordinary, **options) == expected, case
+        assert len(launcher.children) == child_count + 1
+        assert set(launcher.scratch.glob('marker-*')) == markers
+        if case == 'recovery-held-lock':
+            assert lock.is_dir() and not tuple(lock.iterdir())
+        if ordinary is not None:
+            assert ordinary.report().state == live.expected
+            assert ordinary.authority.poll() is None and ordinary.console.poll() is None
+        launcher.cleanup()
+        assert snapshot((live, retained)) == before, case
+    return tuple(case[0] for case in cases)
+
+
+def exercise(launcher):
+    a, b, revoked = [launcher.prepare(identity) for identity in ('a', 'b', 'revoked')]
+    different = launcher.prepare('a', different_capture=True)
+    readiness = exercise_readiness(launcher, a, b, revoked, different)
+    retained = launcher.prepare('recovery')
+    return readiness + exercise_recovery(launcher, a, retained)
 
 
 def main():

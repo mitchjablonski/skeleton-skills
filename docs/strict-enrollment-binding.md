@@ -60,7 +60,9 @@ launcher permits commands or agent admission.
    The launcher needs a protected way to observe the designated console's
    result. The console keeps that client's sequence state after the check.
    A launcher must not spend sequence 1 itself and pass the same stream to a
-   fresh console client. The launcher-to-console reporting mechanism remains open.
+   fresh console client. The [launcher binding fixture](strict-launcher-binding-fixture.md)
+   exercises an inherited console-to-launcher report pipe. The supported-runtime
+   reporting mechanism remains open.
 4. Compare the exact allowlisted `phase`, `revision`, `reviewVersion` and
    `captureVersion` with the launcher's independently expected values and
    require live admissions. Missing, unavailable, malformed, revoked or
@@ -136,7 +138,10 @@ injected failure with a working launch through the same harness.
 `test/strict-human-authority-store.test.mjs` covers the storage part of the
 wrong-enrollment case for both context fields. Equal public state does not
 allow the wrong-context open or a later replacement to satisfy `state()`.
-The fixture does not yet verify launcher provenance.
+The launcher binding fixture exercises provenance and exact capture for owned
+fixture children. The [authority-child adapter](strict-authority-child.md)
+adds a separate one-shot recovery fixture around the host history guard.
+Both leave supported-runtime supervision and restart open.
 
 | Setup or fault | Required observation |
 | --- | --- |
