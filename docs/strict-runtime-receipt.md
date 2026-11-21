@@ -26,6 +26,9 @@ the trusted observer, which must check them before running version commands.
 An invalid selection skips observation. A changed, invalid or unavailable
 observation yields a fixed refusal. A separate cleanup-unproven refusal
 tells the launcher to preserve scratch when helper cleanup is uncertain.
+The observer translates its collector's `ReceiptCleanupFailed` into
+`{'kind': 'cleanup-unproven'}`, so the selector and observer can load their
+modules independently.
 
 An exact match returns the selected fingerprint and leaves process creation
 to the launcher. The launcher must source the expected receipt from its

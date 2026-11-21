@@ -26,18 +26,20 @@ def select_runtime(expected, observe):
 
     The launcher owns the selection. The observer must validate these
     executable pins before executing version commands and must sample
-    current metadata on every call. Neither function starts a worker.
+    current metadata on every call. It returns a canonical receipt or the
+    fixed cleanup-unproven result when helper cleanup cannot be confirmed.
     """
     selected = canonical_receipt(expected)
     if selected is None:
         return {'kind': 'refused', 'code': 'runtime-selection-invalid'}
     pins = {key: selected['descriptor'][key] for key in PIN_FIELDS}
     try:
-        current = canonical_receipt(observe(pins))
-    except receipt['ReceiptCleanupFailed']:
-        return {'kind': 'refused', 'code': 'runtime-observation-cleanup-unproven'}
+        observed = observe(pins)
     except Exception:
         return {'kind': 'refused', 'code': 'runtime-observation-unavailable'}
+    if type(observed) is dict and observed == {'kind': 'cleanup-unproven'}:
+        return {'kind': 'refused', 'code': 'runtime-observation-cleanup-unproven'}
+    current = canonical_receipt(observed)
     if current is None:
         return {'kind': 'refused', 'code': 'runtime-observation-invalid'}
     if current != selected:
@@ -84,10 +86,7 @@ def self_test():
     assert select_runtime(expected, unavailable) == {
         'kind': 'refused', 'code': 'runtime-observation-unavailable'}
 
-    def unproven_cleanup(_pins):
-        raise receipt['ReceiptCleanupFailed']('private helper detail')
-
-    assert select_runtime(expected, unproven_cleanup) == {
+    assert select_runtime(expected, lambda _pins: {'kind': 'cleanup-unproven'}) == {
         'kind': 'refused', 'code': 'runtime-observation-cleanup-unproven'}
     print('strict-runtime-selection self-test passed')
 
