@@ -38,13 +38,21 @@ def bounded_stop(lifecycle, namespace, *, expire_before_proof=False):
 
     forced_at = None
     worker_alive_at_grace_end = None
-    if not lifecycle.exited(namespace["outerFd"], max(0, grace_deadline - time.monotonic())):
-        if time.monotonic() < grace_deadline:
+    wrapper_exited = lifecycle.exited(namespace["outerFd"], max(0, grace_deadline - time.monotonic()))
+    observed_at = time.monotonic()
+    if wrapper_exited:
+        if observed_at > grace_deadline:
+            raise lifecycle.Unproven({"graceObservationLate": True})
+    else:
+        if observed_at < grace_deadline:
             raise lifecycle.Unproven({"graceIncomplete": True})
         worker_alive_at_grace_end = not lifecycle.exited(worker_fd)
         if time.monotonic() >= stop_deadline:
             raise lifecycle.Unproven({"forceLate": True})
-        lifecycle.stop_namespace(namespace)
+        try:
+            signal.pidfd_send_signal(namespace["members"]["init"]["fd"], signal.SIGKILL)
+        except ProcessLookupError as exc:
+            raise lifecycle.Unproven({"forceNotConfirmed": True}) from exc
         forced_at = time.monotonic()
 
     try:
