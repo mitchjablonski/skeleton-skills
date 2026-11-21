@@ -26,12 +26,18 @@ the trusted observer, which must check them before running version commands.
 An invalid selection skips observation. A changed, invalid or unavailable
 observation yields a fixed refusal. A separate cleanup-unproven refusal
 tells the launcher to preserve scratch when helper cleanup is uncertain.
-The observer translates its collector's `ReceiptCleanupFailed` into
-`{'kind': 'cleanup-unproven'}`, so the selector and observer can load their
-modules independently.
+Use `observe_pinned_runtime(client, node, root, pins, ...)` as the trusted
+observer. It hashes the selected client, entrypoint, Node and Bubblewrap
+using the bounded digest helper, and requires all four hashes to match
+before starting any version command. It then reads current metadata and
+returns a canonical receipt. It translates its own `ReceiptCleanupFailed`
+into `{'kind': 'cleanup-unproven'}`, so the selector and observer can load
+their modules independently.
 
 An exact match returns the selected fingerprint and leaves process creation
 to the launcher. The launcher must source the expected receipt from its
 trusted profile configuration and must collect a fresh observation on each
-attempt. The synthetic self-test covers this decision boundary. The pinned
-live observer and supported-runtime integration remain open.
+attempt. Synthetic self-tests cover selected receipt comparison, the
+pre-version pin ordering, and cleanup refusal. Preflight uses trusted host
+paths while observing the runtime. An executable or path replacement
+between hashing and execution remains outside the fixture's proof.
