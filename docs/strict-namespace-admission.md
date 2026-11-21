@@ -26,6 +26,14 @@ request to the still-running console. A successful restart uses a new namespace
 and a fresh stage from the stored capture. Both stages are checked from inside
 their namespaces, and the prior stage is changed before the second start.
 
+The fixture uses the packaged `lib/strict-supervisor-handoff.py` gate.
+It registers the supervisor's exact namespace and wrapper handles, then
+issues a receipt only after the independent proof and wrapper reaping have
+both finished within the shared deadline. Restart consumes that receipt
+once. A failed proof remains ineligible for restart even if a later cleanup
+succeeds. The gate is scoped to one supervisor and leaves signal delivery,
+process discovery, scratch retention and cleanup to that supervisor.
+
 The fixture refuses a partial group stop, a genuine receipt from another
 namespace, and a matching state report requested before the stop. Each
 refusal leaves the next stage absent and durable bytes unchanged. On cleanup

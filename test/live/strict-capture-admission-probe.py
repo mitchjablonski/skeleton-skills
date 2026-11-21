@@ -75,9 +75,7 @@ class CaptureLauncher(Launcher):
         if self.admission is None or (previous is None and stop is not None):
             return None
         if previous is not None and (previous.generation is not current
-                                     or stop is None
-                                     or self.stopped.get(previous.child) is not stop
-                                     or previous.child.poll() is None):
+                                     or not self.restart_proved(previous, report, stop)):
             return None
         sequence = 0 if previous is None else 1
 
@@ -92,6 +90,10 @@ class CaptureLauncher(Launcher):
 
         return self.admission.admit(selected, report, sequence, materialize,
                                     lambda generation: self.start_fill(generation, stage))
+
+    def restart_proved(self, previous, report, stop):
+        return (stop is not None and self.stopped.get(previous.child) is stop
+                and previous.child.poll() is not None)
 
     def start_fill(self, generation, stage):
         read, write = os.pipe()
