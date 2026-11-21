@@ -6,7 +6,7 @@ import path from 'node:path';
 import {fork} from 'node:child_process';
 import {captureStrictManifest} from '../lib/strict-capture.mjs';
 import {createCaptureStore} from '../lib/strict-capture-store.mjs';
-import {createHumanAuthorityStore,openHumanAuthorityStore} from '../lib/strict-human-authority-store.mjs';
+import {createHumanAuthorityStore,openHumanAuthorityStore,openHumanAuthorityHistory} from '../lib/strict-human-authority-store.mjs';
 import {HUMAN_AUTHORITY_POLICY} from '../lib/strict-human-authority.mjs';
 import {deriveHumanCode} from '../lib/strict-human-command.mjs';
 const linux=(name,fn)=>test(name,{skip:process.platform!=='linux'},fn);
@@ -62,6 +62,77 @@ linux('matching public readiness state does not substitute for enrolled context'
   fs.writeFileSync(recordFile,originalBytes);
   assert.deepEqual(f.store.state(),expectedState);
  }
+});
+linux('history-only lookup refuses an uncommitted request and resolves only the retained identity',t=>{
+ const f=fixture(t);
+ const file=path.join(f.dir,'human-authority.json');
+ const command=f.command('lost-approval');
+ const unavailable={kind:'rejected',code:'unavailable'};
+ let captureReads=0;
+ const deps={captureStore:{get(id){captureReads++;return f.captures.get(id);}}};
+ const reader=openHumanAuthorityHistory(f.dir,f.context,deps);
+ assert.deepEqual(Object.keys(reader),['lookup']);
+ assert.throws(()=>openHumanAuthorityHistory(f.dir,{...f.context,sessionId:'other'},deps),/context mismatch/);
+
+ const initial=fs.readFileSync(file),before={...f.count};
+ assert.deepEqual(reader.lookup('verifyAndCommit',command),unavailable);
+ assert.deepEqual(reader.lookup('endSession',{requestId:'lost-end'}),unavailable);
+ assert.deepEqual(fs.readFileSync(file),initial);
+ assert.deepEqual(f.count,before);
+ assert.equal(captureReads,0);
+
+ const approval=f.store.verifyAndCommit(command);
+ assert.equal(approval.kind,'committed');
+ const end=f.store.endSession({requestId:'end'});
+ assert.equal(end.kind,'admissions-revoked');
+ const committed=fs.readFileSync(file),atCommit={...f.count};
+ const reopened=openHumanAuthorityHistory(f.dir,f.context,deps);
+ assert.deepEqual(reopened.lookup('verifyAndCommit',{...command,code:command.code.toLowerCase()}),approval);
+ assert.ok(captureReads>0);
+ assert.deepEqual(reopened.lookup('endSession',{requestId:'end'}),end);
+ assert.deepEqual(reopened.lookup('endSession',{requestId:command.requestId}),unavailable);
+ assert.deepEqual(reopened.lookup('verifyAndCommit',{...command,action:'reshape'}),unavailable);
+ assert.deepEqual(reopened.lookup('verifyAndCommit',{...command,requestId:'absent'}),unavailable);
+ assert.deepEqual(fs.readFileSync(file),committed);
+ assert.deepEqual(f.count,atCommit);
+
+ const foreignDir=path.join(f.base,'foreign-history');
+ const foreign=createHumanAuthorityStore(foreignDir,{
+  ...f.enrollment,state:{...f.enrollment.state,sessionId:'other-session'},
+ },f.deps);
+ assert.equal(foreign.endSession({requestId:'end'}).kind,'admissions-revoked');
+ const foreignFile=path.join(foreignDir,'human-authority.json');
+ const substituted=fs.readFileSync(foreignFile);
+ fs.copyFileSync(foreignFile,file);
+ assert.deepEqual(reopened.lookup('endSession',{requestId:'end'}),unavailable);
+ assert.deepEqual(fs.readFileSync(file),substituted);
+});
+linux('history-only lookup refuses a held lock, missing capture or failed durability check',t=>{
+ const f=fixture(t);
+ const command=f.command('retained');
+ assert.equal(f.store.verifyAndCommit(command).kind,'committed');
+ const file=path.join(f.dir,'human-authority.json');
+ const before=fs.readFileSync(file),counts={...f.count};
+ const deps={captureStore:f.captures};
+ const reader=openHumanAuthorityHistory(f.dir,f.context,deps);
+ const unavailable={kind:'rejected',code:'unavailable'};
+ const lock=path.join(f.dir,'.authority-lock');
+ fs.mkdirSync(lock,{mode:0o700});
+ assert.deepEqual(reader.lookup('verifyAndCommit',command),unavailable);
+ assert.ok(fs.existsSync(lock)); // The pre-existing holder directory is not ours.
+ fs.rmdirSync(lock);
+
+ const faulty=openHumanAuthorityHistory(f.dir,f.context,{...deps,storageOperations:{
+  fsyncSync(fd){
+   if(fs.readlinkSync('/proc/self/fd/'+fd)===file)throw Error('fixture record sync failed');
+   fs.fsyncSync(fd);
+  },
+ }});
+ assert.deepEqual(faulty.lookup('verifyAndCommit',command),unavailable);
+ fs.unlinkSync(path.join(f.captures.directory,f.capture.captureVersion+'.json'));
+ assert.deepEqual(reader.lookup('verifyAndCommit',command),unavailable);
+ assert.deepEqual(fs.readFileSync(file),before);
+ assert.deepEqual(f.count,counts);
 });
 linux('mismatch, lockout, end and full ledger replay without observation or entropy',t=>{
  const f=fixture(t,{commandCap:4});const good=f.command('wrong');const wrong={...good,code:good.code==='0000-0000'?'1111-1111':'0000-0000'};
