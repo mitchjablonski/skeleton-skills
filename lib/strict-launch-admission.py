@@ -37,21 +37,26 @@ class LaunchAdmission:
     def invalidate(self):
         self._generation = None
 
+    def _live_generation(self, generation):
+        return (self._generation is generation and self._peers_live(generation) is True
+                and self._generation is generation)
+
     def admit(self, enrollment, report, sequence, materialize, start):
         generation = self._generation
+        report_sequence = getattr(report, 'sequence', None)
         if (self._admitting or generation is None or self._expected is None or enrollment is not self._enrollment
-                or report.origin is not generation or type(report.sequence) is not int or type(sequence) is not int
-                or report.sequence != sequence or sequence != self._next_sequence):
+                or getattr(report, 'origin', None) is not generation or type(report_sequence) is not int
+                or type(sequence) is not int or report_sequence != sequence or sequence != self._next_sequence):
             return None
         self._next_sequence += 1
         self._admitting = True
         try:
-            if _live_state(report.state) != self._expected or self._peers_live(generation) is not True:
+            if _live_state(getattr(report, 'state', None)) != self._expected or not self._live_generation(generation):
                 return None
             _, _, review, capture = self._expected
             if materialize(review, capture) is not True:
                 return None
-            if self._generation is not generation or self._peers_live(generation) is not True:
+            if not self._live_generation(generation):
                 return None
             return start(generation)
         finally:

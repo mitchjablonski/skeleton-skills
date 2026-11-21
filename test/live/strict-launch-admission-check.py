@@ -33,6 +33,7 @@ def check():
     wrong_origin = SimpleNamespace(origin=object(), sequence=0, state=state)
     assert gate.admit(enrollment, wrong_origin, 0, materialize, start) is None
     assert gate.admit(object(), report, 0, materialize, start) is None
+    assert gate.admit(enrollment, None, 0, materialize, start) is None
     assert gate.admit(enrollment, report, 0, materialize, start) == 'started'
     assert gate.admit(enrollment, report, 0, materialize, start) is None
     assert events == ['materialize', 'start']
@@ -61,6 +62,16 @@ def check():
         return materialize(review, capture)
 
     assert gate.admit(enrollment, report, 0, canceled, start) is None
+    assert events == ['materialize']
+    events.clear()
+
+    def peer_check(_):
+        if events:
+            gate.invalidate()
+        return True
+
+    gate = LaunchAdmission(generation, state, peer_check)
+    assert gate.admit(enrollment, report, 0, materialize, start) is None
     assert events == ['materialize']
     print('strict launch admission checks passed')
 
