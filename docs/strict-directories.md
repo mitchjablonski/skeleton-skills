@@ -44,7 +44,9 @@ writer first (the launcher's physical stop comes before cleanup).
 every writer into the scratch has exited. It then rechecks the ancestors and
 requires the path to still be the directory that was created. It deletes
 with its own walk, which **unlinks symlinks without following them** and
-refuses to cross filesystems.
+refuses to descend onto a **different device**. A bind mount of the same
+filesystem shares the device and isn't detected; creating one needs mount
+privilege.
 
 Any other outcome returns `{ removed: false, retained, reason }` and keeps
 everything. The reason is one of:

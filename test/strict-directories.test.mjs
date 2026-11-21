@@ -196,6 +196,16 @@ linux("reopen requires exactly the layout, no symlinked or extra entries, all on
   assert.equal(prepareDurableHistory(root).root, root);
 });
 
+linux("a rename failure after the temporary layout exists cleans the temporary directory up", (t) => {
+  const dir = base(t);
+  const failRename = { firstEnrollment: true, renameSync: () => { throw new Error("injected"); } };
+  assert.throws(() => prepareDurableHistory(path.join(dir, "history"), failRename), refusal("io-error"));
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes("enrolling") || n === "history"), [],
+    "neither the root nor the .history.enrolling-* temporary remains");
+});
+
+// Note: the device checks (a subdirectory or tree entry on another device) need a
+// real mount to exercise; the statfs mocks here cover only the filesystem-type check.
 linux("a failed first enrollment leaves no root and no temporary directory behind", (t) => {
   const dir = base(t);
   const parent = path.join(dir, "parent");
