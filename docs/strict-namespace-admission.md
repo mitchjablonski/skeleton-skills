@@ -31,7 +31,8 @@ It registers the supervisor's exact namespace and wrapper handles, then
 issues a receipt only after the independent proof and wrapper reaping have
 both finished within the shared deadline. Restart consumes that receipt
 once. A failed proof remains ineligible for restart even if a later cleanup
-succeeds. The gate is scoped to one supervisor and leaves signal delivery,
+succeeds. A caller's confirmation deadline can shorten the configured bound.
+The gate is scoped to one supervisor and leaves signal delivery,
 process discovery, scratch retention and cleanup to that supervisor.
 
 The fixture refuses a partial group stop, a genuine receipt from another

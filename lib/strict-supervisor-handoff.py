@@ -52,13 +52,15 @@ class StopHandoff:
         return owned
 
     def _finish(self, owned, deadline):
-        if (type(deadline) not in (int, float) or not math.isfinite(deadline)
-                or time.monotonic() >= deadline):
+        if time.monotonic() >= deadline:
             raise StopUnproven('stop-deadline-unavailable')
         if self._prove(owned.namespace, deadline) is not True:
             raise StopUnproven('namespace-proof-missing')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise StopUnproven('stop-proof-late')
         try:
-            owned.wrapper.wait(timeout=max(0, deadline - time.monotonic()))
+            owned.wrapper.wait(timeout=remaining)
         except subprocess.TimeoutExpired as exc:
             raise StopUnproven('wrapper-wait-unproven') from exc
         proved_at = time.monotonic_ns()
@@ -74,7 +76,10 @@ class StopHandoff:
         return self._finish(owned, deadline)
 
     def confirm(self, namespace, deadline):
-        return self._finish(self._begin(namespace), deadline)
+        owned = self._begin(namespace)
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise StopUnproven('stop-deadline-unavailable')
+        return self._finish(owned, min(deadline, time.monotonic() + self._stop_seconds))
 
     def consume_restart(self, namespace, receipt, requested_at):
         owned = self._owned.get(id(namespace))

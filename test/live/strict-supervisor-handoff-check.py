@@ -15,15 +15,16 @@ StopHandoff.stop.__globals__['time'] = SimpleNamespace(
 
 
 class Wrapper:
-    def __init__(self, events, times_out):
+    def __init__(self, events, times_out, wait_seconds):
         self.events = events
         self.times_out = times_out
+        self.wait_seconds = wait_seconds
 
     def wait(self, *, timeout):
         self.events.append(('wait', timeout))
         if self.times_out:
             raise TimeoutExpired('fake-wrapper', timeout)
-        clock.now += 1
+        clock.now += self.wait_seconds
         return 0
 
 
@@ -35,7 +36,7 @@ def expect_unproven(action):
     raise AssertionError('unproven stop was accepted')
 
 
-def setup(*, proved=True, times_out=False):
+def setup(*, proved=True, times_out=False, wait_seconds=1):
     clock.now = 100
     namespace = SimpleNamespace(label='owned')
     proof = SimpleNamespace(result=proved)
@@ -53,7 +54,7 @@ def setup(*, proved=True, times_out=False):
         return proof.result
 
     gate = StopHandoff(terminate, prove, 30)
-    gate.own(namespace, Wrapper(events, times_out))
+    gate.own(namespace, Wrapper(events, times_out, wait_seconds))
     return gate, namespace, events, proof
 
 
@@ -89,6 +90,20 @@ def check():
     receipt = gate.confirm(namespace, deadline)
     assert events == [('prove', deadline), ('wait', 5)]
     assert gate.consume_restart(namespace, receipt, receipt.proved_at + 1)
+
+    gate, namespace, events, _ = setup()
+    receipt = gate.confirm(namespace, 1000)
+    assert events == [('prove', 130), ('wait', 25)]
+    assert gate.consume_restart(namespace, receipt, receipt.proved_at + 1)
+
+    gate, namespace, events, _ = setup(wait_seconds=30)
+    expect_unproven(lambda: gate.confirm(namespace, 1000))
+    assert events == [('prove', 130), ('wait', 25)]
+    expect_unproven(lambda: gate.confirm(namespace, 1100))
+
+    gate, namespace, events, _ = setup()
+    expect_unproven(lambda: gate.confirm(namespace, 104))
+    assert events == [('prove', 104)]
 
     gate, namespace, events, _ = setup()
     expect_unproven(lambda: gate.confirm(namespace, 99))
