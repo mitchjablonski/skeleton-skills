@@ -112,6 +112,15 @@ class NamespaceLauncher(CaptureLauncher):
 ENROLLMENT_REFUSALS = ('wrong-enrollment', 'stale-generation', 'lost-authority', 'lost-console')
 
 
+class PeerLossLauncher(NamespaceLauncher):
+    def start_owned_namespace(self, generation, label, *, stage=None):
+        namespace = super().start_owned_namespace(generation, label, stage=stage)
+        if namespace is not None:
+            generation.console.kill()
+            generation.console.wait(capture['TIMEOUT'])
+        return namespace
+
+
 def refuse_enrollment(launcher, selected, first_stage, case):
     source = selected
     if case == 'wrong-enrollment':
@@ -133,9 +142,12 @@ def refuse_enrollment(launcher, selected, first_stage, case):
             current = launcher.stage(selected, approved=True)
             assert current.report().state == selected.expected and launcher.peers_live(current)
         else:
-            peer = generation.authority if case == 'lost-authority' else generation.console
+            peer, survivor = generation.console, generation.authority
+            if case == 'lost-authority':
+                peer, survivor = survivor, peer
             peer.kill()
             peer.wait(capture['TIMEOUT'])
+            assert survivor.poll() is None
     owned_children = len(launcher.children)
     assert launcher.admit_capture(selected, report, first_stage) is None
     assert len(launcher.children) == owned_children
@@ -146,7 +158,8 @@ def refuse_enrollment(launcher, selected, first_stage, case):
 def exercise(node, scratch, case, check_runtime=None):
     if check_runtime is not None:
         check_runtime()
-    launcher = NamespaceLauncher(node, scratch, check_runtime)
+    launcher_type = PeerLossLauncher if case == 'peer-loss-during-start' else NamespaceLauncher
+    launcher = launcher_type(node, scratch, check_runtime)
     try:
         selected = launcher.prepare_approved(case, 'selected')
         directory = selected.directory.parent
@@ -162,7 +175,15 @@ def exercise(node, scratch, case, check_runtime=None):
         generation = launcher.stage(selected, approved=True)
         initial = generation.report()
         assert initial.state == selected.expected
-        assert launcher.admit_capture(selected, initial, first_stage) == expected
+        admitted = launcher.admit_capture(selected, initial, first_stage)
+        if case == 'peer-loss-during-start':
+            assert admitted is None and not launcher.fills and launcher.active is None
+            owned, = launcher.run.namespaces
+            assert owned['process'].poll() is not None
+            assert launcher.prove_stopped(owned, time.monotonic() + lifecycle['STOP_BOUND'])
+            assert capture['snapshot']((selected,)) == before
+            return
+        assert admitted == expected
         first = launcher.active
         namespace = first.namespace
         fresh = None
@@ -244,7 +265,7 @@ def main():
     check_runtime = runtime_check(selection, node, scratch) if args.runtime_receipt is not None else None
     cases = ('restart', 'partial-stop', 'borrowed-namespace-stop', 'report-before-stop')
     if args.protected_launcher:
-        cases += ENROLLMENT_REFUSALS
+        cases += ENROLLMENT_REFUSALS + ('peer-loss-during-start',)
     try:
         for case in cases:
             exercise(node, scratch, case, check_runtime)

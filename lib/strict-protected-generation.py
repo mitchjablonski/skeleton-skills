@@ -1,4 +1,6 @@
 """Host-owned Linux descriptors and readiness reports for a protected generation."""
+from __future__ import annotations
+
 from contextlib import ExitStack
 from dataclasses import dataclass
 import json

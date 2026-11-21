@@ -62,7 +62,8 @@ before materializing the stored capture. The protected fixture checks a
 wrong-context store with equal public state, an old report from a replaced
 generation, and loss of each peer after a valid report. Each check verifies
 that no materialization worker or namespace starts and durable bytes stay
-unchanged.
+unchanged. A separate case loses the console during namespace startup and
+requires full teardown and wrapper reaping before admission returns.
 
 This fixture uses explicitly pinned binaries and a fixed, owned workload.
 It leaves strict disabled and unverified. The supported-runtime profile,
