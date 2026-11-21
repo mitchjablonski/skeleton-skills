@@ -70,6 +70,8 @@ class NamespaceFill:
 class Listener:
     process: object
     port: int
+    generation: object
+    capture_versions: tuple
 
     def alive(self):
         return self.process.poll() is None
@@ -99,16 +101,25 @@ class NamespaceLauncher(CaptureLauncher):
         self.listener = None
         self.supervisor = StopHandoff(lifecycle['stop_namespace'], self.prove_stopped, lifecycle['STOP_BOUND'])
 
+    def stage(self, enrollment, directory=None, *, approved=False):
+        if self.listener is not None:
+            stop_listener(self)
+            self.listener = None
+        return super().stage(enrollment, directory, approved=approved)
+
     def stage_listener(self, enrollment, *, binding=None, role='decision-listener'):
+        if self.current is None or self.current.enrollment is not enrollment:
+            raise RuntimeError('listener requires the current enrollment')
         if self.listener is not None:
             raise RuntimeError('listener already staged')
         selected = enrollment.expected if binding is None else binding
+        versions = selected['reviewVersion'], selected['captureVersion']
         read_fd, write_fd = os.pipe()
         with os.fdopen(read_fd, 'rb', buffering=0) as report:
             try:
                 process = self.spawn([self.node, capture['WORKER'], role,
                                       enrollment.directory / 'captures', enrollment.identity, str(write_fd),
-                                      selected['reviewVersion'], selected['captureVersion']], (write_fd,))
+                                      *versions], (write_fd,))
             finally:
                 os.close(write_fd)
             try:
@@ -116,17 +127,23 @@ class NamespaceLauncher(CaptureLauncher):
             except (OSError, RuntimeError, ValueError):
                 return
         if set(ready) == {'port'} and type(ready['port']) is int and 1 <= ready['port'] <= 65535:
-            self.listener = Listener(process, ready['port'])
+            self.listener = Listener(process, ready['port'], self.current, versions)
 
-    def listener_ready(self, *, check_response=True):
+    def listener_ready(self, generation, *, check_response=True):
         if not self.listener_required:
             return True
-        if self.listener is None:
+        listener = self.listener
+        if listener is None or generation is None or listener.generation is not generation:
             return False
-        return self.listener.responds() if check_response else self.listener.alive()
+        expected = generation.enrollment.expected
+        if listener.capture_versions != (expected['reviewVersion'], expected['captureVersion']):
+            return False
+        return listener.responds() if check_response else listener.alive()
 
     def admit_capture(self, selected, report, stage, stop=None):
-        if not self.listener_ready():
+        if self.listener_required and (self.current is None or self.current.enrollment is not selected):
+            return None
+        if not self.listener_ready(self.current):
             return None
         return super().admit_capture(selected, report, stage, stop)
 
@@ -138,7 +155,7 @@ class NamespaceLauncher(CaptureLauncher):
     def start_owned_namespace(self, generation, label, *, stage=None):
         if self.check_runtime is not None:
             self.check_runtime()
-        if not self.peers_live(generation) or not self.listener_ready():
+        if not self.peers_live(generation) or not self.listener_ready(generation):
             return None
         namespace = lifecycle['start_namespace'](self.run, label, stage=stage,
                                                  stop_mode=self.stop_mode if stage is not None else None)
@@ -150,7 +167,7 @@ class NamespaceLauncher(CaptureLauncher):
         if namespace is None:
             return None
         lifecycle['alive_at_fault'](namespace)
-        if not self.peers_live(generation) or not self.listener_ready(check_response=False):
+        if not self.peers_live(generation) or not self.listener_ready(generation, check_response=False):
             self.supervisor.stop(namespace)
             return None
         self.active = NamespaceFill(generation, namespace['process'], namespace)
@@ -185,15 +202,26 @@ class NamespaceLauncher(CaptureLauncher):
 ENROLLMENT_REFUSALS = ('wrong-enrollment', 'stale-generation', 'lost-authority', 'lost-console')
 PLANNED_STOPS = {'graceful-restart': 'cooperative', 'forced-restart': 'stubborn',
                  'planned-proof-too-late': 'cooperative'}
-LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-invalid-readiness', 'listener-exited-before-start')
+LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-invalid-readiness', 'listener-exited-before-start',
+                     'stale-listener-generation')
+STARTUP_FAULTS = ('peer-loss-during-start', 'listener-loss-before-namespace', 'listener-loss-after-namespace')
 
 
-class PeerLossLauncher(NamespaceLauncher):
+class StartupFaultLauncher(NamespaceLauncher):
+    def __init__(self, *args, fault, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fault = fault
+
     def start_owned_namespace(self, generation, label, *, stage=None):
+        if self.fault == 'listener-loss-before-namespace':
+            stop_listener(self)
         namespace = super().start_owned_namespace(generation, label, stage=stage)
         if namespace is not None:
-            generation.console.kill()
-            generation.console.wait(capture['TIMEOUT'])
+            if self.fault == 'peer-loss-during-start':
+                generation.console.kill()
+                generation.console.wait(capture['TIMEOUT'])
+            elif self.fault == 'listener-loss-after-namespace':
+                stop_listener(self)
         return namespace
 
 
@@ -235,9 +263,12 @@ def refuse_enrollment(launcher, selected, first_stage, case):
 def exercise(node, scratch, case, check_runtime=None, *, protected=False):
     if check_runtime is not None:
         check_runtime()
-    launcher_type = PeerLossLauncher if case == 'peer-loss-during-start' else NamespaceLauncher
     stop_mode = PLANNED_STOPS.get(case)
-    launcher = launcher_type(node, scratch, check_runtime, stop_mode, listener_required=protected)
+    if case in STARTUP_FAULTS:
+        launcher = StartupFaultLauncher(node, scratch, check_runtime, stop_mode,
+                                        fault=case, listener_required=protected)
+    else:
+        launcher = NamespaceLauncher(node, scratch, check_runtime, stop_mode, listener_required=protected)
     try:
         selected = launcher.prepare_approved(case, 'selected')
         directory = selected.directory.parent
@@ -266,22 +297,35 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
                 assert launcher.children[-1].wait(capture['TIMEOUT']) == 0
                 assert launcher.listener is None
             else:
-                assert launcher.listener_ready()
+                assert launcher.listener_ready(generation)
         if case == 'listener-exited-before-start':
             stop_listener(launcher)
+        if case == 'stale-listener-generation':
+            stale_listener = launcher.listener
+            # Bypass normal disposal to test binding even while the old listener still answers.
+            generation = CaptureLauncher.stage(launcher, selected, approved=True)
+            initial = generation.report()
+            assert initial.state == selected.expected and launcher.peers_live(generation)
+            assert stale_listener.responds()
         if case in LISTENER_REFUSALS:
             children = len(launcher.children)
             assert launcher.admit_capture(selected, initial, first_stage) is None
             assert len(launcher.children) == children and not launcher.run.namespaces and not first_stage.exists()
+            if case == 'stale-listener-generation':
+                launcher.stage(selected, approved=True)
+                assert launcher.listener is None and stale_listener.process.poll() is not None
             assert capture['snapshot']((selected,)) == before
             return
         admitted = launcher.admit_capture(selected, initial, first_stage)
-        if case == 'peer-loss-during-start':
+        if case in STARTUP_FAULTS:
             assert admitted is None and not launcher.fills and launcher.active is None
             assert generation.authority.poll() is None and first_stage.is_dir()
-            owned, = launcher.run.namespaces
-            assert owned['process'].poll() is not None
-            assert launcher.prove_stopped(owned, time.monotonic() + lifecycle['STOP_BOUND'])
+            if case == 'listener-loss-before-namespace':
+                assert not launcher.run.namespaces
+            else:
+                owned, = launcher.run.namespaces
+                assert owned['process'].poll() is not None
+                assert launcher.prove_stopped(owned, time.monotonic() + lifecycle['STOP_BOUND'])
             assert capture['snapshot']((selected,)) == before
             return
         assert admitted == expected
@@ -357,7 +401,6 @@ def stop_listener(launcher):
     listener = launcher.listener.process
     listener.kill()
     listener.wait(capture['TIMEOUT'])
-    assert not launcher.listener_ready()
 
 
 def main():
@@ -390,7 +433,7 @@ def main():
     check_runtime = runtime_check(selection, node, scratch) if args.runtime_receipt is not None else None
     cases = ('restart', 'partial-stop', 'borrowed-namespace-stop', 'report-before-stop')
     if args.protected_launcher:
-        cases += ENROLLMENT_REFUSALS + ('peer-loss-during-start',) + tuple(PLANNED_STOPS)
+        cases += ENROLLMENT_REFUSALS + STARTUP_FAULTS + tuple(PLANNED_STOPS)
         cases += LISTENER_REFUSALS + ('listener-exited-before-restart',)
     try:
         for case in cases:
