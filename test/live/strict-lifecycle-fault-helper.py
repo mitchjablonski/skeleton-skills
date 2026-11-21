@@ -7,6 +7,8 @@ Modes (fixed, no other arguments):
                              leads its own process group (the agent group),
                              and a descendant that escapes into a new session
   agent-capture              same roles, with digests of the two fixture files
+  agent-cooperative          report SIGTERM and exit the worker
+  agent-stubborn             ignore SIGTERM in the worker
   authority SOCK REL STATUS  authority stub: hold one request, reply only
                              after the host writes to REL
   control SOCK               control stand-in: exit when told to hang up
@@ -17,6 +19,7 @@ import json
 import os
 import pathlib
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -29,7 +32,12 @@ def sleep_forever():
         time.sleep(1)
 
 
-def agent(capture=False):
+def acknowledge_term(signum, frame):
+    os.write(sys.stdout.fileno(), b"worker-term\n")
+    raise SystemExit(0)
+
+
+def agent(capture=False, stop_mode=None):
     digests = {}
     if capture:
         stage = pathlib.Path("/fixture-stage")
@@ -54,6 +62,10 @@ def agent(capture=False):
     os.waitpid(first, 0)
     escapee = int(os.read(ready_r, 32).strip())
     os.close(ready_r)
+    if stop_mode == "cooperative":
+        signal.signal(signal.SIGTERM, acknowledge_term)
+    elif stop_mode == "stubborn":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     record = {
         "pidNs": os.readlink("/proc/self/ns/pid"),
         "worker": os.getpid(),
@@ -121,6 +133,10 @@ def main():
         agent()
     elif args == ["agent-capture"]:
         agent(capture=True)
+    elif args == ["agent-cooperative"]:
+        agent(stop_mode="cooperative")
+    elif args == ["agent-stubborn"]:
+        agent(stop_mode="stubborn")
     elif len(args) == 4 and args[0] == "authority":
         authority(int(args[1]), int(args[2]), int(args[3]))
     elif len(args) == 2 and args[0] == "control":
