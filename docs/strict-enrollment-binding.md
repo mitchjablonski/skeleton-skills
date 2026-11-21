@@ -76,6 +76,15 @@ launcher permits commands or agent admission.
    an agent racing with cancellation. Confirm teardown independently of any
    authority response. Cleanup uncertainty retains scratch and refuses success.
 
+The host-side `lib/strict-launch-admission.py` gate implements the state and
+spawn ordering for a single owned generation. It snapshots the selected
+state, checks enrollment and pipe provenance by launcher object identity,
+consumes each report at most once, and requires verified materialization of
+the exact capture pair. It checks peer liveness again before spawn. The
+stored-capture and namespace fixtures exercise this gate. A supported
+launcher still needs to establish the objects and pipe outside the agent,
+apply the other bootstrap gates, and supervise a namespace after spawn.
+
 Prefer this fixed open-before-serve order because it uses the existing four
 operations (`state`, `verifyAndCommit`, `recapture`, `endSession`). The
 order gives evidence only when the launcher controls the code path, child
