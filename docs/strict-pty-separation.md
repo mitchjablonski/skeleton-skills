@@ -58,3 +58,25 @@ Linux namespace availability must be checked
 on each WSL setup. Windows terminal ownership, broader ptrace/process-vm reach,
 actual CLI admission, browser profile C20, OSC filtering, raw-console policy,
 human bootstrap and supported-profile qualification remain open.
+
+## Owned control-console host (#207)
+
+```sh
+/usr/bin/python3 -I test/live/strict-terminal-host-probe.py \
+  --node /path/to/pinned/node --node-sha256 <selected-node-digest>
+```
+
+This opt-in Linux fixture puts the real control console and input parser on a
+launcher-owned PTY. The launcher checks the console's session, foreground
+group, terminal identity, raw mode and restoration. Node uses an explicit
+inherited terminal descriptor. Its standard streams stay on separate
+descriptors so terminal hangup can complete even on a pinned Node build that
+aborts while restoring hung-up standard streams.
+
+One complete `status` line reaches the enrolled authority over the inherited
+command socket. Incomplete input is discarded, and decision methods refuse
+in the fixture. Readiness uses its own bounded report pipe. A hangup or failed
+terminal setup prevents admission, the launcher reaps its owned workers, and
+durable bytes stay unchanged. This fixture uses synthetic input and leaves
+strict `unverified`. A supported terminal emulator, its paste framing, and
+its interaction with the fresh browser profile remain open.
