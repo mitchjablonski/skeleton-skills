@@ -32,6 +32,16 @@ refusal leaves the next stage absent and durable bytes unchanged. On cleanup
 the launcher verifies the namespace stop before removing scratch. Failure
 retains scratch.
 
+Pass `--runtime-receipt /path/to/selected-receipt.json` to exercise selected
+runtime admission. Supply a canonical receipt from trusted configuration
+before running the fixture. This mode expects `node-channel-control`, with
+Node as the client and `test/live/strict-launcher-binding-worker.mjs` as its
+entrypoint. The launcher collects a fresh pinned receipt before staging any
+fixture workers and again immediately before each namespace start. A
+refusal starts no namespace for that attempt. Unproven observation cleanup
+retains scratch. The invocation above exercises namespace teardown with the
+explicit binary pins alone.
+
 This fixture uses explicitly pinned binaries and a fixed, owned workload.
 It leaves strict disabled and unverified. The supported-runtime profile,
 graceful-stop escalation, listener gates, and production launcher ownership
