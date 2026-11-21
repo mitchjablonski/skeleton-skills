@@ -19,6 +19,11 @@ FIELDS = ('platform', 'kernel_release', 'machine', 'uid', 'gid', 'client_role', 
           'client_version', 'node_sha256', 'node_version', 'bwrap_sha256', 'bwrap_version',
           'filesystem_type', 'filesystem_source_sha256', 'mount_options_sha256',
           'namespace_types', 'userns_max', 'unprivileged_userns_clone')
+PIN_FIELDS = ('client_sha256', 'client_entrypoint_sha256', 'node_sha256', 'bwrap_sha256')
+
+
+def _is_digest(value):
+    return type(value) is str and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
 
 def receipt_from_observations(observations):
     if type(observations) is not dict or set(observations) != set(FIELDS):
@@ -31,8 +36,8 @@ def receipt_from_observations(observations):
         raise ReceiptUnavailable('Linux observations required')
     if d['client_role'] not in ('pinned-cli', 'node-channel-control'):
         raise ReceiptUnavailable('invalid client role')
-    for key in ('client_sha256', 'client_entrypoint_sha256', 'node_sha256', 'bwrap_sha256', 'filesystem_source_sha256', 'mount_options_sha256'):
-        if len(d[key]) != 64 or any(c not in '0123456789abcdef' for c in d[key]):
+    for key in (*PIN_FIELDS, 'filesystem_source_sha256', 'mount_options_sha256'):
+        if not _is_digest(d[key]):
             raise ReceiptUnavailable('invalid digest')
     for key in ('uid', 'gid', 'userns_max'):
         if not d[key].isascii() or not d[key].isdigit():
@@ -126,11 +131,11 @@ finally:os.close(fd)
 def _digest(path):
     # Hashing is also a bounded child operation, including open/read stalls.
     digest = _run([sys.executable, '-I', '-c', _DIGEST_HELPER, str(path)])
-    if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+    if not _is_digest(digest):
         raise ReceiptUnavailable('invalid executable digest')
     return digest
 
-def capture_runtime_receipt(client, node, root, *, client_role='pinned-cli', client_entrypoint=None):
+def _collect_runtime_receipt(client, node, root, *, client_role, client_entrypoint, expected_pins):
     if platform.system() != 'Linux':
         raise ReceiptUnavailable('Linux required')
     try:
@@ -139,6 +144,13 @@ def capture_runtime_receipt(client, node, root, *, client_role='pinned-cli', cli
         findmnt = shutil.which('findmnt', path='/usr/bin:/bin')
         if not bwrap or not findmnt:
             raise ReceiptUnavailable('required metadata executable missing')
+        bwrap = str(Path(bwrap).resolve(strict=True))
+        entrypoint = str(Path(client_entrypoint).resolve(strict=True)) if client_entrypoint is not None else client
+        executables = dict(zip(PIN_FIELDS, (client, entrypoint, node, bwrap)))
+        # Complete all pin checks before any of the selected binaries is run.
+        hashes = {key: _digest(path) for key, path in executables.items()}
+        if expected_pins is not None and hashes != expected_pins:
+            raise ReceiptUnavailable('selected executable pin mismatch')
         mount = json.loads(_run([findmnt, '--json', '--target', root, '--output', 'FSTYPE,SOURCE,OPTIONS']))['filesystems']
         if len(mount) != 1:
             raise ReceiptUnavailable('ambiguous filesystem')
@@ -150,13 +162,79 @@ def capture_runtime_receipt(client, node, root, *, client_role='pinned-cli', cli
             raise ReceiptUnavailable('invalid filesystem source')
         namespaces = ','.join(sorted(p.name for p in Path('/proc/self/ns').iterdir()))
         return receipt_from_observations(dict(zip(FIELDS, (
-            'Linux', platform.release(), platform.machine(), str(os.getuid()), str(os.getgid()), client_role, _digest(client_entrypoint or client),
-            _digest(client), _run([client, '--version']), _digest(node), _run([node, '--version']),
-            _digest(bwrap), _run([bwrap, '--version']), fs['fstype'], hashlib.sha256(source.encode()).hexdigest(),
+            'Linux', platform.release(), platform.machine(), str(os.getuid()), str(os.getgid()), client_role, hashes['client_entrypoint_sha256'],
+            hashes['client_sha256'], _run([client, '--version']), hashes['node_sha256'], _run([node, '--version']),
+            hashes['bwrap_sha256'], _run([bwrap, '--version']), fs['fstype'], hashlib.sha256(source.encode()).hexdigest(),
             hashlib.sha256(fs['options'].encode()).hexdigest(), namespaces, _read('/proc/sys/user/max_user_namespaces'),
             _clone_policy()))))
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise ReceiptUnavailable('runtime metadata unavailable') from exc
+
+
+def capture_runtime_receipt(client, node, root, *, client_role='pinned-cli', client_entrypoint=None):
+    """Record observations for existing fixtures that validate pins independently."""
+    return _collect_runtime_receipt(client, node, root, client_role=client_role,
+                                   client_entrypoint=client_entrypoint, expected_pins=None)
+
+
+def observe_pinned_runtime(client, node, root, pins, *, client_role='pinned-cli', client_entrypoint=None):
+    """Collect fresh launcher observations only after matching the selected pins."""
+    if type(pins) is not dict or set(pins) != set(PIN_FIELDS) or not all(map(_is_digest, pins.values())):
+        raise ReceiptUnavailable('invalid selected executable pins')
+    try:
+        return _collect_runtime_receipt(client, node, root, client_role=client_role,
+                                       client_entrypoint=client_entrypoint, expected_pins=dict(pins))
+    except ReceiptCleanupFailed:
+        return {'kind': 'cleanup-unproven'}
+
+
+def _test_pinned_observer():
+    import tempfile
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory(prefix='runtime-pin-test-') as directory:
+        root = Path(directory).resolve()
+        files = {role: root / role for role in ('client', 'entrypoint', 'node', 'bwrap', 'findmnt')}
+        for role, file in files.items():
+            file.write_text(role, encoding='ascii')
+        pins = {key: hashlib.sha256(role.encode()).hexdigest()
+                for key, role in zip(PIN_FIELDS, ('client', 'entrypoint', 'node', 'bwrap'))}
+        calls = []
+
+        def metadata(argv):
+            calls.append(argv)
+            if argv[0] == str(files['findmnt']):
+                return '{"filesystems":[{"fstype":"ext4","source":"fixture","options":"rw"}]}'
+            assert argv[1:] == ['--version']
+            return 'fixture ' + Path(argv[0]).name
+
+        def observe(selected):
+            return observe_pinned_runtime(files['client'], files['node'], root, selected,
+                                          client_entrypoint=files['entrypoint'])
+
+        with patch.object(shutil, 'which', side_effect=lambda role, **_: str(files[role])), \
+                patch.dict(globals(), _digest=lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                           _run=metadata, _read=lambda _: '100', _clone_policy=lambda: 'not-exposed'):
+            for invalid in (None, {}, *({**pins, key: '0' * 64} for key in PIN_FIELDS)):
+                try:
+                    observe(invalid)
+                except ReceiptUnavailable:
+                    pass
+                else:
+                    raise AssertionError('invalid or mismatched pin accepted')
+                assert not calls, 'metadata command ran before the pins matched'
+            first = observe(pins)
+            assert {key: first['descriptor'][key] for key in PIN_FIELDS} == pins
+            assert [argv[0] for argv in calls] == [str(files[role]) for role in ('findmnt', 'client', 'node', 'bwrap')]
+            assert observe(pins) == first and len(calls) == 8
+
+        def unproven_digest(_):
+            raise ReceiptCleanupFailed()
+
+        with patch.object(shutil, 'which', side_effect=lambda role, **_: str(files[role])), \
+                patch.dict(globals(), _digest=unproven_digest):
+            assert observe(pins) == {'kind': 'cleanup-unproven'}
+
 
 def self_test():
     base = {k: 'observed' for k in FIELDS}
@@ -214,6 +292,7 @@ def self_test():
         subprocess.Popen = old_popen
     if platform.system() == 'Linux':
         import tempfile
+        _test_pinned_observer()
         with tempfile.TemporaryDirectory(prefix='runtime-digest-test-') as directory:
             file = Path(directory) / 'sample'
             file.write_bytes(b'abc')

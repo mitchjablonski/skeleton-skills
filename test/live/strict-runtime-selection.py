@@ -6,7 +6,7 @@ import sys
 
 receipt = runpy.run_path(str(Path(__file__).resolve().with_name('strict-runtime-receipt.py')))
 normalize = receipt['receipt_from_observations']
-PIN_FIELDS = ('client_sha256', 'client_entrypoint_sha256', 'node_sha256', 'bwrap_sha256')
+PIN_FIELDS = receipt['PIN_FIELDS']
 
 
 def canonical_receipt(value):
