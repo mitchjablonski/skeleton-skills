@@ -106,6 +106,33 @@ if (role === 'prepare-approved') {
   } catch {
     process.exit(23);
   }
+} else if (role === 'decision-listener') {
+  const [{createDecisionListener}, {buildStrictCaptureViewModel}] = await Promise.all([
+    import('../../lib/strict-decision-listener.mjs'), import('../../lib/strict-capture-view-model.mjs'),
+  ]);
+  const [reviewVersion, captureVersion] = [reportFd, extraFd];
+  const binding = {...context, protocolVersion: 2, reviewRoundId: 'round', phase: 'fill',
+    reviewVersion, captureVersion, approvedVersion: reviewVersion, approvedCaptureVersion: captureVersion,
+    pendingNotes: false};
+  const capture = openCaptureStore(directory).get(captureVersion);
+  const model = buildStrictCaptureViewModel({binding, capture});
+  const listener = createDecisionListener({provider: {read: () => ({binding, capture})}});
+  const {origin} = await listener.start();
+  const nonce = new URL(listener.mintNavigation()).hash.slice(3);
+  const bind = await fetch(`${origin}/api/bind`, {method: 'POST', signal: AbortSignal.timeout(1000),
+    headers: {origin, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json'},
+    body: JSON.stringify({nonce})});
+  assert.equal(bind.status, 200);
+  const {tab} = await bind.json();
+  const view = await fetch(`${origin}/api/view`, {signal: AbortSignal.timeout(1000),
+    headers: {'sec-fetch-site': 'same-origin', 'x-skel-tab': tab}});
+  assert.equal(view.status, 200);
+  assert.deepEqual(await view.json(), {view: model, codes: {}, codesDropped: false});
+  listener.mintNavigation(); // Revoke the private startup tab; this fixture exports no navigation handle.
+  writeReport(fd, {port: Number(new URL(origin).port)});
+  boundRestartLifetime();
+} else if (role === 'invalid-listener-ready') {
+  writeReport(fd, {port: '1234'});
 } else if (role === 'prepare') {
   const candidate = path.join(directory, 'candidate');
   fs.mkdirSync(candidate, {mode: 0o700});
