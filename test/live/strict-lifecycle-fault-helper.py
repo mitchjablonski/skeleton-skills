@@ -9,6 +9,7 @@ Modes (fixed, no other arguments):
   agent-capture              same roles, with digests of the two fixture files
   agent-cooperative          report SIGTERM and exit the worker
   agent-stubborn             ignore SIGTERM in the worker
+  agent-silent-child         fork one additional child without reporting its ID
   authority SOCK REL STATUS  authority stub: hold one request, reply only
                              after the host writes to REL
   control SOCK               control stand-in: exit when told to hang up
@@ -37,7 +38,7 @@ def acknowledge_term(signum, frame):
     raise SystemExit(0)
 
 
-def agent(capture=False, stop_mode=None):
+def agent(capture=False, stop_mode=None, silent_child=False):
     digests = {}
     if capture:
         stage = pathlib.Path("/fixture-stage")
@@ -62,6 +63,9 @@ def agent(capture=False, stop_mode=None):
     os.waitpid(first, 0)
     escapee = int(os.read(ready_r, 32).strip())
     os.close(ready_r)
+    if silent_child and os.fork() == 0:
+        os.close(sys.stdout.fileno())
+        sleep_forever()
     if stop_mode == "cooperative":
         signal.signal(signal.SIGTERM, acknowledge_term)
     elif stop_mode == "stubborn":
@@ -137,6 +141,8 @@ def main():
         agent(stop_mode="cooperative")
     elif args == ["agent-stubborn"]:
         agent(stop_mode="stubborn")
+    elif args == ["agent-silent-child"]:
+        agent(silent_child=True)
     elif len(args) == 4 and args[0] == "authority":
         authority(int(args[1]), int(args[2]), int(args[3]))
     elif len(args) == 2 and args[0] == "control":

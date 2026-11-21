@@ -84,7 +84,7 @@ class Run:
         return process
 
 
-def bwrap_argv(stage=None, *, stop_mode=None):
+def bwrap_argv(stage=None, *, stop_mode=None, silent_child=False):
     argv = ["/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
             "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib"]
     if pathlib.Path("/lib64").exists():
@@ -97,6 +97,9 @@ def bwrap_argv(stage=None, *, stop_mode=None):
     if stop_mode is not None:
         assert stage is None and stop_mode in ("cooperative", "stubborn")
         mode = "agent-" + stop_mode
+    if silent_child:
+        assert stage is None and stop_mode is None
+        mode = "agent-silent-child"
     return argv + ["--", "/usr/bin/python3", "-I", "/helper.py", mode]
 
 
@@ -194,13 +197,13 @@ def scan(pid_ns, since):
     return sorted(found)
 
 
-def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None):
+def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, silent_child=False):
     """Start the agent namespace, directly or under a launcher stand-in."""
     read_end, write_end = os.pipe()
     run.fd(read_end)
     since = boot_ticks() - 1  # one tick of margin for rounding
     try:
-        argv = bwrap_argv(stage, stop_mode=stop_mode)
+        argv = bwrap_argv(stage, stop_mode=stop_mode, silent_child=silent_child)
         if launcher:
             argv = ["/usr/bin/python3", "-I", str(HELPER), "launcher", "--"] + argv
         process = run.launch(argv, label, stdout=write_end)
@@ -225,37 +228,56 @@ def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None):
         run.launcher_children.append(outer_fd)
     inits = [pid for pid in procs if parent_of(pid) == outer]
     assert len(inits) == 1, "bubblewrap should have one child, the namespace init"
-    init_fd = os.pidfd_open(inits[0])
+    init_pid = inits[0]
+    init_started = started_at(init_pid)
+    init_fd = os.pidfd_open(init_pid)
     run.members.append(init_fd)
-    pid_ns = ns_of(inits[0])
-    assert parent_of(inits[0]) == outer and not exited(outer_fd) and not exited(init_fd), "init changed while opening it"
-    assert nspid_of(inits[0])[-1] == 1, "bubblewrap's child is not namespace PID 1"
+    pid_ns = ns_of(init_pid)
+    assert parent_of(init_pid) == outer and started_at(init_pid) == init_started
+    assert not exited(outer_fd) and not exited(init_fd), "init changed while opening it"
+    assert nspid_of(init_pid)[-1] == 1, "bubblewrap's child is not namespace PID 1"
     assert isinstance(pid_ns, str) and pid_ns.startswith("pid:[") and len(pid_ns) < 64
     assert pid_ns != os.readlink("/proc/self/ns/pid")
     run.inits.append(init_fd)
-    assert record["pidNs"] == pid_ns
-    roles = {1: "init", record["worker"]: "worker", record["child"]: "child", record["escapee"]: "escapee"}
-    assert len(roles) == 4
-    members = {"init": {"pid": inits[0], "fd": init_fd}}
-    for pid in scan(pid_ns, since):
-        if pid == inits[0]:
-            continue
-        fd = os.pidfd_open(pid)
-        run.members.append(fd)
-        # Re-check after opening, so the handle is the namespace member.
-        assert ns_of(pid) == pid_ns and not exited(fd)
-        nspid = nspid_of(pid)
-        assert len(nspid) >= 2 and nspid[0] == pid
-        role = roles.get(nspid[-1])
-        assert role and role not in members, "unexpected namespace member"
-        members[role] = {"pid": pid, "fd": fd}
-    assert set(members) == set(roles.values()), "namespace members missing"
-    worker, child, escapee = (stat_of(members[r]["pid"]) for r in ("worker", "child", "escapee"))
-    assert child["pgrp"] == members["child"]["pid"] != worker["pgrp"], "agent group not separate"
-    assert escapee["pgrp"] != child["pgrp"] and escapee["session"] not in (worker["session"], child["session"])
+    members = {"init": {"pid": init_pid, "fd": init_fd}}
     namespace = {"pidNs": pid_ns, "members": members, "process": process, "since": since,
                  "outer": outer, "outerFd": outer_fd}
     run.namespaces.append(namespace)
+    assert record["pidNs"] == pid_ns
+    roles = {1: "init", record["worker"]: "worker", record["child"]: "child", record["escapee"]: "escapee"}
+    assert len(roles) == 4
+    expected_roles = set(roles.values())
+    if silent_child:
+        assert record.keys() == {"pidNs", "worker", "child", "escapee"}
+        expected_roles.add("silentChild")
+    for pid in scan(pid_ns, since):
+        if pid == init_pid:
+            continue
+        started = started_at(pid)
+        assert started >= since and ns_of(pid) == pid_ns
+        fd = os.pidfd_open(pid)
+        run.members.append(fd)
+        # The census identifies the member, then the pidfd pins that identity.
+        nspid = nspid_of(pid)
+        assert started_at(pid) == started and ns_of(pid) == pid_ns and not exited(fd)
+        assert len(nspid) >= 2 and nspid[0] == pid
+        role = roles.get(nspid[-1])
+        if role is None and silent_child:
+            role = "silentChild"
+        assert role and role not in members, "unexpected namespace member"
+        members[role] = {"pid": pid, "fd": fd}
+    assert set(members) == expected_roles, "namespace members missing"
+    assert started_at(init_pid) == init_started and ns_of(init_pid) == pid_ns
+    assert not exited(init_fd), "namespace init exited during the census"
+    worker, child, escapee = (stat_of(members[r]["pid"]) for r in ("worker", "child", "escapee"))
+    assert child["pgrp"] == members["child"]["pid"] != worker["pgrp"], "agent group not separate"
+    assert escapee["pgrp"] != child["pgrp"] and escapee["session"] not in (worker["session"], child["session"])
+    if silent_child:
+        member = members["silentChild"]
+        child_stat = stat_of(member["pid"])
+        assert child_stat["ppid"] == members["worker"]["pid"]
+        assert (child_stat["pgrp"], child_stat["session"]) == (worker["pgrp"], worker["session"])
+        assert not exited(member["fd"])
     if stop_mode is not None:
         namespace["workerStatus"] = read_end
     if stage is not None:
@@ -348,7 +370,8 @@ def release_and_reply(authority, stopped_ns):
 def alive_at_fault(namespace):
     """No-fault observation: until the fault, every member is alive and the namespace is intact."""
     dead = [role for role, m in namespace["members"].items() if exited(m["fd"])]
-    assert not dead and len(scan(namespace["pidNs"], namespace["since"])) == 4, "namespace changed before the fault"
+    recorded_pids = sorted(m["pid"] for m in namespace["members"].values())
+    assert not dead and scan(namespace["pidNs"], namespace["since"]) == recorded_pids, "namespace changed before the fault"
 
 
 def selective_child_stop(namespace):
