@@ -51,6 +51,19 @@ refusal starts no namespace for that attempt. Unproven observation cleanup
 retains scratch. The invocation above exercises namespace teardown with the
 explicit binary pins alone.
 
+Add `--protected-launcher` to exercise all enrollment, readiness and restart
+checks together. This mode requires the selected receipt and refuses before
+starting fixture workers if it is absent or does not match. The packaged
+`lib/strict-protected-generation.py` adapter creates the authority/console
+socket pair and separate initial and refresh report pipes. Only the owned
+console inherits the report writers. The authority must open the selected
+durable enrollment, and the launcher checks the generation and owned peers
+before materializing the stored capture. The protected fixture checks a
+wrong-context store with equal public state, an old report from a replaced
+generation, and loss of each peer after a valid report. Each check verifies
+that no materialization worker or namespace starts and durable bytes stay
+unchanged.
+
 This fixture uses explicitly pinned binaries and a fixed, owned workload.
 It leaves strict disabled and unverified. The supported-runtime profile,
 graceful-stop escalation, listener gates, and production launcher ownership

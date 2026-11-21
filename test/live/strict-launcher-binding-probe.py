@@ -7,34 +7,19 @@ import json
 import os
 from pathlib import Path
 import runpy
-import select
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
-import time
 
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / 'strict-launcher-binding-worker.mjs'
-MAX_REPORT = 512
+protected = runpy.run_path(str(HERE.parent.parent / 'lib' / 'strict-protected-generation.py'))
+stage_generation, read_json = protected['stage_generation'], protected['read_json']
 MAX_RECOVERY_REQUEST = 1024
 TIMEOUT = 6
 UNAVAILABLE = {'kind': 'rejected', 'code': 'unavailable'}
-
-
-def read_json(reader):
-    data = bytearray()
-    deadline = time.monotonic() + TIMEOUT
-    while True:
-        if not select.select([reader], [], [], max(0, deadline - time.monotonic()))[0]:
-            raise RuntimeError('missing report EOF')
-        chunk = os.read(reader.fileno(), MAX_REPORT + 1 - len(data))
-        if not chunk:
-            return json.loads(data)
-        data.extend(chunk)
-        if len(data) > MAX_REPORT:
-            raise RuntimeError('oversize report')
 
 
 def encode_request(request):
@@ -46,44 +31,6 @@ class Enrollment:
     directory: Path
     identity: str
     expected: dict
-
-
-@dataclass(eq=False)
-class Generation:
-    enrollment: Enrollment
-    authority: subprocess.Popen
-    console: subprocess.Popen
-    reader: object
-    descriptors: frozenset
-    consumed: bool = False
-    refresh_reader: object = None
-    refresh_request: object = None
-
-    def report(self):
-        # Only the designated console inherited this pipe's single writing end.
-        with self.reader:
-            return Report(self, read_json(self.reader))
-
-    def fresh_report(self):
-        # The same console owns a distinct pipe for its second state observation.
-        requested_at = time.monotonic_ns()
-        with self.refresh_request:
-            self.refresh_request.write(b'R')
-        with self.refresh_reader:
-            return Report(self, read_json(self.refresh_reader), sequence=1, requested_at=requested_at)
-
-    def close_reports(self):
-        for pipe in (self.reader, self.refresh_reader, self.refresh_request):
-            if pipe is not None:
-                pipe.close()
-
-
-@dataclass(frozen=True)
-class Report:
-    origin: Generation
-    state: dict
-    sequence: int = 0
-    requested_at: int | None = None
 
 
 def snapshot(enrollments):
@@ -117,35 +64,18 @@ class Launcher:
         if self.current is not None:
             self.current.close_reports()
         self.current = None
-        with ExitStack() as stack, ExitStack() as held:
-            left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-            stack.enter_context(left)
-            stack.enter_context(right)
-            ordinary_descriptors = {os.readlink(f'/proc/self/fd/{endpoint.fileno()}') for endpoint in (left, right)}
-            authority_role = 'managed-authority' if approved else 'authority'
-            authority = self.spawn([self.node, WORKER, authority_role, directory or enrollment.directory,
-                                    enrollment.identity, str(left.fileno())], (left.fileno(),))
-            left.close()
-            read, write = os.pipe()
-            reader = held.enter_context(os.fdopen(read, 'rb', buffering=0))
-            stack.enter_context(os.fdopen(write, 'wb', buffering=0))
-            console_role = 'restart-console' if approved else 'console'
-            console_fds = [right.fileno(), write]
-            refresh_reader = refresh_request = None
-            if approved:
-                signal_read, signal_write = os.pipe()
-                stack.enter_context(os.fdopen(signal_read, 'rb', buffering=0))
-                refresh_request = held.enter_context(os.fdopen(signal_write, 'wb', buffering=0))
-                refresh_read, refresh_write = os.pipe()
-                refresh_reader = held.enter_context(os.fdopen(refresh_read, 'rb', buffering=0))
-                stack.enter_context(os.fdopen(refresh_write, 'wb', buffering=0))
-                console_fds.extend((signal_read, refresh_write))
-            ordinary_descriptors.update(os.readlink(f'/proc/self/fd/{fd}') for fd in console_fds)
-            console = self.spawn([self.node, WORKER, console_role, enrollment.directory, enrollment.identity,
-                                  *map(str, console_fds)], tuple(console_fds))
-            self.current = Generation(enrollment, authority, console, reader, frozenset(ordinary_descriptors),
-                                      refresh_reader=refresh_reader, refresh_request=refresh_request)
-            held.pop_all()  # Generation owns the parent ends after successful setup.
+        authority_role = 'managed-authority' if approved else 'authority'
+        console_role = 'restart-console' if approved else 'console'
+
+        def launch_authority(fd):
+            return self.spawn([self.node, WORKER, authority_role, directory or enrollment.directory,
+                               enrollment.identity, str(fd)], (fd,))
+
+        def launch_console(fds):
+            return self.spawn([self.node, WORKER, console_role, enrollment.directory, enrollment.identity,
+                               *map(str, fds)], fds)
+
+        self.current = stage_generation(enrollment, launch_authority, launch_console, refresh=approved)
         return self.current
 
     def recover(self, enrollment, request, *, identity=None, close_request=True, ordinary=None):

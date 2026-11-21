@@ -152,7 +152,10 @@ allow the wrong-context open or a later replacement to satisfy `state()`.
 The launcher binding fixture exercises provenance and exact capture for owned
 fixture children. The [authority-child adapter](strict-authority-child.md)
 adds a separate one-shot recovery fixture around the host history guard.
-Both leave supported-runtime supervision and restart open.
+The [namespace admission fixture](strict-namespace-admission.md) connects
+the owned peers and dedicated console pipes to the live runtime check,
+stored-capture admission and supervisor restart proof. Supported-runtime
+supervision and the production launcher remain open.
 
 | Setup or fault | Required observation |
 | --- | --- |
@@ -172,7 +175,7 @@ This assumes trusted host processes and protected dependencies. Directory
 permissions and ordered startup do not defend against a hostile same-UID
 host process or detect storage rollback. Choosing the control terminal,
 qualifying a supported profile, establishing external integrity and
-proving the supervisor and reporting mechanisms remain separate work.
+validating supervision in that supported profile remain separate work.
 
 Related contracts: [protected bootstrap](strict-protected-bootstrap.md),
 [inherited command channel](strict-human-channel-transport.md),

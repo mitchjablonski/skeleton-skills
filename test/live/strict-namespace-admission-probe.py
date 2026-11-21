@@ -89,6 +89,9 @@ class NamespaceLauncher(CaptureLauncher):
         if namespace is None:
             return None
         lifecycle['alive_at_fault'](namespace)
+        if not self.peers_live(generation):
+            self.supervisor.stop(namespace)
+            return None
         self.active = NamespaceFill(generation, namespace['process'], namespace)
         self.fills.append(self.active)
         return namespace['digests']
@@ -106,6 +109,40 @@ class NamespaceLauncher(CaptureLauncher):
             capture['Launcher'].cleanup(self)
 
 
+ENROLLMENT_REFUSALS = ('wrong-enrollment', 'stale-generation', 'lost-authority', 'lost-console')
+
+
+def refuse_enrollment(launcher, selected, first_stage, case):
+    source = selected
+    if case == 'wrong-enrollment':
+        source = launcher.prepare_approved(case + '-other', 'other')
+        assert source.expected == selected.expected
+    before = capture['snapshot']((selected, source))
+    generation = launcher.stage(selected, source.directory, approved=True)
+    report = generation.report()
+    if case == 'wrong-enrollment':
+        assert generation.authority.wait(capture['TIMEOUT']) == 23
+        assert report.state == capture['UNAVAILABLE']
+    else:
+        assert report.state == selected.expected and launcher.peers_live(generation)
+        if case == 'stale-generation':
+            generation.close_reports()
+            for peer in (generation.console, generation.authority):
+                peer.kill()
+                peer.wait(capture['TIMEOUT'])
+            current = launcher.stage(selected, approved=True)
+            assert current.report().state == selected.expected and launcher.peers_live(current)
+        else:
+            peer = generation.authority if case == 'lost-authority' else generation.console
+            peer.kill()
+            peer.wait(capture['TIMEOUT'])
+    owned_children = len(launcher.children)
+    assert launcher.admit_capture(selected, report, first_stage) is None
+    assert len(launcher.children) == owned_children
+    assert not launcher.run.namespaces and not launcher.fills and not first_stage.exists()
+    assert capture['snapshot']((selected, source)) == before
+
+
 def exercise(node, scratch, case, check_runtime=None):
     if check_runtime is not None:
         check_runtime()
@@ -113,6 +150,10 @@ def exercise(node, scratch, case, check_runtime=None):
     try:
         selected = launcher.prepare_approved(case, 'selected')
         directory = selected.directory.parent
+        first_stage = directory / 'stage-first'
+        if case in ENROLLMENT_REFUSALS:
+            refuse_enrollment(launcher, selected, first_stage, case)
+            return
         candidate = directory / 'candidate'
         expected = {name: sha256((candidate / name).read_bytes()).hexdigest()
                     for name in capture['MEMBERS']}
@@ -121,7 +162,6 @@ def exercise(node, scratch, case, check_runtime=None):
         generation = launcher.stage(selected, approved=True)
         initial = generation.report()
         assert initial.state == selected.expected
-        first_stage = directory / 'stage-first'
         assert launcher.admit_capture(selected, initial, first_stage) == expected
         first = launcher.active
         namespace = first.namespace
@@ -181,6 +221,8 @@ def main():
     parser.add_argument('--bwrap-sha256', required=True)
     parser.add_argument('--runtime-receipt', type=Path,
                         help='require the preselected canonical fixture receipt before admission')
+    parser.add_argument('--protected-launcher', action='store_true',
+                        help='require a runtime receipt and also exercise enrollment and peer refusals')
     args = parser.parse_args()
     if (sys.platform != 'linux' or sys.flags.optimize
             or Path(sys.executable).resolve() != Path('/usr/bin/python3').resolve()
@@ -192,6 +234,8 @@ def main():
     if node_error or bwrap_error:
         parser.error('fixture executable pin refused')
     try:
+        if args.protected_launcher and args.runtime_receipt is None:
+            raise RuntimeRefused('runtime-selection-required')
         selection = read_runtime_selection(args.runtime_receipt) if args.runtime_receipt is not None else None
     except RuntimeRefused as exc:
         print(json.dumps({'ok': False, 'strictState': 'unverified', 'code': str(exc)}))
@@ -199,6 +243,8 @@ def main():
     scratch = Path(tempfile.mkdtemp(prefix='strict-namespace-admission-')).resolve()
     check_runtime = runtime_check(selection, node, scratch) if args.runtime_receipt is not None else None
     cases = ('restart', 'partial-stop', 'borrowed-namespace-stop', 'report-before-stop')
+    if args.protected_launcher:
+        cases += ENROLLMENT_REFUSALS
     try:
         for case in cases:
             exercise(node, scratch, case, check_runtime)
