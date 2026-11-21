@@ -41,3 +41,23 @@ attempt. Synthetic self-tests cover selected receipt comparison, the
 pre-version pin ordering, and cleanup refusal. Preflight uses trusted host
 paths while observing the runtime. An executable or path replacement
 between hashing and execution remains outside the fixture's proof.
+
+## Passive terminal metadata for #79
+
+Run `/usr/bin/python3 -I test/live/strict-terminal-profile-evidence.py` on
+the Linux host that supplies the receipt. Record the result as a separate
+observation alongside the receipt for that run. The helper reads
+`dev.tty.legacy_tiocsti` without terminal input or a settings change. It
+reports `0` (legacy behavior disabled), `1` (legacy behavior enabled) or
+`not-exposed` (the active procfs view exposes no setting). A missing setting
+leaves the effective behavior unknown. The helper checks that procfs reports
+the running kernel and requires the terminal sysctl directory to exist before
+recording absence. An unavailable, unreadable or malformed value refuses.
+Run the same command with `--self-test` for synthetic value, absence and
+read-failure checks. This leaves the v1 receipt and selected fingerprint
+unchanged.
+
+On 2026-11-21, the WSL2 host reported `0` on kernel
+`6.6.87.2-microsoft-standard-WSL2` (`x86_64`). This kernel setting is
+passive evidence. N2 and C18 still need the selected terminal's behavioral
+evidence before any qualification decision.
