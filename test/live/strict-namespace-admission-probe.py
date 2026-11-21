@@ -9,6 +9,7 @@ from pathlib import Path
 import runpy
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -17,6 +18,41 @@ HERE = Path(__file__).resolve().parent
 capture = runpy.run_path(str(HERE / 'strict-capture-admission-probe.py'))
 lifecycle = runpy.run_path(str(HERE / 'strict-lifecycle-fault-probe.py'))
 CaptureLauncher = capture['CaptureLauncher']
+MAX_RECEIPT_BYTES = 512 * 1024
+
+
+class RuntimeRefused(Exception):
+    pass
+
+
+def read_runtime_selection(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise RuntimeRefused('runtime-selection-invalid')
+            data = source.read(MAX_RECEIPT_BYTES + 1)
+        if len(data) > MAX_RECEIPT_BYTES:
+            raise RuntimeRefused('runtime-selection-invalid')
+        return json.loads(data.decode('utf-8'))
+    except (OSError, ValueError, RecursionError) as exc:
+        raise RuntimeRefused('runtime-selection-invalid') from exc
+
+
+def runtime_check(selection, node, scratch):
+    observer = runpy.run_path(str(HERE / 'strict-runtime-receipt.py'))['observe_pinned_runtime']
+    select = runpy.run_path(str(HERE / 'strict-runtime-selection.py'))['select_runtime']
+
+    def check():
+        def observe(pins):
+            return observer(node, node, scratch, pins, client_role='node-channel-control',
+                            client_entrypoint=capture['WORKER'])
+
+        result = select(selection, observe)
+        if result['kind'] != 'runtime-selected':
+            raise RuntimeRefused(result['code'])
+
+    return check
 
 
 @dataclass(eq=False)
@@ -32,11 +68,16 @@ class NamespaceStop:
 
 
 class NamespaceLauncher(CaptureLauncher):
-    def __init__(self, node, scratch):
+    def __init__(self, node, scratch, check_runtime):
         super().__init__(node, scratch)
         self.run = lifecycle['Run'](scratch)
+        self.check_runtime = check_runtime
 
     def start_fill(self, generation, stage):
+        if self.check_runtime is not None:
+            self.check_runtime()
+            if not self.peers_live(generation):
+                return None
         namespace = lifecycle['start_namespace'](self.run, stage.name, stage=stage)
         lifecycle['alive_at_fault'](namespace)
         self.active = NamespaceFill(generation, namespace['process'], namespace)
@@ -75,8 +116,10 @@ class NamespaceLauncher(CaptureLauncher):
             capture['Launcher'].cleanup(self)
 
 
-def exercise(node, scratch, case):
-    launcher = NamespaceLauncher(node, scratch)
+def exercise(node, scratch, case, check_runtime=None):
+    if check_runtime is not None:
+        check_runtime()
+    launcher = NamespaceLauncher(node, scratch, check_runtime)
     try:
         selected = launcher.prepare_approved(case, 'selected')
         directory = selected.directory.parent
@@ -147,6 +190,8 @@ def main():
     parser.add_argument('--node', required=True)
     parser.add_argument('--node-sha256', required=True)
     parser.add_argument('--bwrap-sha256', required=True)
+    parser.add_argument('--runtime-receipt', type=Path,
+                        help='require the preselected canonical fixture receipt before admission')
     args = parser.parse_args()
     if (sys.platform != 'linux' or sys.flags.optimize
             or Path(sys.executable).resolve() != Path('/usr/bin/python3').resolve()
@@ -157,16 +202,31 @@ def main():
     _, _, bwrap_error = pin('/usr/bin/bwrap', args.bwrap_sha256, 'bwrap')
     if node_error or bwrap_error:
         parser.error('fixture executable pin refused')
+    try:
+        selection = read_runtime_selection(args.runtime_receipt) if args.runtime_receipt is not None else None
+    except RuntimeRefused as exc:
+        print(json.dumps({'ok': False, 'strictState': 'unverified', 'code': str(exc)}))
+        raise SystemExit(2)
     scratch = Path(tempfile.mkdtemp(prefix='strict-namespace-admission-')).resolve()
+    check_runtime = runtime_check(selection, node, scratch) if args.runtime_receipt is not None else None
     cases = ('restart', 'partial-stop', 'borrowed-namespace-stop', 'report-before-stop')
     try:
         for case in cases:
-            exercise(node, scratch, case)
+            exercise(node, scratch, case, check_runtime)
+    except RuntimeRefused as exc:
+        code = str(exc)
+        if code == 'runtime-observation-cleanup-unproven':
+            print('Runtime cleanup unproven. Retained scratch at ' + str(scratch), file=sys.stderr)
+        else:
+            shutil.rmtree(scratch)
+        print(json.dumps({'ok': False, 'strictState': 'unverified', 'code': code}))
+        raise SystemExit(2)
     except BaseException:
         print('Fixture failed. Retained scratch at ' + str(scratch), file=sys.stderr)
         raise
     shutil.rmtree(scratch)
-    print(json.dumps({'ok': True, 'strictState': 'unverified', 'cases': cases, 'durableBytesUnchanged': True}))
+    print(json.dumps({'ok': True, 'strictState': 'unverified', 'cases': cases, 'durableBytesUnchanged': True,
+                      'runtimeReceiptChecked': check_runtime is not None}))
 
 
 if __name__ == '__main__':
