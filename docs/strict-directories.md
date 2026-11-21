@@ -15,15 +15,14 @@ writer first (the launcher's physical stop comes before cleanup).
 `prepareDurableHistory(root, { firstEnrollment })`:
 - **Reopen (the default).** The root must hold **exactly** `authority/` and
   `captures/`. Each must be private, ours, not a symlink, on the root's
-  device (so nothing is mounted under it) and on an allowed filesystem.
+  device and on an allowed filesystem.
   Nothing is created. Missing, incomplete or unexpected entries refuse.
-- **First enrollment** (`firstEnrollment: true`). The root must not exist.
-  The layout is built in a private temporary sibling, fsynced, renamed into
-  place, and then the parent is fsynced. If anything fails, the temporary
-  directory is removed and no half-made root is left. One limit: an empty
-  directory that a same-uid process races into the root path between the
-  last check and the rename would be replaced, because Node has no no-replace
-  rename.
+- **First enrollment** (`firstEnrollment: true`). An exclusive mkdir
+  creates the private root. The manager fsyncs it and its parent and returns
+  the absent leaf paths. The store constructors create `authority/` and
+  `captures/`. An incomplete enrollment is retained for outside-host
+  inspection. Reopen refuses incomplete layout, and a new enrollment attempt
+  refuses the existing root.
 - **Enrollment itself** (the record and its binding) is validated by the
   authority store in step 3, not by this module. A laid-out but empty
   history is not an enrolled one.
@@ -36,7 +35,8 @@ writer first (the launcher's physical stop comes before cleanup).
 - after creation, the **opened directory** is checked (private, ours), and
   the path must still name it. The filesystem is checked on both the parent
   and the new directory;
-- any failure during creation closes the handle and removes the directory;
+- a failure during creation closes the handle. Cleanup removes an empty
+  directory only if the path still identifies the pinned directory;
 - the handle **keeps the directory open** until removal, which pins its
   inode.
 
@@ -45,11 +45,11 @@ every writer into the scratch has exited. It then rechecks the ancestors and
 requires the path to still be the directory that was created. It deletes
 with its own walk, which **unlinks symlinks without following them** and
 refuses to descend onto a **different device**. A bind mount of the same
-filesystem shares the device and isn't detected; creating one needs mount
-privilege.
+filesystem shares the device. Keep the mount namespace stable and free of
+nested mounts before removal.
 
-Any other outcome returns `{ removed: false, retained, reason }` and keeps
-everything. The reason is one of:
+Any other outcome returns `{ removed: false, retained, reason }`. A failed
+walk can leave a partially cleaned scratch. The reason is one of:
 - `writers-not-stopped`;
 - `unsafe-ancestor`;
 - `scratch-missing`;

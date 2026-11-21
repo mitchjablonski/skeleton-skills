@@ -6,6 +6,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { prepareDurableHistory, createScratch, FILESYSTEM_TYPES } from "../lib/strict-directories.mjs";
+import { captureStrictManifest } from "../lib/strict-capture.mjs";
+import { createCaptureStore, openCaptureStore } from "../lib/strict-capture-store.mjs";
+import { HUMAN_AUTHORITY_POLICY } from "../lib/strict-human-authority.mjs";
+import { createHumanAuthorityStore, openHumanAuthorityStore } from "../lib/strict-human-authority-store.mjs";
 
 const linux = (name, fn) => test(name, { skip: process.platform !== "linux" }, fn);
 const refusal = (code) => (e) => e?.name === "DirectoryRefusal" && e.code === code;
@@ -17,18 +21,50 @@ function base(t) {
   return dir;
 }
 
-linux("first enrollment creates a private layout; reopen finds it and creates nothing", (t) => {
-  const root = path.join(base(t), "history");
+function layout(root) {
+  const made = prepareDurableHistory(root, { firstEnrollment: true });
+  for (const dir of [made.authority, made.captures]) fs.mkdirSync(dir, { mode: 0o700 });
+  return made;
+}
+
+linux("first enrollment reserves absent leaves for the real stores, then reopens", (t) => {
+  const dir = base(t);
+  const root = path.join(dir, "history");
   const made = prepareDurableHistory(root, { firstEnrollment: true });
   assert.equal(made.root, root);
-  for (const p of [made.root, made.authority, made.captures]) {
-    const st = fs.lstatSync(p);
-    assert.ok(st.isDirectory() && !st.isSymbolicLink());
-    assert.equal(st.mode & 0o777, 0o700);
-  }
+  assert.equal(fs.lstatSync(root).mode & 0o777, 0o700);
+  assert.deepEqual(fs.readdirSync(root), []);
+  assert.throws(() => prepareDurableHistory(root), refusal("durable-history-incomplete"));
+  const candidate = path.join(dir, "candidate");
+  fs.mkdirSync(candidate, { mode: 0o700 });
+  fs.writeFileSync(path.join(candidate, "plan.js"), "// SKEL[1] body\ninitial\n// /SKEL[1]\n");
+  const fd = fs.openSync(candidate, fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  let capture;
+  try { capture = captureStrictManifest(fd, [{ path: "plan.js", mode: "fenced" }]); }
+  finally { fs.closeSync(fd); }
+  const captureStore = createCaptureStore(made.captures);
+  captureStore.put(capture);
+  assert.throws(() => prepareDurableHistory(root), refusal("durable-history-incomplete"));
+  assert.equal(fs.existsSync(made.authority), false);
+  const context = { projectId: "directories", sessionId: "fixture" };
+  const state = {
+    ...context, protocolVersion: 2, reviewRoundId: "initial", phase: "skeleton", revision: 0,
+    reviewVersion: capture.shapeVersion, captureVersion: capture.captureVersion,
+    approvedVersion: null, approvedCaptureVersion: null,
+  };
+  const policy = {
+    policyVersion: HUMAN_AUTHORITY_POLICY, roundMismatchCap: 2, sessionMismatchCap: 4,
+    commandCap: 20, authorityCap: 10,
+  };
+  const observeUnderLock = () => { throw Error("unexpected observation"); };
+  createHumanAuthorityStore(made.authority, { state, policy }, { captureStore, observeUnderLock });
   const before = fs.readdirSync(root).sort();
   const reopened = prepareDurableHistory(root);
   assert.deepEqual(reopened, made);
+  const authority = openHumanAuthorityStore(reopened.authority, context, {
+    captureStore: openCaptureStore(reopened.captures), observeUnderLock,
+  });
+  assert.equal(authority.state().captureVersion, capture.captureVersion);
   assert.deepEqual(fs.readdirSync(root).sort(), before);
 });
 
@@ -55,7 +91,7 @@ linux("reopen refuses missing, incomplete, symlinked, foreign-mode or non-privat
   assert.equal(fs.existsSync(path.join(incomplete, "captures")), false);
 
   const real = path.join(dir, "real");
-  prepareDurableHistory(real, { firstEnrollment: true });
+  layout(real);
   const linked = path.join(dir, "linked");
   fs.symlinkSync(real, linked);
   assert.throws(() => prepareDurableHistory(linked), refusal("not-a-directory"));
@@ -109,7 +145,7 @@ linux("scratch is created fresh, refuses an existing path or dangling symlink, a
 
 linux("scratch removal removes only that scratch and never durable history; a swapped path is retained", (t) => {
   const dir = base(t);
-  const durable = prepareDurableHistory(path.join(dir, "history"), { firstEnrollment: true });
+  const durable = layout(path.join(dir, "history"));
   fs.writeFileSync(path.join(durable.captures, "blob"), "keep");
   const s = createScratch(path.join(dir, "scratch"), { durable });
   fs.mkdirSync(path.join(s.path, "nested"));
@@ -158,7 +194,7 @@ test("unsupported platform refuses", { skip: process.platform === "linux" }, () 
 
 linux("removal requires stopped writers, refuses after retain, and never follows a link inside scratch", (t) => {
   const dir = base(t);
-  const durable = prepareDurableHistory(path.join(dir, "history"), { firstEnrollment: true });
+  const durable = layout(path.join(dir, "history"));
   fs.writeFileSync(path.join(durable.captures, "blob"), "keep");
   const s = createScratch(path.join(dir, "scratch"), { durable });
   assert.deepEqual(s.remove(), { removed: false, retained: s.path, reason: "writers-not-stopped" });
@@ -176,7 +212,7 @@ linux("removal requires stopped writers, refuses after retain, and never follows
 linux("reopen requires exactly the layout, no symlinked or extra entries, all on one filesystem", (t) => {
   const dir = base(t);
   const root = path.join(dir, "history");
-  prepareDurableHistory(root, { firstEnrollment: true });
+  layout(root);
   fs.symlinkSync("/etc", path.join(root, "extra"));
   assert.throws(() => prepareDurableHistory(root), refusal("durable-history-unexpected-entry"));
   fs.unlinkSync(path.join(root, "extra"));
@@ -196,27 +232,13 @@ linux("reopen requires exactly the layout, no symlinked or extra entries, all on
   assert.equal(prepareDurableHistory(root).root, root);
 });
 
-linux("a rename failure after the temporary layout exists cleans the temporary directory up", (t) => {
-  const dir = base(t);
-  const failRename = { firstEnrollment: true, renameSync: () => { throw new Error("injected"); } };
-  assert.throws(() => prepareDurableHistory(path.join(dir, "history"), failRename), refusal("io-error"));
-  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes("enrolling") || n === "history"), [],
-    "neither the root nor the .history.enrolling-* temporary remains");
-});
-
-// Note: the device checks (a subdirectory or tree entry on another device) need a
-// real mount to exercise; the statfs mocks here cover only the filesystem-type check.
-linux("a failed first enrollment leaves no root and no temporary directory behind", (t) => {
-  const dir = base(t);
-  const parent = path.join(dir, "parent");
-  fs.mkdirSync(parent, { mode: 0o700 });
-  fs.chmodSync(parent, 0o500); // can't create inside
-  assert.throws(() => prepareDurableHistory(path.join(parent, "history"), { firstEnrollment: true }), refusal("io-error"));
-  fs.chmodSync(parent, 0o700);
-  assert.deepEqual(fs.readdirSync(parent), []);
-  const ok = prepareDurableHistory(path.join(parent, "history"), { firstEnrollment: true });
-  assert.deepEqual(fs.readdirSync(parent), ["history"], "only the root remains; the temporary sibling was renamed");
-  assert.equal(ok.root, path.join(parent, "history"));
+linux("validation failure after root creation retains it and refuses automatic enrollment", (t) => {
+  const root = path.join(base(t), "history");
+  const statfs = (p) => ({ type: p === root ? FILESYSTEM_TYPES.tmpfs : FILESYSTEM_TYPES.ext });
+  assert.throws(() => prepareDurableHistory(root, { firstEnrollment: true, statfs }), refusal("filesystem-not-allowed"));
+  assert.deepEqual(fs.readdirSync(root), []);
+  assert.throws(() => prepareDurableHistory(root, { firstEnrollment: true }), refusal("durable-history-exists"));
+  assert.throws(() => prepareDurableHistory(root), refusal("durable-history-incomplete"));
 });
 
 linux("scratch filesystem is checked on the created directory too, and a refusal leaves nothing behind", (t) => {
@@ -224,4 +246,19 @@ linux("scratch filesystem is checked on the created directory too, and a refusal
   const parentOkChildBad = (p) => ({ type: p.endsWith("scratch") ? 0x01021997 : FILESYSTEM_TYPES.ext });
   assert.throws(() => createScratch(path.join(dir, "scratch"), { statfs: parentOkChildBad }), refusal("filesystem-not-allowed"));
   assert.equal(fs.existsSync(path.join(dir, "scratch")), false, "the refused scratch was removed");
+});
+
+linux("scratch validation retains a replacement at the original pathname", (t) => {
+  const dir = base(t);
+  const scratch = path.join(dir, "scratch");
+  const displaced = path.join(dir, "displaced");
+  const statfs = (p) => {
+    if (p !== scratch) return { type: FILESYSTEM_TYPES.ext };
+    fs.renameSync(scratch, displaced);
+    fs.mkdirSync(scratch, { mode: 0o700 });
+    return { type: 0x01021997 };
+  };
+  assert.throws(() => createScratch(scratch, { statfs }), refusal("filesystem-not-allowed"));
+  assert.equal(fs.lstatSync(scratch).isDirectory(), true);
+  assert.equal(fs.lstatSync(displaced).isDirectory(), true);
 });
