@@ -114,6 +114,8 @@ class NamespaceLauncher(CaptureLauncher):
         return super().admit_capture(selected, report, stage, stop)
 
     def cleanup(self):
+        if self.admission is not None:
+            self.admission.invalidate()
         try:
             if not lifecycle['cleanup_run'](self.run):
                 raise RuntimeError('namespace cleanup unproven')

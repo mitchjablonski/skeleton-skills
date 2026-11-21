@@ -13,6 +13,7 @@ import tempfile
 
 HERE = Path(__file__).resolve().parent
 binding = runpy.run_path(str(HERE / 'strict-launcher-binding-probe.py'))
+LaunchAdmission = runpy.run_path(str(HERE.parent.parent / 'lib' / 'strict-launch-admission.py'))['LaunchAdmission']
 Launcher, Enrollment, WORKER, TIMEOUT, UNAVAILABLE, read_json, snapshot, encode_request = (
     binding[name] for name in ('Launcher', 'Enrollment', 'WORKER', 'TIMEOUT',
                                'UNAVAILABLE', 'read_json', 'snapshot', 'encode_request'))
@@ -42,7 +43,7 @@ class CaptureLauncher(Launcher):
         super().__init__(node, scratch)
         self.active = None
         self.stopped = {}
-        self.reports_used = set()
+        self.admission = None
         self.fills = []
 
     def prepare_approved(self, case, identity):
@@ -61,10 +62,17 @@ class CaptureLauncher(Launcher):
         self.stopped[child] = receipt
         return receipt
 
+    def stage(self, enrollment, directory=None, *, approved=False):
+        if self.admission is not None:
+            self.admission.invalidate()
+        generation = super().stage(enrollment, directory, approved=approved)
+        self.admission = LaunchAdmission(generation, enrollment.expected, self.peers_live)
+        return generation
+
     def admit_capture(self, selected, report, stage, stop=None):
         current = self.current
         previous = self.active
-        if previous is None and stop is not None:
+        if self.admission is None or (previous is None and stop is not None):
             return None
         if previous is not None and (previous.generation is not current
                                      or stop is None
@@ -72,25 +80,18 @@ class CaptureLauncher(Launcher):
                                      or previous.child.poll() is None):
             return None
         sequence = 0 if previous is None else 1
-        report_key = (current, sequence)
-        if (current is None or current is not report.origin or current.enrollment is not selected
-                or report.sequence != sequence or report_key in self.reports_used):
-            return None
-        self.reports_used.add(report_key)
-        expected = selected.expected
-        if json.dumps(report.state, sort_keys=True) != json.dumps(expected, sort_keys=True):
-            return None
-        if not self.peers_live(current):
-            return None
-        materializer = self.spawn([self.node, WORKER, 'materialize-approved', selected.directory,
-                                   selected.identity, stage, expected['reviewVersion'], expected['captureVersion']])
-        status = materializer.wait(TIMEOUT)
-        if status == 23:
-            return None
-        assert status == 0
-        if not self.peers_live(current):
-            return None
-        return self.start_fill(current, stage)
+
+        def materialize(review, capture):
+            process = self.spawn([self.node, WORKER, 'materialize-approved', selected.directory,
+                                  selected.identity, stage, review, capture])
+            status = process.wait(TIMEOUT)
+            if status == 23:
+                return False
+            assert status == 0
+            return True
+
+        return self.admission.admit(selected, report, sequence, materialize,
+                                    lambda generation: self.start_fill(generation, stage))
 
     def start_fill(self, generation, stage):
         read, write = os.pipe()
@@ -113,6 +114,8 @@ class CaptureLauncher(Launcher):
         return generation.authority.poll() is None and generation.console.poll() is None
 
     def cleanup(self):
+        if self.admission is not None:
+            self.admission.invalidate()
         for fill in self.fills:
             fill.lifetime.close()
         super().cleanup()
