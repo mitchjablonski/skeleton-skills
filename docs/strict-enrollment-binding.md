@@ -122,6 +122,8 @@ Prove the old namespace quiescent and complete the checkpoint gates before
 starting a fresh agent namespace from the verified stored approved bytes.
 A fresh state check must still agree with the expected checkpoint even when
 the same healthy peer connection is preserved.
+The [stored capture admission fixture](strict-capture-admission.md) exercises
+that sequence with an owned leaf and the existing authority and console.
 A planned replacement connection between the same healthy peers still needs
 a freshly created pair, one-use handoff and readiness check. A previous
 connection's sequence or readiness cannot carry forward. An actual peer
