@@ -73,12 +73,17 @@ class NamespaceLauncher(CaptureLauncher):
         self.run = lifecycle['Run'](scratch)
         self.check_runtime = check_runtime
 
-    def start_fill(self, generation, stage):
+    def start_owned_namespace(self, generation, label, *, stage=None):
         if self.check_runtime is not None:
             self.check_runtime()
             if not self.peers_live(generation):
                 return None
-        namespace = lifecycle['start_namespace'](self.run, stage.name, stage=stage)
+        return lifecycle['start_namespace'](self.run, label, stage=stage)
+
+    def start_fill(self, generation, stage):
+        namespace = self.start_owned_namespace(generation, stage.name, stage=stage)
+        if namespace is None:
+            return None
         lifecycle['alive_at_fault'](namespace)
         self.active = NamespaceFill(generation, namespace['process'], namespace)
         self.fills.append(self.active)
@@ -156,7 +161,8 @@ def exercise(node, scratch, case, check_runtime=None):
             stop = launcher.stop(namespace)
             (first_stage / 'plan.js').write_bytes(b'changed previous stage\n')
             if case == 'borrowed-namespace-stop':
-                unrelated = lifecycle['start_namespace'](launcher.run, 'unrelated')
+                unrelated = launcher.start_owned_namespace(generation, 'unrelated')
+                assert unrelated is not None
                 stop = launcher.stop(unrelated)
 
         if fresh is None:
