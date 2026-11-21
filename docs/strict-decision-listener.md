@@ -1,7 +1,9 @@
 # Prototype protected decision listener (#77)
 
-Status: **prototype, wired into nothing.** No production module imports or
-starts `lib/strict-decision-listener.mjs`, and no launcher exists to run it.
+Status: **prototype.** The opt-in [namespace admission fixture](strict-namespace-admission.md)
+starts the listener from an owned process and checks a read-only view from
+its selected stored capture. No production module imports or starts
+`lib/strict-decision-listener.mjs`.
 It has **no decision route**: no approve, reshape, finalize, Recapture or
 submit. It authenticates no human. Strict stays disabled.
 

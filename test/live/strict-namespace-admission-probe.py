@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import dataclass
 from hashlib import sha256
+from http.client import HTTPConnection, HTTPException
 import json
 import os
 from pathlib import Path
@@ -65,13 +66,69 @@ class NamespaceFill:
     namespace: dict
 
 
+@dataclass(frozen=True)
+class Listener:
+    process: object
+    port: int
+
+    def alive(self):
+        return self.process.poll() is None
+
+    def responds(self):
+        if not self.alive():
+            return False
+        connection = HTTPConnection('127.0.0.1', self.port, timeout=0.5)
+        try:
+            connection.request('GET', '/api/state', headers={'Sec-Fetch-Site': 'same-origin'})
+            response = connection.getresponse()
+            return (response.status == 403 and response.read(64) == b'{"error":"tab-binding"}'
+                    and self.alive())
+        except (OSError, HTTPException):
+            return False
+        finally:
+            connection.close()
+
+
 class NamespaceLauncher(CaptureLauncher):
-    def __init__(self, node, scratch, check_runtime, stop_mode=None):
+    def __init__(self, node, scratch, check_runtime, stop_mode=None, *, listener_required=False):
         super().__init__(node, scratch)
         self.run = lifecycle['Run'](scratch)
         self.check_runtime = check_runtime
         self.stop_mode = stop_mode
+        self.listener_required = listener_required
+        self.listener = None
         self.supervisor = StopHandoff(lifecycle['stop_namespace'], self.prove_stopped, lifecycle['STOP_BOUND'])
+
+    def stage_listener(self, enrollment, *, binding=None, role='decision-listener'):
+        if self.listener is not None:
+            raise RuntimeError('listener already staged')
+        selected = enrollment.expected if binding is None else binding
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, 'rb', buffering=0) as report:
+            try:
+                process = self.spawn([self.node, capture['WORKER'], role,
+                                      enrollment.directory / 'captures', enrollment.identity, str(write_fd),
+                                      selected['reviewVersion'], selected['captureVersion']], (write_fd,))
+            finally:
+                os.close(write_fd)
+            try:
+                ready = capture['read_json'](report)
+            except (OSError, RuntimeError, ValueError):
+                return
+        if set(ready) == {'port'} and type(ready['port']) is int and 1 <= ready['port'] <= 65535:
+            self.listener = Listener(process, ready['port'])
+
+    def listener_ready(self, *, check_response=True):
+        if not self.listener_required:
+            return True
+        if self.listener is None:
+            return False
+        return self.listener.responds() if check_response else self.listener.alive()
+
+    def admit_capture(self, selected, report, stage, stop=None):
+        if not self.listener_ready():
+            return None
+        return super().admit_capture(selected, report, stage, stop)
 
     @staticmethod
     def prove_stopped(namespace, deadline):
@@ -81,8 +138,8 @@ class NamespaceLauncher(CaptureLauncher):
     def start_owned_namespace(self, generation, label, *, stage=None):
         if self.check_runtime is not None:
             self.check_runtime()
-            if not self.peers_live(generation):
-                return None
+        if not self.peers_live(generation) or not self.listener_ready():
+            return None
         namespace = lifecycle['start_namespace'](self.run, label, stage=stage,
                                                  stop_mode=self.stop_mode if stage is not None else None)
         self.supervisor.own(namespace, namespace['process'])
@@ -93,7 +150,7 @@ class NamespaceLauncher(CaptureLauncher):
         if namespace is None:
             return None
         lifecycle['alive_at_fault'](namespace)
-        if not self.peers_live(generation):
+        if not self.peers_live(generation) or not self.listener_ready(check_response=False):
             self.supervisor.stop(namespace)
             return None
         self.active = NamespaceFill(generation, namespace['process'], namespace)
@@ -128,6 +185,7 @@ class NamespaceLauncher(CaptureLauncher):
 ENROLLMENT_REFUSALS = ('wrong-enrollment', 'stale-generation', 'lost-authority', 'lost-console')
 PLANNED_STOPS = {'graceful-restart': 'cooperative', 'forced-restart': 'stubborn',
                  'planned-proof-too-late': 'cooperative'}
+LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-invalid-readiness', 'listener-exited-before-start')
 
 
 class PeerLossLauncher(NamespaceLauncher):
@@ -167,18 +225,19 @@ def refuse_enrollment(launcher, selected, first_stage, case):
             peer.wait(capture['TIMEOUT'])
             assert survivor.poll() is None
     owned_children = len(launcher.children)
-    assert launcher.admit_capture(selected, report, first_stage) is None
+    # Exercise the enrollment gate directly so a missing listener cannot mask a regression.
+    assert CaptureLauncher.admit_capture(launcher, selected, report, first_stage) is None
     assert len(launcher.children) == owned_children
     assert not launcher.run.namespaces and not launcher.fills and not first_stage.exists()
     assert capture['snapshot']((selected, source)) == before
 
 
-def exercise(node, scratch, case, check_runtime=None):
+def exercise(node, scratch, case, check_runtime=None, *, protected=False):
     if check_runtime is not None:
         check_runtime()
     launcher_type = PeerLossLauncher if case == 'peer-loss-during-start' else NamespaceLauncher
     stop_mode = PLANNED_STOPS.get(case)
-    launcher = launcher_type(node, scratch, check_runtime, stop_mode)
+    launcher = launcher_type(node, scratch, check_runtime, stop_mode, listener_required=protected)
     try:
         selected = launcher.prepare_approved(case, 'selected')
         directory = selected.directory.parent
@@ -194,6 +253,28 @@ def exercise(node, scratch, case, check_runtime=None):
         generation = launcher.stage(selected, approved=True)
         initial = generation.report()
         assert initial.state == selected.expected
+        if protected:
+            binding = None
+            if case == 'listener-store-mismatch':
+                binding = {**selected.expected, 'reviewVersion': '0' * 64}
+            role = 'invalid-listener-ready' if case == 'listener-invalid-readiness' else 'decision-listener'
+            launcher.stage_listener(selected, binding=binding, role=role)
+            if case == 'listener-store-mismatch':
+                assert launcher.children[-1].wait(capture['TIMEOUT']) != 0
+                assert launcher.listener is None
+            elif case == 'listener-invalid-readiness':
+                assert launcher.children[-1].wait(capture['TIMEOUT']) == 0
+                assert launcher.listener is None
+            else:
+                assert launcher.listener_ready()
+        if case == 'listener-exited-before-start':
+            stop_listener(launcher)
+        if case in LISTENER_REFUSALS:
+            children = len(launcher.children)
+            assert launcher.admit_capture(selected, initial, first_stage) is None
+            assert len(launcher.children) == children and not launcher.run.namespaces and not first_stage.exists()
+            assert capture['snapshot']((selected,)) == before
+            return
         admitted = launcher.admit_capture(selected, initial, first_stage)
         if case == 'peer-loss-during-start':
             assert admitted is None and not launcher.fills and launcher.active is None
@@ -248,6 +329,8 @@ def exercise(node, scratch, case, check_runtime=None):
         if fresh is None:
             fresh = generation.fresh_report()
         assert fresh.state == selected.expected and launcher.peers_live(generation)
+        if case == 'listener-exited-before-restart':
+            stop_listener(launcher)
         next_stage = directory / 'stage-restart'
         if case in ('restart', 'graceful-restart', 'forced-restart'):
             assert launcher.admit_capture(selected, fresh, next_stage, stop) == expected
@@ -268,6 +351,13 @@ def exercise(node, scratch, case, check_runtime=None):
         assert capture['snapshot']((selected,)) == before
     finally:
         launcher.cleanup()
+
+
+def stop_listener(launcher):
+    listener = launcher.listener.process
+    listener.kill()
+    listener.wait(capture['TIMEOUT'])
+    assert not launcher.listener_ready()
 
 
 def main():
@@ -301,9 +391,10 @@ def main():
     cases = ('restart', 'partial-stop', 'borrowed-namespace-stop', 'report-before-stop')
     if args.protected_launcher:
         cases += ENROLLMENT_REFUSALS + ('peer-loss-during-start',) + tuple(PLANNED_STOPS)
+        cases += LISTENER_REFUSALS + ('listener-exited-before-restart',)
     try:
         for case in cases:
-            exercise(node, scratch, case, check_runtime)
+            exercise(node, scratch, case, check_runtime, protected=args.protected_launcher)
     except RuntimeRefused as exc:
         code = str(exc)
         if code == 'runtime-observation-cleanup-unproven':

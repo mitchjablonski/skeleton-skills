@@ -71,6 +71,17 @@ independent namespace proof and wrapper reap share one deadline. A proof
 attempt after that deadline cannot authorize another namespace. Faults and
 peer loss continue to use the immediate owned stop.
 
+The protected fixture starts the read-only decision listener as a separate
+owned process after console readiness. The worker checks its selected view
+against the immutable capture store and makes a private loopback view read
+before reporting its port on an inherited pipe. The launcher confirms the
+loopback response and requires the listener at initial admission and planned
+restart. It checks again before each namespace start. A mismatched stored
+view, malformed readiness report or dead listener refuses before new bytes
+are staged or a namespace starts. The startup tab is revoked before the
+report. The fixture exports no navigation link or decision capability.
+Closing an already admitted listener does not authorize another start.
+
 This fixture uses explicitly pinned binaries and a fixed, owned workload.
-It leaves strict disabled and unverified. The supported-runtime profile,
-listener gates, and production launcher ownership remain open.
+It leaves strict disabled and unverified. Browser-profile qualification,
+protected code issuance and production launcher ownership remain open.
