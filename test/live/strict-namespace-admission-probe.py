@@ -27,6 +27,8 @@ CaptureLauncher = capture['CaptureLauncher']
 handoff = runpy.run_path(str(HERE.parent.parent / 'lib' / 'strict-supervisor-handoff.py'))
 StopHandoff, StopUnproven = handoff['StopHandoff'], handoff['StopUnproven']
 MAX_RECEIPT_BYTES = 512 * 1024
+LISTENER_SCOPE = HERE / 'strict-owned-listener-scope.py'
+LISTENER_SCOPE_TIMEOUT = 12  # Allow the scope's bounded descendant reaping to finish.
 
 
 class RuntimeRefused(Exception):
@@ -89,11 +91,27 @@ class PeerWatch:
 
 
 @dataclass(frozen=True)
-class Listener:
+class ListenerScope:
     process: object
+    lifeline: object
+
+    def stop(self):
+        self.lifeline.close()
+        status = self.process.wait(LISTENER_SCOPE_TIMEOUT)
+        if status < 0 or status == 125:
+            raise RuntimeError('listener scope cleanup unproven')
+
+
+@dataclass(frozen=True)
+class Listener:
+    scope: ListenerScope
     port: int
     generation: object
     capture_versions: tuple
+
+    @property
+    def process(self):
+        return self.scope.process
 
     def alive(self):
         return self.process.poll() is None
@@ -123,6 +141,7 @@ class NamespaceLauncher(CaptureLauncher):
         self.terminal_mode = terminal_mode
         self.terminal = None
         self.listener = None
+        self.listener_scopes = []
         self.peer_fault = False
         self.peer_watch = None
         self.supervisor = StopHandoff(lifecycle['stop_namespace'], self.prove_stopped, lifecycle['STOP_BOUND'])
@@ -172,21 +191,25 @@ class NamespaceLauncher(CaptureLauncher):
         selected = enrollment.expected if binding is None else binding
         versions = selected['reviewVersion'], selected['captureVersion']
         read_fd, write_fd = os.pipe()
-        with os.fdopen(read_fd, 'rb', buffering=0) as report:
-            try:
-                process = self.spawn([self.node, capture['WORKER'], role,
-                                      enrollment.directory / 'captures', enrollment.identity, str(write_fd),
-                                      *versions], (write_fd,))
-            finally:
-                os.close(write_fd)
+        with os.fdopen(read_fd, 'rb', buffering=0) as report, ExitStack() as lifeline_owner:
+            with os.fdopen(write_fd, 'wb', buffering=0):
+                stop_read, stop_write = os.pipe()
+                lifeline = lifeline_owner.enter_context(os.fdopen(stop_write, 'wb', buffering=0))
+                with os.fdopen(stop_read, 'rb', buffering=0):
+                    process = self.spawn([sys.executable, '-I', LISTENER_SCOPE, str(stop_read), str(write_fd),
+                                          self.node, capture['WORKER'], role, enrollment.directory / 'captures',
+                                          enrollment.identity, str(write_fd), *versions], (stop_read, write_fd))
+                scope = ListenerScope(process, lifeline)
+                self.listener_scopes.append(scope)
+                lifeline_owner.pop_all()
             try:
                 ready = capture['read_json'](report)
             except (OSError, RuntimeError, ValueError):
                 return
         if set(ready) == {'port'} and type(ready['port']) is int and 1 <= ready['port'] <= 65535:
-            self.listener = Listener(process, ready['port'], self.current, versions)
+            self.listener = Listener(scope, ready['port'], self.current, versions)
 
-    def listener_ready(self, generation, *, check_response=True):
+    def listener_ready(self, generation):
         if not self.protected:
             return True
         listener = self.listener
@@ -195,7 +218,7 @@ class NamespaceLauncher(CaptureLauncher):
         expected = generation.enrollment.expected
         if listener.capture_versions != (expected['reviewVersion'], expected['captureVersion']):
             return False
-        return listener.responds() if check_response else listener.alive()
+        return listener.responds()
 
     def admit_capture(self, selected, report, stage, stop=None):
         if self.peer_fault or report is None:
@@ -226,7 +249,7 @@ class NamespaceLauncher(CaptureLauncher):
         if namespace is None:
             return None
         lifecycle['alive_at_fault'](namespace)
-        if not self.peers_live(generation) or not self.listener_ready(generation, check_response=False):
+        if not self.peers_live(generation) or not self.listener_ready(generation):
             self.supervisor.stop_fault(namespace, time.monotonic() + lifecycle['STOP_BOUND'])
             return None
         self.active = NamespaceFill(generation, namespace['process'], namespace)
@@ -305,7 +328,13 @@ class NamespaceLauncher(CaptureLauncher):
                 raise RuntimeError('namespace cleanup unproven')
         finally:
             try:
-                capture['Launcher'].cleanup(self)
+                with ExitStack() as cleanup:
+                    cleanup.callback(capture['Launcher'].cleanup, self)
+                    for scope in self.listener_scopes:
+                        # The generic launcher hard-kills children. Give each scope its
+                        # own stop and reaping path, including on readiness failure.
+                        self.children.remove(scope.process)
+                        cleanup.callback(scope.stop)
             finally:
                 if self.terminal is not None:
                     self.terminal.close()
@@ -314,7 +343,7 @@ class NamespaceLauncher(CaptureLauncher):
 ENROLLMENT_REFUSALS = ('wrong-enrollment', 'stale-generation', 'lost-authority', 'lost-console')
 PLANNED_STOPS = {'graceful-restart': 'cooperative', 'forced-restart': 'stubborn',
                  'planned-proof-too-late': 'cooperative'}
-LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-missing-selected-view',
+LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-missing-selected-view', 'listener-crashed-with-detached-child',
                      'listener-invalid-readiness', 'listener-exited-before-start',
                      'stale-listener-generation')
 STARTUP_FAULTS = ('peer-loss-during-start', 'listener-loss-before-namespace', 'listener-loss-after-namespace')
@@ -459,7 +488,9 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
             if case == 'listener-store-mismatch':
                 binding = {**selected.expected, 'reviewVersion': '0' * 64}
             role = {'listener-invalid-readiness': 'invalid-listener-ready',
-                    'listener-missing-selected-view': 'listener-missing-selected-view'}.get(case, 'decision-listener')
+                    'listener-missing-selected-view': 'listener-missing-selected-view',
+                    'listener-crashed-with-detached-child': 'listener-crashed-with-detached-child'}.get(
+                        case, 'decision-listener')
             launcher.stage_listener(selected, binding=binding, role=role)
             if case == 'listener-store-mismatch':
                 assert launcher.children[-1].wait(capture['TIMEOUT']) != 0
@@ -469,6 +500,11 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
                 assert launcher.listener is None
             elif case == 'listener-missing-selected-view':
                 assert launcher.children[-1].wait(capture['TIMEOUT']) == 23
+                assert launcher.listener is None
+            elif case == 'listener-crashed-with-detached-child':
+                assert launcher.children[-1].wait(LISTENER_SCOPE_TIMEOUT) == 128 + signal.SIGKILL
+                child_pid = int((scratch / 'listener-scope-test-child').read_text())
+                assert not (Path('/proc') / str(child_pid)).exists()
                 assert launcher.listener is None
             else:
                 assert launcher.listener_ready(generation)
@@ -591,9 +627,7 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
 
 
 def stop_listener(launcher):
-    listener = launcher.listener.process
-    listener.kill()
-    listener.wait(capture['TIMEOUT'])
+    launcher.listener.scope.stop()
 
 
 def hangup_terminal(launcher, generation):
