@@ -64,9 +64,33 @@ Before each poll it re-proves that the agent is alive and still owns the
 port. Only HTTP 200 responses are accepted. Agent death, lost ownership or
 a failed poll stops polling and fails the run. Each poll snapshots its phase
 before the request. At every phase change the fixture awaits the in-flight
-poll and discards its result, so an observation that crosses a boundary
-counts toward neither phase. The same settling happens before the handoff
-and control outcomes are classified.
+poll. A poll that crossed the boundary loses only its phase attribution,
+never its evidence. The same settling happens before the handoff and control
+outcomes are classified.
+
+**Boundary and idle polls.** Every discarded (boundary) poll and every
+`idle` poll is counted in a bucket keyed by the delivery epoch its request
+started in. The output reports per-bucket counts (`polls`, `boundaryPolls`,
+`originSeen`) under `boundaryIdlePolls`:
+- `launch`: before any deliberate delivery, which covers the launcher run
+  and its settling. An origin seen here fails the run;
+- `singleton`: started after the singleton handoff was launched. An origin
+  seen here is treated as a forward, conservatively, and is never ignored;
+- `control`: started after the negative control began. An origin is
+  expected here.
+
+The rule for a boundary poll that straddles the control phase depends on
+when its request started:
+- **into** control: the poll started in the earlier epoch, and the
+  `PUT /json/new` is sent only after it settles. Its origin counts against
+  that earlier epoch;
+- **out of** control: the poll started in the control epoch, so an origin
+  in it is expected.
+
+The test-only hook `SKEL_C20_TEST_INJECT_BOUNDARY_ORIGIN=1` records one
+synthetic discarded poll that saw the origin at the after-to-idle boundary.
+The measured run failed with exit 1: "listener origin seen in a boundary or
+idle poll before any deliberate delivery".
 
 The run requires:
 - polls in all three phases and no poll failure;
