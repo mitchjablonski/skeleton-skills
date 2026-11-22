@@ -42,6 +42,27 @@ pre-version pin ordering, and cleanup refusal. Preflight uses trusted host
 paths while observing the runtime. An executable or path replacement
 between hashing and execution remains outside the fixture's proof.
 
+## Record the protected fixture candidate (#216)
+
+Use preselected digests for Node, system Bubblewrap, and the fixed
+`test/live/strict-launcher-binding-worker.mjs` entrypoint. Use the existing
+directory on the same mount where the namespace fixture will create its
+scratch directory. This example observes the system temporary directory.
+
+```sh
+/usr/bin/python3 -I test/live/strict-runtime-receipt.py observe-node-channel \
+  --node "$NODE" --node-sha256 "$NODE_SHA256" \
+  --bwrap-sha256 "$BWRAP_SHA256" \
+  --binding-worker-sha256 "$BINDING_WORKER_SHA256" \
+  --scratch-root /tmp > observed-receipt.json
+```
+
+Exit 0 writes a canonical v1 receipt. Exit 2 writes a typed refusal for
+missing or mismatched observations, or for unproven metadata-helper
+cleanup. The command creates no fixture scratch and starts no namespace.
+Keep trusted runtime selection separate from recording. The protected
+namespace fixture also requires its own terminal entrypoint pin.
+
 ## Passive terminal metadata for #79
 
 Run `/usr/bin/python3 -I test/live/strict-terminal-profile-evidence.py` on

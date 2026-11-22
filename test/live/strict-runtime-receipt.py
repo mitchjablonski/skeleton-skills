@@ -1,4 +1,5 @@
 """Bounded configuration receipt; never a runtime support or authentication verdict."""
+import argparse
 import hashlib
 import json
 import os
@@ -308,8 +309,39 @@ def self_test():
                     raise AssertionError('unbounded/nonregular digest input accepted')
     print('strict-runtime-receipt self-test passed')
 
+def record_node_channel(argv):
+    parser = argparse.ArgumentParser(description='Record the pinned node-channel-control fixture runtime receipt.',
+                                     epilog='Pass --self-test by itself to run the existing collector checks.')
+    parser.add_argument('operation', choices=('observe-node-channel',))
+    parser.add_argument('--node', type=Path, required=True)
+    parser.add_argument('--node-sha256', required=True)
+    parser.add_argument('--bwrap-sha256', required=True)
+    parser.add_argument('--binding-worker-sha256', required=True)
+    parser.add_argument('--scratch-root', type=Path, required=True,
+                        help='existing directory on the mount used for fixture scratch')
+    args = parser.parse_args(argv)
+    pins = {'client_sha256': args.node_sha256, 'node_sha256': args.node_sha256,
+            'bwrap_sha256': args.bwrap_sha256, 'client_entrypoint_sha256': args.binding_worker_sha256}
+    worker = Path(__file__).resolve().with_name('strict-launcher-binding-worker.mjs')
+    try:
+        if not args.scratch_root.is_dir():
+            raise ReceiptUnavailable('scratch root unavailable')
+        observed = observe_pinned_runtime(args.node, args.node, args.scratch_root, pins,
+                                          client_role='node-channel-control', client_entrypoint=worker)
+    except (OSError, ReceiptUnavailable):
+        code = 'runtime-observation-unavailable'
+    else:
+        if observed != {'kind': 'cleanup-unproven'}:
+            print(json.dumps(observed, sort_keys=True, separators=(',', ':'), ensure_ascii=True))
+            return 0
+        code = 'runtime-observation-cleanup-unproven'
+    print(json.dumps({'ok': False, 'strictState': 'unverified', 'code': code}))
+    return 2
+
+
 if __name__ == '__main__':
-    if sys.argv[1:] != ['--self-test']:
-        raise SystemExit('usage: strict-runtime-receipt.py --self-test')
-    self_test()
+    if sys.argv[1:] == ['--self-test']:
+        self_test()
+    else:
+        raise SystemExit(record_node_channel(sys.argv[1:]))
 
