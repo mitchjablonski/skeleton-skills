@@ -33,10 +33,27 @@ LISTENER_SCOPE = HERE / 'strict-owned-listener-scope.py'
 LISTENER_SCOPE_TIMEOUT = 12  # Allow the scope's bounded descendant reaping to finish.
 WINDOW_READY_TIMEOUT = 18
 WINDOW_ROOT = Path('/dev/shm')
+WINDOW_STARTUP_REFUSALS = {
+    1: 'window-listener-startup-failed',
+    23: 'window-worker-startup-refused',
+    24: 'window-selected-view-missing',
+    25: 'window-browser-pin-mismatch',
+    26: 'window-display-startup-failed',
+    27: 'window-browser-verification-failed',
+    28: 'window-not-mapped',
+    125: 'window-listener-scope-unproven',
+}
 
 
 class RuntimeRefused(Exception):
     pass
+
+
+class WindowReadinessRefused(RuntimeRefused):
+    def __init__(self, code, phase, *, unavailable):
+        super().__init__(code)
+        self.phase = phase
+        self.unavailable = unavailable
 
 
 def read_runtime_selection(path):
@@ -133,6 +150,14 @@ class ListenerScope:
     lifeline: object
     window: OwnedWindow | None = None
 
+    def startup_refusal(self):
+        try:
+            # EOF can precede the subreaper's final exit status.
+            status = self.process.wait(timeout=LISTENER_SCOPE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return 'window-readiness-report-unavailable'
+        return WINDOW_STARTUP_REFUSALS.get(status, 'window-readiness-report-invalid')
+
     def stop(self):
         if self.window is not None:
             self.window.control.close()
@@ -159,17 +184,23 @@ class Listener:
         return self.process.poll() is None
 
     def responds(self):
+        return self.refusal() is None
+
+    def refusal(self):
         window = self.scope.window
-        if not self.alive() or (window is not None and not window.live()):
-            return False
+        if not self.alive():
+            return 'listener-exited'
+        if window is not None and not window.live():
+            return 'window-liveness-refused'
         connection = HTTPConnection('127.0.0.1', self.port, timeout=0.5)
         try:
             connection.request('GET', '/api/state', headers={'Sec-Fetch-Site': 'same-origin'})
             response = connection.getresponse()
-            return (response.status == 403 and response.read(64) == b'{"error":"tab-binding"}'
-                    and self.alive())
+            if response.status != 403 or response.read(64) != b'{"error":"tab-binding"}':
+                return 'listener-health-response-invalid'
+            return None if self.alive() else 'listener-exited'
         except (OSError, HTTPException):
-            return False
+            return 'listener-health-unavailable'
         finally:
             connection.close()
 
@@ -186,6 +217,7 @@ class NamespaceLauncher(CaptureLauncher):
         self.chrome_pin = chrome_pin
         self.terminal = None
         self.listener = None
+        self.listener_refusal = None
         self.listener_scopes = []
         self.peer_fault = False
         self.peer_watch = None
@@ -233,6 +265,7 @@ class NamespaceLauncher(CaptureLauncher):
             raise RuntimeError('listener requires the current enrollment')
         if self.listener is not None:
             raise RuntimeError('listener already staged')
+        self.listener_refusal = None
         selected = enrollment.expected if binding is None else binding
         versions = selected['reviewVersion'], selected['captureVersion']
         read_fd, write_fd = os.pipe()
@@ -267,21 +300,42 @@ class NamespaceLauncher(CaptureLauncher):
             try:
                 ready = (capture['read_json'](report) if window is None else
                          capture['read_json'](report, timeout=WINDOW_READY_TIMEOUT))
-            except (OSError, RuntimeError, ValueError):
+            except RuntimeError as error:
+                self.listener_refusal = ('listener-readiness-report-timeout' if str(error) == 'missing report EOF'
+                                         else 'listener-readiness-report-invalid')
+                return
+            except (OSError, ValueError):
+                self.listener_refusal = (scope.startup_refusal() if window is not None else
+                                         'listener-readiness-report-unavailable')
                 return
         if set(ready) == {'port'} and type(ready['port']) is int and 1 <= ready['port'] <= 65535:
             self.listener = Listener(scope, ready['port'], self.current, versions)
+        else:
+            self.listener_refusal = 'listener-readiness-report-invalid'
 
     def listener_ready(self, generation):
         if not self.protected:
             return True
         listener = self.listener
-        if listener is None or generation is None or listener.generation is not generation:
+        if listener is None:
+            self.listener_refusal = self.listener_refusal or 'listener-not-staged'
+            return False
+        if generation is None or listener.generation is not generation:
+            self.listener_refusal = 'listener-generation-mismatch'
             return False
         expected = generation.enrollment.expected
         if listener.capture_versions != (expected['reviewVersion'], expected['captureVersion']):
+            self.listener_refusal = 'listener-capture-mismatch'
             return False
-        return listener.responds()
+        self.listener_refusal = listener.refusal()
+        return self.listener_refusal is None
+
+    def require_listener(self, generation, *, phase='initial'):
+        if not self.listener_ready(generation):
+            if self.chrome_pin is not None:
+                raise WindowReadinessRefused(self.listener_refusal, phase,
+                                             unavailable=phase == 'initial' and self.listener is None)
+            raise AssertionError(self.listener_refusal)
 
     def admit_capture(self, selected, report, stage, stop=None):
         if self.peer_fault or report is None:
@@ -576,14 +630,13 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
             elif case in WINDOW_REFUSALS:
                 scope = launcher.listener_scopes[-1]
                 assert scope.process.wait(LISTENER_SCOPE_TIMEOUT) == WINDOW_REFUSALS[case]
+                assert launcher.listener_refusal == WINDOW_STARTUP_REFUSALS[WINDOW_REFUSALS[case]]
                 assert launcher.listener is None
                 assert (scope.window.profile / 'display-slot').exists() == (case == 'window-missing-view')
                 scope.stop()
                 assert not scope.window.profile.exists()
             else:
-                if chrome_pin is not None and launcher.listener is None:
-                    raise RuntimeRefused('protected-window-unavailable')
-                assert launcher.listener_ready(generation)
+                launcher.require_listener(generation)
             if case == 'window-replaced-generation':
                 old = launcher.listener.scope.window
                 generation = launcher.stage(selected, approved=True)
@@ -594,7 +647,8 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
                 terminal_host['read_console_status'](terminal.master, selected.expected)
                 assert not old.profile.exists()
                 launcher.stage_listener(selected)
-                assert launcher.listener_ready(generation) and launcher.listener.scope.window is not old
+                launcher.require_listener(generation, phase='replacement')
+                assert launcher.listener.scope.window is not old
         if case == 'listener-exited-before-start':
             stop_listener(launcher)
         if case == 'stale-listener-generation':
@@ -793,12 +847,16 @@ def main():
             exercise(node, scratch, case, check_runtime, protected=args.protected_launcher, chrome_pin=chrome_pin)
     except RuntimeRefused as exc:
         code = str(exc)
-        if code == 'runtime-observation-cleanup-unproven':
-            print('Runtime cleanup unproven. Retained scratch at ' + str(scratch), file=sys.stderr)
+        failed_window = isinstance(exc, WindowReadinessRefused) and not exc.unavailable
+        if failed_window or code == 'runtime-observation-cleanup-unproven':
+            print('Fixture refused. Retained scratch at ' + str(scratch), file=sys.stderr)
         else:
             shutil.rmtree(scratch)
-        print(json.dumps({'ok': False, 'strictState': 'unverified', 'code': code}))
-        raise SystemExit(2)
+        result = {'ok': False, 'strictState': 'unverified', 'code': code}
+        if isinstance(exc, WindowReadinessRefused):
+            result.update(case=case, phase=exc.phase)
+        print(json.dumps(result))
+        raise SystemExit(1 if failed_window else 2)
     except BaseException:
         print('Fixture failed. Retained scratch at ' + str(scratch), file=sys.stderr)
         raise
