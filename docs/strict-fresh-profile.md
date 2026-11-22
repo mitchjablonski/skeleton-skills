@@ -25,10 +25,20 @@ and would not satisfy C20.)
 
 **Browser pin.** The fixture resolves the Chrome or Chromium launcher to the
 ELF binary it executes; a wrapper script is resolved to its sibling `chrome`.
-It records that binary's SHA-256 and `--version`, and checks the running
-browser's `/proc/<pid>/exe` is that binary. With `--chrome-sha256`, a
-mismatch refuses with exit 2 (`browser-pin-mismatch`) before anything is
-launched. On the measured host the hash was
+It hashes that binary and, with `--chrome-sha256`, compares the digest
+**immediately, before the binary is ever run** (even `--version`). A
+mismatch refuses with exit 2 (`browser-pin-mismatch`).
+
+Scope of the pin:
+- only the `chrome` ELF is hashed, not its bundled shared libraries or the
+  crash handler;
+- the running browser's `/proc/<pid>/exe` is compared with the hashed file
+  **by path**, not by content. A swap by rename while the browser runs makes
+  `exe` read `<path> (deleted)`, so the comparison fails closed. A swap by
+  rename in the moment between hashing and launch is not detected, because
+  the new file has the same path.
+
+On the measured host the hash was
 `7ee5f9e4bf6674e3b19d8c7fb952aea78385e6ba6caa6330d62ed9821558cf6f`
 (Chrome 143.0.7499.192).
 
@@ -45,32 +55,48 @@ Chromium location.
 
 **Browser.** One headless run: `--headless=new --virtual-time-budget=10000
 --dump-dom <URL>`, in its own session, with **Chrome's default sandbox only**.
-There is no `--no-sandbox` fallback: if the sandboxed browser exits without
-a DOM, the run refuses with exit 2 (`browser-sandbox-unavailable`). Its
+There is no `--no-sandbox` fallback.
+
+**Classifying a failed run.** The debugging evidence is evaluated and
+recorded first. Exit 2 (`browser-sandbox-unavailable`) is returned only when
+all of these hold:
+- held listeners, `DevToolsActivePort` and debugging switches were all 0;
+- the browser exited with a numeric code (not a signal) and no DOM;
+- its captured stderr (bounded, never printed) matches Chrome's sandbox or
+  zygote failure text.
+
+Any other failed run is exit 1 (`browser-run-failed`), and the debugging
+block stays in the output. A real sandbox failure that ends in a signal is
+therefore exit 1, which fails closed. Its
 environment is only `HOME` (the scratch root), `PATH` and
 `DBUS_SESSION_BUS_ADDRESS=disabled:`. There are no display variables, so WSLg
 is never touched; the fixture checks the browser's `/proc/<pid>/environ`
 for them.
 
-**Remote debugging off, TCP only, sampled while the browser runs.** Every
-50 ms until the `--dump-dom` browser exits, the fixture collects the
-browser's processes: 5 to 12 samples per run on the measured host, and at
-least 2 are required. The processes are its session, its process tree, the
+**Remote debugging off, TCP only, sampled while the browser runs.** About
+every 50 ms plus scan time, until the `--dump-dom` browser exits, the fixture
+collects the browser's processes. The output reports the number of samples
+(5 or 6 per run on the measured host), and at least 2 are required. A
+listener that exists only between two samples is missed. The processes are its session, its process tree, the
 fixture's own children (reparented helpers) and any process naming the
 scratch root. For each sample:
-- no browser process command line contains `--remote-debugging` (any form);
+- no browser process command line contains `--remote-debugging` (any form).
+  An unreadable command line of a live browser process counts as
+  unverified and fails the run;
 - no `DevToolsActivePort` exists under the scratch root (checked again after
   exit);
 - no TCP listener is held. The fixture collects the listening (`0A`) inodes
   from `net/tcp` and `net/tcp6` of every network namespace seen through
   those pids, then reads each process's `/proc/<pid>/fd` socket inodes. The
   intersection must be empty. An unreadable descriptor or net table of a live
-  process fails the run. A read is retried once after 25 ms, so a process
-  caught mid-exit isn't counted;
-- at least one process is sandboxed (seccomp filter mode or its own user
-  namespace).
-
-Listeners opened and closed between two samples are not seen.
+  process fails the run, and so does any descriptor entry that fails with
+  anything but `ENOENT` or `ESRCH` (a vanished entry). A read is retried once
+  after 25 ms, so a process caught mid-exit isn't counted;
+- at least one process added a sandbox boundary beyond the probe's own: a
+  user namespace different from the probe's, or seccomp filtering when the
+  probe itself is unfiltered. An inherited filter is not counted. If the
+  probe can't read its own namespace or seccomp state, the sandbox evidence
+  is reported as `unavailable` and not required.
 
 **Positive rendering.** The fixture parses the dumped DOM:
 - the capture view (`data-strict-capture`) is present;
@@ -81,12 +107,14 @@ Listeners opened and closed between two samples are not seen.
 The virtual time budget lets the page's own binding script finish before the
 dump, as in the listener browser probe.
 
-**Negative control.** A second disposable headless browser starts in its own
-fresh directory with `--remote-debugging-address=127.0.0.1
---remote-debugging-port=0`. It goes through the same process collection and
-the same check, which must report at least one held TCP listener, at least
-one `DevToolsActivePort` and at least one debugging switch. Nothing connects
-to that port. Every run found 1, 1 and 5.
+**Negative control.** The same `--dump-dom` run, with
+`--remote-debugging-address=127.0.0.1 --remote-debugging-port=0` added, in
+its own fresh directory. It goes through the same sampling loop and totals.
+At least one sample must find a held TCP listener, at least one a
+`DevToolsActivePort` and at least one a debugging switch. With a debugging
+port, headless Chrome keeps running after the dump, so this run is sampled
+for a 4 s window and then stopped. Nothing connects to that port. Each run
+had 33 to 37 of about 35 samples showing each of the three.
 
 | Gate | Agent (Bubblewrap, `--unshare-net`) | Positive control (same worker, shared network namespace) |
 | --- | --- | --- |
@@ -117,9 +145,26 @@ watchdog fires. The run is abandoned, cleanup and its proof run, and the
 scratch root is removed once proven. The result is `interrupted` or
 `watchdog-aborted`, with exit 1. The outer process forwards those signals to
 the inner one, and its own 180 s timeout as SIGTERM. It sends SIGKILL only
-after a 45 s grace period. The test-only variable
-`SKEL_C20_TEST_PAUSE_AFTER_LAUNCH_MS` pauses while the negative-control browser
-is up, so a signal test can interrupt a live browser.
+after a 45 s grace period. An abandoned run
+that resolves in the background records nothing more. The interrupted
+status and exit code are set after cleanup, so a signal during cleanup of an
+otherwise passing run still ends `ok: false`, exit 1.
+
+**Test-only hooks.** Each one is labelled in the output, and a run using one
+never passes:
+- `SKEL_C20_TEST_ANNOUNCE_LAUNCH=1` writes a stderr marker once the primary
+  browser is up, for the signal test;
+- `SKEL_C20_TEST_MUTATION=debugging-then-kill` adds a debugging port to the
+  primary run and SIGKILLs it after 3 samples. The measured result: exit 1,
+  `browser-run-failed`, with the held listener, `DevToolsActivePort` and
+  switch kept in the output;
+- `SKEL_C20_TEST_MUTATION=sandbox-blocked` runs the primary browser under
+  Bubblewrap with user namespaces disabled. The measured result: exit 2,
+  `browser-sandbox-unavailable` (exit code 134, sandbox text, debugging
+  all 0);
+- `SKEL_C20_TEST_BROWSER=<file>` replaces the browser binary. A script that
+  would create a marker file, run with Chrome's hash, refused with exit 2 and
+  left no marker. Run with its own hash, it ran and the marker appeared.
 
 **Output.** One bounded JSON object: labels, booleans, counts and the binary
 hash, with no paths, nonces or cookies. Exceptions are reported as fixed
@@ -133,14 +178,16 @@ labels.
 ## Measured
 
 WSL2 (kernel 6.6), Chrome 143.0.7499.192 with its default sandbox, Node 20:
-- five consecutive runs passed, one of them with a matching `--chrome-sha256`;
-- each `--dump-dom` run was sampled 5 to 12 times with the browser up, with
-  up to 14 processes, 8 of them sandboxed. It showed 0 TCP listeners held,
-  0 debugging switches, no `DevToolsActivePort` and 0 unreadable tables;
+- three consecutive runs passed, one of them with a matching
+  `--chrome-sha256`;
+- each `--dump-dom` run was sampled 5 times with the browser up, with up to
+  14 processes, 6 or 7 of them adding a sandbox boundary. It showed 0 TCP
+  listeners held, 0 debugging switches, no `DevToolsActivePort` and 0
+  unreadable tables or command lines;
 - the agent got `ECONNREFUSED`, and the shared-network control got HTTP 505
   (the listener refuses HTTP/1.0);
 - a wrong `--chrome-sha256` refused with exit 2;
-- SIGINT to the probe's process group while the control browser was up ended
+- SIGINT to the probe's process group while the primary browser was up ended
   `interrupted` with exit 1, with no browser process left and the scratch
   root removed;
 - `/mnt/wslg/stderr.log` gained no lines.
