@@ -61,7 +61,7 @@ exits. The run requires:
 **Singleton handoff: what Chrome actually does.** With a second nonce, the
 fixture starts the pinned Chrome headless on the URL with the **agent's**
 data directory (`--user-data-dir=<agent dir>`, no `--dump-dom`).
-Headless Chrome 143 does **not** forward the URL to the running agent:
+On **headless Chrome 143** (the measured build) it does **not** forward the URL to the running agent:
 - the new process fails to create `SingletonLock` (`File exists`), logs
   "Failed to create a ProcessSingleton for your profile directory ...
   Aborting now", and exits with code 21 within about 100 ms;
@@ -75,7 +75,7 @@ forwarded, and the listener request count.
 check can detect a page arriving in the agent another way. With a third
 nonce, it opens the URL in the agent through CDP `PUT /json/new` on the
 agent's fixture-owned port. `/json/list` must then show a target with the
-listener origin; the listener also logs the agent's bind. If a future Chrome
+listener origin, and the listener must log at least one bind from the agent. That shows the exactly-one-bind check would catch a second consumer of a nonce. If a future Chrome
 does forward through the singleton, that forward is used as the control.
 
 **Cleanup, on a normal or signalled exit.** Between phases the fixture stops
@@ -123,6 +123,11 @@ Node 20:
 ## Not shown
 
 - The human's protected window, or the real launcher (#75).
+- A **windowed** agent browser on the same data directory. In normal
+  (non-headless) Chrome, a second launch forwards the URL to the running
+  instance through the process singleton. It isn't tested here because it
+  would need a non-headless browser; the lock refusal above was observed on
+  headless Chrome 143 only.
 - An agent reaching a browser through other channels: a CDP pipe it holds,
   extensions, shared files, or a debugging endpoint the fixture didn't
   start.

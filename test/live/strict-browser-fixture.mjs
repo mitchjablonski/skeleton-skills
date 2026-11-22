@@ -98,6 +98,16 @@ export function namingPids(needle) {
   }
   return out;
 }
+/** Processes with exactly `--user-data-dir=<dir>` as one whole argv element (no prefix collisions). */
+export function userDataDirPids(dir) {
+  const want = `--user-data-dir=${dir}`;
+  const out = [];
+  for (const p of allPids()) {
+    if (p === process.pid) continue;
+    try { if (readCmdline(p).toString("utf8").split("\0").includes(want) && live(stat(p))) out.push(p); } catch { /* gone or unreadable */ }
+  }
+  return out;
+}
 export function descendants(root) {
   const kids = new Map();
   for (const p of allPids()) { const s = stat(p); if (live(s)) kids.set(s.ppid, [...(kids.get(s.ppid) ?? []), p]); }
@@ -305,11 +315,11 @@ export function createFixture({ prefix }) {
   const guard = () => { if (state.aborted) throw new Fail("aborted"); };
   const ANNOUNCE = process.env.SKEL_C20_TEST_ANNOUNCE_LAUNCH === "1";
 
-  /** The processes that are certainly this launch's: its session, tree, those naming its own
-   *  directory, and crash handlers they reference by --crashpad-handler-pid. */
+  /** The processes that are certainly this launch's: its session, tree, those with exactly its
+   *  --user-data-dir argument, and crash handlers they reference by --crashpad-handler-pid. */
   function corePids(rec) {
     if (!rec.pid) return new Set();
-    const set = new Set([...sessionPids(rec.pid), ...descendants(rec.pid), ...namingPids(rec.dir)]);
+    const set = new Set([...sessionPids(rec.pid), ...descendants(rec.pid), ...userDataDirPids(rec.dir)]);
     if (live(stat(rec.pid))) set.add(rec.pid);
     for (const p of [...set]) {
       try { const m = /--crashpad-handler-pid=(\d+)/.exec(readCmdline(p).toString("latin1")); if (m && live(stat(Number(m[1])))) set.add(Number(m[1])); } catch { /* gone */ }

@@ -201,6 +201,8 @@ async function run(pin) {
       listenerBindsFromAgent: log.slice(beforeControl).filter((e) => e.url === "/api/bind").length };
   }
   expect(result.negativeControl.originSeenInAgent, "negative control: a page opened in the agent browser was not seen");
+  if (result.negativeControl.method === "cdp-json-new")
+    expect(result.negativeControl.listenerBindsFromAgent >= 1, "negative control: the listener did not log the agent's bind (a second consumer would go unseen)");
   poller.stop = true;
   await poller.done;
 
