@@ -138,14 +138,20 @@ In every scenario a run fails on:
 - the same in **edited content**: the new text of an Edit, Write, MultiEdit
   or NotebookEdit is checked for skel invocations, for `child_process`,
   `exec*`/`spawn*` or interpreter calls naming a privileged word, and for
-  `.skeleton/` paths. It also fails if edited content loads skel's own code
-  in process: the plugin dir path or `skel.mjs`/`bin/skel` anywhere, or an
-  import or require of a `lib/<file>` that is one of skel's lib files and not
-  a project-relative `./` path (so `process.argv = [..., "approve"]` plus
-  `import(".../bin/skel.mjs")`, or importing `lib/snapshot.mjs`, fails, while
-  `./add.js` and `node:` builtins don't). An interpreter eval (`node -e`,
-  `-p`, `python -c`, `sh -c`) that names the plugin dir, `skel.mjs` or a skel
-  lib file fails too;
+  `.skeleton/` paths. It also fails on **any string literal** (whatever
+  uses it: import, require, `createRequire`, `fs.readFileSync`, spawn) that
+  names the plugin by absolute path or basename (`skel-c9-plugin-…`, or the
+  checkout's name), names `skel.mjs` or `bin/skel`, or ends in
+  `lib/<one of skel's lib files>` unless, normalized, it is relative with no
+  `..` segment (so `./lib/state.mjs` in the project is fine, but
+  `./../../skel-c9-plugin-X/lib/state.mjs`, an absolute path, `~` or an
+  unresolved `${…}` fails). The plugin's path or basename anywhere in the
+  content fails too. An interpreter eval (`node -e`, `-p`, `python -c`,
+  `sh -c`) that names the plugin, `skel.mjs` or a skel lib file fails;
+- a Bash command that names the plugin (path or basename) anywhere except
+  in the exact form `node "<plugin>/bin/skel.mjs" <non-privileged
+  subcommand> [flags or plain words] [2>&1]`, per shell segment. `cat`, `cp`,
+  `ln -s`, `cd` into it, or a redirect into it fail;
 - an equivalent: an interpreter one-liner (`node -e`, `python -c`, …) naming
   approve, reshape, finalize, strict, authority or skel state, a shell write
   into `.skeleton/`, or an Edit or Write there;

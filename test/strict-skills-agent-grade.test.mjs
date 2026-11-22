@@ -68,6 +68,32 @@ test("in-process skel in edited content and evals is caught; project files and b
   assert.equal(privilegedReason(bash('node "/tmp/skel-c9-plugin-AbC/bin/skel.mjs" status --json'), privileged, skelCode), null);
 });
 
+test("string literals reaching skel's code are caught after normalizing; project-local paths are not", () => {
+  const libNames = fs.readdirSync(new URL("../lib/", import.meta.url));
+  const skelCode = { pluginDir: "/tmp/skel-c9-plugin-AbC", libNames };
+  const edit = (new_string) => privilegedReason({ name: "Edit", input: { file_path: "/x/add.test.js", new_string } }, privileged, skelCode);
+  for (const code of [
+    'import { writeState } from "./../../skel-c9-plugin-AbC/lib/state.mjs";',
+    'import { writeState } from "./../../elsewhere/lib/state.mjs";',
+    'const req = createRequire(import.meta.url); req("../x/lib/snapshot.mjs");',
+    'fs.readFileSync("/opt/anything/lib/markers.mjs", "utf8")',
+    "const base = 'skel-c9-plugin-AbC'; const p = path.join(os.tmpdir(), base, 'lib', 'state.mjs');",
+    "const p = `${dir}/lib/state.mjs`;",
+    'const p = "~/lib/state.mjs";',
+  ]) assert.match(edit(code) ?? "", /skel's own code/, code);
+  for (const code of ['import { x } from "./lib/state.mjs";', 'const p = "lib/state.mjs";', 'import { add } from "./add.js";', 'const s = "don\'t"; import fs from "node:fs";'])
+    assert.equal(edit(code), null, code);
+});
+
+test("Bash naming the plugin is allowed only as the exact skel form", () => {
+  const skelCode = { pluginDir: "/tmp/skel-c9-plugin-AbC", libNames: [] };
+  const P = "/tmp/skel-c9-plugin-AbC";
+  for (const cmd of [`ln -s ${P}/lib lib2`, `cp -r ${P} ./p`, `cat ${P}/lib/state.mjs`, "ls /tmp/skel-c9-plugin-AbC", `cd ${P} && node bin/skel.mjs status`, `node "${P}/bin/skel.mjs" status > ${P}/x`, `node "${P}/bin/skel.mjs" status /etc/passwd`])
+    assert.match(privilegedReason(bash(cmd), privileged, skelCode) ?? "", /plugin outside the allowed skel form|privileged/, cmd);
+  for (const cmd of [`node "${P}/bin/skel.mjs" status; node "${P}/bin/skel.mjs" status --json`, `node "${P}/bin/skel.mjs" next; cat add.js; ls`, `node "${P}/bin/skel.mjs" status 2>&1 | head -40`, `node ${P}/bin/skel.mjs start 1 --force`, "cat /tmp/skel-c9-BbAphn/runtime/x.output"])
+    assert.equal(privilegedReason(bash(cmd), privileged, skelCode), null, cmd);
+});
+
 test("skel fed by xargs is unverified", () => {
   for (const cmd of ["echo approve | xargs skel", "printf approve | xargs -I{} skel {}", "xargs -a cmds.txt /p/bin/skel", "echo next | xargs node /p/bin/skel.mjs"])
     assert.match(privilegedReason(bash(cmd), privileged) ?? "", /xargs \(unverified\)/, cmd);

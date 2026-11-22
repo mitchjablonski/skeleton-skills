@@ -67,6 +67,8 @@ export function privilegedReason(call, privileged, skelCode = {}) {
     if (sk) return `${sk}: ${short(cmd)}`;
     if (INTERPRETER.test(cmd) && PRIVILEGED_WORDS.test(cmd)) return `privileged equivalent through an interpreter: ${short(cmd)}`;
     if (INTERPRETER.test(cmd) && namesSkelCode(cmd, skelCode)) return `interpreter eval names skel's own code: ${short(cmd)}`;
+    const pb = pluginBashReason(cmd, privileged, skelCode);
+    if (pb) return `${pb}: ${short(cmd)}`;
     if (/(?:>|\btee\b|\bcp\b|\bmv\b|\brm\b|\bsed\s+-i|\btruncate\b|\bln\b)[^;|&]*\.skeleton\//.test(cmd)) return `writes skel state by shell: ${short(cmd)}`;
   }
   if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(name)) {
@@ -79,7 +81,7 @@ export function privilegedReason(call, privileged, skelCode = {}) {
     if (sk) return `${sk} in edited content of ${short(p, 60)}: ${short(content)}`;
     if ((INTERPRETER.test(content) || /child_process|\bexec(?:Sync|File|FileSync)?\s*\(|\bspawn(?:Sync)?\s*\(/.test(content)) && PRIVILEGED_WORDS.test(content))
       return `edited content runs a privileged equivalent in ${short(p, 60)}: ${short(content)}`;
-    const own = importsSkelCode(content, skelCode);
+    const own = literalSkelCode(content, skelCode);
     if (own) return `edited content loads skel's own code (${short(own, 60)}) in ${short(p, 60)}`;
     if (/\.skeleton[\\/]/.test(content)) return `edited content reaches skel state in ${short(p, 60)}: ${short(content)}`;
   }
@@ -89,32 +91,75 @@ export function privilegedReason(call, privileged, skelCode = {}) {
 const INTERPRETER = /\b(?:node|nodejs|python3?|deno|bun|perl|ruby|sh|bash)\b[^|;&]*\s(?:-e|-c|-p|--eval|--print)\b/;
 const PRIVILEGED_WORDS = /approve|reshape|finalize|strict|authority|state\.json|writeState|recordSkeleton/i;
 
-/**
- * skel's own code, for in-process use: `pluginDir` (the loaded plugin's
- * directory) and `libNames` (the basenames of its lib/*.mjs, from the caller).
- */
-function namesSkelCode(text, { pluginDir, libNames = [] } = {}) {
-  if (pluginDir && text.includes(pluginDir.replace(/\/+$/, ""))) return true;
-  if (/\bskel\.mjs\b|(?:^|[\\/])bin[\\/]skel\b/.test(text)) return true;
-  return libNames.some((n) => new RegExp(`(?:^|[\\s\\/'"\`])lib[\\/]${esc(n)}\\b`).test(text));
+/** The plugin's absolute path (no trailing slash) and basename, or nulls. */
+function pluginNames({ pluginDir } = {}) {
+  if (typeof pluginDir !== "string" || !pluginDir) return { dir: null, base: null };
+  const dir = pluginDir.replace(/[\\/]+$/, "");
+  return { dir, base: dir.split(/[\\/]/).pop() || null };
+}
+
+/** Whether `text` names the plugin: its absolute path or its basename. */
+function namesPlugin(text, skelCode) {
+  const { dir, base } = pluginNames(skelCode);
+  return !!((dir && text.includes(dir)) || (base && text.includes(base)));
 }
 
 /**
- * What edited content loads of skel's own code, or null: the plugin dir
- * anywhere, `skel.mjs` or `bin/skel` anywhere, or an import or require of a
- * `lib/<skel lib>.mjs` that isn't a project-relative `./` path. The project's
- * own files (`./add.js`) and node builtins don't match.
+ * A path that stays inside the project: relative, and with no `..` segment
+ * once normalized (`./lib/x.mjs`, `lib/x.mjs`). Anything absolute, with a
+ * `..`, a `~`, a URL scheme or an unresolved expansion is not.
  */
-export function importsSkelCode(text, skelCode = {}) {
-  const { pluginDir, libNames = [] } = skelCode;
-  if (pluginDir && text.includes(pluginDir.replace(/\/+$/, ""))) return "the plugin dir";
-  const named = /\bskel\.mjs\b|(?:^|[\\/'"`])bin[\\/]skel\b/.exec(text);
+export function projectLocal(spec) {
+  if (/^(?:[\\/]|~|[A-Za-z]:|[a-z][a-z0-9+.-]*:)/i.test(spec) || /[$`]/.test(spec)) return false;
+  return !spec.split(/[\\/]+/).some((seg) => seg === "..");
+}
+
+/** skel's own code named in a shell eval: the plugin, skel.mjs, bin/skel or a skel lib file. */
+function namesSkelCode(text, skelCode = {}) {
+  if (namesPlugin(text, skelCode)) return true;
+  if (/\bskel\.mjs\b|(?:^|[\\/])bin[\\/]skel\b/.test(text)) return true;
+  return (skelCode.libNames ?? []).some((n) => new RegExp(`(?:^|[\\s\\/'"\`])lib[\\/]${esc(n)}\\b`).test(text));
+}
+
+/**
+ * The first string literal in edited content that reaches skel's own code, or
+ * null. Every '…', "…" and `…` literal is checked, whatever uses it (import,
+ * require, createRequire, fs.readFileSync, spawn, …). A literal fails if it
+ * names the plugin (absolute path or basename), names `skel.mjs` or
+ * `bin/skel`, or ends in `lib/<one of skel's lib files>` unless it is a
+ * project-local path (projectLocal). Builtins and project files don't match.
+ */
+export function literalSkelCode(text, skelCode = {}) {
+  const libNames = skelCode.libNames ?? [];
+  // Anywhere in the content too, so a mis-paired quote can't hide them.
+  if (namesPlugin(String(text), skelCode)) return "the plugin dir";
+  const named = /\bskel\.mjs\b|(?:^|[\\/'"`])bin[\\/]skel\b/.exec(String(text));
   if (named) return named[0];
-  for (const m of text.matchAll(/(?:\bimport\s*\(\s*|\bfrom\s*|\bimport\s+|\brequire\s*\(\s*)(['"`])([^'"`\n]+)\1/g)) {
-    const spec = m[2];
-    if (spec.startsWith("./") || spec.startsWith("node:")) continue;
-    const base = /(?:^|[\\/])lib[\\/]([^\\/]+)$/.exec(spec);
-    if (base && libNames.includes(base[1])) return spec;
+  for (const m of String(text).matchAll(/'((?:\\.|[^'\\\n])*)'|"((?:\\.|[^"\\\n])*)"|`((?:\\.|[^`\\])*)`/g)) {
+    const lit = m[1] ?? m[2] ?? m[3] ?? "";
+    if (namesPlugin(lit, skelCode)) return lit;
+    if (/\bskel\.mjs\b|(?:^|[\\/])bin[\\/]skel\b/.test(lit)) return lit;
+    const tail = /(?:^|[\\/])lib[\\/]([^\\/]+)$/.exec(lit);
+    if (tail && libNames.includes(tail[1]) && !projectLocal(lit)) return lit;
+  }
+  return null;
+}
+
+/**
+ * Why a Bash command that names the plugin is not the one allowed form, or
+ * null. Every shell segment that names the plugin (path or basename) must be
+ * exactly `node "<plugin>/bin/skel.mjs" <non-privileged subcommand> [flags or
+ * plain words] [2>&1]`; anything else (`cat`, `cp`, `ln -s`, `node -e`, a
+ * path into lib/) fails.
+ */
+export function pluginBashReason(cmd, privileged, skelCode = {}) {
+  const { dir } = pluginNames(skelCode);
+  if (!dir || !namesPlugin(cmd, skelCode)) return null;
+  const allowed = new RegExp(`^node\\s+(["']?)${esc(dir)}/bin/skel\\.mjs\\1\\s+([a-z][a-z-]*)((?:\\s+(?:--?[A-Za-z][\\w-]*|[A-Za-z0-9_.=-]+))*)(?:\\s+2>&1)?$`);
+  for (const seg of cmd.split(/\s*(?:&&|\|\||;|\||\n)\s*/)) {
+    if (!namesPlugin(seg, skelCode)) continue;
+    const m = allowed.exec(seg.trim());
+    if (!m || privileged.includes(m[2])) return `names the plugin outside the allowed skel form`;
   }
   return null;
 }
