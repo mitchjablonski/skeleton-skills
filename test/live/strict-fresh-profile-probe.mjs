@@ -501,8 +501,9 @@ async function run(pin) {
 
   // Primary evidence: one --dump-dom run, no debugging switch, sampled while it runs.
   const beforeNav = log.length;
+  const windowNavigation = state.listener.mintWindowNavigation(binding);
   const mutationArgs = MUTATION === "debugging-then-kill" ? ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"] : [];
-  const main = launch("browser-data", [...mutationArgs, "--virtual-time-budget=10000", "--dump-dom", state.listener.mintNavigation()], { primary: true });
+  const main = launch("browser-data", [...mutationArgs, "--virtual-time-budget=10000", "--dump-dom", windowNavigation.url], { primary: true });
   state.exitCode = 1; result.code = "fixture-failed";
   result.dataDirectory = main.check;
   const agg = await sampleRun(main);
@@ -536,6 +537,8 @@ async function run(pin) {
   expect(/Showing stored capture/.test(result.rendering.status), "status does not say showing");
   expect(!result.rendering.imgInView && result.rendering.hostileTitleAsText, "hostile title not rendered as text");
   expect(result.rendering.bindOk && result.rendering.viewOk, "listener did not serve bind and view");
+  result.rendering.selectedViewObserved = windowNavigation.takeView();
+  expect(result.rendering.selectedViewObserved && !windowNavigation.takeView(), "missing or reusable selected listener view observation");
   if (!(await stopOwned())) state.cleanupOk = false;
   expect(sessionPids(main.pid).length === 0, "dump-dom browser session survived");
 

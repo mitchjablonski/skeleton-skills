@@ -30,7 +30,7 @@ async function setup(t, opts = {}) {
   const cap = realCapture();
   let clock = 1_000_000;
   const provider = opts.provider ?? { read: () => ({ binding: bindingFor(cap), capture: cap }) };
-  const l = createDecisionListener({ provider, now: () => clock });
+  const l = createDecisionListener({ provider, now: () => clock, observe: opts.observe });
   const { origin } = await l.start();
   t.after(() => l.close());
   const port = Number(new URL(origin).port);
@@ -192,6 +192,78 @@ lt("a provider failure or mismatched pair refuses with a code and leaks nothing"
   mode = "pair";
   const b = await s.req("GET", "/api/view", { ...s.api, [TAB_HEADER]: tab });
   assert.deepEqual([b.status, JSON.parse(b.text)], [503, { error: "VIEW_PAIR" }]);
+});
+
+lt("window navigation observes a finished matching view exactly once", async (t) => {
+  const s = await setup(t);
+  const binding = bindingFor(s.cap);
+  assert.throws(() => s.l.mintWindowNavigation({ ...binding, extra: true }), TypeError);
+  const navigation = s.l.mintWindowNavigation(binding);
+  assert.ok(Object.isFrozen(navigation));
+  binding.reviewRoundId = "changed-after-mint";
+  assert.equal(navigation.takeView(), false);
+
+  const bound = await s.bind(s.nonceOf(navigation.url));
+  assert.equal(bound.status, 200);
+  const headers = { ...s.api, [TAB_HEADER]: JSON.parse(bound.text).tab };
+  assert.equal(navigation.takeView(), false);
+  assert.equal((await s.req("GET", "/api/state", headers)).status, 200);
+  assert.equal(navigation.takeView(), false);
+  assert.equal((await s.req("GET", "/api/view", headers)).status, 200);
+  assert.equal(navigation.takeView(), true);
+  assert.equal(navigation.takeView(), false);
+  assert.equal((await s.req("GET", "/api/view", headers)).status, 200);
+  assert.equal(navigation.takeView(), false);
+});
+
+lt("new mismatched or failed views clear an untaken window observation", async (t) => {
+  const cap = realCapture();
+  const binding = bindingFor(cap);
+  let providedBinding = binding;
+  const s = await setup(t, { provider: { read() {
+    if (!providedBinding) throw new Error("provider unavailable");
+    return { binding: providedBinding, capture: cap };
+  } } });
+  const navigation = s.l.mintWindowNavigation(binding);
+  const bound = await s.bind(s.nonceOf(navigation.url));
+  assert.equal(bound.status, 200);
+  const headers = { ...s.api, [TAB_HEADER]: JSON.parse(bound.text).tab };
+  const getView = () => s.req("GET", "/api/view", headers);
+
+  assert.equal((await getView()).status, 200);
+  providedBinding = { ...binding, reviewRoundId: "another-round" };
+  assert.equal((await getView()).status, 200);
+  assert.equal(navigation.takeView(), false);
+
+  providedBinding = binding;
+  assert.equal((await getView()).status, 200);
+  providedBinding = null;
+  assert.equal((await getView()).status, 503);
+  assert.equal(navigation.takeView(), false);
+});
+
+lt("a superseded response cannot count, and closing invalidates a finished observation", async (t) => {
+  let replacement;
+  let supersedeOnFinish = true;
+  const s = await setup(t, { observe({ url, status }) {
+    if (url === "/api/view" && status === 200 && supersedeOnFinish) {
+      supersedeOnFinish = false;
+      replacement = s.l.mintWindowNavigation(bindingFor(s.cap));
+    }
+  } });
+  const navigation = s.l.mintWindowNavigation(bindingFor(s.cap));
+  const requestView = async (window) => {
+    const bound = await s.bind(s.nonceOf(window.url));
+    assert.equal(bound.status, 200);
+    return s.req("GET", "/api/view", { ...s.api, [TAB_HEADER]: JSON.parse(bound.text).tab });
+  };
+  assert.equal((await requestView(navigation)).status, 200);
+  assert.equal(navigation.takeView(), false);
+  assert.equal(replacement.takeView(), false);
+  assert.equal((await requestView(replacement)).status, 200);
+  await s.l.close();
+  assert.equal(replacement.takeView(), false);
+  assert.throws(() => s.l.mintWindowNavigation(bindingFor(s.cap)), /listener not started/);
 });
 
 lt("no decision routes, no preflight, no CORS headers, cookies grant nothing", async (t) => {
