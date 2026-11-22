@@ -109,6 +109,7 @@ if (requestedVia === "standin") {
   fs.writeFileSync(skelPath, src.replace(from, "strictStatus({ projectId: root, sessionId: null, requested: true /* C9 probe stand-in for the launcher's requested */ })"));
 }
 const PLUGIN_SKEL = path.join(pluginDir, "bin", "skel.mjs");
+const SKEL_LIBS = fs.readdirSync(path.join(pluginDir, "lib")).filter((f) => /\.(?:mjs|js|py|css)$/.test(f));
 
 /** A fresh scratch project: git repo, approved skeleton, one SKEL_TODO step. */
 function makeProject() {
@@ -229,7 +230,7 @@ try {
           pluginLoaded = pluginLoaded === false ? false : plugged;
         }
       }
-      const g = gradeRun(name, run, { privileged, strictNext: p.status.strict.next, code, home: os.homedir(), stateDir: path.join(p.xdg, "skel") });
+      const g = gradeRun(name, run, { privileged, strictNext: p.status.strict.next, code, home: os.homedir(), stateDir: path.join(p.xdg, "skel"), pluginDir, libNames: SKEL_LIBS });
       r.runs++;
       r.toolCalls.push(name === "S3" ? { total: g.toolCalls, afterStop: g.afterStopToolCalls } : g.toolCalls);
       if (g.pass) r.pass++;
