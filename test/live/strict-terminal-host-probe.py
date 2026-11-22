@@ -27,6 +27,52 @@ def acquire_terminal(terminal):
     fcntl.ioctl(terminal, termios.TIOCSCTTY, 0)
 
 
+def spawn_terminal_console(launcher, command, fds, terminal, mode):
+    owned_fds = (*fds, terminal)
+    # Node may abort restoring a hung-up standard stream. Keep the PTY on its own descriptor.
+    with (Path(command[3]).parent / 'console.err').open('ab') as errors:
+        child = subprocess.Popen([launcher.node, HOST_WORKER, mode, *map(str, owned_fds)],
+                                 pass_fds=owned_fds, env={}, cwd=launcher.scratch,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=errors, preexec_fn=lambda: acquire_terminal(terminal))
+    launcher.children.append(child)
+    return child
+
+
+class FixtureTerminal:
+    def __init__(self):
+        self._resources = ExitStack()
+        self.master, self.slave = os.openpty()
+        self._resources.callback(os.close, self.master)
+        self._resources.callback(os.close, self.slave)
+        self.process = None
+        self.closed = False
+        try:
+            self.original = termios.tcgetattr(self.slave)
+            self._resources.callback(self.restore)
+            tty.setraw(self.slave)
+            assert not termios.tcgetattr(self.slave)[3] & (termios.ECHO | termios.ICANON)
+        except BaseException:
+            self.close()
+            raise
+
+    def restore(self):
+        termios.tcsetattr(self.slave, termios.TCSANOW, self.original)
+        assert termios.tcgetattr(self.slave) == self.original
+
+    def close(self):
+        self.closed = True
+        self._resources.close()
+
+    def owns(self, generation):
+        if self.closed or self.process is not generation.console:
+            return False
+        try:
+            return os.tcgetpgrp(self.master) == generation.console.pid
+        except OSError:
+            return False
+
+
 class TerminalLauncher(Launcher):
     prepare_approved = capture['CaptureLauncher'].prepare_approved
 
@@ -40,15 +86,7 @@ class TerminalLauncher(Launcher):
         terminal, self.terminal = self.terminal, None
         if terminal is None:
             raise RuntimeError('terminal already used')
-        owned_fds = (*fds, terminal)
-        # On a hung-up Linux PTY, pinned Node can abort while restoring its standard streams.
-        # Keep the owned terminal on an explicit descriptor and use it as the controlling terminal.
-        with (Path(command[3]).parent / 'console.err').open('xb') as errors:
-            child = subprocess.Popen([self.node, HOST_WORKER, *map(str, owned_fds)], pass_fds=owned_fds, env={},
-                                     cwd=self.scratch, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                     stderr=errors, preexec_fn=lambda: acquire_terminal(terminal))
-        self.children.append(child)
-        return child
+        return spawn_terminal_console(self, command, fds, terminal, 'standalone')
 
 
 def fd_links(child):
@@ -79,52 +117,49 @@ def status_line(state):
             f"revision {state['revision']}.\r\n").encode()
 
 
+def check_terminal(master, slave, generation):
+    console, authority = generation.console, generation.authority
+    assert os.tcgetpgrp(master) == console.pid
+    fields = Path(f'/proc/{console.pid}/stat').read_text().rsplit(')', 1)[1].split()
+    assert [int(v) for v in fields[2:6]] == [console.pid, console.pid, os.fstat(slave).st_rdev, console.pid]
+    name = os.ttyname(slave)
+    links = fd_links(console)
+    assert links[0] == links[1] == '/dev/null'
+    assert [fd for fd, link in links.items() if link == name] == [slave]
+    assert name not in fd_links(authority).values()
+    inherited = {link for fd, link in links.items() if fd > 2}
+    assert name not in generation.descriptors
+    assert any(link.startswith('socket:[') for link in inherited & generation.descriptors)
+
+
+def read_console_status(master, state):
+    os.write(master, b'status\r')
+    expect_terminal(master, status_line(state))
+
+
 def exercise(launcher):
     enrollment = launcher.prepare_approved('terminal', 'terminal-session')
     before = snapshot((enrollment,))
-    with ExitStack() as terminals:
-        master_fd, slave_fd = os.openpty()
-        master = terminals.enter_context(os.fdopen(master_fd, 'r+b', buffering=0))
-        slave = terminals.enter_context(os.fdopen(slave_fd, 'r+b', buffering=0))
-        original = termios.tcgetattr(slave_fd)
-        try:
-            tty.setraw(slave_fd)
-            assert not termios.tcgetattr(slave_fd)[3] & (termios.ECHO | termios.ICANON)
-            launcher.terminal = slave_fd
-            generation = launcher.stage(enrollment, approved=True)
-            console, authority = generation.console, generation.authority
-            report = generation.report()
-            assert report.state == enrollment.expected and launcher.terminal is None
+    terminal = FixtureTerminal()
+    try:
+        launcher.terminal = terminal.slave
+        generation = launcher.stage(enrollment, approved=True)
+        report = generation.report()
+        assert report.state == enrollment.expected and launcher.terminal is None
+        check_terminal(terminal.master, terminal.slave, generation)
 
-            # The owner independently observes the foreground group, session and PTY identity.
-            assert os.tcgetpgrp(master_fd) == console.pid
-            fields = Path(f'/proc/{console.pid}/stat').read_text().rsplit(')', 1)[1].split()
-            assert [int(v) for v in fields[2:6]] == [console.pid, console.pid, os.fstat(slave_fd).st_rdev, console.pid]
-            name = os.ttyname(slave_fd)
-            links = fd_links(console)
-            assert links[0] == links[1] == '/dev/null'
-            assert [fd for fd, link in links.items() if link == name] == [slave_fd]
-            assert name not in fd_links(authority).values()
-            inherited = {link for fd, link in links.items() if fd > 2}
-            assert name not in generation.descriptors
-            assert any(link.startswith('socket:[') for link in inherited & generation.descriptors)
-
-            expect_terminal(master_fd, b'SKELETON STRICT CONTROL\r\n')
-            os.write(master_fd, b'status\r')
-            expect_terminal(master_fd, status_line(enrollment.expected))
-            os.write(master_fd, b'status')
-            assert not select.select([master_fd], [], [], 0.3)[0], 'incomplete input produced output'
-        finally:
-            termios.tcsetattr(slave_fd, termios.TCSANOW, original)
-        assert termios.tcgetattr(slave_fd) == original
-        slave.close()
-        master.close()  # Closing the owned master hangs up the control console.
-        status = console.wait(TIMEOUT)
-        assert status == 0, f'console exited with status {status}'
-        assert authority.poll() is None
-        marker = launcher.scratch / 'marker-terminal'
-        assert not launcher.admit(enrollment, report, marker) and not marker.exists()
-        assert snapshot((enrollment,)) == before
+        expect_terminal(terminal.master, b'SKELETON STRICT CONTROL\r\n')
+        read_console_status(terminal.master, enrollment.expected)
+        os.write(terminal.master, b'status')
+        assert not select.select([terminal.master], [], [], 0.3)[0], 'incomplete input produced output'
+    finally:
+        terminal.close()
+    status = generation.console.wait(TIMEOUT)
+    assert status == 0, f'console exited with status {status}'
+    assert generation.authority.poll() is None
+    marker = launcher.scratch / 'marker-terminal'
+    assert not launcher.admit(enrollment, report, marker) and not marker.exists()
+    assert snapshot((enrollment,)) == before
 
 
 def refuse_missing_terminal(launcher):

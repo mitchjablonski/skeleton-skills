@@ -52,8 +52,10 @@ retains scratch. The invocation above exercises namespace teardown with the
 explicit binary pins alone.
 
 Add `--protected-launcher` to exercise all enrollment, readiness and restart
-checks together. This mode requires the selected receipt and refuses before
-starting fixture workers if it is absent or does not match. The packaged
+checks together. Supply both the selected receipt and an independently
+chosen `--terminal-worker-sha256` for `test/live/strict-terminal-host-worker.mjs`.
+The launcher checks the terminal entrypoint as well as the live receipt
+before starting fixture workers and before each namespace start. The packaged
 `lib/strict-protected-generation.py` adapter creates the authority/console
 socket pair and separate initial and refresh report pipes. Only the owned
 console inherits the report writers. The authority must open the selected
@@ -64,6 +66,16 @@ generation, and loss of each peer after a valid report. Each check verifies
 that no materialization worker or namespace starts and durable bytes stay
 unchanged. A separate case loses the console during namespace startup and
 requires full teardown and wrapper reaping before admission returns.
+
+The console uses its own foreground PTY in the protected mode. The launcher
+checks its session, terminal identity and inherited command socket before
+admission. The terminal parser serves a fixture `status` command while the
+separate readiness pipes carry initial and refresh observations. The same
+terminal, authority and listener persist through a healthy restart. After
+proving the stop and reaping the wrapper, the supervisor requires a new
+`state()` observation from that console on the refresh pipe. Lost or
+malformed refresh and a terminal hangup on either side of refresh refuse
+the replacement without staging bytes or changing durable history.
 
 Planned restart cases exercise a cooperative shutdown and bounded forced
 escalation of the fixed staged worker. The graceful request, escalation,
