@@ -17,6 +17,7 @@ import time
 
 HERE = Path(__file__).resolve().parent
 capture = runpy.run_path(str(HERE / 'strict-capture-admission-probe.py'))
+terminal_host = runpy.run_path(str(HERE / 'strict-terminal-host-probe.py'))
 lifecycle = runpy.run_path(str(HERE / 'strict-lifecycle-fault-probe.py'))
 request_stop = runpy.run_path(str(HERE / 'strict-graceful-stop-probe.py'))['request_stop']
 CaptureLauncher = capture['CaptureLauncher']
@@ -43,14 +44,24 @@ def read_runtime_selection(path):
         raise RuntimeRefused('runtime-selection-invalid') from exc
 
 
-def runtime_check(selection, node, scratch):
-    observer = runpy.run_path(str(HERE / 'strict-runtime-receipt.py'))['observe_pinned_runtime']
+def runtime_check(selection, node, scratch, *, terminal_pin=None):
+    receipt = runpy.run_path(str(HERE / 'strict-runtime-receipt.py'))
     select = runpy.run_path(str(HERE / 'strict-runtime-selection.py'))['select_runtime']
 
     def check():
+        if terminal_pin is not None:
+            try:
+                digest = receipt['_digest'](terminal_host['HOST_WORKER'])
+            except receipt['ReceiptCleanupFailed'] as exc:
+                raise RuntimeRefused('runtime-observation-cleanup-unproven') from exc
+            except receipt['ReceiptUnavailable'] as exc:
+                raise RuntimeRefused('terminal-entrypoint-unavailable') from exc
+            if digest != terminal_pin:
+                raise RuntimeRefused('terminal-entrypoint-mismatch')
+
         def observe(pins):
-            return observer(node, node, scratch, pins, client_role='node-channel-control',
-                            client_entrypoint=capture['WORKER'])
+            return receipt['observe_pinned_runtime'](node, node, scratch, pins, client_role='node-channel-control',
+                                                    client_entrypoint=capture['WORKER'])
 
         result = select(selection, observe)
         if result['kind'] != 'runtime-selected':
@@ -92,12 +103,14 @@ class Listener:
 
 
 class NamespaceLauncher(CaptureLauncher):
-    def __init__(self, node, scratch, check_runtime, stop_mode=None, *, listener_required=False):
+    def __init__(self, node, scratch, check_runtime, stop_mode=None, *, protected=False, terminal_mode='restart'):
         super().__init__(node, scratch)
         self.run = lifecycle['Run'](scratch)
         self.check_runtime = check_runtime
         self.stop_mode = stop_mode
-        self.listener_required = listener_required
+        self.protected = protected
+        self.terminal_mode = terminal_mode
+        self.terminal = None
         self.listener = None
         self.supervisor = StopHandoff(lifecycle['stop_namespace'], self.prove_stopped, lifecycle['STOP_BOUND'])
 
@@ -105,7 +118,36 @@ class NamespaceLauncher(CaptureLauncher):
         if self.listener is not None:
             stop_listener(self)
             self.listener = None
+        if self.terminal is not None:
+            self.terminal.close()
+            self.terminal = None
+        if self.protected:
+            self.terminal = terminal_host['FixtureTerminal']()
         return super().stage(enrollment, directory, approved=approved)
+
+    def spawn(self, command, fds=()):
+        if self.protected and command[1:3] == [capture['WORKER'], 'restart-console']:
+            terminal = self.terminal
+            if terminal is None or terminal.closed or terminal.process is not None:
+                raise RuntimeError('console requires a fresh owned terminal')
+            terminal.process = terminal_host['spawn_terminal_console'](
+                self, command, fds, terminal.slave, self.terminal_mode)
+            return terminal.process
+        return super().spawn(command, fds)
+
+    def peers_live(self, generation):
+        return super().peers_live(generation) and (
+            not self.protected or (self.terminal is not None and self.terminal.owns(generation)))
+
+    def refresh(self, generation):
+        if not self.peers_live(generation):
+            self.admission.invalidate()
+            return None
+        try:
+            return generation.fresh_report()
+        except (OSError, RuntimeError, ValueError, RecursionError):
+            self.admission.invalidate()
+            return None
 
     def stage_listener(self, enrollment, *, binding=None, role='decision-listener'):
         if self.current is None or self.current.enrollment is not enrollment:
@@ -130,7 +172,7 @@ class NamespaceLauncher(CaptureLauncher):
             self.listener = Listener(process, ready['port'], self.current, versions)
 
     def listener_ready(self, generation, *, check_response=True):
-        if not self.listener_required:
+        if not self.protected:
             return True
         listener = self.listener
         if listener is None or generation is None or listener.generation is not generation:
@@ -141,7 +183,9 @@ class NamespaceLauncher(CaptureLauncher):
         return listener.responds() if check_response else listener.alive()
 
     def admit_capture(self, selected, report, stage, stop=None):
-        if self.listener_required and (self.current is None or self.current.enrollment is not selected):
+        if report is None:
+            return None
+        if self.protected and (self.current is None or self.current.enrollment is not selected):
             return None
         if not self.listener_ready(self.current):
             return None
@@ -196,7 +240,11 @@ class NamespaceLauncher(CaptureLauncher):
             if not lifecycle['cleanup_run'](self.run):
                 raise RuntimeError('namespace cleanup unproven')
         finally:
-            capture['Launcher'].cleanup(self)
+            try:
+                capture['Launcher'].cleanup(self)
+            finally:
+                if self.terminal is not None:
+                    self.terminal.close()
 
 
 ENROLLMENT_REFUSALS = ('wrong-enrollment', 'stale-generation', 'lost-authority', 'lost-console')
@@ -205,6 +253,8 @@ PLANNED_STOPS = {'graceful-restart': 'cooperative', 'forced-restart': 'stubborn'
 LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-invalid-readiness', 'listener-exited-before-start',
                      'stale-listener-generation')
 STARTUP_FAULTS = ('peer-loss-during-start', 'listener-loss-before-namespace', 'listener-loss-after-namespace')
+REFRESH_FAILURES = {'terminal-refresh-lost': 'refresh-lost', 'terminal-refresh-malformed': 'refresh-malformed',
+                    'terminal-hangup-before-refresh': 'restart'}
 
 
 class StartupFaultLauncher(NamespaceLauncher):
@@ -264,11 +314,11 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
     if check_runtime is not None:
         check_runtime()
     stop_mode = PLANNED_STOPS.get(case)
+    options = {'protected': protected, 'terminal_mode': REFRESH_FAILURES.get(case, 'restart')}
     if case in STARTUP_FAULTS:
-        launcher = StartupFaultLauncher(node, scratch, check_runtime, stop_mode,
-                                        fault=case, listener_required=protected)
+        launcher = StartupFaultLauncher(node, scratch, check_runtime, stop_mode, fault=case, **options)
     else:
-        launcher = NamespaceLauncher(node, scratch, check_runtime, stop_mode, listener_required=protected)
+        launcher = NamespaceLauncher(node, scratch, check_runtime, stop_mode, **options)
     try:
         selected = launcher.prepare_approved(case, 'selected')
         directory = selected.directory.parent
@@ -285,6 +335,10 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
         initial = generation.report()
         assert initial.state == selected.expected
         if protected:
+            terminal = launcher.terminal
+            terminal_host['check_terminal'](terminal.master, terminal.slave, generation)
+            terminal_host['expect_terminal'](terminal.master, b'SKELETON STRICT CONTROL\r\n')
+            terminal_host['read_console_status'](terminal.master, selected.expected)
             binding = None
             if case == 'listener-store-mismatch':
                 binding = {**selected.expected, 'reviewVersion': '0' * 64}
@@ -302,8 +356,10 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
             stop_listener(launcher)
         if case == 'stale-listener-generation':
             stale_listener = launcher.listener
-            # Bypass normal disposal to test binding even while the old listener still answers.
-            generation = CaptureLauncher.stage(launcher, selected, approved=True)
+            # Hold the old listener open to test its binding independently of disposal.
+            launcher.listener = None
+            generation = launcher.stage(selected, approved=True)
+            launcher.listener = stale_listener
             initial = generation.report()
             assert initial.state == selected.expected and launcher.peers_live(generation)
             assert stale_listener.responds()
@@ -361,8 +417,8 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
             stop = None
         else:
             if case == 'report-before-stop':
-                fresh = generation.fresh_report()
-                assert first.child.poll() is None
+                fresh = launcher.refresh(generation)
+                assert fresh is not None and first.child.poll() is None
             stop = launcher.supervisor.stop(namespace)
             (first_stage / 'plan.js').write_bytes(b'changed previous stage\n')
             if case == 'borrowed-namespace-stop':
@@ -371,8 +427,17 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
                 stop = launcher.supervisor.stop(unrelated)
 
         if fresh is None:
-            fresh = generation.fresh_report()
-        assert fresh.state == selected.expected and launcher.peers_live(generation)
+            if case == 'terminal-hangup-before-refresh':
+                hangup_terminal(launcher, generation)
+            fresh = launcher.refresh(generation)
+        if case in REFRESH_FAILURES:
+            assert fresh is None
+            if case != 'terminal-hangup-before-refresh':
+                assert launcher.peers_live(generation) and launcher.listener_ready(generation)
+        else:
+            assert fresh.state == selected.expected and launcher.peers_live(generation)
+        if case == 'terminal-hangup-after-refresh':
+            hangup_terminal(launcher, generation)
         if case == 'listener-exited-before-restart':
             stop_listener(launcher)
         next_stage = directory / 'stage-restart'
@@ -382,14 +447,18 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
             assert len(launcher.fills) == 2 and second.generation is generation
             assert second.child is not first.child and second.namespace['pidNs'] != namespace['pidNs']
             assert launcher.peers_live(generation)
+            if protected:
+                assert launcher.terminal is terminal and launcher.listener_ready(generation)
+                terminal_host['read_console_status'](terminal.master, selected.expected)
             for name in capture['MEMBERS']:
                 assert not os.path.samefile(first_stage / name, next_stage / name)
             launcher.supervisor.stop(second.namespace)
         else:
             count = len(launcher.run.namespaces)
+            children = len(launcher.children)
             assert launcher.admit_capture(selected, fresh, next_stage, stop) is None
             assert launcher.fills == [first] and len(launcher.run.namespaces) == count
-            assert not next_stage.exists()
+            assert len(launcher.children) == children and not next_stage.exists()
             if case == 'partial-stop':
                 assert not lifecycle['exited'](namespace['members']['escapee']['fd'])
         assert capture['snapshot']((selected,)) == before
@@ -403,6 +472,12 @@ def stop_listener(launcher):
     listener.wait(capture['TIMEOUT'])
 
 
+def hangup_terminal(launcher, generation):
+    launcher.terminal.close()
+    assert generation.console.wait(capture['TIMEOUT']) == 0
+    assert generation.authority.poll() is None and launcher.listener_ready(generation)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--node', required=True)
@@ -410,6 +485,7 @@ def main():
     parser.add_argument('--bwrap-sha256', required=True)
     parser.add_argument('--runtime-receipt', type=Path,
                         help='require the preselected canonical fixture receipt before admission')
+    parser.add_argument('--terminal-worker-sha256', help='independently selected terminal entrypoint pin')
     parser.add_argument('--protected-launcher', action='store_true',
                         help='require a runtime receipt and also exercise enrollment and peer refusals')
     args = parser.parse_args()
@@ -425,16 +501,22 @@ def main():
     try:
         if args.protected_launcher and args.runtime_receipt is None:
             raise RuntimeRefused('runtime-selection-required')
+        terminal_pin = args.terminal_worker_sha256
+        if args.protected_launcher and (terminal_pin is None or len(terminal_pin) != 64
+                                        or any(c not in '0123456789abcdef' for c in terminal_pin)):
+            raise RuntimeRefused('terminal-entrypoint-pin-required')
         selection = read_runtime_selection(args.runtime_receipt) if args.runtime_receipt is not None else None
     except RuntimeRefused as exc:
         print(json.dumps({'ok': False, 'strictState': 'unverified', 'code': str(exc)}))
         raise SystemExit(2)
     scratch = Path(tempfile.mkdtemp(prefix='strict-namespace-admission-')).resolve()
-    check_runtime = runtime_check(selection, node, scratch) if args.runtime_receipt is not None else None
+    check_runtime = (runtime_check(selection, node, scratch, terminal_pin=terminal_pin)
+                     if args.runtime_receipt is not None else None)
     cases = ('restart', 'partial-stop', 'borrowed-namespace-stop', 'report-before-stop')
     if args.protected_launcher:
         cases += ENROLLMENT_REFUSALS + STARTUP_FAULTS + tuple(PLANNED_STOPS)
         cases += LISTENER_REFUSALS + ('listener-exited-before-restart',)
+        cases += tuple(REFRESH_FAILURES) + ('terminal-hangup-after-refresh',)
     try:
         for case in cases:
             exercise(node, scratch, case, check_runtime, protected=args.protected_launcher)
@@ -451,7 +533,8 @@ def main():
         raise
     shutil.rmtree(scratch)
     print(json.dumps({'ok': True, 'strictState': 'unverified', 'cases': cases, 'durableBytesUnchanged': True,
-                      'runtimeReceiptChecked': check_runtime is not None}))
+                      'runtimeReceiptChecked': check_runtime is not None,
+                      'terminalPinChecked': check_runtime is not None and terminal_pin is not None}))
 
 
 if __name__ == '__main__':
