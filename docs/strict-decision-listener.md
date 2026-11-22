@@ -33,6 +33,12 @@ createDecisionListener({ provider, now?, observe? })
 - `mintNavigation()` stands in for the launcher control channel's
   open/reopen. It returns `http://127.0.0.1:<port>/#n=<nonce>`. Each mint
   invalidates every earlier nonce and the live tab.
+- `mintWindowNavigation(expectedBinding)` is a host-only handoff. It returns
+  the one-time URL and `takeView()`. Only a completed `/api/view` response
+  to the bound tab for the exact selected capture binding makes `takeView()`
+  succeed once. A failed or mismatched view before the observation is taken,
+  a replacement navigation or listener shutdown invalidates it. The
+  launcher still needs to prove browser and profile ownership independently.
 - `observe` receives `{ method, url, status, code }` per request, for probes.
   It never receives headers or bodies.
 
