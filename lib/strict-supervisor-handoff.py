@@ -51,7 +51,7 @@ class StopHandoff:
         owned.attempted = True
         return owned
 
-    def _finish(self, owned, deadline):
+    def _finish(self, owned, deadline, *, restartable=True):
         if time.monotonic() >= deadline:
             raise StopUnproven('stop-deadline-unavailable')
         if self._prove(owned.namespace, deadline) is not True:
@@ -66,6 +66,8 @@ class StopHandoff:
         proved_at = time.monotonic_ns()
         if proved_at / 1_000_000_000 > deadline:
             raise StopUnproven('stop-proof-late')
+        if not restartable:
+            return None
         owned.receipt = _StopReceipt(proved_at)
         return owned.receipt
 
@@ -74,6 +76,15 @@ class StopHandoff:
         deadline = time.monotonic() + self._stop_seconds
         self._terminate(namespace)
         return self._finish(owned, deadline)
+
+    def stop_fault(self, namespace, deadline):
+        """Stop the exact owned namespace without granting restart permission."""
+        owned = self._begin(namespace)
+        bound = time.monotonic() + self._stop_seconds
+        self._terminate(namespace)
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise StopUnproven('stop-deadline-unavailable')
+        self._finish(owned, min(deadline, bound), restartable=False)
 
     def stop_planned(self, namespace, request_stop):
         """Let the supervisor perform bounded graceful escalation before proving stop."""

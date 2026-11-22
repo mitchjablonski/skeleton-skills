@@ -83,6 +83,19 @@ independent namespace proof and wrapper reap share one deadline. A proof
 attempt after that deadline cannot authorize another namespace. Faults and
 peer loss continue to use the immediate owned stop.
 
+While an admitted namespace is running, the protected fixture watches the
+exact console and authority pidfds for that fill. Its live control leaves
+both peers and the namespace running and then completes a healthy restart.
+An exit already recorded on an owned child triggers the stop without
+reopening its numeric PID.
+Closing the owned terminal or stopping the owned authority triggers an
+immediate namespace stop. The launcher invalidates admission, proves no
+namespace members remain and reaps the wrapper within the fault deadline.
+The fault stop issues no restart receipt. The run refuses further staging
+and restart, and the surviving peer, listener and durable history remain
+intact. This measures peer exit and physical stop. Authority request stalls
+and revocation are separate cases.
+
 The protected fixture starts the read-only decision listener as a separate
 owned process after console readiness. The worker checks its selected view
 against the immutable capture store and makes a private loopback view read
