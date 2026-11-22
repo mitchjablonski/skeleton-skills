@@ -79,32 +79,70 @@ function jsonNew(port, url) {
 }
 const pageSignature = (list) => list.filter((t) => t.type === "page").map((t) => String(t.url)).sort().join("\n");
 
+// Test-only hook (labelled in the output; a run using it never passes):
+// SKEL_C20_TEST_INJECT_BOUNDARY_ORIGIN=1 records one synthetic discarded poll that saw the
+// listener origin at the after->idle boundary, to show such evidence now fails the run.
+const INJECT_BOUNDARY_ORIGIN = process.env.SKEL_C20_TEST_INJECT_BOUNDARY_ORIGIN === "1";
+
 /**
  * Background poller of the agent's targets. Each poll first proves the agent is alive and
- * still owns the port, snapshots the phase, then requests /json/list (HTTP 200 only).
- * setPhase() bumps a generation and awaits the in-flight poll, whose result is then
- * discarded, so no observation crossing a boundary counts toward either phase.
- * Ownership loss, agent death or a failed poll stops polling and fails closed.
+ * still owns the port, snapshots the phase and the delivery epoch, then requests /json/list
+ * (HTTP 200 only). Ownership loss, agent death or a failed poll stops polling and fails closed.
+ *
+ * Phase attribution vs evidence: setPhase() bumps a generation and awaits the in-flight poll.
+ * A poll that crossed a boundary loses only its PHASE attribution, never its evidence. Every
+ * discarded (boundary) poll and every `idle` poll is counted in a boundary/idle bucket keyed
+ * by the delivery epoch its request STARTED in:
+ *   - "launch": before any deliberate delivery (launcher run and its settling). An origin
+ *     seen here fails the run.
+ *   - "singleton": started after the singleton handoff was launched. An origin seen here is
+ *     treated as the handoff having been forwarded (conservative: never ignored).
+ *   - "control": started after the negative control began. An origin is expected here.
+ * A boundary poll straddling INTO the control phase started in the earlier epoch, and the
+ * PUT is only sent after it settles, so its origin counts against that earlier epoch. One
+ * straddling OUT of the control phase started in the control epoch, so its origin is expected.
  */
 function startPoller(agent, port, origin) {
-  const p = { phase: "before", gen: 0, polls: {}, discarded: 0, originSeen: {}, maxTargets: 0, pageSignatures: new Set(),
+  const epochBucket = () => ({ polls: 0, boundaryPolls: 0, originSeen: 0 });
+  const p = { phase: "before", epoch: "launch", gen: 0, polls: {}, discarded: 0, originSeen: {}, maxTargets: 0, pageSignatures: new Set(),
+    boundaryIdle: { launch: epochBucket(), singleton: epochBucket(), control: epochBucket() },
     stop: false, last: null, failure: null, inflight: Promise.resolve() };
-  p.setPhase = async (name) => { p.gen++; p.phase = name; await p.inflight; if (p.failure) throw new Fail(p.failure); };
+  /** Account one completed poll: phase attribution only if no boundary was crossed; evidence always. */
+  p.account = ({ phase, epoch, gen, list, hit }) => {
+    const crossed = gen !== p.gen;
+    if (crossed) p.discarded++;
+    if (crossed || phase === "idle") {
+      const b = p.boundaryIdle[epoch];
+      b.polls++; if (crossed) b.boundaryPolls++; if (hit) b.originSeen++;
+      if (epoch === "launch" && list) p.pageSignatures.add(pageSignature(list));
+      if (!crossed && list) p.last = list;
+      return;
+    }
+    p.last = list;
+    p.polls[phase] = (p.polls[phase] ?? 0) + 1;
+    p.maxTargets = Math.max(p.maxTargets, list.length);
+    if (hit) p.originSeen[phase] = true;
+    p.pageSignatures.add(pageSignature(list));
+  };
+  p.setPhase = async (name) => {
+    if (INJECT_BOUNDARY_ORIGIN && p.phase === "after" && name === "idle") // test only: a synthetic discarded poll with the origin
+      p.account({ phase: "after", epoch: "launch", gen: p.gen - 1, list: null, hit: true });
+    if (name === "singleton") p.epoch = "singleton";
+    if (name === "control") p.epoch = "control";
+    p.gen++; p.phase = name;
+    await p.inflight;
+    if (p.failure) throw new Fail(p.failure);
+  };
   p.done = (async () => {
     while (!p.stop && !state.aborted && !p.failure) {
       const owner = fx.portOwnedBy(agent, port);
       if (!owner.owned) { p.failure = `agent-port-${owner.reason}`; break; }
-      const phase = p.phase, gen = p.gen;
+      const phase = p.phase, epoch = p.epoch, gen = p.gen;
       const request = jsonList(port);
       p.inflight = request.then(() => {}, () => {});
       let list;
       try { list = await request; } catch (e) { p.failure = e instanceof Fail ? e.label : "agent-target-poll-failed"; break; }
-      if (gen !== p.gen) { p.discarded++; continue; } // crossed a phase boundary: discarded
-      p.last = list;
-      p.polls[phase] = (p.polls[phase] ?? 0) + 1;
-      p.maxTargets = Math.max(p.maxTargets, list.length);
-      if (list.some((t) => String(t.url).includes(origin))) p.originSeen[phase] = true;
-      p.pageSignatures.add(pageSignature(list));
+      p.account({ phase, epoch, gen, list, hit: list.some((t) => String(t.url).includes(origin)) });
       await sleep(100);
     }
   })();
@@ -175,6 +213,7 @@ async function run(pin) {
   result.agentNeverReceived = {
     polls: { before: poller.polls.before ?? 0, during: poller.polls.during ?? 0, after: poller.polls.after ?? 0 }, discardedAtBoundaries: poller.discarded,
     pollFailure: poller.failure, originSeen: ["before", "during", "after"].some((ph) => poller.originSeen[ph]),
+    boundaryIdleLaunchOriginSeen: poller.boundaryIdle.launch.originSeen,
     pageTargetsUnchanged: poller.pageSignatures.size === 1 && poller.pageSignatures.has(pageSignature(baseline)),
     finalTargets: finalList.length, finalPageTargets: finalList.filter((t) => t.type === "page").length,
     binds: binds.length, bindsOk: binds.filter((e) => e.status === 200).length, views: views.length,
@@ -183,6 +222,7 @@ async function run(pin) {
   const r = result.agentNeverReceived;
   expect((poller.polls.before ?? 0) >= 1 && (poller.polls.during ?? 0) >= 2 && (poller.polls.after ?? 0) >= 2, "agent targets not polled before, during and after");
   expect(!r.originSeen, "an agent browser target named the listener origin");
+  expect(r.boundaryIdleLaunchOriginSeen === 0, "listener origin seen in a boundary or idle poll before any deliberate delivery");
   expect(r.pageTargetsUnchanged, "the agent browser's page targets changed");
   expect(r.binds === 1 && r.bindsOk === 1 && r.views >= 1 && r.allBindsAndViewsInLauncherRun, "binds or views outside the launcher run");
   expect(r.pollFailure === null, "agent target poll failed or port ownership lost");
@@ -199,7 +239,7 @@ async function run(pin) {
   result.singleton = {
     exited: handoff.exit !== null, exitCode: handoff.exit?.code ?? null, exitSignal: handoff.exit?.signal ?? null,
     lockRefusal: /SingletonLock|ProcessSingleton/.test(stderr),
-    forwardedToAgent: !!poller.originSeen.singleton,
+    forwardedToAgent: !!poller.originSeen.singleton || poller.boundaryIdle.singleton.originSeen > 0,
     listenerRequests: log.length - beforeSingleton,
     secondInstance: handoff.exit === null,
   };
@@ -228,9 +268,15 @@ async function run(pin) {
   poller.stop = true;
   await poller.done;
   expect(poller.failure === null, "agent target poll failed or port ownership lost");
+  // Final evidence check: every boundary/idle poll, per delivery epoch.
+  result.boundaryIdlePolls = JSON.parse(JSON.stringify(poller.boundaryIdle));
+  result.boundaryIdlePolls.discardedAtBoundaries = poller.discarded;
+  expect(poller.boundaryIdle.launch.originSeen === 0, "listener origin seen in a boundary or idle poll before any deliberate delivery");
+  if (!result.singleton.forwardedToAgent && poller.boundaryIdle.singleton.originSeen > 0) failures.push("singleton-epoch origin seen after classification");
 
   guard();
-  if (fx.ANNOUNCE) failures.push("test-hook-active");
+  if (INJECT_BOUNDARY_ORIGIN) result.testInjectBoundaryOrigin = true;
+  if (fx.ANNOUNCE || INJECT_BOUNDARY_ORIGIN) failures.push("test-hook-active");
   if (!failures.length) { state.exitCode = 0; result.ok = true; result.code = "agent-browser-fixture-passed"; }
 }
 
