@@ -27,6 +27,7 @@ lifecycle = runpy.run_path(str(HERE / 'strict-lifecycle-fault-probe.py'))
 request_stop = runpy.run_path(str(HERE / 'strict-graceful-stop-probe.py'))['request_stop']
 CaptureLauncher = capture['CaptureLauncher']
 handoff = runpy.run_path(str(HERE.parent.parent / 'lib' / 'strict-supervisor-handoff.py'))
+x11_slot = runpy.run_path(str(HERE / 'strict-x11-slot.py'))
 StopHandoff, StopUnproven = handoff['StopHandoff'], handoff['StopUnproven']
 MAX_RECEIPT_BYTES = 512 * 1024
 LISTENER_SCOPE = HERE / 'strict-owned-listener-scope.py'
@@ -138,8 +139,8 @@ class OwnedWindow:
             if len(value) not in (4, 5) or value[-1:] != b'\n' or not value[:-1].isdigit():
                 raise RuntimeError('owned display slot could not be verified')
             number = int(value)
-            if not 100 <= number <= 9999 or any(os.path.lexists(path) for path in (
-                    f'/tmp/.X{number}-lock', f'/tmp/.X11-unix/X{number}')):
+            # Lock, filesystem socket and abstract socket (read from /proc/self/net/unix) must all be gone.
+            if not 100 <= number <= 9999 or not x11_slot['slot_clean'](number):
                 raise RuntimeError('owned display cleanup unproven')
         shutil.rmtree(self.profile)
 
@@ -864,7 +865,8 @@ def main():
     print(json.dumps({'ok': True, 'strictState': 'unverified', 'cases': cases, 'durableBytesUnchanged': True,
                       'runtimeReceiptChecked': check_runtime is not None,
                       'terminalPinChecked': check_runtime is not None and terminal_pin is not None,
-                      **({'protectedWindowChecked': True} if chrome_pin is not None else {})}))
+                      **({'protectedWindowChecked': True, 'x11SocketDirectory': x11_slot['socket_directory_label']()}
+                         if chrome_pin is not None else {})}))
 
 
 if __name__ == '__main__':

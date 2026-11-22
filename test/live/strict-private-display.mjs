@@ -30,6 +30,73 @@ function ownsDisplayLock(number, pid) {
   } catch { return false; }
 }
 
+// --- display-slot proof ------------------------------------------------------
+// Where /tmp/.X11-unix is not writable (WSL: a read-only bind of WSLg's tmpfs), Xvfb can't
+// create the filesystem socket and listens only on the ABSTRACT socket @/tmp/.X11-unix/X<n>.
+// A slot is therefore proven free only when the lock file, the filesystem socket and the
+// abstract socket are all absent. Abstract sockets are seen only by READING /proc/<pid>/net/unix
+// (never connecting). That table is per network namespace: Xvfb is spawned here without any
+// namespace change, so it shares the probe's network namespace. While the server lives its own
+// /proc/<pid>/net/unix is read (after checking its namespace matches ours); otherwise
+// /proc/self/net/unix. An unreadable or malformed table means "not proven" (fail closed).
+const SOCKET_DIR = "/tmp/.X11-unix";
+
+/** Pure parser for /proc/net/unix text: the set of bound paths (abstract ones start with "@"). */
+export function parseUnixSocketTable(text) {
+  const paths = new Set();
+  let malformed = 0, rows = 0;
+  const lines = String(text).split("\n");
+  if (!/^Num\s+RefCount\s+Protocol\s+Flags\s+Type\s+St\s+Inode(\s+Path)?\s*$/.test(lines[0] ?? "")) return { paths, rows, malformed: 1, header: false };
+  for (const line of lines.slice(1)) {
+    if (!line.trim()) continue;
+    const m = /^\s*[0-9a-fA-F]+:\s+[0-9A-Fa-f]{8}\s+[0-9A-Fa-f]{8}\s+[0-9A-Fa-f]{8}\s+[0-9A-Fa-f]{4}\s+[0-9A-Fa-f]{2}\s+\d+(?:\s+(\S.*))?$/.exec(line);
+    if (!m) { malformed++; continue; }
+    rows++;
+    if (m[1] !== undefined) paths.add(m[1]);
+  }
+  return { paths, rows, malformed, header: true };
+}
+
+/** Pure: socket state for display `number` from /proc/net/unix text (null text = unreadable). */
+export function x11SocketState(text, number) {
+  if (text === null || text === undefined) return { abstract: null, filesystem: null, proven: false };
+  const table = parseUnixSocketTable(text);
+  const name = `${SOCKET_DIR}/X${number}`;
+  return { abstract: table.paths.has("@" + name), filesystem: table.paths.has(name), proven: table.header && table.malformed === 0 };
+}
+
+const readNetNs = (pid) => { try { return fs.readlinkSync(`/proc/${pid}/ns/net`); } catch { return null; } };
+function readUnixTable(pid) {
+  try { return fs.readFileSync(`/proc/${pid}/net/unix`, "utf8"); } catch { return null; }
+}
+/** Fixed label: can this host's X socket directory take a filesystem socket? */
+export function socketDirectoryLabel() {
+  try { fs.accessSync(SOCKET_DIR, fs.constants.W_OK); return "writable"; }
+  catch (e) { return e.code === "ENOENT" ? "absent" : e.code === "EACCES" || e.code === "EROFS" ? "read-only" : "unavailable"; }
+}
+
+/** The slot's lock, filesystem socket and abstract socket; `proven` false when the table can't be read. */
+export function displaySlotState(display) {
+  const { number } = display;
+  const server = display.server;
+  const serverLive = server && server.exitCode === null && server.signalCode === null && !display.failed;
+  let pid = "self";
+  if (serverLive) {
+    const own = readNetNs("self"), theirs = readNetNs(server.pid);
+    if (own && theirs && own === theirs) pid = server.pid;
+    else if (theirs !== null) return { lock: true, filesystemSocket: true, abstractSocket: null, proven: false };
+  } else if (display.netNamespace && display.netNamespace !== readNetNs("self")) {
+    return { lock: true, filesystemSocket: true, abstractSocket: null, proven: false };
+  }
+  const table = x11SocketState(readUnixTable(pid), number);
+  return {
+    lock: fs.existsSync(`/tmp/.X${number}-lock`),
+    filesystemSocket: fs.existsSync(`${SOCKET_DIR}/X${number}`) || table.filesystem === true,
+    abstractSocket: table.abstract,
+    proven: table.proven,
+  };
+}
+
 export function startPrivateDisplay(scratch, { beforeSpawn } = {}) {
   const number = Array.from({ length: 16 }, () => randomInt(100, 10000)).find((candidate) => !displaySocketPresent({ number: candidate }));
   if (number === undefined) throw new PrivateDisplayError("display-number-unavailable");
@@ -46,7 +113,7 @@ export function startPrivateDisplay(scratch, { beforeSpawn } = {}) {
   beforeSpawn?.(number);
   const server = spawn(XVFB, [environment.DISPLAY, "-nolisten", "tcp", "-auth", authority, "-screen", "0", "1024x768x24"],
     { env: TOOL_ENV, stdio: "ignore" });
-  const display = { environment, server, number, failed: false };
+  const display = { environment, server, number, failed: false, socketDirectory: socketDirectoryLabel(), netNamespace: readNetNs("self") };
   server.once("error", () => { display.failed = true; });
   return display;
 }
@@ -91,6 +158,8 @@ export function findMappedBrowserWindow(display, browserPid, expected = null) {
   return null;
 }
 
+/** True unless the slot is proven clean: lock, filesystem socket and abstract socket all gone. */
 export function displaySocketPresent(display) {
-  return fs.existsSync(`/tmp/.X11-unix/X${display.number}`) || fs.existsSync(`/tmp/.X${display.number}-lock`);
+  const slot = displaySlotState(display);
+  return !slot.proven || slot.lock || slot.filesystemSocket || slot.abstractSocket !== false;
 }

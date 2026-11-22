@@ -146,7 +146,13 @@ wrong browser pin, and a mapped window without the selected navigation
 observation. They verify that loss of the listener, browser or display
 blocks restart before staging any replacement. The scope waits for
 descendants to exit and be reaped before the launcher checks the display
-slot and removes the profile. Unproven cleanup retains the scratch
+slot and removes the profile. The slot check requires the lock, the
+filesystem socket and the abstract socket `@/tmp/.X11-unix/X<n>` to be gone.
+The abstract socket is read from `/proc/self/net/unix`; the scope starts
+Xvfb in the probe's own network namespace. Nothing connects to any socket.
+An unreadable table fails closed. On WSL, `/tmp/.X11-unix` is read-only, so
+Xvfb listens only on the abstract socket. The success output records
+`x11SocketDirectory`. Unproven cleanup retains the scratch
 directory.
 
 This check applies at admission and restart. Active-fill teardown remains
