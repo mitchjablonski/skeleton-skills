@@ -56,6 +56,7 @@ import { spawnSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { captureStrictManifest } from "../../lib/strict-capture.mjs";
 import { createDecisionListener } from "../../lib/strict-decision-listener.mjs";
+import { displaySocketPresent, displayToolsAvailable, mappedBrowserWindow, PrivateDisplayError, startPrivateDisplay, waitForPrivateDisplay, XVFB } from "./strict-private-display.mjs";
 
 const MAX = 32768;
 const CANDIDATES = ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
@@ -64,6 +65,10 @@ const BWRAP = "/usr/bin/bwrap";
 const PREFIX = "strict-fresh-profile-";
 const SELF = fileURLToPath(import.meta.url);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const supervised = process.argv[2] === "--supervised";
+const args = process.argv.slice(supervised ? 3 : 2);
+const privateDisplay = args[0] === "--private-display";
+const pinArgs = privateDisplay ? args.slice(1) : args;
 
 const unsupported = (reason, code = "unsupported") => ({ ok: false, strictState: "unverified", code, reason });
 function finish(result, exitCode) {
@@ -81,14 +86,15 @@ if libc.prctl(36, 1, 0, 0, 0) != 0 or libc.prctl(37, ctypes.byref(v), 0, 0, 0) !
     sys.exit(3)
 os.execv(sys.argv[1], sys.argv[1:])
 `;
-if (process.argv[2] !== "--supervised") {
-  const args = process.argv.slice(2);
-  const pinOk = args.length === 0 || (args.length === 2 && args[0] === "--chrome-sha256" && /^[0-9a-f]{64}$/i.test(args[1]));
-  if (!pinOk) finish(unsupported("unexpected arguments"), 2);
+const pinOk = (!privateDisplay && pinArgs.length === 0)
+  || (pinArgs.length === 2 && pinArgs[0] === "--chrome-sha256" && /^[0-9a-f]{64}$/i.test(pinArgs[1]));
+if (!pinOk) finish(unsupported("unexpected arguments"), 2);
+if (!supervised) {
   if (process.platform !== "linux") finish(unsupported("not Linux"), 2);
   if (!CANDIDATES.some((c) => fs.existsSync(c))) finish(unsupported("no Chrome or Chromium"), 2);
   if (!fs.existsSync(BWRAP)) finish(unsupported("no /usr/bin/bwrap"), 2);
   if (!fs.existsSync(PYTHON)) finish(unsupported("no /usr/bin/python3"), 2);
+  if (privateDisplay && !displayToolsAvailable()) finish(unsupported("private display tools unavailable", "display-unavailable"), 2);
   // Signals and the overall timeout are forwarded so the inner run cleans up;
   // SIGKILL only after a grace period, and only to the inner process we started.
   const inner = spawn(PYTHON, ["-I", "-c", SHIM, process.execPath, SELF, "--supervised", ...args.map((a) => a.toLowerCase())],
@@ -272,7 +278,7 @@ function runWorker(unshareNet, port) {
 
 // --- supervised run ---------------------------------------------------------
 const result = { ok: false, strictState: "unverified", code: "unsupported" };
-const state = { exitCode: 2, scratch: null, listener: null, launches: [], aborted: null, cleanupOk: true, binary: null };
+const state = { exitCode: 2, scratch: null, listener: null, display: null, launches: [], aborted: null, cleanupOk: true, binary: null };
 const failures = [];
 // After an abort the abandoned run may still resolve in the background: it records nothing more.
 const expect = (ok, what) => { if (!ok && !state.aborted) failures.push(what); };
@@ -356,17 +362,17 @@ function makeDataDir(name) {
 }
 
 /** Headless, Chrome's default sandbox (never --no-sandbox), own session, no display variables. */
-function launch(name, args, { primary = false } = {}) {
+function launch(name, args, { primary = false, display = null } = {}) {
   const { dir, check } = makeDataDir(name);
   guard();
-  const env = { HOME: state.scratch, PATH: "/usr/bin:/bin", DBUS_SESSION_BUS_ADDRESS: "disabled:" };
-  let argv = [state.binary, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+  const env = { HOME: state.scratch, PATH: "/usr/bin:/bin", DBUS_SESSION_BUS_ADDRESS: "disabled:", ...display?.environment };
+  let argv = [state.binary, display ? "--ozone-platform=x11" : "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
     "--disable-extensions", "--disable-background-networking", `--user-data-dir=${dir}`, ...args];
   if (primary && MUTATION === "sandbox-blocked") // test only: no user namespaces, so Chrome's sandbox can't start
     argv = [BWRAP, "--unshare-user", "--disable-userns", "--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/",
       "--dev", "/dev", "--proc", "/proc", "--bind", state.scratch, state.scratch, "--", ...argv];
   const proc = spawn(argv[0], argv.slice(1), { detached: true, env, stdio: ["ignore", "pipe", "pipe"] });
-  const rec = { proc, pid: proc.pid, dir, check, primary, out: Buffer.alloc(0), err: Buffer.alloc(0), overflow: false, exit: null };
+  const rec = { proc, pid: proc.pid, dir, check, primary, display, out: Buffer.alloc(0), err: Buffer.alloc(0), overflow: false, exit: null };
   state.launches.push(rec);
   rec.exited = new Promise((r) => {
     proc.on("error", () => { rec.exit = { code: null, signal: null, error: true }; r(); });
@@ -407,20 +413,23 @@ function debuggingCheck(rec) {
 }
 
 /** The sampling loop: about every 50 ms plus scan time, until the --dump-dom browser exits.
- *  `window` (negative control only) ends sampling after that many ms instead: with a debugging
- *  port, headless Chrome keeps running after the dump, and the probe then stops it. */
+ *  `window` bounds the sample for the windowed run and the debugging control,
+ *  which keep Chrome running until the probe stops it. */
 async function sampleRun(rec, { window = null } = {}) {
   const agg = { samples: 0, samplesWithBrowser: 0, samplesWithHeld: 0, samplesWithDevToolsActivePort: 0, samplesWithSwitch: 0,
     maxProcesses: 0, maxSockets: 0, held: 0, unreadable: 0, netUnreadable: 0, cmdlineUnreadable: 0,
     devToolsActivePort: 0, debuggingFlag: 0, maxSandboxed: SANDBOX_EVIDENCE === "measured" ? 0 : null,
-    ownSession: false, exePinned: false, displayVariable: false };
+    ownSession: false, exePinned: false, displayVariable: false, privateDisplayMatched: false };
   let announced = false, killed = false;
   const started = Date.now(), deadline = started + (window ?? 60000);
   while (rec.exit === null && Date.now() < deadline) {
     guard();
     const c = debuggingCheck(rec);
+    const browser = stat(rec.pid);
+    const browserRunning = rec.exit === null && live(browser);
+    const browserSampled = rec.display ? browserRunning : c.processes > 0;
     agg.samples++;
-    if (c.processes > 0) agg.samplesWithBrowser++;
+    if (browserSampled) agg.samplesWithBrowser++;
     if (c.held > 0) agg.samplesWithHeld++;
     if (c.devToolsActivePort > 0) agg.samplesWithDevToolsActivePort++;
     if (c.debuggingFlag > 0) agg.samplesWithSwitch++;
@@ -429,15 +438,18 @@ async function sampleRun(rec, { window = null } = {}) {
     agg.devToolsActivePort = Math.max(agg.devToolsActivePort, c.devToolsActivePort);
     agg.debuggingFlag = Math.max(agg.debuggingFlag, c.debuggingFlag);
     if (c.sandboxed !== null) agg.maxSandboxed = Math.max(agg.maxSandboxed, c.sandboxed);
-    if (rec.exit === null && live(stat(rec.pid))) {
-      agg.ownSession ||= stat(rec.pid)?.sid === rec.pid;
+    if (browserRunning) {
+      agg.ownSession ||= browser.sid === rec.pid;
       try { agg.exePinned ||= fs.readlinkSync(`/proc/${rec.pid}/exe`) === state.binary; } catch { /* exited */ }
       try {
-        const keys = fs.readFileSync(`/proc/${rec.pid}/environ`, "utf8").split("\0").map((kv) => kv.split("=")[0]);
-        agg.displayVariable ||= keys.some((k) => ["DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "PULSE_SERVER"].includes(k));
+        const env = fs.readFileSync(`/proc/${rec.pid}/environ`, "utf8").split("\0");
+        const keys = env.map((kv) => kv.split("=")[0]);
+        agg.displayVariable ||= keys.some((k) => ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "PULSE_SERVER"].includes(k)
+          || (!rec.display && ["DISPLAY", "XAUTHORITY"].includes(k)));
+        if (rec.display) agg.privateDisplayMatched ||= Object.entries(rec.display.environment).every(([key, value]) => env.includes(`${key}=${value}`));
       } catch { /* exited */ }
     }
-    if (rec.primary && ANNOUNCE && !announced && c.processes > 0) { announced = true; process.stderr.write("probe: browser launched\n"); }
+    if (rec.primary && ANNOUNCE && !announced && browserSampled) { announced = true; process.stderr.write("probe: browser launched\n"); }
     if (rec.primary && MUTATION === "debugging-then-kill" && !killed && agg.samplesWithBrowser >= 3) {
       killed = true; try { rec.proc.kill("SIGKILL"); } catch { /* exited */ }
     }
@@ -453,6 +465,12 @@ async function sampleRun(rec, { window = null } = {}) {
 
 const SANDBOX_TEXT = /(FATAL|ERROR)[^\n]*(sandbox|zygote)/i;
 const statusOf = (dom) => /<p id="status"[^>]*>([^<]*)<\/p>/.exec(dom)?.[1] ?? "";
+
+function conclude(code) {
+  guard();
+  if (MUTATION || ANNOUNCE) failures.push("test-hook-active");
+  if (!failures.length) { state.exitCode = 0; result.ok = true; result.code = code; }
+}
 
 async function run(pin) {
   if (ANNOUNCE) result.testLaunchAnnouncement = true;
@@ -483,6 +501,17 @@ async function run(pin) {
 
   state.scratch = fs.mkdtempSync(path.join(os.tmpdir(), PREFIX));
   fs.chmodSync(state.scratch, 0o700);
+  if (privateDisplay) {
+    const sha256 = sha256File(XVFB);
+    try {
+      state.display = startPrivateDisplay(state.scratch);
+      await waitForPrivateDisplay(state.display);
+    } catch (error) {
+      throw new Fail(error instanceof PrivateDisplayError ? error.message : "private-display-start-failed", true, "display-unavailable");
+    }
+    guard();
+    result.display = { fixture: "Xvfb", sha256, authenticated: true };
+  }
 
   // Listener with a fixed fixture capture (as the listener browser probe builds it).
   const src = path.join(state.scratch, "src"); fs.mkdirSync(src, { mode: 0o700 });
@@ -499,23 +528,26 @@ async function run(pin) {
   const { origin } = await state.listener.start();
   const port = Number(new URL(origin).port);
 
-  // Primary evidence: one --dump-dom run, no debugging switch, sampled while it runs.
+  // Primary evidence: a private window or a --dump-dom run, with no debugging switch.
   const beforeNav = log.length;
   const windowNavigation = state.listener.mintWindowNavigation(binding);
   const mutationArgs = MUTATION === "debugging-then-kill" ? ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"] : [];
-  const main = launch("browser-data", [...mutationArgs, "--virtual-time-budget=10000", "--dump-dom", windowNavigation.url], { primary: true });
+  const navigationArgs = privateDisplay ? ["--new-window", windowNavigation.url]
+    : ["--virtual-time-budget=10000", "--dump-dom", windowNavigation.url];
+  const main = launch("browser-data", [...mutationArgs, ...navigationArgs], { primary: true, display: state.display });
   state.exitCode = 1; result.code = "fixture-failed";
   result.dataDirectory = main.check;
-  const agg = await sampleRun(main);
+  const agg = await sampleRun(main, privateDisplay ? { window: 4000 } : undefined);
   const dom = main.out.toString("utf8");
   const sandboxText = SANDBOX_TEXT.test(main.err.toString("utf8"));
-  result.remoteDebugging = { mode: "off", evidence: "dump-dom run only", sampling: "about every 50 ms plus scan time, while the browser ran",
+  result.remoteDebugging = { mode: "off", evidence: privateDisplay ? "private display run" : "dump-dom run only",
+    sampling: "about every 50 ms plus scan time, while the browser ran",
     sandboxEvidence: SANDBOX_EVIDENCE, stderrSandboxText: sandboxText, ...agg };
   // Classify only after the debugging evidence is recorded.
   const debugSeen = agg.held > 0 || agg.devToolsActivePort > 0 || agg.debuggingFlag > 0;
-  const ranClean = main.exit.code === 0 && dom.length > 0 && !main.overflow;
+  const ranClean = privateDisplay ? main.exit === null : main.exit?.code === 0 && dom.length > 0 && !main.overflow;
   const tablesRead = agg.unreadable === 0 && agg.netUnreadable === 0 && agg.cmdlineUnreadable === 0; // else "no debugging" is unverified
-  if (!ranClean && !debugSeen && tablesRead && Number.isInteger(main.exit.code) && main.exit.code !== 0 && sandboxText && !dom.length)
+  if (!ranClean && !debugSeen && tablesRead && Number.isInteger(main.exit?.code) && main.exit.code !== 0 && sandboxText && !dom.length)
     throw new Fail("browser-sandbox-unavailable", true, "browser-sandbox-unavailable");
   expect(agg.samplesWithBrowser >= 2, "browser not sampled at least twice while running");
   expect(agg.debuggingFlag === 0, "a browser process carries a remote-debugging switch");
@@ -526,6 +558,17 @@ async function run(pin) {
   expect(agg.ownSession && agg.exePinned && !agg.displayVariable, "browser session, binary or environment unexpected");
   expect(agg.maxSandboxed >= 1, "no browser process added a sandbox boundary");
   if (!ranClean) throw new Fail("browser-run-failed");
+
+  if (privateDisplay) {
+    const mappedWindow = mappedBrowserWindow(state.display, main.pid);
+    const selectedViewObserved = windowNavigation.takeView();
+    expect(agg.privateDisplayMatched, "browser did not use the owned display environment");
+    expect(mappedWindow && main.exit === null, "expected owned browser window is not mapped");
+    expect(selectedViewObserved && !windowNavigation.takeView(), "missing or reusable selected listener view observation");
+    result.window = { mappedWindow, selectedViewObserved };
+    conclude("private-display-fixture-passed");
+    return;
+  }
 
   // Fixed positive rendering, from the dumped DOM.
   const served = log.slice(beforeNav);
@@ -571,9 +614,7 @@ async function run(pin) {
   if (!(await stopOwned())) state.cleanupOk = false;
   expect(sessionPids(ctrl.pid).length === 0, "control browser session survived");
 
-  guard();
-  if (MUTATION || ANNOUNCE) failures.push("test-hook-active");
-  if (!failures.length) { state.exitCode = 0; result.ok = true; result.code = "fresh-browser-data-fixture-passed"; }
+  conclude("fresh-browser-data-fixture-passed");
 }
 
 /** One cleanup for normal exit, failure, signal and watchdog. */
@@ -587,7 +628,8 @@ async function cleanup() {
     c.childrenLeft = childPids().length;
     c.namingDataDirLeft = state.launches.reduce((n, r) => n + namingPids(r.dir).length, 0);
     c.namingScratchLeft = state.scratch ? namingPids(state.scratch).length : 0;
-    if (c.sessionLeft || c.childrenLeft || c.namingDataDirLeft || c.namingScratchLeft) state.cleanupOk = false;
+    if (state.display) c.displaySocketLeft = displaySocketPresent(state.display);
+    if (c.sessionLeft || c.childrenLeft || c.namingDataDirLeft || c.namingScratchLeft || c.displaySocketLeft) state.cleanupOk = false;
   }
   // Remove only after the proof: on a pass, an unsupported run, or an interrupted one.
   if (state.scratch && state.cleanupOk && (failures.length === 0 || state.aborted)) {
@@ -601,10 +643,10 @@ async function cleanup() {
   return c;
 }
 
-if (process.argv[2] === "--supervised") {
+if (supervised) {
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => abort(`signal-${sig}`));
   const watchdog = setTimeout(() => abort("watchdog"), 150000);
-  const pin = process.argv[3] === "--chrome-sha256" ? process.argv[4] : null;
+  const pin = pinArgs[0] === "--chrome-sha256" ? pinArgs[1] : null;
   const running = run(pin);
   running.catch(() => {}); // after an abort it may still reject; the race below already settled
   try {
@@ -626,7 +668,9 @@ if (process.argv[2] === "--supervised") {
   result.cleanup = cleanupResult;
   if (state.exitCode === 1 && state.scratch && fs.existsSync(state.scratch)) { result.retainedScratch = true; process.stderr.write(`retained scratch: ${state.scratch}\n`); }
   result.node = process.version;
-  result.limitations = ["no-debugging evidence comes from the --dump-dom run only; no CDP or pipe is used",
+  result.limitations = privateDisplay ? ["windowed Chromium on an owned Xvfb display; human desktop acceptance remains open",
+    "selected listener view and mapped browser window; no DOM verification in this mode",
+    "TCP listeners sampled; broader automation paths and runtime support remain open"] : ["no-debugging evidence comes from the --dump-dom run only; no CDP or pipe is used",
     "one fixture-owned headless browser, not the human's window",
     "agent control is network-namespace only; an agent-started browser is not launched",
     "TCP listeners only, sampled about every 50 ms plus scan time; a listener that exists only between samples is missed",

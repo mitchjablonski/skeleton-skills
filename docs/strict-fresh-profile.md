@@ -18,7 +18,7 @@ agent can't reach the listener the page talks to. It reuses the existing
 read-only [decision listener](strict-decision-listener.md) and the same
 `--dump-dom` approach as `test/live/strict-decision-listener-browser.mjs`.
 
-**No-debugging evidence comes from the `--dump-dom` run only.** No CDP is
+**Headless no-debugging evidence comes from the `--dump-dom` run.** No CDP is
 used, so neither `--remote-debugging-pipe` nor `--remote-debugging-port` is
 ever passed to that browser. (`--remote-debugging-pipe` is itself debugging
 and would not satisfy C20.)
@@ -205,6 +205,28 @@ WSL2 (kernel 6.6), Chrome 143.0.7499.192 with its default sandbox, Node 20:
   `interrupted` with exit 1, with no browser process left and the scratch
   root removed;
 - `/mnt/wslg/stderr.log` gained no lines.
+
+## Private display window (#219)
+
+The opt-in windowed run requires an explicit Chrome binary digest and the
+system Xvfb, xauth, xwininfo, and xprop tools:
+
+```sh
+node test/live/strict-fresh-profile-probe.mjs --private-display --chrome-sha256 "$CHROME_SHA256"
+```
+
+The fixture starts Xvfb on its own display number with TCP disabled. It
+checks the server's PID in the display lock, authenticates with a cookie in
+the private scratch directory, and verifies that an unauthenticated query
+is refused. It starts pinned Chrome in a fresh profile with the default
+sandbox and no debugging flags. During a bounded sample the probe checks for
+debugging switches, TCP listeners, the debugging port file, and evidence of
+Chrome's sandbox. It then verifies two facts while Chrome is still up: the
+decision window is mapped and owned by the launched browser PID, and the
+listener saw an authenticated response for the exact selected capture and
+binding. Cleanup checks the processes, display socket and lock, and scratch
+directory. The headless mode above still provides the DOM, network
+namespace, and debugging-port controls.
 
 ## Not shown
 
