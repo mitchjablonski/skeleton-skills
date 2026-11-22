@@ -13,7 +13,9 @@ import runpy
 import select
 import shutil
 import signal
+import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -29,6 +31,8 @@ StopHandoff, StopUnproven = handoff['StopHandoff'], handoff['StopUnproven']
 MAX_RECEIPT_BYTES = 512 * 1024
 LISTENER_SCOPE = HERE / 'strict-owned-listener-scope.py'
 LISTENER_SCOPE_TIMEOUT = 12  # Allow the scope's bounded descendant reaping to finish.
+WINDOW_READY_TIMEOUT = 18
+WINDOW_ROOT = Path('/dev/shm')
 
 
 class RuntimeRefused(Exception):
@@ -91,15 +95,53 @@ class PeerWatch:
 
 
 @dataclass(frozen=True)
+class OwnedWindow:
+    profile: Path
+    control: socket.socket
+
+    def live(self):
+        try:
+            self.control.sendall(b'v')
+            if self.control.recv(2) == b'y':
+                return True
+        except OSError:
+            pass
+        self.control.close()
+        return False
+
+    def dispose(self):
+        slot = self.profile / 'display-slot'
+        if os.path.lexists(slot):
+            fd = os.open(slot, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as source:
+                status = os.fstat(fd)
+                if not stat.S_ISREG(status.st_mode) or status.st_uid != os.getuid():
+                    raise RuntimeError('owned display slot could not be verified')
+                value = source.read(6)
+            if len(value) not in (4, 5) or value[-1:] != b'\n' or not value[:-1].isdigit():
+                raise RuntimeError('owned display slot could not be verified')
+            number = int(value)
+            if not 100 <= number <= 9999 or any(os.path.lexists(path) for path in (
+                    f'/tmp/.X{number}-lock', f'/tmp/.X11-unix/X{number}')):
+                raise RuntimeError('owned display cleanup unproven')
+        shutil.rmtree(self.profile)
+
+
+@dataclass(frozen=True)
 class ListenerScope:
     process: object
     lifeline: object
+    window: OwnedWindow | None = None
 
     def stop(self):
+        if self.window is not None:
+            self.window.control.close()
         self.lifeline.close()
         status = self.process.wait(LISTENER_SCOPE_TIMEOUT)
         if status < 0 or status == 125:
             raise RuntimeError('listener scope cleanup unproven')
+        if self.window is not None and self.window.profile.exists():
+            self.window.dispose()
 
 
 @dataclass(frozen=True)
@@ -117,7 +159,8 @@ class Listener:
         return self.process.poll() is None
 
     def responds(self):
-        if not self.alive():
+        window = self.scope.window
+        if not self.alive() or (window is not None and not window.live()):
             return False
         connection = HTTPConnection('127.0.0.1', self.port, timeout=0.5)
         try:
@@ -132,13 +175,15 @@ class Listener:
 
 
 class NamespaceLauncher(CaptureLauncher):
-    def __init__(self, node, scratch, check_runtime, stop_mode=None, *, protected=False, terminal_mode='restart'):
+    def __init__(self, node, scratch, check_runtime, stop_mode=None, *, protected=False, terminal_mode='restart',
+                 chrome_pin=None):
         super().__init__(node, scratch)
         self.run = lifecycle['Run'](scratch)
         self.check_runtime = check_runtime
         self.stop_mode = stop_mode
         self.protected = protected
         self.terminal_mode = terminal_mode
+        self.chrome_pin = chrome_pin
         self.terminal = None
         self.listener = None
         self.listener_scopes = []
@@ -191,19 +236,37 @@ class NamespaceLauncher(CaptureLauncher):
         selected = enrollment.expected if binding is None else binding
         versions = selected['reviewVersion'], selected['captureVersion']
         read_fd, write_fd = os.pipe()
-        with os.fdopen(read_fd, 'rb', buffering=0) as report, ExitStack() as lifeline_owner:
-            with os.fdopen(write_fd, 'wb', buffering=0):
+        with os.fdopen(read_fd, 'rb', buffering=0) as report, ExitStack() as scope_owner:
+            window = None
+            with os.fdopen(write_fd, 'wb', buffering=0), ExitStack() as child_handles:
                 stop_read, stop_write = os.pipe()
-                lifeline = lifeline_owner.enter_context(os.fdopen(stop_write, 'wb', buffering=0))
-                with os.fdopen(stop_read, 'rb', buffering=0):
-                    process = self.spawn([sys.executable, '-I', LISTENER_SCOPE, str(stop_read), str(write_fd),
-                                          self.node, capture['WORKER'], role, enrollment.directory / 'captures',
-                                          enrollment.identity, str(write_fd), *versions], (stop_read, write_fd))
-                scope = ListenerScope(process, lifeline)
+                lifeline = scope_owner.enter_context(os.fdopen(stop_write, 'wb', buffering=0))
+                child_handles.enter_context(os.fdopen(stop_read, 'rb', buffering=0))
+                command = [sys.executable, '-I', LISTENER_SCOPE, str(stop_read), str(write_fd)]
+                pass_fds = [stop_read, write_fd]
+                worker_args = []
+                if self.chrome_pin is not None and role in ('decision-listener', 'protected-window-missing-view'):
+                    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+                    scope_owner.enter_context(parent)
+                    child_handles.enter_context(child)
+                    parent.settimeout(4)
+                    profile = Path(tempfile.mkdtemp(prefix='strict-owned-window-', dir=WINDOW_ROOT))
+                    scope_owner.callback(shutil.rmtree, profile)
+                    window = OwnedWindow(profile, parent)
+                    control = child.fileno()
+                    command += ['--control-fd', str(control)]
+                    pass_fds.append(control)
+                    if role == 'decision-listener':
+                        role = 'protected-window-listener'
+                    worker_args = [profile, self.chrome_pin, str(control)]
+                process = self.spawn([*command, self.node, capture['WORKER'], role, enrollment.directory / 'captures',
+                                      enrollment.identity, str(write_fd), *versions, *worker_args], tuple(pass_fds))
+                scope = ListenerScope(process, lifeline, window)
                 self.listener_scopes.append(scope)
-                lifeline_owner.pop_all()
+                scope_owner.pop_all()
             try:
-                ready = capture['read_json'](report)
+                ready = (capture['read_json'](report) if window is None else
+                         capture['read_json'](report, timeout=WINDOW_READY_TIMEOUT))
             except (OSError, RuntimeError, ValueError):
                 return
         if set(ready) == {'port'} and type(ready['port']) is int and 1 <= ready['port'] <= 65535:
@@ -346,6 +409,8 @@ PLANNED_STOPS = {'graceful-restart': 'cooperative', 'forced-restart': 'stubborn'
 LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-missing-selected-view', 'listener-crashed-with-detached-child',
                      'listener-invalid-readiness', 'listener-exited-before-start',
                      'stale-listener-generation')
+WINDOW_LOSSES = {'window-browser-loss': b'b', 'window-display-loss': b'd'}
+WINDOW_REFUSALS = {'window-wrong-pin': 25, 'window-missing-view': 24}
 STARTUP_FAULTS = ('peer-loss-during-start', 'listener-loss-before-namespace', 'listener-loss-after-namespace')
 REFRESH_FAILURES = {'terminal-refresh-lost': 'refresh-lost', 'terminal-refresh-malformed': 'refresh-malformed',
                     'terminal-hangup-before-refresh': 'restart'}
@@ -455,11 +520,12 @@ def exercise_active_peer(launcher, fill, case, selected, before):
     assert capture['snapshot']((selected,)) == before
 
 
-def exercise(node, scratch, case, check_runtime=None, *, protected=False):
+def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome_pin=None):
     if check_runtime is not None:
         check_runtime()
     stop_mode = PLANNED_STOPS.get(case)
-    options = {'protected': protected, 'terminal_mode': REFRESH_FAILURES.get(case, 'restart')}
+    options = {'protected': protected, 'terminal_mode': REFRESH_FAILURES.get(case, 'restart'),
+               'chrome_pin': '0' * 64 if case == 'window-wrong-pin' else chrome_pin}
     if case in STARTUP_FAULTS:
         launcher = StartupFaultLauncher(node, scratch, check_runtime, stop_mode, fault=case, **options)
     else:
@@ -489,7 +555,8 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
                 binding = {**selected.expected, 'reviewVersion': '0' * 64}
             role = {'listener-invalid-readiness': 'invalid-listener-ready',
                     'listener-missing-selected-view': 'listener-missing-selected-view',
-                    'listener-crashed-with-detached-child': 'listener-crashed-with-detached-child'}.get(
+                    'listener-crashed-with-detached-child': 'listener-crashed-with-detached-child',
+                    'window-missing-view': 'protected-window-missing-view'}.get(
                         case, 'decision-listener')
             launcher.stage_listener(selected, binding=binding, role=role)
             if case == 'listener-store-mismatch':
@@ -506,8 +573,28 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
                 child_pid = int((scratch / 'listener-scope-test-child').read_text())
                 assert not (Path('/proc') / str(child_pid)).exists()
                 assert launcher.listener is None
+            elif case in WINDOW_REFUSALS:
+                scope = launcher.listener_scopes[-1]
+                assert scope.process.wait(LISTENER_SCOPE_TIMEOUT) == WINDOW_REFUSALS[case]
+                assert launcher.listener is None
+                assert (scope.window.profile / 'display-slot').exists() == (case == 'window-missing-view')
+                scope.stop()
+                assert not scope.window.profile.exists()
             else:
+                if chrome_pin is not None and launcher.listener is None:
+                    raise RuntimeRefused('protected-window-unavailable')
                 assert launcher.listener_ready(generation)
+            if case == 'window-replaced-generation':
+                old = launcher.listener.scope.window
+                generation = launcher.stage(selected, approved=True)
+                terminal = launcher.terminal
+                initial = generation.report()
+                terminal_host['check_terminal'](terminal.master, terminal.slave, generation)
+                terminal_host['expect_terminal'](terminal.master, b'SKELETON STRICT CONTROL\r\n')
+                terminal_host['read_console_status'](terminal.master, selected.expected)
+                assert not old.profile.exists()
+                launcher.stage_listener(selected)
+                assert launcher.listener_ready(generation) and launcher.listener.scope.window is not old
         if case == 'listener-exited-before-start':
             stop_listener(launcher)
         if case == 'stale-listener-generation':
@@ -519,7 +606,7 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
             initial = generation.report()
             assert initial.state == selected.expected and launcher.peers_live(generation)
             assert stale_listener.responds()
-        if case in LISTENER_REFUSALS:
+        if case in (*LISTENER_REFUSALS, *WINDOW_REFUSALS):
             children = len(launcher.children)
             assert launcher.admit_capture(selected, initial, first_stage) is None
             assert len(launcher.children) == children and not launcher.run.namespaces and not first_stage.exists()
@@ -528,6 +615,7 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
                 assert launcher.listener is None and stale_listener.process.poll() is not None
             assert capture['snapshot']((selected,)) == before
             return
+        initial_listener = launcher.listener
         admitted = launcher.admit_capture(selected, initial, first_stage)
         if case in STARTUP_FAULTS:
             assert admitted is None and not launcher.fills and launcher.active is None
@@ -600,14 +688,21 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
             hangup_terminal(launcher, generation)
         if case == 'listener-exited-before-restart':
             stop_listener(launcher)
+        if case in WINDOW_LOSSES:
+            scope = launcher.listener.scope
+            scope.window.control.sendall(WINDOW_LOSSES[case])
+            assert scope.process.wait(LISTENER_SCOPE_TIMEOUT) == 23
+            scope.stop()
+            assert not scope.window.profile.exists()
         next_stage = directory / 'stage-restart'
-        if case in ('restart', 'graceful-restart', 'forced-restart'):
+        if case in ('restart', 'graceful-restart', 'forced-restart', 'window-replaced-generation'):
             assert launcher.admit_capture(selected, fresh, next_stage, stop) == expected
             second = launcher.active
             assert len(launcher.fills) == 2 and second.generation is generation
             assert second.child is not first.child and second.namespace['pidNs'] != namespace['pidNs']
             assert launcher.peers_live(generation)
             if protected:
+                assert launcher.listener is initial_listener
                 assert launcher.terminal is terminal and launcher.listener_ready(generation)
                 terminal_host['read_console_status'](terminal.master, selected.expected)
             for name in capture['MEMBERS']:
@@ -646,6 +741,7 @@ def main():
     parser.add_argument('--terminal-worker-sha256', help='independently selected terminal entrypoint pin')
     parser.add_argument('--protected-launcher', action='store_true',
                         help='require a runtime receipt and also exercise enrollment and peer refusals')
+    parser.add_argument('--chrome-sha256', help='exercise the protected window with a pinned Chrome ELF')
     args = parser.parse_args()
     if (sys.platform != 'linux' or sys.flags.optimize
             or Path(sys.executable).resolve() != Path('/usr/bin/python3').resolve()
@@ -657,6 +753,19 @@ def main():
     if node_error or bwrap_error:
         parser.error('fixture executable pin refused')
     try:
+        chrome_pin = args.chrome_sha256
+        if chrome_pin is not None:
+            if not args.protected_launcher:
+                raise RuntimeRefused('protected-launcher-required-for-window')
+            if len(chrome_pin) != 64 or any(c not in '0123456789abcdef' for c in chrome_pin):
+                raise RuntimeRefused('chrome-pin-invalid')
+            try:
+                mount = subprocess.run(['/usr/bin/stat', '-f', '-c', '%T', WINDOW_ROOT],
+                                       timeout=2, capture_output=True, env={}, check=True)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeRefused('window-profile-tmpfs-unavailable') from exc
+            if mount.stdout.strip() != b'tmpfs':
+                raise RuntimeRefused('window-profile-tmpfs-unavailable')
         if args.protected_launcher and args.runtime_receipt is None:
             raise RuntimeRefused('runtime-selection-required')
         terminal_pin = args.terminal_worker_sha256
@@ -676,9 +785,12 @@ def main():
         cases += LISTENER_REFUSALS + ('listener-exited-before-restart',)
         cases += tuple(REFRESH_FAILURES) + ('terminal-hangup-after-refresh',)
         cases += tuple(ACTIVE_FAULTS)
+    if chrome_pin is not None:
+        cases = ('restart', 'window-replaced-generation', 'listener-store-mismatch',
+                 'stale-listener-generation', 'listener-exited-before-restart', *WINDOW_REFUSALS, *WINDOW_LOSSES)
     try:
         for case in cases:
-            exercise(node, scratch, case, check_runtime, protected=args.protected_launcher)
+            exercise(node, scratch, case, check_runtime, protected=args.protected_launcher, chrome_pin=chrome_pin)
     except RuntimeRefused as exc:
         code = str(exc)
         if code == 'runtime-observation-cleanup-unproven':
@@ -693,7 +805,8 @@ def main():
     shutil.rmtree(scratch)
     print(json.dumps({'ok': True, 'strictState': 'unverified', 'cases': cases, 'durableBytesUnchanged': True,
                       'runtimeReceiptChecked': check_runtime is not None,
-                      'terminalPinChecked': check_runtime is not None and terminal_pin is not None}))
+                      'terminalPinChecked': check_runtime is not None and terminal_pin is not None,
+                      **({'protectedWindowChecked': True} if chrome_pin is not None else {})}))
 
 
 if __name__ == '__main__':

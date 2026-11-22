@@ -13,7 +13,7 @@ import {createHumanCommandClient} from '../../lib/strict-human-channel.mjs';
 import {recoverHumanAuthorityChild, serveHumanAuthorityChild} from '../../lib/strict-authority-child.mjs';
 import {FIXTURE_CONTEXT, FIXTURE_PLAN, materialize} from './strict-candidate-inner.mjs';
 
-const [role, directory, identity, fd, reportFd, extraFd, refreshReportFd] = process.argv.slice(2);
+const [role, directory, identity, fd, reportFd, extraFd, refreshReportFd, chromePin, controlFd] = process.argv.slice(2);
 const authority = path.join(directory, 'authority');
 const captures = path.join(directory, 'captures');
 const context = {projectId: 'binding-fixture', sessionId: identity};
@@ -33,6 +33,69 @@ function boundFixtureLifetime(stream) {
 function boundRestartLifetime() {
   // Keep the endpoint owner alive during fixture mutations, even after its link closes.
   setTimeout(() => process.exit(1), 45000);
+}
+
+async function runProtectedWindow(listener, binding, origin, scratch) {
+  const control = new net.Socket({fd: Number(controlFd), readable: true, writable: true});
+  let closing = false;
+  let exitStatus = 23;
+  function close() {
+    if (closing) return;
+    closing = true;
+    control.destroy();
+    setTimeout(() => process.exit(exitStatus), 500);
+    void listener.close().finally(() => process.exit(exitStatus));
+  }
+  control.on('error', close);
+  control.on('end', close);
+  control.on('close', close);
+  // Leave time for the full restart, but also close on a stalled fixture.
+  setTimeout(close, 45000);
+  let window;
+  let busy = false;
+  control.on('data', async bytes => {
+    if (closing || !window || busy || bytes.length !== 1) {
+      close();
+      return;
+    }
+    busy = true;
+    try {
+      switch (bytes[0]) {
+        case 0x76: { // v
+          const live = await window.isLive();
+          control.write(live ? 'y' : 'n', error => {
+            if (error || !live) close();
+            else busy = false;
+          });
+          break;
+        }
+        case 0x62: // b
+          if (!window.stopBrowser()) close();
+          break;
+        case 0x64: // d
+          if (!window.stopDisplay()) close();
+          break;
+        default:
+          close();
+      }
+    } catch {
+      close();
+    }
+  });
+  try {
+    privateFixtureDirectory(scratch);
+    const {startProtectedWindow} = await import('./strict-protected-window.mjs');
+    const selected = listener.mintWindowNavigation(binding);
+    const navigation = role === 'protected-window-missing-view'
+      ? {url: listener.mintNavigation(), takeView: selected.takeView}
+      : selected;
+    window = await startProtectedWindow({scratch, chromePin, navigation, onLoss: close});
+    if (!closing) writeReport(fd, {port: Number(new URL(origin).port)});
+  } catch (error) {
+    if (error?.label === 'protected-window-view-missing') exitStatus = 24;
+    if (error?.label === 'browser-pin-mismatch') exitStatus = 25;
+    close();
+  }
 }
 
 function writeReport(descriptor, value) {
@@ -106,7 +169,8 @@ if (role === 'prepare-approved') {
   } catch {
     process.exit(23);
   }
-} else if (role === 'decision-listener' || role === 'listener-missing-selected-view') {
+} else if (['decision-listener', 'listener-missing-selected-view',
+            'protected-window-listener', 'protected-window-missing-view'].includes(role)) {
   const [{createDecisionListener}, {buildStrictCaptureViewModel}] = await Promise.all([
     import('../../lib/strict-decision-listener.mjs'), import('../../lib/strict-capture-view-model.mjs'),
   ]);
@@ -134,9 +198,13 @@ if (role === 'prepare-approved') {
     await listener.close();
     process.exit(23);
   }
-  listener.mintNavigation(); // Revoke the private startup tab; this fixture exports no navigation handle.
-  writeReport(fd, {port: Number(new URL(origin).port)});
-  boundRestartLifetime();
+  listener.mintNavigation(); // Revoke the private startup tab.
+  if (role === 'protected-window-listener' || role === 'protected-window-missing-view') {
+    await runProtectedWindow(listener, binding, origin, refreshReportFd);
+  } else {
+    writeReport(fd, {port: Number(new URL(origin).port)});
+    boundRestartLifetime();
+  }
 } else if (role === 'invalid-listener-ready') {
   writeReport(fd, {port: '1234'});
 } else if (role === 'listener-crashed-with-detached-child') {

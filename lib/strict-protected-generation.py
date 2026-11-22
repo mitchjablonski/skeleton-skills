@@ -28,10 +28,10 @@ def _invalid_constant(value):
     raise ValueError(f'invalid JSON constant: {value}')
 
 
-def read_json(reader):
+def read_json(reader, *, timeout=TIMEOUT):
     """Read exactly one UTF-8 JSON object from a pipe through EOF."""
     data = bytearray()
-    deadline = time.monotonic() + TIMEOUT
+    deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not select.select([reader], [], [], remaining)[0]:

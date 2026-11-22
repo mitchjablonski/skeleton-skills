@@ -121,8 +121,41 @@ reporting its own exit. The crash case starts a detached child that ignores
 SIGTERM, kills the listener, and verifies the scope reaped the child before
 admission can proceed. The launcher leaves scratch for inspection if the
 scope cannot prove teardown. The scope itself must remain alive to do this
-work. This is the ownership precursor to attaching Chromium and Xvfb.
+work.
+
+## Protected browser window
+
+Add `--chrome-sha256 <hex>` to the protected-launcher invocation to run
+the window and restart cases. The digest is for the selected Chrome ELF.
+The fixture requires Xvfb and the system X11 helper tools. Its browser
+profile, X cookie and display ownership marker use a fresh private
+directory on the verified `/dev/shm` tmpfs.
+
+The listener checks the stored selection and revokes the startup tab
+before minting a separate navigation for the pinned, sandboxed browser.
+It reports the port only after the authenticated private display maps the
+window and the listener observes a completed read for that exact selected
+capture and navigation. The launcher checks the same owned browser, X
+window and enrolled capture over an inherited private socket at admission
+and restart. A healthy same-generation restart preserves the window and
+the selected-view proof. A replacement generation disposes the old scope
+and must obtain its own proof.
+
+The cases cover refusal for a stale generation, a stored view mismatch, a
+wrong browser pin, and a mapped window without the selected navigation
+observation. They verify that loss of the listener, browser or display
+blocks restart before staging any replacement. The scope waits for
+descendants to exit and be reaped before the launcher checks the display
+slot and removes the profile. Unproven cleanup retains the scratch
+directory.
+
+This check applies at admission and restart. Active-fill teardown remains
+covered separately by the authority and console fault cases. Window
+evidence combines the selected listener read with mapped X window and
+process identity. Browser argument visibility is limited by the owned
+fixture namespace, and qualification of the actual human desktop remains
+open.
 
 This fixture uses explicitly pinned binaries and a fixed, owned workload.
-It leaves strict disabled and unverified. Browser-profile qualification,
+It leaves strict disabled and unverified. Actual desktop qualification,
 protected code issuance and production launcher ownership remain open.
