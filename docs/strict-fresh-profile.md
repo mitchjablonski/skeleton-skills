@@ -117,6 +117,11 @@ scratch root. For each sample:
 The virtual time budget lets the page's own binding script finish before the
 dump, as in the listener browser probe.
 
+The launcher obtains its one-use URL through the listener's host-only window
+navigation method. After Chromium returns the DOM, the fixture consumes the
+listener's observation of the exact selected view once. The DOM check,
+browser process checks and listener observation are independent requirements.
+
 **Negative control.** The same `--dump-dom` run, with
 `--remote-debugging-address=127.0.0.1 --remote-debugging-port=0` added, in
 its own fresh directory. The probe first stops the primary browser's

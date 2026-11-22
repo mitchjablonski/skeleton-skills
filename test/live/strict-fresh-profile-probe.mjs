@@ -50,7 +50,7 @@
 
 import { fileURLToPath } from "node:url";
 import { createDecisionListener } from "../../lib/strict-decision-listener.mjs";
-import { BWRAP, runOuter, sessionPids, childPids, namingPids, runWorker, Fail, buildFixtureCapture, renderingOf, createFixture } from "./strict-browser-fixture.mjs";
+import { BWRAP, runOuter, sessionPids, childPids, namingPids, runWorker, Fail, buildFixtureCapture, createFixture } from "./strict-browser-fixture.mjs";
 
 const PREFIX = "strict-fresh-profile-";
 const SELF = fileURLToPath(import.meta.url);
@@ -86,7 +86,8 @@ async function run(pin) {
   const wrap = MUTATION === "sandbox-blocked" // test only: no user namespaces, so Chrome's sandbox can't start
     ? [BWRAP, "--unshare-user", "--disable-userns", "--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/",
       "--dev", "/dev", "--proc", "/proc", "--bind", state.scratch, state.scratch, "--"] : null;
-  const main = fx.launch("browser-data", [...mutationArgs, "--virtual-time-budget=10000", "--dump-dom", state.listener.mintNavigation()], { primary: true, wrap });
+  const windowNavigation = state.listener.mintWindowNavigation(binding);
+  const main = fx.launch("browser-data", [...mutationArgs, "--virtual-time-budget=10000", "--dump-dom", windowNavigation.url], { primary: true, wrap });
   state.exitCode = 1; result.code = "fixture-failed";
   result.dataDirectory = main.check;
   let killed = false;
@@ -99,11 +100,7 @@ async function run(pin) {
   if (!assessed.ranClean) throw new Fail("browser-run-failed");
 
   // Fixed positive rendering, from the dumped DOM.
-  result.rendering = renderingOf(assessed.dom, log.slice(beforeNav));
-  expect(result.rendering.capture, "dumped DOM has no capture view");
-  expect(/Showing stored capture/.test(result.rendering.status), "status does not say showing");
-  expect(!result.rendering.imgInView && result.rendering.hostileTitleAsText, "hostile title not rendered as text");
-  expect(result.rendering.bindOk && result.rendering.viewOk, "listener did not serve bind and view");
+  result.rendering = fx.assessRendering(assessed.dom, log.slice(beforeNav), windowNavigation);
   if (!(await fx.stopOwned())) state.cleanupOk = false;
   expect(sessionPids(main.pid).length === 0, "dump-dom browser session survived");
 

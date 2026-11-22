@@ -24,8 +24,12 @@ receives the page**.
 **Agent browser.** The fixture starts an "agent" headless Chrome from the
 pinned ELF on `about:blank`. It runs in its own fresh 0700 data directory,
 with `--remote-debugging-address=127.0.0.1 --remote-debugging-port=0`. The
-port is read from a bounded, validated `DevToolsActivePort`. The browser
-keeps running for the whole run, and the fixture waits 2 s for its own
+port is read from a bounded, validated `DevToolsActivePort`. Before the
+first request to it, the fixture proves the port is a `127.0.0.1` listening
+socket held by a process of exactly that agent launch. It uses the
+sampler's socket-inode method: the listener's inode from the agent's
+`net/tcp`, found among the agent processes' `/proc/<pid>/fd` sockets. The
+browser keeps running for the whole run, and the fixture waits 2 s for its own
 background targets to settle before taking a baseline of its targets.
 
 **Launcher open.** The read-only decision listener starts with the fixed
@@ -42,14 +46,30 @@ runs, with the same checks as the fresh browser data directory fixture:
 The agent's processes are attributed to the agent and excluded from the
 launcher's sample. Attribution covers the agent's session, its process tree,
 processes naming its directory, and the crash handlers those processes
-reference by `--crashpad-handler-pid`. The rendering must show the capture,
-with bind and view 200s.
+reference by `--crashpad-handler-pid`, and launches are matched by their
+exact `--user-data-dir=<dir>` argument. The rendering requirements are the
+same independent checks as the fresh browser data directory fixture:
+- the escaped capture DOM;
+- bind and view 200s;
+- the listener's once-only observation of the exact selected view (#220).
+  The URL comes from the host-only window navigation method, and the
+  observation can be taken once only.
 
 **The agent browser never received it.** A background poller sends
 `GET /json/list` to the agent's fixture-owned port about every 100 ms. It
 polls before the launcher starts, during its run, and for 1.5 s after it
-exits. The run requires:
-- polls in all three phases and no poll errors;
+exits.
+
+Before each poll it re-proves that the agent is alive and still owns the
+port. Only HTTP 200 responses are accepted. Agent death, lost ownership or
+a failed poll stops polling and fails the run. Each poll snapshots its phase
+before the request. At every phase change the fixture awaits the in-flight
+poll and discards its result, so an observation that crosses a boundary
+counts toward neither phase. The same settling happens before the handoff
+and control outcomes are classified.
+
+The run requires:
+- polls in all three phases and no poll failure;
 - no target URL containing the listener origin;
 - the agent's `page` targets identical to the baseline. Its own background
   and service-worker targets may appear on their own, so only page targets
@@ -108,7 +128,8 @@ Node 20:
 - each launcher run was sampled 4 times, with up to 16 processes and 7
   sandboxed. It showed 0 held listeners, 0 switches, no
   `DevToolsActivePort` and 0 unreadable tables;
-- the agent was polled 5 times before, 4 during and 16 after. It never named
+- the agent was polled about 5 times before, 4 to 5 during and 14 to 16
+  after. It never named
   the listener origin, its page targets were unchanged, and the listener saw
   1 bind;
 - the singleton handoff exited 21 with the lock refusal text, forwarding

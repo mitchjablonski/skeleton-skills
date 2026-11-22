@@ -155,6 +155,18 @@ function socketInodes(pid) {
   }
   return out;
 }
+/** Inodes of 127.0.0.1:<port> TCP listeners in the network namespace seen through `pid`, or null if unreadable. */
+function loopbackListenerInodes(pid, port) {
+  const want = "0100007F:" + port.toString(16).toUpperCase().padStart(4, "0");
+  const r = procRead(pid, () => fs.readFileSync(`/proc/${pid}/net/tcp`, "utf8"));
+  if (!("value" in r)) return null;
+  const out = new Set();
+  for (const row of r.value.split("\n").slice(1)) {
+    const f = row.trim().split(/\s+/);
+    if (f.length > 9 && f[1] === want && f[3] === "0A") out.add(Number(f[9]));
+  }
+  return out;
+}
 /** Count listeners held by `pids`; unreadable fd and net tables are counted, never skipped silently. */
 export function heldListeners(pids) {
   const { inodes: listening, netUnreadable } = listeningInodes(pids);
@@ -338,6 +350,20 @@ export function createFixture({ prefix }) {
     return [...set];
   }
 
+  /** Is 127.0.0.1:<port> a listening socket held by a process of exactly this launch?
+   *  The same socket-inode method as the sampler; anything unreadable is "not proven". */
+  function portOwnedBy(rec, port) {
+    if (rec.exit !== null || !live(stat(rec.pid))) return { owned: false, reason: "browser-exited" };
+    const inodes = loopbackListenerInodes(rec.pid, port);
+    if (inodes === null) return { owned: false, reason: "net-table-unreadable" };
+    if (!inodes.size) return { owned: false, reason: "no-loopback-listener" };
+    for (const p of corePids(rec)) {
+      const r = procRead(p, () => socketInodes(p));
+      if ("value" in r && [...inodes].some((i) => r.value.has(i))) return { owned: true };
+    }
+    return { owned: false, reason: "listener-not-held-by-launch" };
+  }
+
   /** Our direct children only, except those `keep` (a running launch) accounts for. */
   async function stopOwned(keep = null) {
     const started = Date.now();
@@ -512,6 +538,19 @@ export function createFixture({ prefix }) {
     return { block, dom, ranClean };
   }
 
+  /** The launcher's positive rendering: escaped DOM markers, bind and view 200s, and (#220) the
+   *  listener's once-only observation of the exact selected view, each an independent requirement. */
+  function assessRendering(dom, served, windowNavigation) {
+    const rendering = renderingOf(dom, served);
+    expect(rendering.capture, "dumped DOM has no capture view");
+    expect(/Showing stored capture/.test(rendering.status), "status does not say showing");
+    expect(!rendering.imgInView && rendering.hostileTitleAsText, "hostile title not rendered as text");
+    expect(rendering.bindOk && rendering.viewOk, "listener did not serve bind and view");
+    rendering.selectedViewObserved = windowNavigation.takeView();
+    expect(rendering.selectedViewObserved && !windowNavigation.takeView(), "missing or reusable selected listener view observation");
+    return rendering;
+  }
+
   /** One cleanup for normal exit, failure, signal and watchdog: every browser, including agents. */
   async function cleanup() {
     const c = {};
@@ -569,6 +608,6 @@ export function createFixture({ prefix }) {
     finish(result, state.exitCode);
   }
 
-  return { result, state, failures, expect, guard, ANNOUNCE, corePids, browserPids, stopOwned, pinBrowser, prepare,
-    makeDataDir, launch, debuggingCheck, sampleRun, assessPrimary, cleanup, supervise };
+  return { result, state, failures, expect, guard, ANNOUNCE, corePids, browserPids, portOwnedBy, stopOwned, pinBrowser, prepare,
+    makeDataDir, launch, debuggingCheck, sampleRun, assessPrimary, assessRendering, cleanup, supervise };
 }

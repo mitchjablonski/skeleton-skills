@@ -42,7 +42,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDecisionListener } from "../../lib/strict-decision-listener.mjs";
-import { MAX, sleep, runOuter, sessionPids, Fail, buildFixtureCapture, renderingOf, createFixture } from "./strict-browser-fixture.mjs";
+import { MAX, sleep, runOuter, sessionPids, Fail, buildFixtureCapture, createFixture } from "./strict-browser-fixture.mjs";
 
 const PREFIX = "strict-agent-browser-";
 const SELF = fileURLToPath(import.meta.url);
@@ -55,6 +55,7 @@ const { result, state, failures, expect, guard } = fx;
 function jsonList(port) {
   return new Promise((resolve, reject) => {
     const req = http.get({ host: "127.0.0.1", port, path: "/json/list", timeout: 2000 }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return reject(new Fail("agent-target-list-not-200")); }
       let body = Buffer.alloc(0);
       res.on("data", (c) => { body = Buffer.concat([body, c]); if (body.length > MAX * 8) req.destroy(new Error("too large")); });
       res.on("end", () => {
@@ -78,19 +79,32 @@ function jsonNew(port, url) {
 }
 const pageSignature = (list) => list.filter((t) => t.type === "page").map((t) => String(t.url)).sort().join("\n");
 
-/** Background poller of the agent's targets; phases label when each poll happened. */
-function startPoller(port, origin) {
-  const p = { phase: "before", polls: {}, errors: 0, originSeen: {}, maxTargets: 0, pageSignatures: new Set(), stop: false, last: null };
+/**
+ * Background poller of the agent's targets. Each poll first proves the agent is alive and
+ * still owns the port, snapshots the phase, then requests /json/list (HTTP 200 only).
+ * setPhase() bumps a generation and awaits the in-flight poll, whose result is then
+ * discarded, so no observation crossing a boundary counts toward either phase.
+ * Ownership loss, agent death or a failed poll stops polling and fails closed.
+ */
+function startPoller(agent, port, origin) {
+  const p = { phase: "before", gen: 0, polls: {}, discarded: 0, originSeen: {}, maxTargets: 0, pageSignatures: new Set(),
+    stop: false, last: null, failure: null, inflight: Promise.resolve() };
+  p.setPhase = async (name) => { p.gen++; p.phase = name; await p.inflight; if (p.failure) throw new Fail(p.failure); };
   p.done = (async () => {
-    while (!p.stop && !state.aborted) {
-      try {
-        const list = await jsonList(port);
-        p.last = list;
-        p.polls[p.phase] = (p.polls[p.phase] ?? 0) + 1;
-        p.maxTargets = Math.max(p.maxTargets, list.length);
-        if (list.some((t) => String(t.url).includes(origin))) p.originSeen[p.phase] = true;
-        p.pageSignatures.add(pageSignature(list));
-      } catch { p.errors++; }
+    while (!p.stop && !state.aborted && !p.failure) {
+      const owner = fx.portOwnedBy(agent, port);
+      if (!owner.owned) { p.failure = `agent-port-${owner.reason}`; break; }
+      const phase = p.phase, gen = p.gen;
+      const request = jsonList(port);
+      p.inflight = request.then(() => {}, () => {});
+      let list;
+      try { list = await request; } catch (e) { p.failure = e instanceof Fail ? e.label : "agent-target-poll-failed"; break; }
+      if (gen !== p.gen) { p.discarded++; continue; } // crossed a phase boundary: discarded
+      p.last = list;
+      p.polls[phase] = (p.polls[phase] ?? 0) + 1;
+      p.maxTargets = Math.max(p.maxTargets, list.length);
+      if (list.some((t) => String(t.url).includes(origin))) p.originSeen[phase] = true;
+      p.pageSignatures.add(pageSignature(list));
       await sleep(100);
     }
   })();
@@ -117,47 +131,50 @@ async function run(pin) {
   if (agentPort === null) throw new Fail("agent-browser-cannot-start", true, "agent-browser-unavailable");
   await sleep(2000); // let the agent's own background targets settle before the baseline
   guard();
+  // The port must be a loopback listener held by this exact agent launch before any request to it.
+  const owner = fx.portOwnedBy(agent, agentPort);
+  result.agentBrowser = { portOwnedByAgentLaunch: owner.owned };
+  if (!owner.owned) throw new Fail(`agent-port-${owner.reason}`);
   const baseline = await jsonList(agentPort);
-  result.agentBrowser = { dataDirectoryFresh: agent.check.fresh && agent.check.mode === "0700", debuggingPort: "loopback, fixture-owned",
-    baselineTargets: baseline.length, baselinePageTargets: baseline.filter((t) => t.type === "page").length };
+  Object.assign(result.agentBrowser, { dataDirectoryFresh: agent.check.fresh && agent.check.mode === "0700", debuggingPort: "loopback, fixture-owned",
+    baselineTargets: baseline.length, baselinePageTargets: baseline.filter((t) => t.type === "page").length });
 
   // 2. The listener, then the launcher open on the #213 primary path.
   const { cap, binding } = buildFixtureCapture(state.scratch);
   const log = [];
   state.listener = createDecisionListener({ provider: { read: () => ({ binding, capture: cap }) }, observe: (e) => log.push(e) });
   const { origin } = await state.listener.start();
-  const poller = startPoller(agentPort, origin);
+  const poller = startPoller(agent, agentPort, origin);
   await sleep(500);
   guard();
 
-  poller.phase = "during";
+  await poller.setPhase("during");
   const beforeLaunch = log.length;
-  const main = fx.launch("launcher-data", ["--virtual-time-budget=10000", "--dump-dom", state.listener.mintNavigation()], { primary: true });
+  const windowNavigation = state.listener.mintWindowNavigation(binding);
+  const main = fx.launch("launcher-data", ["--virtual-time-budget=10000", "--dump-dom", windowNavigation.url], { primary: true });
   state.exitCode = 1; result.code = "fixture-failed";
   result.dataDirectory = main.check;
   const agg = await fx.sampleRun(main);
   const afterLaunch = log.length;
-  poller.phase = "after";
+  await poller.setPhase("after");
   const assessed = fx.assessPrimary(main, agg);
   result.remoteDebugging = assessed.block;
   if (assessed.unavailable) throw new Fail("browser-sandbox-unavailable", true, "browser-sandbox-unavailable");
   if (!assessed.ranClean) throw new Fail("browser-run-failed");
-  result.rendering = renderingOf(assessed.dom, log.slice(beforeLaunch, afterLaunch));
-  expect(result.rendering.capture, "dumped DOM has no capture view");
-  expect(/Showing stored capture/.test(result.rendering.status), "status does not say showing");
-  expect(!result.rendering.imgInView && result.rendering.hostileTitleAsText, "hostile title not rendered as text");
-  expect(result.rendering.bindOk && result.rendering.viewOk, "listener did not serve bind and view");
+  result.rendering = fx.assessRendering(assessed.dom, log.slice(beforeLaunch, afterLaunch), windowNavigation);
   if (!(await fx.stopOwned(agent))) state.cleanupOk = false; // the launcher's leftovers only; the agent keeps running
   expect(sessionPids(main.pid).length === 0, "launcher browser session survived");
   await sleep(1500); // keep polling the agent after the launcher run
   guard();
+  await poller.setPhase("idle"); // settle: the in-flight "after" poll is discarded, not misfiled
 
   // 3. The agent browser never received the page.
   const binds = log.filter((e) => e.url === "/api/bind"), views = log.filter((e) => e.url === "/api/view");
   const inLaunch = (e) => { const i = log.indexOf(e); return i >= beforeLaunch && i < afterLaunch; };
   const finalList = poller.last ?? [];
   result.agentNeverReceived = {
-    polls: { ...poller.polls }, pollErrors: poller.errors, originSeen: Object.keys(poller.originSeen).length > 0,
+    polls: { before: poller.polls.before ?? 0, during: poller.polls.during ?? 0, after: poller.polls.after ?? 0 }, discardedAtBoundaries: poller.discarded,
+    pollFailure: poller.failure, originSeen: ["before", "during", "after"].some((ph) => poller.originSeen[ph]),
     pageTargetsUnchanged: poller.pageSignatures.size === 1 && poller.pageSignatures.has(pageSignature(baseline)),
     finalTargets: finalList.length, finalPageTargets: finalList.filter((t) => t.type === "page").length,
     binds: binds.length, bindsOk: binds.filter((e) => e.status === 200).length, views: views.length,
@@ -168,15 +185,16 @@ async function run(pin) {
   expect(!r.originSeen, "an agent browser target named the listener origin");
   expect(r.pageTargetsUnchanged, "the agent browser's page targets changed");
   expect(r.binds === 1 && r.bindsOk === 1 && r.views >= 1 && r.allBindsAndViewsInLauncherRun, "binds or views outside the launcher run");
-  expect(r.pollErrors === 0, "agent target poll failed");
+  expect(r.pollFailure === null, "agent target poll failed or port ownership lost");
 
   // 4. Singleton handoff with a second nonce: the agent's data directory, no --dump-dom.
-  poller.phase = "singleton";
+  await poller.setPhase("singleton");
   const beforeSingleton = log.length;
   const handoff = fx.launch("singleton-handoff", [state.listener.mintNavigation()], { existingDir: agent.dir });
   await Promise.race([handoff.exited, sleep(10000)]);
   await sleep(1500);
   guard();
+  await poller.setPhase("idle"); // settle before classifying the handoff
   const stderr = handoff.err.toString("utf8");
   result.singleton = {
     exited: handoff.exit !== null, exitCode: handoff.exit?.code ?? null, exitSignal: handoff.exit?.signal ?? null,
@@ -192,11 +210,12 @@ async function run(pin) {
   if (result.singleton.forwardedToAgent) {
     result.negativeControl = { method: "singleton-forward", originSeenInAgent: true };
   } else {
-    poller.phase = "control";
+    await poller.setPhase("control");
     const beforeControl = log.length;
     const status = await jsonNew(agentPort, state.listener.mintNavigation());
-    for (let i = 0; i < 100 && !poller.originSeen.control; i++) { await sleep(100); guard(); }
+    for (let i = 0; i < 100 && !poller.originSeen.control && !poller.failure; i++) { await sleep(100); guard(); }
     await sleep(1000);
+    await poller.setPhase("idle");
     result.negativeControl = { method: "cdp-json-new", status, originSeenInAgent: !!poller.originSeen.control,
       listenerBindsFromAgent: log.slice(beforeControl).filter((e) => e.url === "/api/bind").length };
   }
@@ -205,6 +224,7 @@ async function run(pin) {
     expect(result.negativeControl.listenerBindsFromAgent >= 1, "negative control: the listener did not log the agent's bind (a second consumer would go unseen)");
   poller.stop = true;
   await poller.done;
+  expect(poller.failure === null, "agent target poll failed or port ownership lost");
 
   guard();
   if (fx.ANNOUNCE) failures.push("test-hook-active");
