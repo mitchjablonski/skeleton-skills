@@ -93,7 +93,12 @@ async function runProtectedWindow(listener, binding, origin, scratch) {
     if (!closing) writeReport(fd, {port: Number(new URL(origin).port)});
   } catch (error) {
     if (error?.label === 'protected-window-view-missing') exitStatus = 24;
-    if (error?.label === 'browser-pin-mismatch') exitStatus = 25;
+    else if (error?.label === 'browser-pin-mismatch') exitStatus = 25;
+    else if (error?.code === 'display-unavailable' || error?.label === 'private-display-start-failed') exitStatus = 26;
+    else if (error?.label === 'protected-browser-verification-failed' ||
+      error?.label === 'browser-sandbox-unavailable' || error?.label === 'running-browser-pin-mismatch') exitStatus = 27;
+    else if (error?.label === 'protected-window-not-mapped' ||
+      error?.label === 'protected-window-lost-during-startup') exitStatus = 28;
     close();
   }
 }
