@@ -375,13 +375,18 @@ function launch(name, args, { primary = false } = {}) {
 const cmdlineOf = (p) => { try { return fs.readFileSync(`/proc/${p}/cmdline`, "utf8"); } catch { return null; } };
 const userNs = (p) => { try { return fs.readlinkSync(`/proc/${p}/ns/user`); } catch { return null; } };
 const seccomp = (p) => { try { return /^Seccomp:\s*(\d)/m.exec(fs.readFileSync(`/proc/${p}/status`, "utf8"))?.[1] ?? null; } catch { return null; } };
-// The probe's own baseline, read once; without it sandbox evidence is "unavailable", never "differs".
-const BASELINE = { userNs: userNs("self"), seccomp: seccomp("self") };
-const SANDBOX_EVIDENCE = BASELINE.userNs && BASELINE.seccomp !== null ? "measured" : "unavailable";
-/** A browser process is counted as sandboxed only for a boundary it added beyond the probe's own. */
+// If this /proc doesn't expose namespace and seccomp state, sandbox evidence is
+// "unavailable" and the run refuses (exit 2) rather than passing without it.
+const SANDBOX_EVIDENCE = userNs("self") && seccomp("self") !== null ? "measured" : "unavailable";
+const exeOf = (p) => { try { return fs.readlinkSync(`/proc/${p}/exe`); } catch { return null; } };
+/** A boundary Chrome itself added: the process and its parent both run the pinned binary,
+ *  and the process is in a different user namespace from its parent, or is seccomp-filtered
+ *  while its parent isn't. A wrapper's namespace (e.g. bwrap) is never counted. */
 function addedBoundary(p) {
-  const ns = userNs(p), sc = seccomp(p);
-  return (ns !== null && ns !== BASELINE.userNs) || (BASELINE.seccomp !== "2" && sc === "2");
+  const parent = stat(p)?.ppid;
+  if (!parent || exeOf(p) !== state.binary || exeOf(parent) !== state.binary) return false;
+  const ns = userNs(p), pns = userNs(parent), sc = seccomp(p), psc = seccomp(parent);
+  return (ns !== null && pns !== null && ns !== pns) || (sc === "2" && psc !== null && psc !== "2");
 }
 /** One sample; the same check for the real browser and the debugging-port negative control. */
 function debuggingCheck(rec) {
@@ -452,6 +457,7 @@ async function run(pin) {
   result.browser = { label: b.label, sha256: b.sha256, pinRequested: !!pin, pinMatched: pin ? pin === b.sha256 : null };
   if (pin && pin !== b.sha256) throw new Fail("browser-pin-mismatch", true, "browser-pin-mismatch");
   state.binary = b.binary;
+  if (SANDBOX_EVIDENCE !== "measured") throw new Fail("sandbox-evidence-unavailable", true, "sandbox-evidence-unavailable");
 
   // Preconditions (unsupported until the browser is up).
   if (childPids().length) throw new Fail("probe-started-with-children", true);
@@ -500,7 +506,8 @@ async function run(pin) {
   // Classify only after the debugging evidence is recorded.
   const debugSeen = agg.held > 0 || agg.devToolsActivePort > 0 || agg.debuggingFlag > 0;
   const ranClean = main.exit.code === 0 && dom.length > 0 && !main.overflow;
-  if (!ranClean && !debugSeen && Number.isInteger(main.exit.code) && main.exit.code !== 0 && sandboxText && !dom.length)
+  const tablesRead = agg.unreadable === 0 && agg.netUnreadable === 0 && agg.cmdlineUnreadable === 0; // else "no debugging" is unverified
+  if (!ranClean && !debugSeen && tablesRead && Number.isInteger(main.exit.code) && main.exit.code !== 0 && sandboxText && !dom.length)
     throw new Fail("browser-sandbox-unavailable", true, "browser-sandbox-unavailable");
   expect(agg.samplesWithBrowser >= 2, "browser not sampled at least twice while running");
   expect(agg.debuggingFlag === 0, "a browser process carries a remote-debugging switch");
@@ -509,7 +516,7 @@ async function run(pin) {
   expect(agg.unreadable === 0 && agg.netUnreadable === 0, "unreadable fd or net tables");
   expect(agg.cmdlineUnreadable === 0, "unverified browser command line");
   expect(agg.ownSession && agg.exePinned && !agg.displayVariable, "browser session, binary or environment unexpected");
-  if (SANDBOX_EVIDENCE === "measured") expect(agg.maxSandboxed >= 1, "no browser process added a sandbox boundary");
+  expect(agg.maxSandboxed >= 1, "no browser process added a sandbox boundary");
   if (!ranClean) throw new Fail("browser-run-failed");
 
   // Fixed positive rendering, from the dumped DOM.

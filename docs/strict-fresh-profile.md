@@ -60,7 +60,9 @@ There is no `--no-sandbox` fallback.
 **Classifying a failed run.** The debugging evidence is evaluated and
 recorded first. Exit 2 (`browser-sandbox-unavailable`) is returned only when
 all of these hold:
-- held listeners, `DevToolsActivePort` and debugging switches were all 0;
+- held listeners, `DevToolsActivePort` and debugging switches were all 0,
+  and no descriptor, net table or command line was unreadable (otherwise
+  "no debugging" is unverified);
 - the browser exited with a numeric code (not a signal) and no DOM;
 - its captured stderr (bounded, never printed) matches Chrome's sandbox or
   zygote failure text.
@@ -92,11 +94,14 @@ scratch root. For each sample:
   process fails the run, and so does any descriptor entry that fails with
   anything but `ENOENT` or `ESRCH` (a vanished entry). A read is retried once
   after 25 ms, so a process caught mid-exit isn't counted;
-- at least one process added a sandbox boundary beyond the probe's own: a
-  user namespace different from the probe's, or seccomp filtering when the
-  probe itself is unfiltered. An inherited filter is not counted. If the
-  probe can't read its own namespace or seccomp state, the sandbox evidence
-  is reported as `unavailable` and not required.
+- at least one process shows a sandbox boundary Chrome itself added. Both
+  the process and its parent must run the pinned binary, and the process
+  must be in a different user namespace from its parent, or be
+  seccomp-filtered while its parent isn't. An inherited filter, or a
+  wrapper's namespace (such as Bubblewrap's), is not counted: under the
+  `sandbox-blocked` hook the count is 0. If this `/proc` doesn't expose
+  namespace and seccomp state, the run refuses with exit 2
+  (`sandbox-evidence-unavailable`) instead of passing without the evidence.
 
 **Positive rendering.** The fixture parses the dumped DOM:
 - the capture view (`data-strict-capture`) is present;
@@ -173,7 +178,8 @@ labels.
 - Exit 1: a check or cleanup failed.
 - Exit 2: not Linux, no Chrome or Chromium binary, no `/usr/bin/bwrap` or
   `/usr/bin/python3`, no child subreaper, Bubblewrap can't start a sandbox,
-  a pin mismatch, or the sandboxed browser can't start.
+  a pin mismatch, sandbox evidence unavailable, or the sandboxed browser
+  can't start.
 
 ## Measured
 
@@ -181,7 +187,7 @@ WSL2 (kernel 6.6), Chrome 143.0.7499.192 with its default sandbox, Node 20:
 - three consecutive runs passed, one of them with a matching
   `--chrome-sha256`;
 - each `--dump-dom` run was sampled 5 times with the browser up, with up to
-  14 processes, 6 or 7 of them adding a sandbox boundary. It showed 0 TCP
+  14 processes, 5 to 7 of them showing a boundary Chrome added. It showed 0 TCP
   listeners held, 0 debugging switches, no `DevToolsActivePort` and 0
   unreadable tables or command lines;
 - the agent got `ECONNREFUSED`, and the shared-network control got HTTP 505
