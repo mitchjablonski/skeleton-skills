@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Opt-in Linux test of capture admission with owned namespace teardown."""
 import argparse
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from http.client import HTTPConnection, HTTPException
 import json
+from math import ceil
 import os
 from pathlib import Path
 import runpy
+import select
 import shutil
 import signal
 import stat
@@ -78,6 +81,14 @@ class NamespaceFill:
 
 
 @dataclass(frozen=True)
+class PeerWatch:
+    fill: NamespaceFill
+    poller: object
+    roles: dict
+    exited: tuple
+
+
+@dataclass(frozen=True)
 class Listener:
     process: object
     port: int
@@ -112,9 +123,13 @@ class NamespaceLauncher(CaptureLauncher):
         self.terminal_mode = terminal_mode
         self.terminal = None
         self.listener = None
+        self.peer_fault = False
+        self.peer_watch = None
         self.supervisor = StopHandoff(lifecycle['stop_namespace'], self.prove_stopped, lifecycle['STOP_BOUND'])
 
     def stage(self, enrollment, directory=None, *, approved=False):
+        if self.peer_fault:
+            raise RuntimeError('peer fault is latched')
         if self.listener is not None:
             stop_listener(self)
             self.listener = None
@@ -136,7 +151,7 @@ class NamespaceLauncher(CaptureLauncher):
         return super().spawn(command, fds)
 
     def peers_live(self, generation):
-        return super().peers_live(generation) and (
+        return not self.peer_fault and super().peers_live(generation) and (
             not self.protected or (self.terminal is not None and self.terminal.owns(generation)))
 
     def refresh(self, generation):
@@ -183,7 +198,7 @@ class NamespaceLauncher(CaptureLauncher):
         return listener.responds() if check_response else listener.alive()
 
     def admit_capture(self, selected, report, stage, stop=None):
-        if report is None:
+        if self.peer_fault or report is None:
             return None
         if self.protected and (self.current is None or self.current.enrollment is not selected):
             return None
@@ -212,11 +227,60 @@ class NamespaceLauncher(CaptureLauncher):
             return None
         lifecycle['alive_at_fault'](namespace)
         if not self.peers_live(generation) or not self.listener_ready(generation, check_response=False):
-            self.supervisor.stop(namespace)
+            self.supervisor.stop_fault(namespace, time.monotonic() + lifecycle['STOP_BOUND'])
             return None
         self.active = NamespaceFill(generation, namespace['process'], namespace)
         self.fills.append(self.active)
         return namespace['digests']
+
+    @contextmanager
+    def watch_active(self, fill):
+        if (self.peer_watch is not None or self.peer_fault or fill is None or fill is not self.active
+                or fill.generation is not self.current):
+            raise RuntimeError('peer watch requires the current fill')
+        with ExitStack() as fds:
+            poller = select.poll()
+            roles = {}
+            exited = []
+            try:
+                for role in ('authority', 'console'):
+                    child = getattr(fill.generation, role)
+                    if child.returncode is not None:
+                        exited.append(role)
+                        continue
+                    # This single-threaded launcher has not reaped the Popen child.
+                    fd = os.pidfd_open(child.pid)
+                    fds.callback(os.close, fd)
+                    roles[fd] = role
+                    poller.register(fd, select.POLLIN)
+            except OSError:
+                self._stop_active_fault(fill, time.monotonic() + lifecycle['STOP_BOUND'])
+                raise
+            watch = PeerWatch(fill, poller, roles, tuple(exited))
+            self.peer_watch = watch
+            try:
+                yield watch
+            finally:
+                self.peer_watch = None
+
+    def stop_on_peer_exit(self, watch, deadline):
+        fill = watch.fill
+        if watch is not self.peer_watch or fill is not self.active or fill.generation is not self.current:
+            raise RuntimeError('peer watch no longer owns the fill')
+        timeout = 0 if watch.exited else ceil(max(0, deadline - time.monotonic()) * 1000)
+        events = watch.poller.poll(timeout)
+        if not events and not watch.exited:
+            return ()
+        self._stop_active_fault(fill, deadline)
+        if any(not (flags & select.POLLIN) for _, flags in events):
+            raise RuntimeError('peer exit observation unavailable')
+        return watch.exited + tuple(watch.roles[fd] for fd, _ in events)
+
+    def _stop_active_fault(self, fill, deadline):
+        self.peer_fault = True
+        self.admission.invalidate()
+        self.supervisor.stop_fault(fill.namespace, deadline)
+        self.active = None
 
     def restart_proved(self, previous, report, stop):
         return self.supervisor.consume_restart(previous.namespace, stop, report.requested_at)
@@ -255,6 +319,8 @@ LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-invalid-readiness', 'l
 STARTUP_FAULTS = ('peer-loss-during-start', 'listener-loss-before-namespace', 'listener-loss-after-namespace')
 REFRESH_FAILURES = {'terminal-refresh-lost': 'refresh-lost', 'terminal-refresh-malformed': 'refresh-malformed',
                     'terminal-hangup-before-refresh': 'restart'}
+ACTIVE_FAULTS = {'active-terminal-hangup': 'console', 'active-authority-loss': 'authority',
+                 'active-authority-already-reaped': 'authority'}
 
 
 class StartupFaultLauncher(NamespaceLauncher):
@@ -308,6 +374,55 @@ def refuse_enrollment(launcher, selected, first_stage, case):
     assert len(launcher.children) == owned_children
     assert not launcher.run.namespaces and not launcher.fills and not first_stage.exists()
     assert capture['snapshot']((selected, source)) == before
+
+
+def exercise_active_peer(launcher, fill, case, selected, before):
+    generation = fill.generation
+    with launcher.watch_active(fill) as watch:
+        try:
+            launcher.stop_on_peer_exit(PeerWatch(fill, watch.poller, watch.roles, watch.exited), time.monotonic())
+        except RuntimeError as exc:
+            assert str(exc) == 'peer watch no longer owns the fill'
+        else:
+            raise AssertionError('the launcher accepted an unregistered watcher')
+        assert launcher.stop_on_peer_exit(watch, time.monotonic() + 0.05) == ()
+        assert launcher.active is fill
+        lifecycle['alive_at_fault'](fill.namespace)
+        if case == 'restart':
+            return
+
+        stale = launcher.refresh(generation)
+        assert stale.state == selected.expected
+        lifecycle['alive_at_fault'](fill.namespace)
+        deadline = time.monotonic() + lifecycle['STOP_BOUND']
+        peer = ACTIVE_FAULTS[case]
+        if peer == 'console':
+            launcher.terminal.close()
+        else:
+            generation.authority.kill()
+        if case != 'active-authority-already-reaped':
+            assert launcher.stop_on_peer_exit(watch, deadline) == (peer,)
+    if case == 'active-authority-already-reaped':
+        generation.authority.wait(max(0, deadline - time.monotonic()))
+        with launcher.watch_active(fill) as watch:
+            assert watch.exited == ('authority',)
+            assert launcher.stop_on_peer_exit(watch, deadline) == ('authority',)
+    assert launcher.peer_fault and launcher.active is None and fill.child.poll() is not None
+    assert launcher.prove_stopped(fill.namespace, deadline)
+    survivor = generation.authority if peer == 'console' else generation.console
+    assert survivor.poll() is None and launcher.listener_ready(generation)
+    children = len(launcher.children)
+    replacement = selected.directory.parent / 'stage-restart'
+    assert launcher.admit_capture(selected, stale, replacement) is None
+    try:
+        launcher.stage(selected, approved=True)
+    except RuntimeError as exc:
+        assert str(exc) == 'peer fault is latched'
+    else:
+        raise AssertionError('the stopped run prepared a new generation')
+    assert len(launcher.children) == children and not replacement.exists()
+    assert launcher.fills == [fill] and launcher.run.namespaces == [fill.namespace]
+    assert capture['snapshot']((selected,)) == before
 
 
 def exercise(node, scratch, case, check_runtime=None, *, protected=False):
@@ -386,6 +501,10 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
             return
         assert admitted == expected
         first = launcher.active
+        if protected and (case == 'restart' or case in ACTIVE_FAULTS):
+            exercise_active_peer(launcher, first, case, selected, before)
+            if case in ACTIVE_FAULTS:
+                return
         namespace = first.namespace
         fresh = None
 
@@ -517,6 +636,7 @@ def main():
         cases += ENROLLMENT_REFUSALS + STARTUP_FAULTS + tuple(PLANNED_STOPS)
         cases += LISTENER_REFUSALS + ('listener-exited-before-restart',)
         cases += tuple(REFRESH_FAILURES) + ('terminal-hangup-after-refresh',)
+        cases += tuple(ACTIVE_FAULTS)
     try:
         for case in cases:
             exercise(node, scratch, case, check_runtime, protected=args.protected_launcher)

@@ -144,6 +144,19 @@ def check():
     expect_unproven(lambda: gate.confirm(namespace, 200))
     assert events == [('planned', 100, 130)]
 
+    gate, namespace, events, _ = setup()
+    expect_unproven(lambda: gate.stop_fault(wrong_namespace, 115))
+    assert events == []
+    assert gate.stop_fault(namespace, 115) is None
+    assert events == ['terminate', ('prove', 115), ('wait', 7)]
+    assert not gate.consume_restart(namespace, None, 120_000_000_000)
+    expect_unproven(lambda: gate.confirm(namespace, 125))
+
+    gate, namespace, events, _ = setup()
+    expect_unproven(lambda: gate.stop_fault(namespace, 99))
+    assert events == ['terminate']  # An expired proof budget still issues the physical stop.
+    expect_unproven(lambda: gate.stop(namespace))
+
     print('strict supervisor handoff checks passed')
 
 
