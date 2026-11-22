@@ -26,15 +26,20 @@ function removeDir(dir) {
  * Launch Chrome with a fresh private profile. `sandbox: false` adds
  * --no-sandbox (needed where user namespaces are unavailable); callers record
  * it in their evidence. The profile is removed on close or launch failure.
+ *
+ * `userDataDir` hands in a caller-owned directory instead: it is never
+ * removed here, so the caller can inspect it after close. `env` replaces the
+ * browser's environment and `detached` starts it in its own session.
  */
-export async function launchChrome(chrome, { sandbox = true, extraArgs = [] } = {}) {
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "skel-cdp-"));
+export async function launchChrome(chrome, { sandbox = true, extraArgs = [], userDataDir = null, env = undefined, detached = false } = {}) {
+  const owned = !userDataDir;
+  const profile = userDataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "skel-cdp-"));
   let proc;
   try {
     proc = spawn(chrome, ["--headless=new", ...(sandbox ? [] : ["--no-sandbox"]), "--disable-gpu", "--no-first-run",
       "--no-default-browser-check", "--disable-extensions", "--disable-background-networking", `--user-data-dir=${profile}`,
-      "--remote-debugging-pipe", ...extraArgs, "about:blank"], { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
-  } catch (e) { removeDir(profile); throw e; }
+      "--remote-debugging-pipe", ...extraArgs, "about:blank"], { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"], env, detached });
+  } catch (e) { if (owned) removeDir(profile); throw e; }
   const out = proc.stdio[3], inp = proc.stdio[4];
   let id = 0, buf = Buffer.alloc(0), dead = null;
   const pending = new Map(), listeners = new Set();
@@ -110,11 +115,11 @@ export async function launchChrome(chrome, { sandbox = true, extraArgs = [] } = 
         proc.once("exit", () => { clearTimeout(t); r(); });
       });
     }
-    if (!removeDir(profile)) console.error(`warning: could not remove ${profile}`);
+    if (owned && !removeDir(profile)) console.error(`warning: could not remove ${profile}`);
   }
 
   try {
     const { product } = await send("Browser.getVersion");
-    return { send, on, waitFor, newPage, close, product, profile, sandbox };
+    return { send, on, waitFor, newPage, close, product, profile, sandbox, pid: proc.pid, exited: () => proc.exitCode !== null || proc.signalCode !== null };
   } catch (e) { await close(); throw e; }
 }
