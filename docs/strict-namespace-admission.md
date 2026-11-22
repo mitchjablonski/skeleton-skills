@@ -43,7 +43,8 @@ retains scratch.
 
 Pass `--runtime-receipt /path/to/selected-receipt.json` to exercise selected
 runtime admission. Supply a canonical receipt from trusted configuration
-before running the fixture. This mode expects `node-channel-control`, with
+before running the fixture. The [pinned receipt recorder](strict-runtime-receipt.md#record-the-protected-fixture-candidate-216)
+can collect a candidate for comparison. This mode expects `node-channel-control`, with
 Node as the client and `test/live/strict-launcher-binding-worker.mjs` as its
 entrypoint. The launcher collects a fresh pinned receipt before staging any
 fixture workers and again immediately before each namespace start. A
