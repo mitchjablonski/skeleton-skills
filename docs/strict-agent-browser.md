@@ -94,7 +94,9 @@ forwarded, and the listener request count.
 **Negative control.** Because the singleton refuses, the fixture shows the
 check can detect a page arriving in the agent another way. With a third
 nonce, it opens the URL in the agent through CDP `PUT /json/new` on the
-agent's fixture-owned port. `/json/list` must then show a target with the
+agent's fixture-owned port. Immediately before that request the fixture re-proves the port is a
+loopback listener held by the live agent launch, and fails closed instead
+of sending if not. `/json/list` must then show a target with the
 listener origin, and the listener must log at least one bind from the agent. That shows the exactly-one-bind check would catch a second consumer of a nonce. If a future Chrome
 does forward through the singleton, that forward is used as the control.
 

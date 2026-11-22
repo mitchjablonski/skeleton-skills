@@ -50,11 +50,14 @@
 
 import { fileURLToPath } from "node:url";
 import { createDecisionListener } from "../../lib/strict-decision-listener.mjs";
-import { BWRAP, runOuter, sessionPids, childPids, namingPids, runWorker, Fail, buildFixtureCapture, createFixture } from "./strict-browser-fixture.mjs";
+import { BWRAP, runOuter, parseArgs, sha256File, sessionPids, childPids, namingPids, runWorker, Fail, buildFixtureCapture, createFixture } from "./strict-browser-fixture.mjs";
+import { mappedBrowserWindow, PrivateDisplayError, startPrivateDisplay, waitForPrivateDisplay, XVFB } from "./strict-private-display.mjs";
 
 const PREFIX = "strict-fresh-profile-";
 const SELF = fileURLToPath(import.meta.url);
-if (process.argv[2] !== "--supervised") runOuter(SELF);
+// `--private-display` (#222) runs the windowed mode on the fixture's own Xvfb display only.
+const { supervised, privateDisplay } = parseArgs({ allowPrivateDisplay: true });
+if (!supervised) runOuter(SELF, { allowPrivateDisplay: true });
 
 // Test-only hooks (each labelled in the output; a run using one never passes):
 // SKEL_C20_TEST_ANNOUNCE_LAUNCH=1 writes a stderr marker once the primary browser is up (signal test);
@@ -72,6 +75,17 @@ async function run(pin) {
   if (TEST_BROWSER) result.testBrowserOverride = true;
   fx.pinBrowser(pin, TEST_BROWSER);
   await fx.prepare();
+  if (privateDisplay) {
+    const sha256 = sha256File(XVFB);
+    try {
+      state.display = startPrivateDisplay(state.scratch);
+      await waitForPrivateDisplay(state.display);
+    } catch (error) {
+      throw new Fail(error instanceof PrivateDisplayError ? error.message : "private-display-start-failed", true, "display-unavailable");
+    }
+    guard();
+    result.display = { fixture: "Xvfb", sha256, authenticated: true };
+  }
 
   // Listener with a fixed fixture capture (as the listener browser probe builds it).
   const { cap, binding } = buildFixtureCapture(state.scratch);
@@ -80,24 +94,37 @@ async function run(pin) {
   const { origin } = await state.listener.start();
   const port = Number(new URL(origin).port);
 
-  // Primary evidence: one --dump-dom run, no debugging switch, sampled while it runs.
+  // Primary evidence: a private window or a --dump-dom run, with no debugging switch.
   const beforeNav = log.length;
   const mutationArgs = MUTATION === "debugging-then-kill" ? ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"] : [];
   const wrap = MUTATION === "sandbox-blocked" // test only: no user namespaces, so Chrome's sandbox can't start
     ? [BWRAP, "--unshare-user", "--disable-userns", "--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/",
       "--dev", "/dev", "--proc", "/proc", "--bind", state.scratch, state.scratch, "--"] : null;
   const windowNavigation = state.listener.mintWindowNavigation(binding);
-  const main = fx.launch("browser-data", [...mutationArgs, "--virtual-time-budget=10000", "--dump-dom", windowNavigation.url], { primary: true, wrap });
+  const navigationArgs = privateDisplay ? ["--new-window", windowNavigation.url]
+    : ["--virtual-time-budget=10000", "--dump-dom", windowNavigation.url];
+  const main = fx.launch("browser-data", [...mutationArgs, ...navigationArgs], { primary: true, wrap, display: state.display });
   state.exitCode = 1; result.code = "fixture-failed";
   result.dataDirectory = main.check;
   let killed = false;
-  const agg = await fx.sampleRun(main, { onSample: (a) => {
+  const agg = await fx.sampleRun(main, { window: privateDisplay ? 4000 : null, onSample: (a) => {
     if (MUTATION === "debugging-then-kill" && !killed && a.samplesWithBrowser >= 3) { killed = true; try { main.proc.kill("SIGKILL"); } catch { /* exited */ } }
   } });
   const assessed = fx.assessPrimary(main, agg);
   result.remoteDebugging = assessed.block;
   if (assessed.unavailable) throw new Fail("browser-sandbox-unavailable", true, "browser-sandbox-unavailable");
   if (!assessed.ranClean) throw new Fail("browser-run-failed");
+
+  if (privateDisplay) {
+    const mappedWindow = mappedBrowserWindow(state.display, main.pid);
+    const selectedViewObserved = windowNavigation.takeView();
+    expect(agg.privateDisplayMatched, "browser did not use the owned display environment");
+    expect(mappedWindow && main.exit === null, "expected owned browser window is not mapped");
+    expect(selectedViewObserved && !windowNavigation.takeView(), "missing or reusable selected listener view observation");
+    result.window = { mappedWindow, selectedViewObserved };
+    conclude("private-display-fixture-passed");
+    return;
+  }
 
   // Fixed positive rendering, from the dumped DOM.
   result.rendering = fx.assessRendering(assessed.dom, log.slice(beforeNav), windowNavigation);
@@ -133,13 +160,19 @@ async function run(pin) {
   if (!(await fx.stopOwned())) state.cleanupOk = false;
   expect(sessionPids(ctrl.pid).length === 0, "control browser session survived");
 
-  guard();
-  if (MUTATION || fx.ANNOUNCE) failures.push("test-hook-active");
-  if (!failures.length) { state.exitCode = 0; result.ok = true; result.code = "fresh-browser-data-fixture-passed"; }
+  conclude("fresh-browser-data-fixture-passed");
 }
 
-if (process.argv[2] === "--supervised") {
-  await fx.supervise(run, { limitations: ["no-debugging evidence comes from the --dump-dom run only; no CDP or pipe is used",
+function conclude(code) {
+  guard();
+  if (MUTATION || fx.ANNOUNCE) failures.push("test-hook-active");
+  if (!failures.length) { state.exitCode = 0; result.ok = true; result.code = code; }
+}
+
+if (supervised) {
+  await fx.supervise(run, { allowPrivateDisplay: true, limitations: privateDisplay ? ["windowed Chromium on an owned Xvfb display; human desktop acceptance remains open",
+    "selected listener view and mapped browser window; no DOM verification in this mode",
+    "TCP listeners sampled; broader automation paths and runtime support remain open"] : ["no-debugging evidence comes from the --dump-dom run only; no CDP or pipe is used",
     "one fixture-owned headless browser, not the human's window",
     "agent control is network-namespace only; an agent-started browser is not launched (see strict-agent-browser-probe.mjs)",
     "TCP listeners only, sampled about every 50 ms plus scan time; a listener that exists only between samples is missed",

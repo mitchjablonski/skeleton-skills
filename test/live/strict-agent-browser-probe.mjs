@@ -212,6 +212,9 @@ async function run(pin) {
   } else {
     await poller.setPhase("control");
     const beforeControl = log.length;
+    // Same live ownership proof as every poll, immediately before sending: fail closed otherwise.
+    const controlOwner = fx.portOwnedBy(agent, agentPort);
+    if (!controlOwner.owned) throw new Fail(`agent-port-${controlOwner.reason}`);
     const status = await jsonNew(agentPort, state.listener.mintNavigation());
     for (let i = 0; i < 100 && !poller.originSeen.control && !poller.failure; i++) { await sleep(100); guard(); }
     await sleep(1000);

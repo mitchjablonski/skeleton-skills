@@ -16,6 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync, spawn } from "node:child_process";
 import { captureStrictManifest } from "../../lib/strict-capture.mjs";
+import { displaySocketPresent, displayToolsAvailable } from "./strict-private-display.mjs";
 
 export const MAX = 32768;
 export const CANDIDATES = ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
@@ -40,16 +41,29 @@ if libc.prctl(36, 1, 0, 0, 0) != 0 or libc.prctl(37, ctypes.byref(v), 0, 0, 0) !
     sys.exit(3)
 os.execv(sys.argv[1], sys.argv[1:])
 `;
+/** Arguments: `[--private-display] [--chrome-sha256 <hex>]` (the same in the outer and the
+ *  supervised process). `--private-display` (#222) is accepted only where allowed, and
+ *  requires an explicit digest. */
+export function parseArgs({ allowPrivateDisplay = false } = {}) {
+  const supervised = process.argv[2] === "--supervised";
+  const args = process.argv.slice(supervised ? 3 : 2);
+  const privateDisplay = allowPrivateDisplay && args[0] === "--private-display";
+  const pinArgs = privateDisplay ? args.slice(1) : args;
+  const ok = (!privateDisplay && pinArgs.length === 0)
+    || (pinArgs.length === 2 && pinArgs[0] === "--chrome-sha256" && /^[0-9a-f]{64}$/i.test(pinArgs[1]));
+  return { supervised, args, privateDisplay, ok, pin: pinArgs[0] === "--chrome-sha256" ? pinArgs[1] : null };
+}
+
 /** Outer process. Signals and the overall timeout are forwarded so the inner run
  *  cleans up; SIGKILL only after a grace period, and only to the inner process. */
-export function runOuter(self) {
-  const args = process.argv.slice(2);
-  const pinOk = args.length === 0 || (args.length === 2 && args[0] === "--chrome-sha256" && /^[0-9a-f]{64}$/i.test(args[1]));
-  if (!pinOk) finish(unsupported("unexpected arguments"), 2);
+export function runOuter(self, options = {}) {
+  const { args, privateDisplay, ok } = parseArgs(options);
+  if (!ok) finish(unsupported("unexpected arguments"), 2);
   if (process.platform !== "linux") finish(unsupported("not Linux"), 2);
   if (!CANDIDATES.some((c) => fs.existsSync(c))) finish(unsupported("no Chrome or Chromium"), 2);
   if (!fs.existsSync(BWRAP)) finish(unsupported("no /usr/bin/bwrap"), 2);
   if (!fs.existsSync(PYTHON)) finish(unsupported("no /usr/bin/python3"), 2);
+  if (privateDisplay && !displayToolsAvailable()) finish(unsupported("private display tools unavailable", "display-unavailable"), 2);
   const inner = spawn(PYTHON, ["-I", "-c", SHIM, process.execPath, self, "--supervised", ...args.map((a) => a.toLowerCase())],
     { stdio: ["ignore", "pipe", "inherit"] });
   let buf = Buffer.alloc(0), hard = null;
@@ -246,7 +260,7 @@ export class Fail extends Error {
 }
 export const labelOf = (e) => e instanceof Fail ? e.label : /^E[A-Z]+$/.test(e?.code ?? "") ? `unexpected-error:${e.code}` : "unexpected-error";
 
-function sha256File(file) {
+export function sha256File(file) {
   const hash = crypto.createHash("sha256"), fd = fs.openSync(file, "r"), chunk = Buffer.alloc(1 << 20);
   try { let n; while ((n = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) hash.update(chunk.subarray(0, n)); } finally { fs.closeSync(fd); }
   return hash.digest("hex");
@@ -317,7 +331,7 @@ export function renderingOf(dom, served) {
  */
 export function createFixture({ prefix }) {
   const result = { ok: false, strictState: "unverified", code: "unsupported" };
-  const state = { exitCode: 2, scratch: null, listener: null, launches: [], aborted: null, cleanupOk: true, binary: null };
+  const state = { exitCode: 2, scratch: null, listener: null, display: null, launches: [], aborted: null, cleanupOk: true, binary: null };
   const failures = [];
   // After an abort the abandoned run may still resolve in the background: it records nothing more.
   const expect = (ok, what) => { if (!ok && !state.aborted) failures.push(what); };
@@ -434,17 +448,19 @@ export function createFixture({ prefix }) {
   /**
    * Headless, Chrome's default sandbox (never --no-sandbox), own session, no display variables,
    * HOME = the scratch root. `existingDir` reuses another launch's directory (singleton
-   * handoff only); `wrap` prefixes the argv (test only).
+   * handoff only); `wrap` prefixes the argv (test only). `display` (#222) is only ever the
+   * fixture's own private Xvfb display: its DISPLAY/XAUTHORITY replace headless mode.
    */
-  function launch(name, args, { primary = false, existingDir = null, wrap = null } = {}) {
+  function launch(name, args, { primary = false, existingDir = null, wrap = null, display = null } = {}) {
     const { dir, check } = existingDir ? { dir: existingDir, check: null } : makeDataDir(name);
     guard();
-    const env = { HOME: state.scratch, PATH: "/usr/bin:/bin", DBUS_SESSION_BUS_ADDRESS: "disabled:" };
-    let argv = [state.binary, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+    if (display && display !== state.display) throw new Fail("display-not-fixture-owned");
+    const env = { HOME: state.scratch, PATH: "/usr/bin:/bin", DBUS_SESSION_BUS_ADDRESS: "disabled:", ...display?.environment };
+    let argv = [state.binary, display ? "--ozone-platform=x11" : "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
       "--disable-extensions", "--disable-background-networking", `--user-data-dir=${dir}`, ...args];
     if (wrap) argv = [...wrap, ...argv];
     const proc = spawn(argv[0], argv.slice(1), { detached: true, env, stdio: ["ignore", "pipe", "pipe"] });
-    const rec = { name, proc, pid: proc.pid, dir, check, primary, out: Buffer.alloc(0), err: Buffer.alloc(0), overflow: false, exit: null };
+    const rec = { name, proc, pid: proc.pid, dir, check, primary, display, out: Buffer.alloc(0), err: Buffer.alloc(0), overflow: false, exit: null };
     state.launches.push(rec);
     rec.exited = new Promise((r) => {
       proc.on("error", () => { rec.exit = { code: null, signal: null, error: true }; r(); });
@@ -473,20 +489,23 @@ export function createFixture({ prefix }) {
   }
 
   /** The sampling loop: about every 50 ms plus scan time, until the --dump-dom browser exits.
-   *  `window` ends sampling after that many ms instead (a debugging-port browser keeps running
-   *  after the dump). `onSample(agg, sample)` is called after each sample. */
+   *  `window` ends sampling after that many ms instead (the private-display window and a
+   *  debugging-port browser keep running). `onSample(agg, sample)` is called after each sample. */
   async function sampleRun(rec, { window = null, onSample = null } = {}) {
     const agg = { samples: 0, samplesWithBrowser: 0, samplesWithHeld: 0, samplesWithDevToolsActivePort: 0, samplesWithSwitch: 0,
       maxProcesses: 0, maxSockets: 0, held: 0, unreadable: 0, netUnreadable: 0, cmdlineUnreadable: 0,
       devToolsActivePort: 0, debuggingFlag: 0, maxSandboxed: SANDBOX_EVIDENCE === "measured" ? 0 : null,
-      ownSession: false, exePinned: false, displayVariable: false };
+      ownSession: false, exePinned: false, displayVariable: false, privateDisplayMatched: false };
     let announced = false;
     const deadline = Date.now() + (window ?? 60000);
     while (rec.exit === null && Date.now() < deadline) {
       guard();
       const c = debuggingCheck(rec);
+      const browser = stat(rec.pid);
+      const browserRunning = rec.exit === null && live(browser);
+      const browserSampled = rec.display ? browserRunning : c.processes > 0;
       agg.samples++;
-      if (c.processes > 0) agg.samplesWithBrowser++;
+      if (browserSampled) agg.samplesWithBrowser++;
       if (c.held > 0) agg.samplesWithHeld++;
       if (c.devToolsActivePort > 0) agg.samplesWithDevToolsActivePort++;
       if (c.debuggingFlag > 0) agg.samplesWithSwitch++;
@@ -495,15 +514,18 @@ export function createFixture({ prefix }) {
       agg.devToolsActivePort = Math.max(agg.devToolsActivePort, c.devToolsActivePort);
       agg.debuggingFlag = Math.max(agg.debuggingFlag, c.debuggingFlag);
       if (c.sandboxed !== null) agg.maxSandboxed = Math.max(agg.maxSandboxed, c.sandboxed);
-      if (rec.exit === null && live(stat(rec.pid))) {
-        agg.ownSession ||= stat(rec.pid)?.sid === rec.pid;
+      if (browserRunning) {
+        agg.ownSession ||= browser.sid === rec.pid;
         try { agg.exePinned ||= fs.readlinkSync(`/proc/${rec.pid}/exe`) === state.binary; } catch { /* exited */ }
         try {
-          const keys = fs.readFileSync(`/proc/${rec.pid}/environ`, "utf8").split("\0").map((kv) => kv.split("=")[0]);
-          agg.displayVariable ||= keys.some((k) => ["DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "PULSE_SERVER"].includes(k));
+          const env = fs.readFileSync(`/proc/${rec.pid}/environ`, "utf8").split("\0");
+          const keys = env.map((kv) => kv.split("=")[0]);
+          agg.displayVariable ||= keys.some((k) => ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "PULSE_SERVER"].includes(k)
+            || (!rec.display && ["DISPLAY", "XAUTHORITY"].includes(k)));
+          if (rec.display) agg.privateDisplayMatched ||= Object.entries(rec.display.environment).every(([key, value]) => env.includes(`${key}=${value}`));
         } catch { /* exited */ }
       }
-      if (rec.primary && ANNOUNCE && !announced && c.processes > 0) { announced = true; process.stderr.write("probe: browser launched\n"); }
+      if (rec.primary && ANNOUNCE && !announced && browserSampled) { announced = true; process.stderr.write("probe: browser launched\n"); }
       onSample?.(agg, c);
       await sleep(50);
     }
@@ -520,12 +542,12 @@ export function createFixture({ prefix }) {
   function assessPrimary(rec, agg) {
     const dom = rec.out.toString("utf8");
     const sandboxText = SANDBOX_TEXT.test(rec.err.toString("utf8"));
-    const block = { mode: "off", evidence: "dump-dom run only", sampling: "about every 50 ms plus scan time, while the browser ran",
+    const block = { mode: "off", evidence: rec.display ? "private display run" : "dump-dom run only", sampling: "about every 50 ms plus scan time, while the browser ran",
       sandboxEvidence: SANDBOX_EVIDENCE, stderrSandboxText: sandboxText, ...agg };
     const debugSeen = agg.held > 0 || agg.devToolsActivePort > 0 || agg.debuggingFlag > 0;
-    const ranClean = rec.exit.code === 0 && dom.length > 0 && !rec.overflow;
+    const ranClean = rec.display ? rec.exit === null : rec.exit?.code === 0 && dom.length > 0 && !rec.overflow;
     const tablesRead = agg.unreadable === 0 && agg.netUnreadable === 0 && agg.cmdlineUnreadable === 0; // else "no debugging" is unverified
-    if (!ranClean && !debugSeen && tablesRead && Number.isInteger(rec.exit.code) && rec.exit.code !== 0 && sandboxText && !dom.length)
+    if (!ranClean && !debugSeen && tablesRead && Number.isInteger(rec.exit?.code) && rec.exit.code !== 0 && sandboxText && !dom.length)
       return { block, dom, unavailable: true };
     expect(agg.samplesWithBrowser >= 2, "browser not sampled at least twice while running");
     expect(agg.debuggingFlag === 0, "a browser process carries a remote-debugging switch");
@@ -563,7 +585,8 @@ export function createFixture({ prefix }) {
       c.childrenLeft = childPids().length;
       c.namingDataDirLeft = [...new Set(state.launches.map((r) => r.dir))].reduce((n, d) => n + namingPids(d).length, 0);
       c.namingScratchLeft = state.scratch ? namingPids(state.scratch).length : 0;
-      if (c.sessionLeft || c.childrenLeft || c.namingDataDirLeft || c.namingScratchLeft) state.cleanupOk = false;
+      if (state.display) c.displaySocketLeft = displaySocketPresent(state.display); // the private Xvfb (our child) is stopped above
+      if (c.sessionLeft || c.childrenLeft || c.namingDataDirLeft || c.namingScratchLeft || c.displaySocketLeft) state.cleanupOk = false;
     }
     // Remove only after the proof: on a pass, an unsupported run, or an interrupted one.
     if (state.scratch && state.cleanupOk && (failures.length === 0 || state.aborted)) {
@@ -578,11 +601,11 @@ export function createFixture({ prefix }) {
   }
 
   /** The supervised run: signals and the watchdog abandon `run`, then one cleanup, then one result. */
-  async function supervise(run, { limitations, failureCodes = ["browser-run-failed"] }) {
+  async function supervise(run, { limitations, failureCodes = ["browser-run-failed"], allowPrivateDisplay = false }) {
     for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => abort(`signal-${sig}`));
     const watchdog = setTimeout(() => abort("watchdog"), 150000);
     if (ANNOUNCE) result.testLaunchAnnouncement = true;
-    const pin = process.argv[3] === "--chrome-sha256" ? process.argv[4] : null;
+    const { pin } = parseArgs({ allowPrivateDisplay });
     const running = run(pin);
     running.catch(() => {}); // after an abort it may still reject; the race below already settled
     try {
