@@ -114,6 +114,15 @@ namespace already exists. The startup tab is revoked before the report.
 The fixture exports no navigation link or decision capability.
 Closing an already admitted listener does not authorize another start.
 
+The listener runs under a dedicated Linux child subreaper. The launcher
+requests stop by closing the private lifeline pipe. The scope also watches
+for the exact listener's exit and reaps its owned descendants before
+reporting its own exit. The crash case starts a detached child that ignores
+SIGTERM, kills the listener, and verifies the scope reaped the child before
+admission can proceed. The launcher leaves scratch for inspection if the
+scope cannot prove teardown. The scope itself must remain alive to do this
+work. This is the ownership precursor to attaching Chromium and Xvfb.
+
 This fixture uses explicitly pinned binaries and a fixed, owned workload.
 It leaves strict disabled and unverified. Browser-profile qualification,
 protected code issuance and production launcher ownership remain open.

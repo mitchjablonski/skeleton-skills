@@ -139,6 +139,13 @@ if (role === 'prepare-approved') {
   boundRestartLifetime();
 } else if (role === 'invalid-listener-ready') {
   writeReport(fd, {port: '1234'});
+} else if (role === 'listener-crashed-with-detached-child') {
+  const [{spawn}, {once}] = await Promise.all([import('node:child_process'), import('node:events')]);
+  const script = 'process.on("SIGTERM", () => {}); process.stdout.write("ready"); setTimeout(() => {}, 30000);';
+  const child = spawn(process.execPath, ['--eval', script], {detached: true, stdio: ['ignore', 'pipe', 'ignore']});
+  assert.equal((await once(child.stdout, 'data'))[0].toString(), 'ready');
+  fs.writeFileSync('listener-scope-test-child', String(child.pid), {mode: 0o600, flag: 'wx'});
+  process.kill(process.pid, 'SIGKILL');
 } else if (role === 'prepare') {
   const candidate = path.join(directory, 'candidate');
   fs.mkdirSync(candidate, {mode: 0o700});
