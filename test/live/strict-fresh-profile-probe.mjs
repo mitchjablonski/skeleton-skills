@@ -1,38 +1,41 @@
 #!/usr/bin/env node
 // Opt-in Linux C20 first slice (#77 / #79): the decision page opens in a
-// fresh, launcher-owned browser data directory with remote debugging off, and
+// fresh, launcher-owned browser data directory with remote debugging OFF, and
 // a sandboxed agent can't reach the listener the page talks to.
 //
-//   node test/live/strict-fresh-profile-probe.mjs
+//   node test/live/strict-fresh-profile-probe.mjs [--chrome-sha256 <hex>]
 //
 // The fixture:
-//   1. starts the existing read-only decision listener on loopback with a
+//   1. pins the browser: SHA-256 of the resolved Chrome/Chromium ELF binary,
+//      which is what it executes (refused, exit 2, on a --chrome-sha256
+//      mismatch);
+//   2. starts the existing read-only decision listener on loopback with a
 //      fixed fixture capture and mints the one-time URL;
-//   2. creates a fresh 0700 browser data directory of its own (an existing
-//      path is refused) and launches headless Chrome on it with
-//      --remote-debugging-pipe only, no display variables (WSLg is never
-//      touched) and HOME set to the scratch root;
-//   3. proves remote debugging is off: no DevToolsActivePort file, and no TCP
-//      listener (any network namespace the browser's processes are in) is held
-//      by any process in the browser's session, tree or reparented helpers
-//      (TCP only, sampled twice). A second disposable browser WITH a loopback
-//      debugging port, in its own fresh directory, is the negative control:
-//      the same check must find its listener and DevToolsActivePort;
-//   4. navigates to the URL over the pipe: the page binds and renders the
-//      fixed capture;
-//   5. agent control: a Bubblewrap worker with --unshare-net gets ECONNREFUSED
+//   3. runs headless Chrome ONCE with --dump-dom <URL> and
+//      --virtual-time-budget, on a fresh 0700 browser data directory of its own
+//      (an existing path is refused), with NO --remote-debugging-* switch of any
+//      kind, Chrome's default sandbox only (no --no-sandbox), no display
+//      variables (WSLg is never touched) and HOME set to the scratch root;
+//   4. while that browser runs, samples its processes: no debugging switch in
+//      any command line, no DevToolsActivePort, and no TCP listener held (any
+//      network namespace they are in). After it exits, parses the dumped DOM
+//      for the fixed capture markers;
+//   5. negative control: a disposable browser WITH a loopback debugging port,
+//      in its own fresh directory, must be caught by the same check;
+//   6. agent control: a Bubblewrap worker with --unshare-net gets ECONNREFUSED
 //      on the listener origin; the same worker sharing the network namespace
 //      connects and gets an HTTP status for GET /;
-//   6. closes the browser and the listener, proves nothing remains in the
-//      browser's session, among our children, or naming the scratch root,
-//      and only then removes the directory. The same cleanup runs on SIGINT,
+//   7. stops the browsers and the listener, proves nothing remains in a
+//      browser session, among our children, or naming the scratch root, and
+//      only then removes the directory. The same cleanup runs on SIGINT,
 //      SIGTERM, SIGHUP and the watchdog, which abandon the run (exit 1).
-// It connects to nothing but the fixture's own listener (and the browser's
-// pipe). Never human proof, never a support claim.
+// No CDP is used. It connects to nothing but the fixture's own listener.
+// Never human proof, never a support claim.
 //
 // Exit 0: passed. Exit 1: a check or cleanup failed (scratch retained; its
 // path goes to stderr only). Exit 2: unsupported (not Linux, no Chrome or
-// Chromium, no Bubblewrap or system Python, or the browser can't start).
+// Chromium, no Bubblewrap or system Python, a pin mismatch, or the sandboxed
+// browser can't start: `browser-sandbox-unavailable`).
 //
 // Cleanup: Chrome's crash handlers leave the browser session. The probe
 // re-executes itself through a tiny Python shim that makes it a Linux child
@@ -42,6 +45,7 @@
 // signal. Node never reaps reparented orphans, so their pids can't be reused
 // while the probe runs.
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -49,7 +53,6 @@ import { spawnSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { captureStrictManifest } from "../../lib/strict-capture.mjs";
 import { createDecisionListener } from "../../lib/strict-decision-listener.mjs";
-import { launchChrome } from "./cdp-pipe.mjs";
 
 const MAX = 32768;
 const CANDIDATES = ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
@@ -59,7 +62,7 @@ const PREFIX = "strict-fresh-profile-";
 const SELF = fileURLToPath(import.meta.url);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const unsupported = (reason) => ({ ok: false, strictState: "unverified", code: "unsupported", reason });
+const unsupported = (reason, code = "unsupported") => ({ ok: false, strictState: "unverified", code, reason });
 function finish(result, exitCode) {
   const line = JSON.stringify(result);
   process.stdout.write((line.length <= MAX ? line : JSON.stringify({ ok: false, code: "fixture-failed", reason: "result too large" })) + "\n");
@@ -76,14 +79,17 @@ if libc.prctl(36, 1, 0, 0, 0) != 0 or libc.prctl(37, ctypes.byref(v), 0, 0, 0) !
 os.execv(sys.argv[1], sys.argv[1:])
 `;
 if (process.argv[2] !== "--supervised") {
-  if (process.argv.length !== 2) finish(unsupported("unexpected arguments"), 2);
+  const args = process.argv.slice(2);
+  const pinOk = args.length === 0 || (args.length === 2 && args[0] === "--chrome-sha256" && /^[0-9a-f]{64}$/i.test(args[1]));
+  if (!pinOk) finish(unsupported("unexpected arguments"), 2);
   if (process.platform !== "linux") finish(unsupported("not Linux"), 2);
   if (!CANDIDATES.some((c) => fs.existsSync(c))) finish(unsupported("no Chrome or Chromium"), 2);
   if (!fs.existsSync(BWRAP)) finish(unsupported("no /usr/bin/bwrap"), 2);
   if (!fs.existsSync(PYTHON)) finish(unsupported("no /usr/bin/python3"), 2);
   // Signals and the overall timeout are forwarded so the inner run cleans up;
   // SIGKILL only after a grace period, and only to the inner process we started.
-  const inner = spawn(PYTHON, ["-I", "-c", SHIM, process.execPath, SELF, "--supervised"], { stdio: ["ignore", "pipe", "inherit"] });
+  const inner = spawn(PYTHON, ["-I", "-c", SHIM, process.execPath, SELF, "--supervised", ...args.map((a) => a.toLowerCase())],
+    { stdio: ["ignore", "pipe", "inherit"] });
   let buf = Buffer.alloc(0), hard = null;
   inner.stdout.on("data", (c) => { if (buf.length <= MAX * 2) buf = Buffer.concat([buf, c]); });
   const forward = (sig) => {
@@ -142,6 +148,13 @@ function browserPids(browserPid, scratch) {
   set.delete(process.pid);
   return [...set];
 }
+/** A /proc read of a live process; a process that is exiting (fd table already
+ *  released) is retried once after 25 ms and then skipped only if no longer live. */
+function procRead(pid, fn) {
+  try { return { value: fn() }; } catch { /* retry below */ }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  try { return { value: fn() }; } catch { return { unreadable: live(stat(pid)) }; }
+}
 /** Listening TCP socket inodes in the network namespace(s) seen through each pid. */
 function listeningInodes(pids) {
   const inodes = new Set();
@@ -149,7 +162,9 @@ function listeningInodes(pids) {
   for (const pid of [process.pid, ...pids]) {
     for (const file of ["net/tcp", "net/tcp6"]) {
       let text;
-      try { text = fs.readFileSync(`/proc/${pid}/${file}`, "utf8"); } catch { if (live(stat(pid))) netUnreadable++; continue; }
+      const r = procRead(pid, () => fs.readFileSync(`/proc/${pid}/${file}`, "utf8"));
+      if (!("value" in r)) { if (r.unreadable) netUnreadable++; continue; }
+      text = r.value;
       for (const row of text.split("\n").slice(1)) {
         const f = row.trim().split(/\s+/);
         if (f.length > 9 && f[3] === "0A") inodes.add(Number(f[9]));
@@ -171,7 +186,9 @@ function heldListeners(pids) {
   let held = 0, sockets = 0, unreadable = 0, readable = 0;
   for (const pid of pids) {
     let mine;
-    try { mine = socketInodes(pid); } catch { if (live(stat(pid))) unreadable++; continue; }
+    const r = procRead(pid, () => socketInodes(pid));
+    if (!("value" in r)) { if (r.unreadable) unreadable++; continue; }
+    mine = r.value;
     readable++; sockets += mine.size;
     for (const i of mine) if (listening.has(i)) held++;
   }
@@ -236,24 +253,23 @@ function runWorker(unshareNet, port) {
 }
 
 
+
 // --- supervised run ---------------------------------------------------------
-const CHROME = CANDIDATES.find((c) => fs.existsSync(c));
 const result = { ok: false, strictState: "unverified", code: "unsupported" };
-const state = { exitCode: 2, scratch: null, listener: null, launches: [], aborted: null, cleanupOk: true };
+const state = { exitCode: 2, scratch: null, listener: null, launches: [], aborted: null, cleanupOk: true, binary: null };
 const failures = [];
 const expect = (ok, what) => { if (!ok) failures.push(what); };
 // Every message that can reach stdout is a fixed label: never a path or token.
-class Fail extends Error { constructor(label, unsupported = false) { super(label); this.label = label; this.unsupported = unsupported; } }
-const labelOf = (e) => e instanceof Fail ? e.label
-  : /timed out|timeout/i.test(e?.message ?? "") ? "browser-timeout"
-  : /chrome (exited|failed)/i.test(e?.message ?? "") ? "browser-exited"
-  : /^E[A-Z]+$/.test(e?.code ?? "") ? `unexpected-error:${e.code}` : "unexpected-error";
+class Fail extends Error {
+  constructor(label, unsupported = false, code = "unsupported") { super(label); this.label = label; this.unsupported = unsupported; this.code = code; }
+}
+const labelOf = (e) => e instanceof Fail ? e.label : /^E[A-Z]+$/.test(e?.code ?? "") ? `unexpected-error:${e.code}` : "unexpected-error";
 
 let abortResolve;
 const aborted = new Promise((r) => { abortResolve = r; });
 function abort(reason) { if (state.aborted) return; state.aborted = reason; abortResolve(); }
 const guard = () => { if (state.aborted) throw new Fail("aborted"); };
-// Test-only hook: pause after the browser is up so a signal test can interrupt it.
+// Test-only hook: pause while the negative-control browser is up so a signal test can interrupt it.
 const PAUSE_MS = Math.min(Number(process.env.SKEL_C20_TEST_PAUSE_AFTER_LAUNCH_MS) || 0, 60000);
 
 async function stopOwned() {
@@ -272,6 +288,20 @@ async function stopOwned() {
   return childPids().length === 0;
 }
 const bounded = (p, ms) => Promise.race([Promise.resolve(p).catch(() => {}), sleep(ms)]);
+
+/** The ELF binary we execute (a wrapper script is resolved to its sibling `chrome`), and its SHA-256. */
+function resolveBrowser() {
+  const isElf = (p) => { try { const fd = fs.openSync(p, "r"); try { const b = Buffer.alloc(4); fs.readSync(fd, b, 0, 4, 0); return b.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])); } finally { fs.closeSync(fd); } } catch { return false; } };
+  for (const c of CANDIDATES) {
+    if (!fs.existsSync(c)) continue;
+    let real = fs.realpathSync(c);
+    if (!isElf(real)) { const sib = path.join(path.dirname(real), "chrome"); if (!isElf(sib)) continue; real = fs.realpathSync(sib); }
+    const hash = crypto.createHash("sha256"), fd = fs.openSync(real, "r"), chunk = Buffer.alloc(1 << 20);
+    try { let n; while ((n = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) hash.update(chunk.subarray(0, n)); } finally { fs.closeSync(fd); }
+    return { label: path.basename(c), binary: real, sha256: hash.digest("hex") };
+  }
+  throw new Fail("no-elf-browser-binary", true);
+}
 
 /** A fresh, owned, 0700 browser data directory per launch; an existing path is refused. */
 function makeDataDir(name) {
@@ -294,27 +324,39 @@ function makeDataDir(name) {
   return { dir, check };
 }
 
-async function launch(name, sandbox, extraArgs = []) {
+/** Headless, Chrome's default sandbox (never --no-sandbox), own session, no display variables. */
+function launch(name, args, captureStdout) {
   const { dir, check } = makeDataDir(name);
-  const env = { HOME: state.scratch, PATH: "/usr/bin:/bin", DBUS_SESSION_BUS_ADDRESS: "disabled:" }; // no display variables
   guard();
-  const browser = await launchChrome(CHROME, { sandbox, userDataDir: dir, env, detached: true, extraArgs });
-  const rec = { browser, pid: browser.pid, dir, check };
+  const env = { HOME: state.scratch, PATH: "/usr/bin:/bin", DBUS_SESSION_BUS_ADDRESS: "disabled:" };
+  const proc = spawn(state.binary, ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+    "--disable-extensions", "--disable-background-networking", `--user-data-dir=${dir}`, ...args],
+  { detached: true, env, stdio: ["ignore", captureStdout ? "pipe" : "ignore", "ignore"] });
+  const rec = { proc, pid: proc.pid, dir, check, out: Buffer.alloc(0), overflow: false, exit: null };
   state.launches.push(rec);
-  guard();
+  rec.exited = new Promise((r) => {
+    proc.on("error", () => { rec.exit = { code: null, error: true }; r(); });
+    proc.on("exit", (code, signal) => { rec.exit = { code, signal }; r(); });
+  });
+  proc.stdout?.on("data", (c) => { if (rec.out.length + c.length > 8 * MAX * 64) rec.overflow = true; else rec.out = Buffer.concat([rec.out, c]); });
   return rec;
 }
 
 const cmdlineOf = (p) => { try { return fs.readFileSync(`/proc/${p}/cmdline`, "utf8"); } catch { return ""; } };
-/** The same check for the real browser and the debugging-port negative control. */
+const userNs = (p) => { try { return fs.readlinkSync(`/proc/${p}/ns/user`); } catch { return null; } };
+const seccomp = (p) => { try { return /^Seccomp:\s*(\d)/m.exec(fs.readFileSync(`/proc/${p}/status`, "utf8"))?.[1] ?? null; } catch { return null; } };
+/** One sample; the same check for the real browser and the debugging-port negative control. */
 function debuggingCheck(rec) {
   const pids = browserPids(rec.pid, state.scratch);
+  const ownNs = userNs(process.pid);
   return { ...heldListeners(pids), devToolsActivePort: findNamed(state.scratch, "DevToolsActivePort"),
-    portFlag: pids.filter((p) => /--remote-debugging-(port|address)/.test(cmdlineOf(p))).length,
-    pipeFlag: /--remote-debugging-pipe/.test(cmdlineOf(rec.pid)) };
+    debuggingFlag: pids.filter((p) => /--remote-debugging/.test(cmdlineOf(p))).length,
+    sandboxed: pids.filter((p) => seccomp(p) === "2" || (userNs(p) && userNs(p) !== ownNs)).length };
 }
 
-async function run() {
+const statusOf = (dom) => /<p id="status"[^>]*>([^<]*)<\/p>/.exec(dom)?.[1] ?? "";
+
+async function run(pin) {
   // Preconditions (unsupported until the browser is up).
   if (childPids().length) throw new Fail("probe-started-with-children", true);
   const probe = spawnSync(PYTHON, ["-I", "-c", "import os,sys,time\npid=os.fork()\nif pid==0:\n time.sleep(20)\n os._exit(0)\nprint(pid)"],
@@ -325,6 +367,14 @@ async function run() {
   if (reparented) process.kill(orphan, "SIGKILL");
   if (!reparented) throw new Fail("child-subreaper-not-effective", true);
   if (runSandboxed([...bwrapArgv(true), "--", "/usr/bin/true"]).status !== 0) throw new Fail("bubblewrap-cannot-start", true);
+
+  // Pin the browser binary we execute.
+  const b = resolveBrowser();
+  state.binary = b.binary;
+  let version = "";
+  try { version = spawnSync(b.binary, ["--version"], { env: { PATH: "/usr/bin:/bin" }, timeout: 10000, maxBuffer: 4096 }).stdout.toString().trim().slice(0, 64); } catch { /* recorded empty */ }
+  result.browser = { label: b.label, version, sha256: b.sha256, pinRequested: !!pin, pinMatched: pin ? pin === b.sha256 : null };
+  if (pin && pin !== b.sha256) throw new Fail("browser-pin-mismatch", true, "browser-pin-mismatch");
 
   state.scratch = fs.mkdtempSync(path.join(os.tmpdir(), PREFIX));
   fs.chmodSync(state.scratch, 0o700);
@@ -344,56 +394,59 @@ async function run() {
   const { origin } = await state.listener.start();
   const port = Number(new URL(origin).port);
 
-  // Browser: pipe only, own session, a fresh directory per attempt; sandbox preferred.
-  let main = null, fallbackReason = null, attempt = 0;
-  for (const sandbox of [true, false]) {
-    try { main = await launch(`browser-data-${++attempt}`, sandbox); break; }
-    catch (e) {
-      if (state.aborted) throw e;
-      fallbackReason = labelOf(e);
-      if (!(await stopOwned()) || namingPids(state.scratch).length) { state.cleanupOk = false; throw new Fail("first-browser-attempt-cleanup-unproven"); }
-    }
-  }
-  if (!main) throw new Fail("browser-cannot-start", true);
-  state.exitCode = 1; result.code = "fixture-failed";
-  result.dataDirectory = { ...main.check, attempts: attempt };
-  result.browser = { product: String(main.browser.product).slice(0, 64), chromeSandbox: main.browser.sandbox,
-    sandboxFallbackReason: main.browser.sandbox ? null : fallbackReason, ownSession: stat(main.pid)?.sid === main.pid };
-  expect(result.browser.ownSession, "browser is not its own session leader");
-  const envSeen = fs.readFileSync(`/proc/${main.pid}/environ`, "utf8").split("\0").filter(Boolean).map((kv) => kv.split("=")[0]);
-  expect(!envSeen.some((k) => ["DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "PULSE_SERVER"].includes(k)), "browser environment has a display variable");
-  if (PAUSE_MS) { process.stderr.write("probe: browser launched\n"); await sleep(PAUSE_MS); guard(); }
-
-  // Remote debugging off, sampled twice (after launch and after rendering).
-  await sleep(500);
-  const atLaunch = debuggingCheck(main);
-
-  // Positive rendering over the pipe.
-  const page = await main.browser.newPage();
+  // Primary evidence: one --dump-dom run, no debugging switch, sampled while it runs.
   const beforeNav = log.length;
-  await page.goto(state.listener.mintNavigation());
-  const rendered = await page.waitUntil(`!!document.querySelector("[data-strict-capture]") && /Showing stored capture/.test(document.getElementById("status")?.textContent ?? "")`, 15000);
-  const view = await page.eval(`(() => { const v = document.getElementById("view"); return {
-    capture: !!document.querySelector("[data-strict-capture]"),
-    status: (document.getElementById("status")?.textContent ?? "").slice(0, 80),
-    imgInView: !!v?.querySelector("img"), hostileTitleAsText: (v?.textContent ?? "").includes("<img src=x onerror"),
-    pwned: window.PWNED === 1, hashStripped: location.hash === "" }; })()`);
-  const served = log.slice(beforeNav);
-  result.rendering = { ...view, bindOk: served.some((e) => e.url === "/api/bind" && e.status === 200),
-    viewOk: served.some((e) => e.url === "/api/view" && e.status === 200), listenerRequests: served.length };
-  expect(rendered && view.capture, "page did not render the capture");
-  expect(/Showing stored capture/.test(view.status), "status does not say showing");
-  expect(!view.imgInView && view.hostileTitleAsText && !view.pwned, "hostile title not rendered as text");
-  expect(result.rendering.bindOk && result.rendering.viewOk, "listener did not serve bind and view");
-  const afterRender = debuggingCheck(main);
-  result.remoteDebugging = { mode: "pipe-only", samples: 2, atLaunch, afterRender };
-  for (const [label, c] of [["launch", atLaunch], ["render", afterRender]]) {
-    expect(c.devToolsActivePort === 0, `${label}: DevToolsActivePort present`);
-    expect(c.held === 0, `${label}: a browser process holds a TCP listener`);
-    expect(c.unreadable === 0 && c.netUnreadable === 0, `${label}: unreadable fd or net tables`);
-    expect(c.portFlag === 0 && c.pipeFlag, `${label}: debugging flags unexpected`);
-    expect(c.processes > 0 && c.sockets > 0, `${label}: no browser processes or sockets observed`);
+  const main = launch("browser-data", ["--virtual-time-budget=10000", "--dump-dom", state.listener.mintNavigation()], true);
+  state.exitCode = 1; result.code = "fixture-failed";
+  result.dataDirectory = main.check;
+  const agg = { samples: 0, samplesWithBrowser: 0, maxProcesses: 0, maxSockets: 0, held: 0, unreadable: 0, netUnreadable: 0,
+    devToolsActivePort: 0, debuggingFlag: 0, maxSandboxed: 0, ownSession: false, exePinned: false, displayVariable: false };
+  const deadline = Date.now() + 60000;
+  while (main.exit === null && Date.now() < deadline) {
+    guard();
+    const c = debuggingCheck(main);
+    agg.samples++;
+    if (c.processes > 0) agg.samplesWithBrowser++;
+    agg.maxProcesses = Math.max(agg.maxProcesses, c.processes); agg.maxSockets = Math.max(agg.maxSockets, c.sockets);
+    agg.held += c.held; agg.unreadable += c.unreadable; agg.netUnreadable += c.netUnreadable;
+    agg.devToolsActivePort = Math.max(agg.devToolsActivePort, c.devToolsActivePort);
+    agg.debuggingFlag = Math.max(agg.debuggingFlag, c.debuggingFlag); agg.maxSandboxed = Math.max(agg.maxSandboxed, c.sandboxed);
+    if (main.exit === null && live(stat(main.pid))) {
+      agg.ownSession ||= stat(main.pid)?.sid === main.pid;
+      try { agg.exePinned ||= fs.readlinkSync(`/proc/${main.pid}/exe`) === state.binary; } catch { /* exited */ }
+      try {
+        const keys = fs.readFileSync(`/proc/${main.pid}/environ`, "utf8").split("\0").map((kv) => kv.split("=")[0]);
+        agg.displayVariable ||= keys.some((k) => ["DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "PULSE_SERVER"].includes(k));
+      } catch { /* exited */ }
+    }
+    await sleep(50);
   }
+  if (main.exit === null) throw new Fail("dump-dom-timeout");
+  agg.devToolsActivePort = Math.max(agg.devToolsActivePort, findNamed(state.scratch, "DevToolsActivePort"));
+  const dom = main.out.toString("utf8");
+  if (main.exit.code !== 0 && !dom.length) throw new Fail("browser-sandbox-unavailable", true, "browser-sandbox-unavailable");
+  result.remoteDebugging = { mode: "off", evidence: "dump-dom run only", sampledWhileRunning: true, ...agg };
+  expect(main.exit.code === 0 && !main.overflow, "dump-dom run did not exit cleanly");
+  expect(agg.samplesWithBrowser >= 2, "browser not sampled at least twice while running");
+  expect(agg.debuggingFlag === 0, "a browser process carries a remote-debugging switch");
+  expect(agg.devToolsActivePort === 0, "DevToolsActivePort present");
+  expect(agg.held === 0, "a browser process holds a TCP listener");
+  expect(agg.unreadable === 0 && agg.netUnreadable === 0, "unreadable fd or net tables");
+  expect(agg.ownSession && agg.exePinned && !agg.displayVariable, "browser session, binary or environment unexpected");
+  expect(agg.maxSandboxed >= 1, "no sandboxed browser process observed");
+
+  // Fixed positive rendering, from the dumped DOM.
+  const served = log.slice(beforeNav);
+  result.rendering = { capture: dom.includes("data-strict-capture"), status: statusOf(dom).slice(0, 80),
+    imgInView: /<img/i.test(dom.split('id="view"')[1] ?? ""), hostileTitleAsText: dom.includes("&lt;img src=x onerror"),
+    bindOk: served.some((e) => e.url === "/api/bind" && e.status === 200),
+    viewOk: served.some((e) => e.url === "/api/view" && e.status === 200), listenerRequests: served.length };
+  expect(result.rendering.capture, "dumped DOM has no capture view");
+  expect(/Showing stored capture/.test(result.rendering.status), "status does not say showing");
+  expect(!result.rendering.imgInView && result.rendering.hostileTitleAsText, "hostile title not rendered as text");
+  expect(result.rendering.bindOk && result.rendering.viewOk, "listener did not serve bind and view");
+  if (!(await stopOwned())) state.cleanupOk = false;
+  expect(sessionPids(main.pid).length === 0, "dump-dom browser session survived");
 
   // Agent-side control and its positive control.
   const beforeAgent = log.length;
@@ -405,29 +458,23 @@ async function run() {
   result.positiveControl = { sharedNet: shared, listenerRequests: sharedReached };
   expect(agent.connect === "ECONNREFUSED" && agent.status === null && agentReached === 0, "agent reached the listener");
   expect(shared.connect === "connected" && Number.isInteger(shared.status) && sharedReached >= 1, "shared-net control did not reach the listener");
-  await page.close();
-
-  // Close the real browser and prove it gone before the negative control.
-  await bounded(main.browser.close(), 8000);
-  if (!(await stopOwned())) state.cleanupOk = false;
-  expect(sessionPids(main.pid).length === 0, "real browser session survived its close");
   guard();
 
   // Negative control: a disposable browser WITH a loopback debugging port, in
   // its own fresh directory, through the same check. Nothing connects to it.
-  const ctrl = await launch("control-data", main.browser.sandbox, ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0"]);
+  const ctrl = launch("control-data", ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", "about:blank"], false);
   const until = Date.now() + 15000;
-  while (Date.now() < until && findNamed(ctrl.dir, "DevToolsActivePort") === 0) { await sleep(100); guard(); }
+  while (Date.now() < until && ctrl.exit === null && findNamed(ctrl.dir, "DevToolsActivePort") === 0) { await sleep(100); guard(); }
   await sleep(300);
+  if (PAUSE_MS) { process.stderr.write("probe: browser launched\n"); await sleep(PAUSE_MS); guard(); }
   const control = debuggingCheck(ctrl);
   result.negativeControl = { dataDirectoryFresh: ctrl.check.fresh && ctrl.check.mode === "0700", ...control };
   expect(control.held >= 1, "negative control: debugging listener not found held by its browser");
   expect(control.devToolsActivePort >= 1, "negative control: no DevToolsActivePort");
-  expect(control.portFlag >= 1, "negative control: port flag not seen");
+  expect(control.debuggingFlag >= 1, "negative control: debugging switch not seen");
   expect(control.unreadable === 0 && control.netUnreadable === 0, "negative control: unreadable fd or net tables");
-  await bounded(ctrl.browser.close(), 8000);
   if (!(await stopOwned())) state.cleanupOk = false;
-  expect(sessionPids(ctrl.pid).length === 0, "control browser session survived its close");
+  expect(sessionPids(ctrl.pid).length === 0, "control browser session survived");
 
   if (!failures.length) { state.exitCode = 0; result.ok = true; result.code = "fresh-browser-data-fixture-passed"; }
 }
@@ -435,12 +482,11 @@ async function run() {
 /** One cleanup for normal exit, failure, signal and watchdog. */
 async function cleanup() {
   const c = {};
-  for (const rec of state.launches) await bounded(rec.browser.close(), 8000);
   if (state.listener) await bounded(state.listener.close(), 3000);
   if (state.launches.length || state.scratch) {
     if (!(await stopOwned())) state.cleanupOk = false;
     await sleep(200);
-    c.sessionLeft = state.launches.reduce((n, r) => n + sessionPids(r.pid).length, 0);
+    c.sessionLeft = state.launches.reduce((n, r) => n + (r.pid ? sessionPids(r.pid).length : 0), 0);
     c.childrenLeft = childPids().length;
     c.namingDataDirLeft = state.launches.reduce((n, r) => n + namingPids(r.dir).length, 0);
     c.namingScratchLeft = state.scratch ? namingPids(state.scratch).length : 0;
@@ -461,12 +507,13 @@ async function cleanup() {
 if (process.argv[2] === "--supervised") {
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => abort(`signal-${sig}`));
   const watchdog = setTimeout(() => abort("watchdog"), 150000);
-  const running = run();
+  const pin = process.argv[3] === "--chrome-sha256" ? process.argv[4] : null;
+  const running = run(pin);
   running.catch(() => {}); // after an abort it may still reject; the race below already settled
   try {
     await Promise.race([running, aborted]);
   } catch (e) {
-    if (e?.unsupported && !state.aborted) { state.exitCode = 2; result.code = "unsupported"; result.reason = labelOf(e); }
+    if (e?.unsupported && !state.aborted) { state.exitCode = 2; result.code = e.code; result.reason = labelOf(e); }
     else if (!state.aborted) { state.exitCode = 1; failures.push(labelOf(e)); }
   }
   clearTimeout(watchdog);
@@ -478,8 +525,10 @@ if (process.argv[2] === "--supervised") {
   result.cleanup = cleanupResult;
   if (state.exitCode === 1 && state.scratch && fs.existsSync(state.scratch)) { result.retainedScratch = true; process.stderr.write(`retained scratch: ${state.scratch}\n`); }
   result.node = process.version;
-  result.limitations = ["one fixture-owned headless browser, not the human's window",
+  result.limitations = ["no-debugging evidence comes from the --dump-dom run only; no CDP or pipe is used",
+    "one fixture-owned headless browser, not the human's window",
     "agent control is network-namespace only; an agent-started browser is not launched",
-    "TCP listeners only, at two samples; Unix-domain and abstract automation sockets are not measured", "measured host only"];
+    "TCP listeners only, sampled every 50 ms while the browser ran; Unix-domain and abstract automation sockets are not measured",
+    "measured host only"];
   finish(result, state.exitCode);
 }
