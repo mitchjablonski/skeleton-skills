@@ -602,10 +602,11 @@ export function createFixture({ prefix }) {
 
   /** The supervised run: signals and the watchdog abandon `run`, then one cleanup, then one result. */
   async function supervise(run, { limitations, failureCodes = ["browser-run-failed"], allowPrivateDisplay = false }) {
+    const { ok, pin } = parseArgs({ allowPrivateDisplay });
+    if (!ok) finish(unsupported("unexpected arguments"), 2);
     for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => abort(`signal-${sig}`));
     const watchdog = setTimeout(() => abort("watchdog"), 150000);
     if (ANNOUNCE) result.testLaunchAnnouncement = true;
-    const { pin } = parseArgs({ allowPrivateDisplay });
     const running = run(pin);
     running.catch(() => {}); // after an abort it may still reject; the race below already settled
     try {
