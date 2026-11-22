@@ -7,6 +7,7 @@ import runpy
 import select
 import subprocess
 import sys
+from contextlib import ExitStack
 
 
 SCOPE_FAILURE = 125
@@ -34,15 +35,23 @@ def main(args):
     try:
         lifeline, readiness, *command = args
         lifeline_fd, readiness_fd = int(lifeline), int(readiness)
-        if min(lifeline_fd, readiness_fd) < 3 or lifeline_fd == readiness_fd or not command:
-            raise ValueError("expected distinct pipe descriptors and a listener command")
+        control_fds = ()
+        if command[:1] == ["--control-fd"]:
+            control_fds = (int(command[1]),)
+            command = command[2:]
+        descriptors = (lifeline_fd, readiness_fd, *control_fds)
+        if min(descriptors) < 3 or len(set(descriptors)) != len(descriptors) or not command:
+            raise ValueError("expected distinct inherited descriptors and a listener command")
 
         helpers = runpy.run_path(str(pathlib.Path(__file__).with_name("strict-browser-endpoint-probe.py")))
         helpers["enable_child_supervision"]()
         with os.fdopen(lifeline_fd, "rb") as parent_pipe:
             try:
-                with os.fdopen(readiness_fd, "wb") as readiness_pipe:
-                    child = subprocess.Popen(command, pass_fds=(readiness_pipe.fileno(),))
+                with ExitStack() as inherited:
+                    child_fds = (readiness_fd, *control_fds)
+                    for fd in child_fds:
+                        inherited.callback(os.close, fd)
+                    child = subprocess.Popen(command, pass_fds=child_fds)
                 parent_stopped = wait_for_stop(parent_pipe.fileno(), child.pid)
             finally:
                 if child is not None and not helpers["stop_owned_children"](child):
@@ -54,8 +63,8 @@ def main(args):
         if parent_stopped:
             return 0
         return child.returncode if child.returncode >= 0 else 128 - child.returncode
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-        print(f"strict listener scope: {error}", file=sys.stderr)
+    except Exception:
+        print("strict listener scope setup or cleanup unproven", file=sys.stderr)
         return SCOPE_FAILURE
 
 
