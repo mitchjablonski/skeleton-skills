@@ -99,17 +99,19 @@ and revocation are separate cases.
 
 The protected fixture starts the read-only decision listener as a separate
 owned process after console readiness. The worker checks its selected view
-against the immutable capture store and makes a private loopback view read
-before reporting its port on an inherited pipe. The launcher confirms the
-loopback response and requires the listener at initial admission and planned
-restart. Readiness binds the exact enrolled generation and capture pair,
+against the immutable capture store and consumes the one-use observation
+for its private startup read before reporting its port on an inherited
+pipe. The launcher confirms the loopback response and requires the
+listener at initial admission and planned restart. Readiness binds the
+exact enrolled generation and capture pair,
 and replacing that generation disposes its listener. The launcher checks
 again before each namespace start. A mismatched stored view, malformed
 report, stale listener or listener already dead at admission refuses before
-materialization. Loss during startup prevents namespace admission and
-requires full teardown if a namespace already exists. The startup tab is
-revoked before the report. The fixture exports no navigation link or
-decision capability.
+materialization. A successful HTTP read under a superseding navigation also
+refuses because it cannot satisfy the selected observation. Loss during
+startup prevents namespace admission and requires full teardown if a
+namespace already exists. The startup tab is revoked before the report.
+The fixture exports no navigation link or decision capability.
 Closing an already admitted listener does not authorize another start.
 
 This fixture uses explicitly pinned binaries and a fixed, owned workload.
