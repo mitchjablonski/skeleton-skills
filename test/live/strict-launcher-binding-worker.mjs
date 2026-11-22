@@ -106,7 +106,7 @@ if (role === 'prepare-approved') {
   } catch {
     process.exit(23);
   }
-} else if (role === 'decision-listener') {
+} else if (role === 'decision-listener' || role === 'listener-missing-selected-view') {
   const [{createDecisionListener}, {buildStrictCaptureViewModel}] = await Promise.all([
     import('../../lib/strict-decision-listener.mjs'), import('../../lib/strict-capture-view-model.mjs'),
   ]);
@@ -118,7 +118,9 @@ if (role === 'prepare-approved') {
   const model = buildStrictCaptureViewModel({binding, capture});
   const listener = createDecisionListener({provider: {read: () => ({binding, capture})}});
   const {origin} = await listener.start();
-  const nonce = new URL(listener.mintNavigation()).hash.slice(3);
+  const startupView = listener.mintWindowNavigation(binding);
+  const navigationUrl = role === 'listener-missing-selected-view' ? listener.mintNavigation() : startupView.url;
+  const nonce = new URL(navigationUrl).hash.slice(3);
   const bind = await fetch(`${origin}/api/bind`, {method: 'POST', signal: AbortSignal.timeout(1000),
     headers: {origin, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json'},
     body: JSON.stringify({nonce})});
@@ -128,6 +130,10 @@ if (role === 'prepare-approved') {
     headers: {'sec-fetch-site': 'same-origin', 'x-skel-tab': tab}});
   assert.equal(view.status, 200);
   assert.deepEqual(await view.json(), {view: model, codes: {}, codesDropped: false});
+  if (!startupView.takeView()) {
+    await listener.close();
+    process.exit(23);
+  }
   listener.mintNavigation(); // Revoke the private startup tab; this fixture exports no navigation handle.
   writeReport(fd, {port: Number(new URL(origin).port)});
   boundRestartLifetime();

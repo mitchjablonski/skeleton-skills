@@ -314,7 +314,8 @@ class NamespaceLauncher(CaptureLauncher):
 ENROLLMENT_REFUSALS = ('wrong-enrollment', 'stale-generation', 'lost-authority', 'lost-console')
 PLANNED_STOPS = {'graceful-restart': 'cooperative', 'forced-restart': 'stubborn',
                  'planned-proof-too-late': 'cooperative'}
-LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-invalid-readiness', 'listener-exited-before-start',
+LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-missing-selected-view',
+                     'listener-invalid-readiness', 'listener-exited-before-start',
                      'stale-listener-generation')
 STARTUP_FAULTS = ('peer-loss-during-start', 'listener-loss-before-namespace', 'listener-loss-after-namespace')
 REFRESH_FAILURES = {'terminal-refresh-lost': 'refresh-lost', 'terminal-refresh-malformed': 'refresh-malformed',
@@ -457,13 +458,17 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False):
             binding = None
             if case == 'listener-store-mismatch':
                 binding = {**selected.expected, 'reviewVersion': '0' * 64}
-            role = 'invalid-listener-ready' if case == 'listener-invalid-readiness' else 'decision-listener'
+            role = {'listener-invalid-readiness': 'invalid-listener-ready',
+                    'listener-missing-selected-view': 'listener-missing-selected-view'}.get(case, 'decision-listener')
             launcher.stage_listener(selected, binding=binding, role=role)
             if case == 'listener-store-mismatch':
                 assert launcher.children[-1].wait(capture['TIMEOUT']) != 0
                 assert launcher.listener is None
             elif case == 'listener-invalid-readiness':
                 assert launcher.children[-1].wait(capture['TIMEOUT']) == 0
+                assert launcher.listener is None
+            elif case == 'listener-missing-selected-view':
+                assert launcher.children[-1].wait(capture['TIMEOUT']) == 23
                 assert launcher.listener is None
             else:
                 assert launcher.listener_ready(generation)
