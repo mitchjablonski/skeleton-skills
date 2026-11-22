@@ -150,7 +150,9 @@ function claudeArgs(project, prompt, extra) {
   const allowed = [
     "Read", "Edit", "Grep", "Glob", "Skill",
     "Bash(skel *)", `Bash(node ${skelAbs} *)`, `Bash(node "${skelAbs}" *)`,
-    "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(node --test*)", "Bash(npm test*)",
+    // node --test runs code the agent may have edited; the grader grades that edited content.
+    // npm test is left out: it runs whatever the (editable) package.json script says.
+    "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(node --test*)",
   ];
   return [
     "-p", prompt, "--output-format", "stream-json", "--verbose",

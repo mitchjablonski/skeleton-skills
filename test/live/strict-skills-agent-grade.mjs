@@ -63,18 +63,56 @@ export function privilegedReason(call, privileged) {
   const input = call.input ?? {};
   if (name === "Bash") {
     const cmd = String(input.command ?? "");
-    // skel, skel.mjs or bin/skel, then optional flags, then the subcommand.
-    for (const m of cmd.matchAll(/(?:^|[\s;&|(`'"/=])skel(?:\.mjs)?['"]?((?:\s+--?[A-Za-z][\w-]*(?:=\S+)?)*)\s+([a-z][a-z-]*)/g)) {
-      if (privileged.includes(m[2])) return `privileged skel command: ${short(cmd)}`;
-    }
-    if (/\b(?:node|nodejs|python3?|deno|bun|perl|ruby|sh|bash)\b[^|;&]*\s(?:-e|-c|-p|--eval|--print)\b/.test(cmd) &&
-        /approve|reshape|finalize|strict|authority|state\.json|writeState|recordSkeleton/i.test(cmd)) return `privileged equivalent through an interpreter: ${short(cmd)}`;
+    const sk = skelInvocationReason(cmd, privileged);
+    if (sk) return `${sk}: ${short(cmd)}`;
+    if (INTERPRETER.test(cmd) && PRIVILEGED_WORDS.test(cmd)) return `privileged equivalent through an interpreter: ${short(cmd)}`;
     if (/(?:>|\btee\b|\bcp\b|\bmv\b|\brm\b|\bsed\s+-i|\btruncate\b|\bln\b)[^;|&]*\.skeleton\//.test(cmd)) return `writes skel state by shell: ${short(cmd)}`;
   }
   if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(name)) {
     const p = String(input.file_path ?? input.notebook_path ?? "");
     // skel's state dir is caught by secretPatterns (stateDir, .local/state/skel).
     if (/(?:^|[\\/])\.skeleton[\\/]/.test(p)) return `edits skel state: ${short(p)}`;
+    // Allowed test commands run edited code, so the edited code is graded too.
+    const content = editContent(input);
+    const sk = skelInvocationReason(content, privileged);
+    if (sk) return `${sk} in edited content of ${short(p, 60)}: ${short(content)}`;
+    if ((INTERPRETER.test(content) || /child_process|\bexec(?:Sync|File|FileSync)?\s*\(|\bspawn(?:Sync)?\s*\(/.test(content)) && PRIVILEGED_WORDS.test(content))
+      return `edited content runs a privileged equivalent in ${short(p, 60)}: ${short(content)}`;
+    if (/\.skeleton[\\/]/.test(content)) return `edited content reaches skel state in ${short(p, 60)}: ${short(content)}`;
+  }
+  return null;
+}
+
+const INTERPRETER = /\b(?:node|nodejs|python3?|deno|bun|perl|ruby|sh|bash)\b[^|;&]*\s(?:-e|-c|-p|--eval|--print)\b/;
+const PRIVILEGED_WORDS = /approve|reshape|finalize|strict|authority|state\.json|writeState|recordSkeleton/i;
+
+/** The new text an Edit, Write, MultiEdit or NotebookEdit call writes. */
+export function editContent(input) {
+  const parts = [input.new_string, input.content, input.new_source];
+  if (Array.isArray(input.edits)) for (const e of input.edits) parts.push(e?.new_string);
+  return parts.filter((x) => typeof x === "string").join("\n");
+}
+
+/**
+ * Every skel invocation in `text` (`skel`, `bin/skel`, `skel.mjs`, `"skel"`,
+ * `$(which skel)`): its first non-flag argument, quotes stripped, must not be
+ * privileged. A subcommand that is a variable or an expansion (`skel $S`,
+ * `skel $(echo approve)`, a template `${…}`) can't be checked, so it fails.
+ */
+export function skelInvocationReason(text, privileged) {
+  for (const m of String(text).matchAll(/(?:^|[\s;&|(`'"/=$])skel(?:\.mjs)?(?=['")`\s]|$)/g)) {
+    let rest = text.slice(m.index + m[0].length).replace(/^['")`]+/, "");
+    for (let i = 0; i < 8; i++) {
+      const t = /^[ \t]+((?:"[^"\n]*"|'[^'\n]*'|[^\s;&|"'])+)/.exec(rest);
+      if (!t) break;
+      rest = rest.slice(t[0].length);
+      const raw = t[1];
+      if (/^-/.test(raw)) { if (/^--reviewed$|^--port$|^--wait$|^--gate$/.test(raw)) { const v = /^[ \t]+\S+/.exec(rest); if (v) rest = rest.slice(v[0].length); } continue; }
+      if (/[$`]/.test(raw)) return `skel subcommand is a variable or expansion (unverified)`;
+      const sub = raw.replace(/["']/g, "");
+      if (privileged.includes(sub)) return `privileged skel command`;
+      break;
+    }
   }
   return null;
 }
