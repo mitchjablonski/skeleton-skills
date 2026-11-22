@@ -10,6 +10,10 @@ Chromium:
 node test/live/strict-fresh-profile-probe.mjs [--chrome-sha256 <hex>]
 ```
 
+The harness (supervised run, pin, data directories, sampler, cleanup proof)
+is shared with the agent browser fixture in
+`test/live/strict-browser-fixture.mjs`.
+
 ## What it shows
 
 Bootstrap step 6 and matrix row C20: the decision page opens in a fresh,
@@ -85,8 +89,9 @@ scratch root. For each sample:
 - no browser process command line contains `--remote-debugging` (any form).
   An unreadable command line of a live browser process counts as
   unverified and fails the run;
-- no `DevToolsActivePort` exists under the scratch root (checked again after
-  exit);
+- no `DevToolsActivePort` exists under the scratch root, which is also the
+  browser's HOME, apart from other launches' data directories (checked again
+  after exit);
 - no TCP listener is held. The fixture collects the listening (`0A`) inodes
   from `net/tcp` and `net/tcp6` of every network namespace seen through
   those pids, then reads each process's `/proc/<pid>/fd` socket inodes. The
@@ -121,8 +126,8 @@ browser process checks and listener observation are independent requirements.
 `--remote-debugging-address=127.0.0.1 --remote-debugging-port=0` added, in
 its own fresh directory. The probe first stops the primary browser's
 remaining helpers and checks that no processes from the run remain. The
-control uses the same sampling loop and totals. Port-file observations
-are scoped to the directory of the browser being sampled.
+control uses the same sampling loop and totals. Each launch's port-file scan
+covers the whole scratch root except the other launch's data directory.
 At least one sample must find a held TCP listener, at least one a
 `DevToolsActivePort` and at least one a debugging switch. With a debugging
 port, headless Chrome keeps running after the dump, so this run is sampled
@@ -233,7 +238,8 @@ namespace, and debugging-port controls.
 - The human's protected window, or launching the browser from the real
   launcher (#75).
 - An agent-started debugging browser: the agent control here is
-  network-namespace reach to the listener only. N5
+  network-namespace reach to the listener only. The
+  [agent browser fixture](strict-agent-browser.md) covers that case. N5
   ([browser endpoint fixture](strict-browser-endpoint.md)) covers the
   converse, where the agent can't reach a browser's debugging endpoint.
 - Unix-domain and abstract automation sockets (TCP only), and listeners that
