@@ -114,7 +114,10 @@ dump, as in the listener browser probe.
 
 **Negative control.** The same `--dump-dom` run, with
 `--remote-debugging-address=127.0.0.1 --remote-debugging-port=0` added, in
-its own fresh directory. It goes through the same sampling loop and totals.
+its own fresh directory. The probe first stops the primary browser's
+remaining helpers and checks that no processes from the run remain. The
+control uses the same sampling loop and totals. Port-file observations
+are scoped to the directory of the browser being sampled.
 At least one sample must find a held TCP listener, at least one a
 `DevToolsActivePort` and at least one a debugging switch. With a debugging
 port, headless Chrome keeps running after the dump, so this run is sampled
@@ -167,9 +170,9 @@ never passes:
   Bubblewrap with user namespaces disabled. The measured result: exit 2,
   `browser-sandbox-unavailable` (exit code 134, sandbox text, debugging
   all 0);
-- `SKEL_C20_TEST_BROWSER=<file>` replaces the browser binary. A script that
-  would create a marker file, run with Chrome's hash, refused with exit 2 and
-  left no marker. Run with its own hash, it ran and the marker appeared.
+- `SKEL_C20_TEST_BROWSER=<file>` supplies a sentinel for the pin-refusal
+  check. A mismatched expected hash refuses with exit 2. A matching or
+  missing hash also refuses. The probe never executes the sentinel.
 
 **Output.** One bounded JSON object: labels, booleans, counts and the binary
 hash, with no paths, nonces or cookies. Exceptions are reported as fixed

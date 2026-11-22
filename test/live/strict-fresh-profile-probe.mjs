@@ -112,13 +112,16 @@ if (process.argv[2] !== "--supervised") {
 }
 
 // --- /proc helpers ----------------------------------------------------------
-function stat(pid) {
-  try {
-    const data = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const f = data.slice(data.lastIndexOf(")") + 2).split(" ");
-    return { state: f[0], ppid: Number(f[1]), sid: Number(f[3]) };
-  } catch { return null; }
+function readStat(pid) {
+  const data = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  const end = data.lastIndexOf(")");
+  const f = data.slice(end + 2).split(" ");
+  if (end < 0 || !/^[A-Z]$/i.test(f[0]) || !/^\d+$/.test(f[1]) || !/^\d+$/.test(f[3]))
+    throw new Error("malformed process status");
+  return { state: f[0], ppid: Number(f[1]), sid: Number(f[3]) };
 }
+function stat(pid) { try { return readStat(pid); } catch { return null; } }
+const vanished = (e) => e.code === "ENOENT" || e.code === "ESRCH";
 const allPids = () => fs.readdirSync("/proc").filter((n) => /^\d+$/.test(n)).map(Number);
 const live = (s) => s && s.state !== "Z" && s.state !== "X";
 const sessionPids = (sid) => allPids().filter((p) => { const s = stat(p); return live(s) && s.sid === sid; });
@@ -156,7 +159,10 @@ function browserPids(browserPid, scratch) {
 function procRead(pid, fn) {
   try { return { value: fn() }; } catch { /* retry below */ }
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-  try { return { value: fn() }; } catch { return { unreadable: live(stat(pid)) }; }
+  try { return { value: fn() }; } catch {
+    try { return { unreadable: live(readStat(pid)) }; }
+    catch (statusError) { return { unreadable: !vanished(statusError) }; }
+  }
 }
 /** Listening TCP socket inodes in the network namespace(s) seen through each pid. */
 function listeningInodes(pids) {
@@ -182,7 +188,7 @@ function socketInodes(pid) {
     let target;
     try { target = fs.readlinkSync(`/proc/${pid}/fd/${fd}`); }
     catch (e) {
-      if (e.code === "ENOENT" || e.code === "ESRCH") continue; // the entry vanished: closed meanwhile
+      if (vanished(e)) continue; // the entry vanished: closed meanwhile
       throw e; // EACCES, EIO, ...: unknown descriptor, so the whole table is unreadable evidence
     }
     const m = /^socket:\[(\d+)\]$/.exec(target);
@@ -372,7 +378,6 @@ function launch(name, args, { primary = false } = {}) {
   return rec;
 }
 
-const cmdlineOf = (p) => { try { return fs.readFileSync(`/proc/${p}/cmdline`, "utf8"); } catch { return null; } };
 const userNs = (p) => { try { return fs.readlinkSync(`/proc/${p}/ns/user`); } catch { return null; } };
 const seccomp = (p) => { try { return /^Seccomp:\s*(\d)/m.exec(fs.readFileSync(`/proc/${p}/status`, "utf8"))?.[1] ?? null; } catch { return null; } };
 // If this /proc doesn't expose namespace and seccomp state, sandbox evidence is
@@ -390,14 +395,14 @@ function addedBoundary(p) {
 }
 /** One sample; the same check for the real browser and the debugging-port negative control. */
 function debuggingCheck(rec) {
-  const pids = browserPids(rec.pid, state.scratch);
+  const pids = browserPids(rec.pid, rec.dir);
   let debuggingFlag = 0, cmdlineUnreadable = 0;
   for (const p of pids) {
-    const c = cmdlineOf(p);
-    if (c === null) { if (live(stat(p))) cmdlineUnreadable++; continue; } // unverified, never "no switch"
-    if (/--remote-debugging/.test(c)) debuggingFlag++;
+    const command = procRead(p, () => fs.readFileSync(`/proc/${p}/cmdline`, "utf8"));
+    if (!("value" in command)) { if (command.unreadable) cmdlineUnreadable++; continue; }
+    if (/--remote-debugging/.test(command.value)) debuggingFlag++;
   }
-  return { ...heldListeners(pids), devToolsActivePort: findNamed(state.scratch, "DevToolsActivePort"), debuggingFlag, cmdlineUnreadable,
+  return { ...heldListeners(pids), devToolsActivePort: findNamed(rec.dir, "DevToolsActivePort"), debuggingFlag, cmdlineUnreadable,
     sandboxed: SANDBOX_EVIDENCE === "measured" ? pids.filter(addedBoundary).length : null };
 }
 
@@ -440,7 +445,7 @@ async function sampleRun(rec, { window = null } = {}) {
   }
   guard();
   if (rec.exit === null && window === null) throw new Fail("dump-dom-timeout");
-  const after = findNamed(state.scratch, "DevToolsActivePort");
+  const after = findNamed(rec.dir, "DevToolsActivePort");
   agg.devToolsActivePort = Math.max(agg.devToolsActivePort, after);
   agg.browserExit = rec.exit ? { code: rec.exit.code, signal: rec.exit.signal } : "running-at-window-end";
   return agg;
@@ -450,12 +455,14 @@ const SANDBOX_TEXT = /(FATAL|ERROR)[^\n]*(sandbox|zygote)/i;
 const statusOf = (dom) => /<p id="status"[^>]*>([^<]*)<\/p>/.exec(dom)?.[1] ?? "";
 
 async function run(pin) {
+  if (ANNOUNCE) result.testLaunchAnnouncement = true;
   if (MUTATION) result.testMutation = MUTATION;
   if (TEST_BROWSER) result.testBrowserOverride = true;
   // Pin first: compared right after the digest, before the binary is ever run.
   const b = resolveBrowser();
   result.browser = { label: b.label, sha256: b.sha256, pinRequested: !!pin, pinMatched: pin ? pin === b.sha256 : null };
   if (pin && pin !== b.sha256) throw new Fail("browser-pin-mismatch", true, "browser-pin-mismatch");
+  if (TEST_BROWSER) throw new Fail("test-browser-override-mismatch-only", true, "test-browser-override-mismatch-only");
   state.binary = b.binary;
   if (SANDBOX_EVIDENCE !== "measured") throw new Fail("sandbox-evidence-unavailable", true, "sandbox-evidence-unavailable");
 
@@ -546,6 +553,10 @@ async function run(pin) {
 
   // Negative control: the same --dump-dom run WITH a loopback debugging port,
   // in its own fresh directory, through the same sampling loop. Nothing connects to the port.
+  if (!(await stopOwned()) || childPids().length || sessionPids(main.pid).length || namingPids(state.scratch).length)
+    throw new Fail("primary-browser-cleanup-unproven");
+  guard();
+  result.primaryChildrenStoppedBeforeControl = true;
   const ctrl = launch("control-data", ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
     "--virtual-time-budget=10000", "--dump-dom", state.listener.mintNavigation()]);
   const control = await sampleRun(ctrl, { window: 4000 });
@@ -558,7 +569,7 @@ async function run(pin) {
   expect(sessionPids(ctrl.pid).length === 0, "control browser session survived");
 
   guard();
-  if (MUTATION || TEST_BROWSER) failures.push("test-hook-active");
+  if (MUTATION || ANNOUNCE) failures.push("test-hook-active");
   if (!failures.length) { state.exitCode = 0; result.ok = true; result.code = "fresh-browser-data-fixture-passed"; }
 }
 
