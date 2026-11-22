@@ -161,8 +161,9 @@ case, the initial or replacement phase, and a fixed reason. Startup
 reasons distinguish the worker, display, browser checks, and selected-view
 proof from an incomplete report. Once the port has been reported, the
 launcher distinguishes the private window check from the HTTP listener
-health check. These labels carry no navigation data. The fixture keeps
-its existing deadlines and requires the same evidence on every attempt.
+health check. These labels carry no navigation data. After an empty
+report, diagnostics allow the existing scope cleanup interval to collect
+the worker exit status. Admission deadlines and evidence are unchanged.
 
 This fixture uses explicitly pinned binaries and a fixed, owned workload.
 It leaves strict disabled and unverified. Actual desktop qualification,

@@ -50,9 +50,10 @@ class RuntimeRefused(Exception):
 
 
 class WindowReadinessRefused(RuntimeRefused):
-    def __init__(self, code, phase):
+    def __init__(self, code, phase, *, unavailable):
         super().__init__(code)
         self.phase = phase
+        self.unavailable = unavailable
 
 
 def read_runtime_selection(path):
@@ -152,7 +153,7 @@ class ListenerScope:
     def startup_refusal(self):
         try:
             # EOF can precede the subreaper's final exit status.
-            status = self.process.wait(timeout=3)
+            status = self.process.wait(timeout=LISTENER_SCOPE_TIMEOUT)
         except subprocess.TimeoutExpired:
             return 'window-readiness-report-unavailable'
         return WINDOW_STARTUP_REFUSALS.get(status, 'window-readiness-report-invalid')
@@ -332,7 +333,8 @@ class NamespaceLauncher(CaptureLauncher):
     def require_listener(self, generation, *, phase='initial'):
         if not self.listener_ready(generation):
             if self.chrome_pin is not None:
-                raise WindowReadinessRefused(self.listener_refusal, phase)
+                raise WindowReadinessRefused(self.listener_refusal, phase,
+                                             unavailable=phase == 'initial' and self.listener is None)
             raise AssertionError(self.listener_refusal)
 
     def admit_capture(self, selected, report, stage, stop=None):
@@ -845,15 +847,16 @@ def main():
             exercise(node, scratch, case, check_runtime, protected=args.protected_launcher, chrome_pin=chrome_pin)
     except RuntimeRefused as exc:
         code = str(exc)
-        if code == 'runtime-observation-cleanup-unproven':
-            print('Runtime cleanup unproven. Retained scratch at ' + str(scratch), file=sys.stderr)
+        failed_window = isinstance(exc, WindowReadinessRefused) and not exc.unavailable
+        if failed_window or code == 'runtime-observation-cleanup-unproven':
+            print('Fixture refused. Retained scratch at ' + str(scratch), file=sys.stderr)
         else:
             shutil.rmtree(scratch)
         result = {'ok': False, 'strictState': 'unverified', 'code': code}
         if isinstance(exc, WindowReadinessRefused):
             result.update(case=case, phase=exc.phase)
         print(json.dumps(result))
-        raise SystemExit(2)
+        raise SystemExit(1 if failed_window else 2)
     except BaseException:
         print('Fixture failed. Retained scratch at ' + str(scratch), file=sys.stderr)
         raise
