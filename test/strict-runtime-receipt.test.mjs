@@ -63,3 +63,20 @@ for statement, expected, status in (
   const run = spawnSync('/usr/bin/python3', ['-I', '-c', script, probe], { encoding: 'utf8', timeout: 5000, env: {} });
   assert.equal(run.status, 0, run.error?.message ?? run.stderr);
 });
+
+test('desktop isolation requires both the owned denial and an added kernel filter', { skip: process.platform !== 'linux' }, () => {
+  const probe = fileURLToPath(new URL('./live/strict-lifecycle-fault-probe.py', import.meta.url));
+  const script = `
+import runpy
+import sys
+
+verified = runpy.run_path(sys.argv[1])['desktop_policy_verified']
+assert verified('vsock-denied', 2, 1)
+assert not verified('vsock-denied', 1, 1)
+assert not verified('vsock-denied', 0, 1)
+assert not verified(None, 2, 1)
+assert not verified('socket-created', 2, 1)
+`;
+  const run = spawnSync('/usr/bin/python3', ['-I', '-c', script, probe], { encoding: 'utf8', timeout: 5000, env: {} });
+  assert.equal(run.status, 0, run.error?.message ?? run.stderr);
+});

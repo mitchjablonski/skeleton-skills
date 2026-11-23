@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import platform
+import runpy
 import select
 import shutil
 import signal
@@ -84,7 +85,7 @@ class Run:
         return process
 
 
-def bwrap_argv(stage=None, *, stop_mode=None, silent_child=False):
+def bwrap_argv(stage=None, *, stop_mode=None, silent_child=False, desktop_filter=None):
     argv = ["/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
             "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib"]
     if pathlib.Path("/lib64").exists():
@@ -100,7 +101,27 @@ def bwrap_argv(stage=None, *, stop_mode=None, silent_child=False):
     if silent_child:
         assert stage is None and stop_mode is None
         mode = "agent-silent-child"
+    if desktop_filter is not None:
+        assert stage is None and stop_mode is None and not silent_child
+        argv += ["--seccomp", str(desktop_filter)]
+        mode = "agent-desktop-policy"
     return argv + ["--", "/usr/bin/python3", "-I", "/helper.py", mode]
+
+
+def seccomp_filter_count(pid):
+    status = pathlib.Path(f"/proc/{pid}/status").read_text()
+    mode = [line.split()[-1] for line in status.splitlines() if line.startswith("Seccomp:")]
+    count = [line.split()[-1] for line in status.splitlines() if line.startswith("Seccomp_filters:")]
+    if len(mode) != 1 or len(count) != 1 or not count[0].isascii() or not count[0].isdigit():
+        raise RuntimeError("seccomp state unavailable")
+    value = int(count[0])
+    if not ((mode[0] == "0" and value == 0) or (mode[0] == "2" and value > 0)):
+        raise RuntimeError("seccomp state unavailable")
+    return value
+
+
+def desktop_policy_verified(report, worker_filters, parent_filters):
+    return report == "vsock-denied" and worker_filters > parent_filters
 
 
 def read_record(fd, deadline):
@@ -197,16 +218,29 @@ def scan(pid_ns, since):
     return sorted(found)
 
 
-def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, silent_child=False):
+def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, silent_child=False,
+                    desktop_policy=False):
     """Start the agent namespace, directly or under a launcher stand-in."""
     read_end, write_end = os.pipe()
     run.fd(read_end)
     since = boot_ticks() - 1  # one tick of margin for rounding
     try:
-        argv = bwrap_argv(stage, stop_mode=stop_mode, silent_child=silent_child)
-        if launcher:
-            argv = ["/usr/bin/python3", "-I", str(HELPER), "launcher", "--"] + argv
-        process = run.launch(argv, label, stdout=write_end)
+        if desktop_policy:
+            if launcher or platform.machine() != "x86_64":
+                raise RuntimeError("desktop policy setup unsupported")
+            parent_filters = seccomp_filter_count("self")
+            policy = runpy.run_path(str(HERE / "strict-desktop-seccomp.py"))
+            with tempfile.TemporaryFile(dir=run.root) as compiled:
+                compiled.write(policy["seccomp_program"]())
+                compiled.seek(0)
+                fd = compiled.fileno()
+                argv = bwrap_argv(stage, stop_mode=stop_mode, silent_child=silent_child, desktop_filter=fd)
+                process = run.launch(argv, label, pass_fds=(fd,), stdout=write_end)
+        else:
+            argv = bwrap_argv(stage, stop_mode=stop_mode, silent_child=silent_child)
+            if launcher:
+                argv = ["/usr/bin/python3", "-I", str(HELPER), "launcher", "--"] + argv
+            process = run.launch(argv, label, stdout=write_end)
     finally:
         os.close(write_end)
     record = read_record(read_end, time.monotonic() + 5)
@@ -278,6 +312,13 @@ def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, s
         assert child_stat["ppid"] == members["worker"]["pid"]
         assert (child_stat["pgrp"], child_stat["session"]) == (worker["pgrp"], worker["session"])
         assert not exited(member["fd"])
+    if desktop_policy:
+        owned_worker = members["worker"]
+        if (exited(owned_worker["fd"])
+                or not desktop_policy_verified(record.get("desktopIsolation"),
+                                               seccomp_filter_count(owned_worker["pid"]), parent_filters)
+                or exited(owned_worker["fd"])):
+            raise RuntimeError("desktop policy proof unavailable")
     if stop_mode is not None:
         namespace["workerStatus"] = read_end
     if stage is not None:

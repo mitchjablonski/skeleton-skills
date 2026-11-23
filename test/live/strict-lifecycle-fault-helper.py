@@ -17,12 +17,14 @@ Modes (fixed, no other arguments):
   control SOCK               control stand-in: exit when told to hang up
   launcher -- ARGV...        launcher stand-in: start ARGV, then wait forever
 """
+import errno
 import hashlib
 import json
 import os
 import pathlib
 import select
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -40,7 +42,17 @@ def acknowledge_term(signum, frame):
     raise SystemExit(0)
 
 
-def agent(capture=False, stop_mode=None, silent_child=False):
+def agent(capture=False, stop_mode=None, silent_child=False, desktop_policy=False):
+    if desktop_policy:
+        # Creation and close only. No endpoint is contacted.
+        try:
+            socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM).close()
+        except OSError as error:
+            if error.errno != errno.EAFNOSUPPORT:
+                raise SystemExit(7)
+        else:
+            raise SystemExit(7)
+        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).close()
     digests = {}
     if capture:
         stage = pathlib.Path("/fixture-stage")
@@ -80,6 +92,8 @@ def agent(capture=False, stop_mode=None, silent_child=False):
     }
     if capture:
         record["digests"] = digests
+    if desktop_policy:
+        record["desktopIsolation"] = "vsock-denied"
     sys.stdout.write(json.dumps(record, sort_keys=True) + "\n")
     sys.stdout.flush()
     sleep_forever()
@@ -137,6 +151,8 @@ def main():
     args = sys.argv[1:]
     if args == ["agent"]:
         agent()
+    elif args == ["agent-desktop-policy"]:
+        agent(desktop_policy=True)
     elif args == ["agent-capture"]:
         agent(capture=True)
     elif args == ["agent-cooperative"]:
