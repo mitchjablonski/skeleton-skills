@@ -34,9 +34,10 @@ It prints one bounded JSON object with fixed labels:
 - **Tools:** whether `xdotool`, `xprop`, `xwininfo`, `xinput`, `xauth`,
   `xclip`, `xsel`, `Xvfb`, `wlrctl`, `wtype`, `ydotool`, `wl-copy`,
   `wl-paste`, `weston` and `bwrap` exist (an executable check only).
-- **Browser:** the pinned Chrome's label, SHA-256 and `--version`. The
-  digest is computed, and compared with `--chrome-sha256`, before Chrome is
-  ever run; a mismatch is exit 2.
+- **Browser:** the installed candidate's label and SHA-256. If
+  `--chrome-sha256` is supplied, the inventory compares the digest and
+  refuses a mismatch. The inventory does not execute the browser. Use
+  separate qualified evidence for the version.
 - **Namespaces:** this process's namespace ids.
 
 **Safety.** An earlier probe crashed WSLg's compositor by connecting to X0
@@ -48,8 +49,7 @@ for the Wayland, Pulse and session-bus sockets, the inventory uses only
 - it never opens, connects to or binds any of them;
 - the Wayland runtime entry is a symlink, and `lstat()` doesn't follow it
   to its target;
-- runs no X or Wayland client, `xdotool`, `xprop`, Xvfb or windowed browser.
-  The only process it starts is the pinned Chrome with `--version`;
+- starts no child processes;
 - prints no home paths, user names or socket paths.
 
 Exit 0: inventory recorded. Exit 2: unsupported (not Linux, no Chrome or
@@ -132,9 +132,9 @@ fall back, when the desktop evidence is unavailable or untrusted:
 - **The agent can reach WSL interop.** That covers the interop socket
   (`/run/WSL`, `WSL_INTEROP`), `/init`, a registered `WSLInterop` binfmt
   that runs Windows binaries for it, or the ability to execute anything
-  under `/mnt/<drive>`. With interop an agent drives the human's real
-  Windows desktop and clipboard, outside WSLg: PowerShell `SendKeys`,
-  `clip.exe`. The N4 fixture ([display interop](strict-display-interop.md))
+  under `/mnt/<drive>`. Interop access invalidates isolation from the
+  human's Windows desktop and clipboard. The N4 fixture
+  ([display interop](strict-display-interop.md))
   shows the strict sandbox refuses a Windows binary and that binding
   `/run/WSL` alone re-enables it. Matrix row X13 records interop as a
   launch refusal.
@@ -173,18 +173,11 @@ on the Windows desktop, not from an agent pane, and report the results under
 4. [ ] **Check it is the owned browser:** confirm the window has no
    extensions, bookmarks or signed-in profile, and that your normal Chrome
    windows are unchanged.
-5. [ ] **Let the agent itself try to inject, from inside its sandbox.**
-   Ask the agent, running in the strict sandbox, to attempt each of these:
-   - WSL interop: `powershell.exe` `SendKeys` and `clip.exe`;
-   - `wl-copy`;
-   - an X client (for example `xdotool type`) and a Wayland client;
-   - an OSC 52 clipboard write.
-
-   Each attempt should fail inside the sandbox. Watch the owned window, the
-   control window and the Windows clipboard (paste into Notepad), and report
-   whether anything arrived. Expected: nothing arrives anywhere. Also paste
-   text into the agent pane yourself, and confirm it doesn't reach the
-   owned or control window.
+5. [ ] **Check isolation evidence for this seat.** Review the launcher
+   report for display, input, clipboard, and interop isolation. Use
+   dedicated, fixture-owned endpoints and synthetic inputs for active
+   controls. Record which checks the candidate could verify, and refuse a
+   support claim while any required check is missing.
 6. [ ] **Windows Terminal cross-pane features:** check that broadcast
    input (sending input to all panes) is off. Check how the clipboard and
    any shared-input or pane-sync features behave across panes and tabs, and
@@ -195,9 +188,10 @@ on the Windows desktop, not from an agent pane, and report the results under
    control.
 8. [ ] **Decide in the control window:** enter the decision in the
    separately identified control window. Confirm it is accepted there only.
-9. [ ] **Clipboard and title:** have the agent print an OSC 52 clipboard
-   write and an OSC 2 title change. Report whether your clipboard or any
-   window title changed. Expected: neither.
+9. [ ] **Clipboard and title:** record the terminal emulator's behavior
+   from an isolated test session using fixture-owned test data and windows.
+   Confirm that agent output leaves the protected clipboard and title
+   unchanged.
 10. [ ] **Restart and loss:** restart the launcher healthily and confirm the
    window and generation are kept. Then close the owned browser window
    yourself, and report whether the launcher refuses or cleans up, with the

@@ -9,9 +9,8 @@
 //   - anything under /mnt/wslg, /tmp/.X11-unix, $XDG_RUNTIME_DIR, and the
 //     Wayland, Pulse and session-bus sockets is only ever stat()ed: never
 //     opened, read, connected to or bound;
-//   - no X or Wayland client, xdotool, xprop, Xvfb or windowed browser is run.
-//     The only process started is the pinned Chrome with `--version`, after its
-//     SHA-256 is computed (and compared when --chrome-sha256 is given);
+//   - no child processes are started. Chrome's executable is hashed and
+//     compared when --chrome-sha256 is given;
 //   - output is bounded JSON with fixed labels: no home paths, user names or
 //     socket paths.
 // Exit 0: inventory recorded. Exit 2: unsupported (not Linux, no Chrome or
@@ -19,7 +18,6 @@
 
 import fs from "node:fs";
 import os from "node:os";
-import { spawnSync } from "node:child_process";
 import { parseArgs, finish, Fail, labelOf, createFixture } from "./strict-browser-fixture.mjs";
 
 /** stat() only, never open: a fixed label for what is at `p`. */
@@ -49,22 +47,20 @@ function sessionBus() {
   return { address: m ? "unix-path" : /^unix:abstract=/.test(v) ? "unix-abstract" : "other", socket: m ? statLabel(m[1]) : "not-a-path" };
 }
 
-const { supervised, ok, pin } = parseArgs();
+const { supervised, ok, pin: suppliedPin } = parseArgs();
 if (supervised || !ok) finish({ ok: false, strictState: "unverified", code: "unsupported", reason: "unexpected arguments" }, 2);
 if (process.platform !== "linux") finish({ ok: false, strictState: "unverified", code: "unsupported", reason: "not Linux" }, 2);
 
 const result = { ok: false, strictState: "unverified", code: "unsupported", kind: "read-only candidate seat inventory" };
 try {
-  // Pin first: the digest is computed (and compared) before Chrome is ever run.
+  const pin = suppliedPin?.toLowerCase() ?? null;
+  // Reuse the fixed discovery and pin checks without executing the browser.
   const fx = createFixture({ prefix: "strict-desktop-inventory-" });
   let browser;
   try { browser = fx.pinBrowser(pin, null); } catch (e) {
     if (e instanceof Fail && e.label === "sandbox-evidence-unavailable") browser = { ...fx.result.browser, label: fx.result.browser?.label };
     else throw e;
   }
-  let version = "";
-  try { version = spawnSync(fx.state.binary ?? "/nonexistent", ["--version"], { env: { PATH: "/usr/bin:/bin" }, timeout: 10000, maxBuffer: 4096 }).stdout.toString().trim().slice(0, 64); } catch { /* recorded empty */ }
-
   let procVersion = "";
   try { procVersion = fs.readFileSync("/proc/version", "utf8").slice(0, 512); } catch { /* unavailable */ }
   const release = os.release();
@@ -105,7 +101,7 @@ try {
     },
     tools: Object.fromEntries(["xdotool", "xprop", "xwininfo", "xinput", "xauth", "xclip", "xsel", "Xvfb",
       "wlrctl", "wtype", "ydotool", "wl-copy", "wl-paste", "weston", "bwrap"].map((t) => [t, toolPresent(t)])),
-    browser: { label: browser.label, sha256: browser.sha256, pinRequested: !!pin, pinMatched: pin ? pin === browser.sha256 : null, version },
+    browser: { label: browser.label, sha256: browser.sha256, pinRequested: !!pin, pinMatched: pin ? pin === browser.sha256 : null },
     namespaces: Object.fromEntries(["net", "mnt", "pid", "user", "uts", "ipc", "cgroup"].map((k) => [k, nsId(k)])),
     notShown: ["no window, input path, clipboard or running browser is observed",
       "socket presence is stat() only: a socket inode says nothing about a live server or who can reach it",
