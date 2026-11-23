@@ -32,8 +32,9 @@ MZ = "/mnt/c/Windows/System32/whoami.exe"  # harmless; its output is never recor
 VSOCK_HOST_CID = 2
 VSOCK_PORT = 50000  # observed WSL host service port; one connect-and-close, nothing sent
 ENV_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "WSL_INTEROP", "PULSE_SERVER", "XDG_RUNTIME_DIR")
-AF_VSOCK = 40
-seccomp_program = runpy.run_path(str(pathlib.Path(__file__).with_name('strict-desktop-seccomp.py')))['seccomp_program']
+seccomp_program = runpy.run_path(
+    str(pathlib.Path(__file__).with_name("strict-desktop-seccomp.py"))
+)["seccomp_program"]
 
 # Runs inside each sandbox. Reads its plan from argv; prints one JSON line.
 WORKER = r'''
