@@ -30,7 +30,7 @@ function ownsDisplayLock(number, pid) {
   } catch { return false; }
 }
 
-export function startPrivateDisplay(scratch) {
+export function startPrivateDisplay(scratch, { beforeSpawn } = {}) {
   const number = Array.from({ length: 16 }, () => randomInt(100, 10000)).find((candidate) => !displaySocketPresent({ number: candidate }));
   if (number === undefined) throw new PrivateDisplayError("display-number-unavailable");
   const authority = path.join(scratch, "Xauthority");
@@ -43,6 +43,7 @@ export function startPrivateDisplay(scratch) {
     throw new PrivateDisplayError("display-authority-not-private");
 
   const environment = { DISPLAY: `:${number}`, XAUTHORITY: authority };
+  beforeSpawn?.(number);
   const server = spawn(XVFB, [environment.DISPLAY, "-nolisten", "tcp", "-auth", authority, "-screen", "0", "1024x768x24"],
     { env: TOOL_ENV, stdio: "ignore" });
   const display = { environment, server, number, failed: false };
@@ -71,17 +72,23 @@ export async function waitForPrivateDisplay(display) {
 }
 
 export function mappedBrowserWindow(display, browserPid) {
-  if (!serverRunning(display) || !ownsDisplayLock(display.number, display.server.pid)) return false;
+  return Boolean(findMappedBrowserWindow(display, browserPid));
+}
+
+export function findMappedBrowserWindow(display, browserPid, expected = null) {
+  if (!serverRunning(display) || !ownsDisplayLock(display.number, display.server.pid)) return null;
   const env = { ...TOOL_ENV, ...display.environment };
   const tree = query(XWININFO, ["-root", "-tree"], env);
-  if (tree.status !== 0) return false;
-  const ids = [...tree.stdout.matchAll(/^\s*(0x[0-9a-f]+)\s+"Skeleton decision \(prototype\)[^"\n]*"/gmi)];
-  return ids.slice(0, 8).some(([, id]) => {
+  if (tree.status !== 0) return null;
+  const windows = [...tree.stdout.matchAll(/^\s*(0x[0-9a-f]+)\s+"(Skeleton decision \(prototype\)[^"\n]*)"/gmi)];
+  for (const [, id, title] of windows.slice(0, 8)) {
+    if (expected && (id !== expected.id || title !== expected.title)) continue;
     const owner = query(XPROP, ["-id", id, "_NET_WM_PID"], env);
-    if (owner.status !== 0 || Number(/=\s*(\d+)\s*$/.exec(owner.stdout)?.[1]) !== browserPid) return false;
+    if (owner.status !== 0 || Number(/=\s*(\d+)\s*$/.exec(owner.stdout)?.[1]) !== browserPid) continue;
     const geometry = query(XWININFO, ["-id", id], env);
-    return geometry.status === 0 && /Map State: IsViewable/.test(geometry.stdout);
-  });
+    if (geometry.status === 0 && /Map State: IsViewable/.test(geometry.stdout)) return { id, title };
+  }
+  return null;
 }
 
 export function displaySocketPresent(display) {
