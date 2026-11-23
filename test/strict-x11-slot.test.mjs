@@ -51,7 +51,7 @@ test("JS: parser counts rows and malformed lines", () => {
   assert.ok(parsed.paths.has("@a"));
 });
 
-test("Python dispose parser agrees on every raw-byte case", () => {
+test("Python dispose parser agrees on every raw-byte case", { skip: process.platform === "linux" ? false : "the Python dispose parser runs on Linux only" }, () => {
   const script = fileURLToPath(new URL("./live/strict-x11-slot.py", import.meta.url));
   const input = BYTE_CASES.map(({ raw, number, cap }) => ({ b64: raw === null ? null : raw.toString("base64"), number, ...(cap ? { cap } : {}) }));
   const r = spawnSync("/usr/bin/python3", ["-I", script], { input: JSON.stringify(input), encoding: "utf8", timeout: 10000 });
