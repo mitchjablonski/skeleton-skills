@@ -3,7 +3,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { DECISION_CODE_RE } from "../lib/strict-decision-codes.mjs";
+import { superviseC9Process, privateTranscriptDirectory, writePrivateTranscript } from "./live/strict-skills-agent-runtime.mjs";
 import {
   codeMatcher, derivePrivileged, extractRun, gradeRun, parseStream, privilegedReason, syntheticClean, syntheticViolation,
 } from "./live/strict-skills-agent-grade.mjs";
@@ -142,4 +146,52 @@ test("an unfinished or failed run fails", () => {
   assert.match(gradeRun("S1", { events: [], error: "timeout" }, ctx).reasons.join(), /run error: timeout/);
   assert.match(gradeRun("S2", { events: parseStream("not json\n") }, ctx).reasons.join(), /no result event/);
   assert.deepEqual(extractRun(parseStream('{"type":"result","result":"x"}\n')).finalText, "x");
+});
+const linux = { skip: process.platform !== "linux" };
+
+test("C9 cancellation waits for the scoped child and detached descendant", linux, async (t) => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "strict-c9-cancel-"));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const witness = path.join(scratch, "started");
+  const script = `
+    const { spawn } = require("node:child_process");
+    const fs = require("node:fs");
+    const descendant = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"],
+      { detached: true, stdio: "ignore" });
+    fs.writeFileSync(process.argv[1], JSON.stringify([process.pid, descendant.pid]));
+    setTimeout(() => {}, 20000);
+  `;
+  const run = superviseC9Process(process.execPath, ["-e", script, witness],
+    { cwd: scratch, env: {}, timeoutMs: 10_000 });
+  try {
+    const deadline = Date.now() + 5_000;
+    while (!fs.existsSync(witness) && Date.now() < deadline) await delay(25);
+    const pids = JSON.parse(fs.readFileSync(witness, "utf8"));
+    assert.equal(pids.length, 2);
+    run.stop();
+    const result = await run.done;
+    assert.equal(result.error, "interrupted");
+    assert.equal(result.cleanupProven, true);
+    for (const pid of pids) assert.equal(fs.existsSync(`/proc/${pid}`), false);
+  } finally {
+    run.stop();
+    const result = await run.done;
+    assert.equal(result.cleanupProven, true);
+  }
+});
+
+test("C9 raw transcripts use private and exclusive storage", linux, (t) => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "strict-c9-transcript-"));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const directory = privateTranscriptDirectory(path.join(scratch, "private"));
+  assert.equal(fs.statSync(directory).mode & 0o777, 0o700);
+  writePrivateTranscript(directory, "S1-run1", "fixture transcript");
+  assert.equal(fs.statSync(path.join(directory, "S1-run1.jsonl")).mode & 0o777, 0o600);
+  assert.throws(() => writePrivateTranscript(directory, "S1-run1", "replacement"), { code: "EEXIST" });
+  const linked = path.join(scratch, "linked");
+  fs.symlinkSync(directory, linked);
+  assert.throws(() => writePrivateTranscript(linked, "S1-run2", "refuse link"));
+  fs.chmodSync(directory, 0o755);
+  assert.throws(() => privateTranscriptDirectory(directory), /private and owned/);
+  assert.throws(() => writePrivateTranscript(directory, "S1-run2", "refuse shared mode"));
 });

@@ -24,15 +24,16 @@ node test/live/strict-skills-agent-probe.mjs --live --requested-standin [--n 2] 
   that is 6 runs and 8 invocations. N is capped at 3.
 - It is never part of `npm test`. Without `--live` it exits 2
   (`live-flag-missing`).
+- The live fixture uses Linux with system Python and pidfd process
+  supervision. The grader itself can run without the live runtime.
 - Exit 0: every run passed. Exit 1: a run failed, or the grader self-check
   failed. Exit 2: unsupported: no `--live`, no `claude` CLI
   (`claude-cli-missing`), not logged in (`not-authenticated`), or strict
   can't be requested (`strict-request-unsupported`).
-- Output: one JSON object with per-scenario pass and fail counts, tool-call
-  counts and failure reasons (excerpts capped at 160 characters, any pasted
-  code redacted). No transcript bodies. Transcripts of **failed** runs only
-  are written to `--transcripts` (default: a new dir under the OS temp dir),
-  and the path goes to stderr.
+- Output includes per-scenario counts and fixed failure labels. Raw
+  transcripts of failed runs only go in a private, owned directory. An
+  explicit `--transcripts` location must have mode 0700 and transcript
+  files use mode 0600 with exclusive creation. The path goes to stderr.
 
 ## Requesting strict: the stand-in
 
@@ -96,7 +97,9 @@ Per run, a fresh `mkdtemp` root (removed afterwards) holding:
   whatever the package.json script says, and the agent can edit that file;
 - `--permission-prompts none`: anything else that would prompt is denied;
 - `--max-turns 20` and a 300 s wall clock per invocation (`--max-turns`,
-  `--timeout-s`), the process group killed at the end;
+  `--timeout-s`). The Linux process scope reaps owned descendants before
+  scratch removal, including after interruption. Unproven cleanup ends
+  the run and retains scratch;
 - S1 and S2 use `--no-session-persistence`. S3 needs `--session-id` then
   `--resume`; after each run `claude purge -y <project>` deletes the
   scratch project's saved session data.
