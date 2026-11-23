@@ -200,6 +200,14 @@ on the Windows desktop, not from an agent pane, and report the results under
     processes remain, and that `/mnt/wslg/stderr.log` has no new lines
     (`wc -l /mnt/wslg/stderr.log` before and after).
 
+## Next: the real-desktop launcher mode
+
+The design for the launcher mode that opens the owned window on this seat is
+in [real-desktop launcher](strict-real-desktop-launcher.md). It covers the
+exact candidate and ozone choice, the ownership checks, refusal codes, the
+maintainer's observations, and what Xvfb can pre-verify. It is design only;
+nothing has been run against WSLg.
+
 ## Not shown yet
 
 - Any real-desktop window, input or clipboard observation.
