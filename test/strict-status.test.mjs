@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_VERIFIER, EVIDENCE_REASONS, IN_BOUNDARY_TRANSITIONS, LOCAL_REASONS, MAX_EVIDENCE_AGE_MS, MAX_EVIDENCE_LIFETIME_MS, STRICT_STATES, classifyEvidence, refuseInBoundaryTransition, refusePrivileged, strictLine, strictStatus } from "../lib/strict-status.mjs";
+import { DEFAULT_VERIFIER, EVIDENCE_REASONS, IN_BOUNDARY_TRANSITIONS, LOCAL_REASONS, MAX_EVIDENCE_AGE_MS, MAX_EVIDENCE_LIFETIME_MS, STRICT_STATES, classifyEvidence, refuseInBoundaryTransition, refusePrivileged, strictLine, strictStatus, strictStatusLead } from "../lib/strict-status.mjs";
 import { ACTIVE, CONTEXT, MALFORMED, NEGATIVE, NOW, POSITIVE, PROFILE, PROJECT, SESSION, UNVERIFIED_REASONS, fixtureVerifier, throwingVerifier } from "./fixtures/strict-evidence.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -399,4 +399,59 @@ test("regression: default-mode skel status output is unchanged, with no strict l
   for (const out of [scaffold, fill]) assert.doesNotMatch(out.stdout + out.stderr, /strict/i);
   // The default approve path is not gated on strict status.
   assert.equal(JSON.parse(run("status", "--json").stdout).phase, "fill");
+});
+
+// ---- #229: the human status leads with strict when it was requested ----
+
+test("strictStatusLead: a refusal line, summary and next when requested; nothing otherwise", async () => {
+  for (const status of [await strictStatus({ ...CONTEXT, requested: true }), classifyEvidence({ kind: "unverified", reason: "launcher-absent" }, CONTEXT), classifyEvidence(ACTIVE, CONTEXT), classifyEvidence({ kind: "ended" }, CONTEXT)]) {
+    const lead = strictStatusLead(status);
+    assert.equal(lead.length, 3, status.state);
+    assert.match(lead[0], new RegExp(`^strict: ${status.state}${status.reason ? ` \\(${status.reason}\\)` : ""} — strict was requested, so approve, reshape and finalize are refused from this session\\.$`));
+    assert.equal(lead[1], status.summary);
+    assert.equal(lead[2], `Next: ${status.next}`);
+  }
+  assert.match(strictStatusLead(await strictStatus({ ...CONTEXT, requested: true })).join("\n"), /Use a release with strict support/);
+  for (const status of [await strictStatus({ projectId: "p", sessionId: null, requested: false }), classifyEvidence(ACTIVE, { ...CONTEXT, requested: false }), null, undefined, { requested: "yes", state: "unsupported" }])
+    assert.deepEqual(strictStatusLead(status), []);
+});
+
+/** A scratch project with an approved one-step skeleton, and a skel run there from `bin`. */
+function approvedProject(bin) {
+  const dir = mkTemp("skel-strict-lead-");
+  const env = { ...process.env, XDG_STATE_HOME: path.join(dir, ".xdg"), CLAUDE_PROJECT_DIR: "" };
+  const git = (...a) => spawnSync("git", ["-C", dir, "-c", "user.email=t@example.invalid", "-c", "user.name=t", ...a], { encoding: "utf8" });
+  git("init", "-q");
+  fs.writeFileSync(path.join(dir, "add.js"), 'export function add(a, b) {\n  // SKEL[1] add\n  throw new Error("SKEL_TODO");\n  // /SKEL[1]\n}\n');
+  const run = (b, ...args) => spawnSync(process.execPath, [b, ...args], { cwd: dir, env, encoding: "utf8", timeout: 60_000 });
+  assert.equal(run(BIN, "init", "t", "--gate", "deny").status, 0);
+  assert.equal(run(BIN, "approve").status, 0);
+  return (...args) => run(bin, ...args);
+}
+
+test("#229: default-mode `skel status` has no strict lines", () => {
+  const out = approvedProject(BIN)("status");
+  assert.equal(out.status, 0, out.stderr);
+  assert.doesNotMatch(out.stdout, /strict/i);
+  assert.match(out.stdout.split("\n")[0], /^t — phase: fill/);
+});
+
+test("#229: with strict requested (the C9 probe's stand-in), `skel status` leads with the strict refusal, summary and next", () => {
+  // The C9 probe's stand-in: a copy of bin and lib with the one requested: false call flipped. No real strict switch.
+  const copy = mkTemp("skel-strict-standin-");
+  for (const d of ["bin", "lib"]) fs.cpSync(path.join(HERE, "..", d), path.join(copy, d), { recursive: true });
+  fs.copyFileSync(path.join(HERE, "..", "package.json"), path.join(copy, "package.json"));
+  const skel = path.join(copy, "bin", "skel.mjs");
+  const from = "strictStatus({ projectId: root, sessionId: null, requested: false })";
+  const src = fs.readFileSync(skel, "utf8");
+  assert.equal(src.split(from).length, 2, "the stand-in seam exists exactly once");
+  fs.writeFileSync(skel, src.replace(from, from.replace("false", "true")));
+  const run = approvedProject(skel);
+  const json = JSON.parse(run("status", "--json").stdout).strict;
+  assert.equal(json.requested, true);
+  const lines = run("status").stdout.split("\n");
+  assert.deepEqual(lines.slice(0, 3), strictStatusLead(json));
+  assert.match(lines[0], /^strict: unsupported — strict was requested, so approve, reshape and finalize are refused/);
+  assert.match(lines[2], /^Next: .*Use a release with strict support/);
+  assert.match(lines[3], /^t — phase: fill/, "the strict lines come before anything else");
 });

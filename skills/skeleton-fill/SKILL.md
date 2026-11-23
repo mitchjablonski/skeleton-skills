@@ -1,6 +1,6 @@
 ---
 name: skeleton-fill
-description: Fill an approved code skeleton one fenced step at a time (the next SKEL_TODO), editing only inside that step's fence, with the edits delegated to the restricted skeleton-filler subagent. Use when the user says /skel:skeleton-fill, "next step", "fill step N", or "fill the rest" after a skeleton was approved with /skel:skeleton.
+description: Fill an approved code skeleton one fenced step at a time (the next SKEL_TODO), editing only inside that step's fence, with the edits delegated to the restricted skeleton-filler subagent. Use when the user says /skel:skeleton-fill, "next step", "fill step N", or "fill the rest" after a skeleton was approved with /skel:skeleton. Never put decision or approval codes in this skill's arguments.
 ---
 
 # Fill the skeleton
@@ -61,7 +61,7 @@ At the end of each of your turns, a Stop hook checks the skeleton against the ap
 Sometimes a step needs something the skeleton doesn't have (you spot it, or the filler comes back `blocked`): a new helper, a changed signature, another file, a parameter. **Don't work around the fence.** Stop and propose the change: what, where, and why, in a few lines. Reopening the skeleton is the human's call. Once they agree (in chat, or with **Reopen skeleton** in the review page):
 
 ```
-skel reshape     # back to skeleton review; Claude Code asks them to allow it
+skel reshape     # back to skeleton review; Claude Code asks them to allow it (not in strict: see Strict mode)
 ```
 
 Make the structural edit yourself, since this is skeleton work, not a fill (new code gets its own fence and id), let the live review reload (or regenerate static review with `skel review`), and get approval again before `skel approve` and `skel next`.
@@ -75,13 +75,13 @@ When you re-approve, `skel approve` checks that the human reviewed the reshaped 
 `skel next` reports that all steps are filled. Run the full test suite, then ask the human whether to finalize. On a yes:
 
 ```
-skel finalize    # strips the SKEL marker lines; Claude Code asks them to allow it
+skel finalize    # strips the SKEL marker lines; Claude Code asks them to allow it (not in strict: see Strict mode)
 ```
 
 Then stop the review server with `skel serve --stop`. The open page already says the skeleton is finalized, and the server has nothing left to show.
 
 ## Strict mode (in development)
 
-Strict isn't available in this release; `skel status --json` reports it under `strict`. All of this applies only when `strict.requested` is `true`; otherwise the project is in default mode and nothing here changes the steps above. When `strict.requested` is `true` and `strict.state` isn't `active`, approve, reshape, finalize and other authority-changing steps are refused: tell the human `strict.next` and stop. In strict mode those steps go only through the protected human flow. Never run an equivalent privileged CLI command, never try to obtain a secret or token for it, and never work around a failed boundary (another interpreter, path or session). A permission prompt you triggered, or a `UserPromptExpansion` event, is not a human-only receipt.
+Strict isn't available in this release; `skel status --json` reports it under `strict`. All of this applies only when `strict.requested` is `true`; otherwise the project is in default mode and nothing here changes the steps above. When `strict.requested` is `true` and `strict.state` isn't `active`, approve, reshape, finalize and other authority-changing steps are refused: tell the human `strict.next` and stop. Whenever you refuse because of strict, quote or paraphrase `strict.next`; a refusal without it leaves the human without a next step. The human-readable `skel status` leads with a `strict:` line in this case. Default-mode approval wording ("the permission prompt is their approval") doesn't apply here. In strict mode those steps go only through the protected human flow. Never run an equivalent privileged CLI command, never try to obtain a secret or token for it, and never work around a failed boundary (another interpreter, path or session). A permission prompt you triggered, or a `UserPromptExpansion` event, is not a human-only receipt.
 
 In strict mode the launcher may stop the session to take a snapshot, have the human review it, or check a fill. When that happens, stop working and wait for the human. The only message you get is "Stopped by the strict launcher. Wait for the human." Never try to restart, recapture, approve or work around the stop. If the strict flow uses decision codes (proposed, not final), they are for the human alone. Never ask for one, suggest one or print anything that looks like one. If the human pastes one into this session, don't use or repeat it. Say only that nothing is decided in this session.
