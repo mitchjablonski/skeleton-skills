@@ -65,9 +65,29 @@ export function x11SocketState(text, number) {
   return { abstract: table.paths.has("@" + name), filesystem: table.paths.has(name), proven: table.header && table.malformed === 0 };
 }
 
+/** Read cap: a table larger than this is truncated evidence, so "not proven". */
+export const UNIX_TABLE_CAP = 4 * 1024 * 1024;
+
+/** Pure: socket state from the raw table bytes. null (unreadable), more than `cap` bytes, or any
+ *  parse error means not proven. Socket names are arbitrary bytes: decoded 1:1 (latin1), so a
+ *  non-UTF-8 name can't break parsing and ASCII X socket paths still match exactly. */
+export function x11SocketStateFromBytes(bytes, number, cap = UNIX_TABLE_CAP) {
+  const unproven = { abstract: null, filesystem: null, proven: false };
+  if (!bytes || bytes.length > cap) return unproven;
+  try { return x11SocketState(Buffer.from(bytes).toString("latin1"), number); } catch { return unproven; }
+}
+
 const readNetNs = (pid) => { try { return fs.readlinkSync(`/proc/${pid}/ns/net`); } catch { return null; } };
+/** Bounded read of at most cap+1 bytes; null when unreadable. */
 function readUnixTable(pid) {
-  try { return fs.readFileSync(`/proc/${pid}/net/unix`, "utf8"); } catch { return null; }
+  let fd;
+  try {
+    fd = fs.openSync(`/proc/${pid}/net/unix`, "r");
+    const buf = Buffer.alloc(UNIX_TABLE_CAP + 1);
+    let total = 0, n;
+    while (total < buf.length && (n = fs.readSync(fd, buf, total, buf.length - total, null)) > 0) total += n;
+    return buf.subarray(0, total);
+  } catch { return null; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* closed */ } }
 }
 /** Fixed label: can this host's X socket directory take a filesystem socket? */
 export function socketDirectoryLabel() {
@@ -88,7 +108,7 @@ export function displaySlotState(display) {
   } else if (display.netNamespace && display.netNamespace !== readNetNs("self")) {
     return { lock: true, filesystemSocket: true, abstractSocket: null, proven: false };
   }
-  const table = x11SocketState(readUnixTable(pid), number);
+  const table = x11SocketStateFromBytes(readUnixTable(pid), number);
   return {
     lock: fs.existsSync(`/tmp/.X${number}-lock`),
     filesystemSocket: fs.existsSync(`${SOCKET_DIR}/X${number}`) || table.filesystem === true,

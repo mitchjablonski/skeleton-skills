@@ -12,6 +12,7 @@ import os
 import re
 
 SOCKET_DIR = '/tmp/.X11-unix'
+UNIX_TABLE_CAP = 4 * 1024 * 1024  # a larger table is truncated evidence: not proven
 _HEADER = re.compile(r'^Num\s+RefCount\s+Protocol\s+Flags\s+Type\s+St\s+Inode(\s+Path)?\s*$')
 _ROW = re.compile(r'^\s*[0-9a-fA-F]+:\s+[0-9A-Fa-f]{8}\s+[0-9A-Fa-f]{8}\s+[0-9A-Fa-f]{8}\s+[0-9A-Fa-f]{4}\s+[0-9A-Fa-f]{2}\s+\d+(?:\s+(\S.*))?$')
 
@@ -44,6 +45,18 @@ def x11_socket_state(text, number):
     return {'abstract': '@' + name in paths, 'filesystem': name in paths, 'proven': header and malformed == 0}
 
 
+def x11_socket_state_bytes(data, number, cap=UNIX_TABLE_CAP):
+    """Pure: state from raw table bytes. None, more than `cap` bytes, or any error: not proven.
+    Socket names are arbitrary bytes, so they are decoded with surrogateescape."""
+    unproven = {'abstract': None, 'filesystem': None, 'proven': False}
+    if data is None or len(data) > cap:
+        return unproven
+    try:
+        return x11_socket_state(bytes(data).decode('utf-8', 'surrogateescape'), number)
+    except Exception:
+        return unproven
+
+
 def socket_directory_label():
     """Fixed label: can this host's X socket directory take a filesystem socket?"""
     if not os.path.lexists(SOCKET_DIR):
@@ -54,11 +67,11 @@ def socket_directory_label():
 def slot_clean(number):
     """True only when lock, filesystem socket and abstract socket are all proven gone."""
     try:
-        with open('/proc/self/net/unix', encoding='utf-8') as source:
-            text = source.read(1 << 22)
-    except OSError:
-        text = None
-    state = x11_socket_state(text, number)
+        with open('/proc/self/net/unix', 'rb') as source:
+            data = source.read(UNIX_TABLE_CAP + 1)
+    except Exception:
+        data = None
+    state = x11_socket_state_bytes(data, number)
     if not state['proven'] or state['abstract'] is not False or state['filesystem']:
         return False
     return not any(os.path.lexists(path) for path in (f'/tmp/.X{number}-lock', f'{SOCKET_DIR}/X{number}'))
@@ -68,5 +81,7 @@ if __name__ == '__main__':
     # Test entry: JSON cases on stdin -> JSON results on stdout (pure parser only).
     import json
     import sys
+    import base64
     cases = json.load(sys.stdin)
-    print(json.dumps([x11_socket_state(case['text'], case['number']) for case in cases]))
+    print(json.dumps([x11_socket_state_bytes(None if case['b64'] is None else base64.b64decode(case['b64']),
+                                             case['number'], case.get('cap', UNIX_TABLE_CAP)) for case in cases]))
