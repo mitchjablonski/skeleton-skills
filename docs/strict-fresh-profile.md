@@ -233,6 +233,28 @@ binding. Cleanup checks the processes, display socket and lock, and scratch
 directory. The headless mode above still provides the DOM, network
 namespace, and debugging-port controls.
 
+**Display slot proof.** On WSL, `/tmp/.X11-unix` is a read-only bind of
+WSLg's tmpfs. Xvfb can't create its filesystem socket there, so it listens
+only on the abstract socket `@/tmp/.X11-unix/X<n>`.
+
+A display number is chosen only if its lock, filesystem socket and abstract
+socket are all absent. Cleanup requires the same three to be gone. Abstract
+sockets are found only by **reading** `/proc/<pid>/net/unix`; nothing ever
+connects to any X socket.
+
+That table is per network namespace. Xvfb is spawned without a namespace
+change, so it shares the probe's namespace:
+- while the server lives, its own `/proc/<pid>/net/unix` is read, after
+  checking that its namespace matches the probe's;
+- afterwards, `/proc/self/net/unix` is read.
+
+An unreadable or malformed table counts as not proven and fails closed. The
+cleanup output records `displaySocketDirectory` (`writable`, `read-only`,
+`absent` or `unavailable`). The same proof, with a shared parser covered by
+`test/strict-x11-slot.test.mjs`, backs the owned window's `dispose` in
+`test/live/strict-namespace-admission-probe.py`
+(`test/live/strict-x11-slot.py`).
+
 ## Not shown
 
 - The human's protected window, or launching the browser from the real
