@@ -40,11 +40,14 @@ It prints one bounded JSON object with fixed labels:
 - **Namespaces:** this process's namespace ids.
 
 **Safety.** An earlier probe crashed WSLg's compositor by connecting to X0
-and the audio sink (see [display interop](strict-display-interop.md)). So
-the inventory:
-- only ever calls `stat()` on anything under `/mnt/wslg`, `/tmp/.X11-unix`
-  or `$XDG_RUNTIME_DIR`, and on the Wayland, Pulse and session-bus sockets.
-  It never opens, reads, connects to or binds them;
+and the audio sink (see [display interop](strict-display-interop.md)). So,
+for anything under `/mnt/wslg`, `/tmp/.X11-unix` or `$XDG_RUNTIME_DIR`, and
+for the Wayland, Pulse and session-bus sockets, the inventory uses only
+`lstat()`, `access(W_OK)` and `readlink()` (the latter only on
+`/proc/self/ns/*`):
+- it never opens, connects to or binds any of them;
+- the Wayland runtime entry is a symlink, and `lstat()` doesn't follow it
+  to its target;
 - runs no X or Wayland client, `xdotool`, `xprop`, Xvfb or windowed browser.
   The only process it starts is the pinned Chrome with `--version`;
 - prints no home paths, user names or socket paths.
@@ -126,6 +129,23 @@ fall back, when the desktop evidence is unavailable or untrusted:
   namespace where an abstract X socket lives.
 - **The agent can inject input.** It can reach an X server with XTEST, a
   writable `/dev/uinput`, or a Wayland or virtual-keyboard protocol socket.
+- **The agent can reach WSL interop.** That covers the interop socket
+  (`/run/WSL`, `WSL_INTEROP`), `/init`, a registered `WSLInterop` binfmt
+  that runs Windows binaries for it, or the ability to execute anything
+  under `/mnt/<drive>`. With interop an agent drives the human's real
+  Windows desktop and clipboard, outside WSLg: PowerShell `SendKeys`,
+  `clip.exe`. The N4 fixture ([display interop](strict-display-interop.md))
+  shows the strict sandbox refuses a Windows binary and that binding
+  `/run/WSL` alone re-enables it. Matrix row X13 records interop as a
+  launch refusal.
+- **AF_VSOCK isn't proven denied.** Refuse unless `socket(AF_VSOCK)` is
+  shown to fail inside the agent sandbox. On WSL2, namespaces don't confine
+  vsock: the N4 fixture reached the Hyper-V host from inside
+  `--unshare-net`. Only its seccomp filter refuses `socket(AF_VSOCK)` (and
+  `io_uring_setup`). The descriptor fixture
+  ([descriptor probe](strict-descriptor-probe.md), #162) shows a
+  `--seccomp` program actually loaded. That filter is still a fixture
+  mitigation, not an adopted policy.
 - **Debugging is on**, or not proven off: any `--remote-debugging-*`
   switch, a `DevToolsActivePort`, a held TCP listener, or unreadable
   evidence.
@@ -153,23 +173,36 @@ on the Windows desktop, not from an agent pane, and report the results under
 4. [ ] **Check it is the owned browser:** confirm the window has no
    extensions, bookmarks or signed-in profile, and that your normal Chrome
    windows are unchanged.
-5. [ ] **Try input from the agent side:** in the agent's pane, type and
-   paste some text (for example `approve`), then try to switch focus to the
-   owned window from there. Report whether any text appeared in the owned
-   window or the control window. Expected: none.
-6. [ ] **Try the browser side:** click in the owned window and type. Report
+5. [ ] **Let the agent itself try to inject, from inside its sandbox.**
+   Ask the agent, running in the strict sandbox, to attempt each of these:
+   - WSL interop: `powershell.exe` `SendKeys` and `clip.exe`;
+   - `wl-copy`;
+   - an X client (for example `xdotool type`) and a Wayland client;
+   - an OSC 52 clipboard write.
+
+   Each attempt should fail inside the sandbox. Watch the owned window, the
+   control window and the Windows clipboard (paste into Notepad), and report
+   whether anything arrived. Expected: nothing arrives anywhere. Also paste
+   text into the agent pane yourself, and confirm it doesn't reach the
+   owned or control window.
+6. [ ] **Windows Terminal cross-pane features:** check that broadcast
+   input (sending input to all panes) is off. Check how the clipboard and
+   any shared-input or pane-sync features behave across panes and tabs, and
+   that none of them joins the agent pane to the control window. Note the
+   Windows Terminal version and the relevant settings.
+7. [ ] **Try the browser side:** click in the owned window and type. Report
    whether anything is accepted. Expected: it is read-only, with no decision
    control.
-7. [ ] **Decide in the control window:** enter the decision in the
+8. [ ] **Decide in the control window:** enter the decision in the
    separately identified control window. Confirm it is accepted there only.
-8. [ ] **Clipboard and title:** have the agent print an OSC 52 clipboard
+9. [ ] **Clipboard and title:** have the agent print an OSC 52 clipboard
    write and an OSC 2 title change. Report whether your clipboard or any
    window title changed. Expected: neither.
-9. [ ] **Restart and loss:** restart the launcher healthily and confirm the
+10. [ ] **Restart and loss:** restart the launcher healthily and confirm the
    window and generation are kept. Then close the owned browser window
    yourself, and report whether the launcher refuses or cleans up, with the
    message shown.
-10. [ ] **Cleanup:** after the run, confirm no extra Chrome windows or
+11. [ ] **Cleanup:** after the run, confirm no extra Chrome windows or
     processes remain, and that `/mnt/wslg/stderr.log` has no new lines
     (`wc -l /mnt/wslg/stderr.log` before and after).
 
