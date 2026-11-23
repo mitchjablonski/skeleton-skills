@@ -107,7 +107,7 @@ rests on human observation alone.
 | Browser process | `/proc/<pid>/exe` path equals the pinned path, not ` (deleted)`; the exe inode and device equal the hashed file's; the browser leads its own session; it is the launcher's direct child (subreaper) | `/proc` reads, as in the C20 sampler | The running process is the pinned file the launcher started, and a swap by rename fails closed |
 | Window attribution | Exactly one top-level window titled `Skeleton decision (prototype)…`, mapped and viewable. Its `_NET_WM_PID` is the launched PID; `WM_CLIENT_MACHINE` is this host; and its lifecycle follows the process (absent before launch, present after, gone within a bound when the owned PID is stopped) | X11 queries on `:0`, run only inside the human-launched session (section 7) | A **claim**, consistent with the owned PID: see below |
 | Window attribution (stronger, if available) | X-Resource client PID (`XResQueryClientIds`, PID mask) for the window's client equals the launched PID | XRes query | A server-side PID, not one the client set |
-| Discriminating phrase | A per-run phrase, printed in the control window and shown on the page, matches (section 5) | The human compares them | The visible window is showing the private navigation's content, not a look-alike |
+| Discriminating phrase | A per-run phrase, printed in the control window and shown on the page, matches (section 5) | The human compares them | **Supports, given the preconditions**, that the visible window shows the private navigation's content. It defeats only a *blind* look-alike: any `:0` client or Windows-side process that captures the real window can copy the phrase, so it relies on the attested `unsandboxed-agent-not-excluded` and `windows-capture-not-excluded` preconditions |
 | Browser data directory | Created fresh (exclusive `mkdir`), 0700, owned by us, on tmpfs, never the default, and unused before launch | `lstat`/`statfs`, as in the harness | No prior state, extension or debugging port file |
 | Debugging off | No `--remote-debugging*` switch in any browser process, no `DevToolsActivePort` under the scratch root (HOME), no TCP listener held, and all tables readable. Checked at launch, during a bounded sample, **and at every restart check** | The shared sampler | No debugging endpoint is open at those samples |
 | Private navigation | The one-use URL comes from the host-only window navigation method. It passes only on the owned browser's argv, inside the launcher's namespace, which the agent can't read. It is never logged, printed or written to agent-visible files. The listener's once-only selected-view observation must be taken (#220) | Listener and launcher code; output schema has no URL or nonce field | The page was read once by the owned navigation, and no credential reached agent-visible evidence |
@@ -256,7 +256,11 @@ windows or files.
 
    The phrase reaches the page only through the private one-use navigation
    that the listener serves to the bound tab. A look-alike window can copy
-   the public hash, but can't know the phrase without reading the real page.
+   the public hash, but a *blind* look-alike can't know the phrase. One that
+   captures the real window can copy the phrase too: any `:0` client, or any
+   Windows-side process through RAIL. So this check relies on the attested
+   `unsandboxed-agent-not-excluded` and `windows-capture-not-excluded`
+   preconditions, and defeats a blind spoofer only.
 4. **Clean browser.** **Expected:** no extensions, bookmarks or sign-in in
    the window, and the user's own Chrome windows unchanged.
 5. **Synthetic agent-pane input.** In the agent pane, the sandboxed agent
