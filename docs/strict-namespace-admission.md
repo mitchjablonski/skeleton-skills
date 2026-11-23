@@ -165,6 +165,14 @@ health check. These labels carry no navigation data. After an empty
 report, diagnostics allow the existing scope cleanup interval to collect
 the worker exit status. Admission deadlines and evidence are unchanged.
 
+The protected fixture also watches the owned control-console pidfd while
+it reads the terminal. A console that exits with the fixture watchdog
+status reports `terminal-watchdog-expired`; an owned console still running
+at the read deadline reports `terminal-response-timeout`. An unexpected
+terminal refusal records its phase, console age, and exit status without
+terminal contents. Both outcomes fail the run and retain scratch for
+inspection after owned cleanup.
+
 This fixture uses explicitly pinned binaries and a fixed, owned workload.
 It leaves strict disabled and unverified. Actual desktop qualification,
 protected code issuance and production launcher ownership remain open.

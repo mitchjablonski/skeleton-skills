@@ -46,6 +46,7 @@ class FixtureTerminal:
         self._resources.callback(os.close, self.master)
         self._resources.callback(os.close, self.slave)
         self.process = None
+        self.started_at = None
         self.closed = False
         try:
             self.original = termios.tcgetattr(self.slave)
@@ -99,16 +100,59 @@ def fd_links(child):
     return links
 
 
-def expect_terminal(fd, expected):
+class TerminalReadFailure(AssertionError):
+    def __init__(self, code, phase, age_ms, status):
+        super().__init__(code)
+        self.phase = phase
+        self.age_ms = age_ms
+        self.status = status
+
+
+def terminal_failure(terminal, phase, code, message):
+    if terminal is None:
+        raise AssertionError(message)
+    status = terminal.process.poll()
+    if status == 3:  # strict-terminal-host-worker.mjs lifetime watchdog
+        code = 'terminal-watchdog-expired'
+    elif status is not None:
+        code = 'terminal-console-exited'
+    age_ms = round((time.monotonic() - terminal.started_at) * 1000)
+    raise TerminalReadFailure(code, phase, age_ms, status)
+
+
+def expect_terminal(fd, expected, *, terminal=None, phase=None):
     data = bytearray()
-    deadline = time.monotonic() + TIMEOUT
-    while len(data) < len(expected):
-        remaining = deadline - time.monotonic()
-        assert remaining > 0 and select.select([fd], [], [], remaining)[0], 'terminal timeout'
-        chunk = os.read(fd, len(expected) - len(data))
-        assert chunk, 'terminal closed early'
-        data.extend(chunk)
-    assert data == expected, 'unexpected terminal bytes'
+    with ExitStack() as owned:
+        watched = [fd]
+        console_fd = None
+        if terminal is not None:
+            if terminal.process.poll() is not None:
+                terminal_failure(terminal, phase, 'terminal-console-exited', 'terminal closed early')
+            try:
+                console_fd = os.pidfd_open(terminal.process.pid)
+            except OSError:
+                terminal_failure(terminal, phase, 'terminal-exit-unobservable', 'terminal closed early')
+            owned.callback(os.close, console_fd)
+            watched.append(console_fd)
+        deadline = time.monotonic() + TIMEOUT
+        while len(data) < len(expected):
+            remaining = deadline - time.monotonic()
+            ready = select.select(watched, [], [], remaining)[0] if remaining > 0 else ()
+            if console_fd in ready:
+                terminal_failure(terminal, phase, 'terminal-console-exited', 'terminal closed early')
+            if fd not in ready:
+                terminal_failure(terminal, phase, 'terminal-response-timeout', 'terminal timeout')
+            try:
+                chunk = os.read(fd, len(expected) - len(data))
+            except OSError:
+                if terminal is None:
+                    raise
+                terminal_failure(terminal, phase, 'terminal-read-failed', 'terminal closed early')
+            if not chunk:
+                terminal_failure(terminal, phase, 'terminal-response-eof', 'terminal closed early')
+            data.extend(chunk)
+        if data != expected:
+            terminal_failure(terminal, phase, 'terminal-response-invalid', 'unexpected terminal bytes')
 
 
 def status_line(state):
@@ -132,9 +176,14 @@ def check_terminal(master, slave, generation):
     assert any(link.startswith('socket:[') for link in inherited & generation.descriptors)
 
 
-def read_console_status(master, state):
-    os.write(master, b'status\r')
-    expect_terminal(master, status_line(state))
+def read_console_status(master, state, *, terminal=None, phase=None):
+    try:
+        os.write(master, b'status\r')
+    except OSError:
+        if terminal is None:
+            raise
+        terminal_failure(terminal, phase, 'terminal-write-failed', 'terminal closed early')
+    expect_terminal(master, status_line(state), terminal=terminal, phase=phase)
 
 
 def exercise(launcher):
