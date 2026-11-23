@@ -6,7 +6,7 @@ import fs from "node:fs";
 const read = (p) => fs.readFileSync(new URL(`../${p}`, import.meta.url), "utf8");
 const doc = read("docs/strict-verification-matrix.md");
 const EXPECTED = [...Array.from({ length: 20 }, (_, i) => `C${i + 1}`), ...Array.from({ length: 18 }, (_, i) => `X${i + 1}`)];
-const KINDS = new Set(["unit", "live-fixture", "design", "—"]);
+const KINDS = new Set(["unit", "live-fixture", "live-model", "design", "—"]);
 const CLAIMS = /\b(profile|verified|contained|containment (?:is )?(?:proven|established)|attested|production[- ]ready|active)\b/i;
 
 const rowLines = doc.split("\n").filter((l) => /^\|\s*[CX]\d/.test(l));

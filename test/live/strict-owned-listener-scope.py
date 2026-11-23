@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Supervise one opt-in fixture listener and reap its descendants on Linux."""
+"""Supervise one opt-in fixture process and reap its descendants on Linux."""
 
 import os
 import pathlib
@@ -33,13 +33,18 @@ def wait_for_stop(lifeline_fd, child_pid):
 def main(args):
     child = None
     try:
-        lifeline, readiness, *command = args
-        lifeline_fd, readiness_fd = int(lifeline), int(readiness)
         control_fds = ()
-        if command[:1] == ["--control-fd"]:
-            control_fds = (int(command[1]),)
-            command = command[2:]
-        descriptors = (lifeline_fd, readiness_fd, *control_fds)
+        if args[:1] == ["--process"]:
+            _, lifeline, *command = args
+            child_fds = ()
+        else:
+            lifeline, readiness, *command = args
+            if command[:1] == ["--control-fd"]:
+                control_fds = (int(command[1]),)
+                command = command[2:]
+            child_fds = (int(readiness), *control_fds)
+        lifeline_fd = int(lifeline)
+        descriptors = (lifeline_fd, *child_fds)
         if min(descriptors) < 3 or len(set(descriptors)) != len(descriptors) or not command:
             raise ValueError("expected distinct inherited descriptors and a listener command")
 
@@ -48,7 +53,6 @@ def main(args):
         with os.fdopen(lifeline_fd, "rb") as parent_pipe:
             try:
                 with ExitStack() as inherited:
-                    child_fds = (readiness_fd, *control_fds)
                     for fd in child_fds:
                         inherited.callback(os.close, fd)
                     child = subprocess.Popen(command, pass_fds=child_fds)
