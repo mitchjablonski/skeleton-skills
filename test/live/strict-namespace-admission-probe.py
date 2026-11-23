@@ -242,6 +242,7 @@ class NamespaceLauncher(CaptureLauncher):
             terminal = self.terminal
             if terminal is None or terminal.closed or terminal.process is not None:
                 raise RuntimeError('console requires a fresh owned terminal')
+            terminal.started_at = time.monotonic()
             terminal.process = terminal_host['spawn_terminal_console'](
                 self, command, fds, terminal.slave, self.terminal_mode)
             return terminal.process
@@ -603,8 +604,10 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
         if protected:
             terminal = launcher.terminal
             terminal_host['check_terminal'](terminal.master, terminal.slave, generation)
-            terminal_host['expect_terminal'](terminal.master, b'SKELETON STRICT CONTROL\r\n')
-            terminal_host['read_console_status'](terminal.master, selected.expected)
+            terminal_host['expect_terminal'](terminal.master, b'SKELETON STRICT CONTROL\r\n',
+                                            terminal=terminal, phase='initial-banner')
+            terminal_host['read_console_status'](terminal.master, selected.expected,
+                                                terminal=terminal, phase='initial-status')
             binding = None
             if case == 'listener-store-mismatch':
                 binding = {**selected.expected, 'reviewVersion': '0' * 64}
@@ -644,8 +647,10 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
                 terminal = launcher.terminal
                 initial = generation.report()
                 terminal_host['check_terminal'](terminal.master, terminal.slave, generation)
-                terminal_host['expect_terminal'](terminal.master, b'SKELETON STRICT CONTROL\r\n')
-                terminal_host['read_console_status'](terminal.master, selected.expected)
+                terminal_host['expect_terminal'](terminal.master, b'SKELETON STRICT CONTROL\r\n',
+                                                terminal=terminal, phase='replacement-banner')
+                terminal_host['read_console_status'](terminal.master, selected.expected,
+                                                    terminal=terminal, phase='replacement-status')
                 assert not old.profile.exists()
                 launcher.stage_listener(selected)
                 launcher.require_listener(generation, phase='replacement')
@@ -759,7 +764,8 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
             if protected:
                 assert launcher.listener is initial_listener
                 assert launcher.terminal is terminal and launcher.listener_ready(generation)
-                terminal_host['read_console_status'](terminal.master, selected.expected)
+                terminal_host['read_console_status'](terminal.master, selected.expected,
+                                                    terminal=terminal, phase='post-restart-status')
             for name in capture['MEMBERS']:
                 assert not os.path.samefile(first_stage / name, next_stage / name)
             launcher.supervisor.stop(second.namespace)
@@ -846,6 +852,11 @@ def main():
     try:
         for case in cases:
             exercise(node, scratch, case, check_runtime, protected=args.protected_launcher, chrome_pin=chrome_pin)
+    except terminal_host['TerminalReadFailure'] as exc:
+        print('Fixture refused. Retained scratch at ' + str(scratch), file=sys.stderr)
+        print(json.dumps({'ok': False, 'strictState': 'unverified', 'code': str(exc), 'case': case,
+                          'phase': exc.phase, 'consoleAgeMs': exc.age_ms, 'consoleExitStatus': exc.status}))
+        raise SystemExit(1)
     except RuntimeRefused as exc:
         code = str(exc)
         failed_window = isinstance(exc, WindowReadinessRefused) and not exc.unavailable
