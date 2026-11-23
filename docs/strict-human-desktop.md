@@ -9,6 +9,21 @@ load slice (#230). Xvfb evidence (the
 window cases) stays fixture evidence and never stands in for the real
 desktop.
 
+## Launcher isolation prerequisite
+
+The opt-in `--desktop-isolation-preflight` mode of
+`test/live/strict-namespace-admission-probe.py` uses the existing Node and
+Bubblewrap pins. It starts only the fixed launcher-owned x86_64 fixture.
+The namespace starts with the shared display isolation filter. Its worker
+checks that AF_VSOCK socket creation is refused and that ordinary local
+socket creation succeeds. Neither check connects to an endpoint.
+
+The launcher requires the worker report from its owned PID namespace and
+independent kernel evidence of an added seccomp filter. It stops the
+namespace and proves cleanup before reporting success. Missing evidence
+refuses the preflight. This mode opens no window and contacts no desktop;
+its result is `unverified` and does not authorize a human-desktop launch.
+
 ## The read-only inventory
 
 ```sh
