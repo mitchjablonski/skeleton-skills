@@ -585,7 +585,7 @@ export function createFixture({ prefix }) {
       c.childrenLeft = childPids().length;
       c.namingDataDirLeft = [...new Set(state.launches.map((r) => r.dir))].reduce((n, d) => n + namingPids(d).length, 0);
       c.namingScratchLeft = state.scratch ? namingPids(state.scratch).length : 0;
-      if (state.display) c.displaySocketLeft = displaySocketPresent(state.display); // the private Xvfb (our child) is stopped above
+      if (state.display) { c.displaySocketLeft = displaySocketPresent(state.display); c.displaySocketDirectory = state.display.socketDirectory; } // the private Xvfb (our child) is stopped above
       if (c.sessionLeft || c.childrenLeft || c.namingDataDirLeft || c.namingScratchLeft || c.displaySocketLeft) state.cleanupOk = false;
     }
     // Remove only after the proof: on a pass, an unsupported run, or an interrupted one.
