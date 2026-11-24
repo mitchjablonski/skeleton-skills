@@ -9,6 +9,7 @@ import json
 from math import ceil
 import os
 from pathlib import Path
+import platform
 import runpy
 import select
 import shutil
@@ -792,6 +793,35 @@ def hangup_terminal(launcher, generation):
     assert generation.authority.poll() is None and launcher.listener_ready(generation)
 
 
+def desktop_isolation_preflight():
+    if platform.machine() != 'x86_64':
+        return {'ok': False, 'strictState': 'unverified', 'code': 'desktop-policy-arch-unavailable'}, 2
+    scratch = Path(tempfile.mkdtemp(prefix='strict-desktop-isolation-')).resolve()
+    run = lifecycle['Run'](scratch)
+    passed = False
+    try:
+        namespace = lifecycle['start_namespace'](run, 'desktop-policy', desktop_policy=True)
+        lifecycle['stop_namespace'](namespace)
+        lifecycle['prove_stopped'](namespace, time.monotonic() + lifecycle['STOP_BOUND'],
+                                   extra=[('wrapper', namespace['outerFd'])])
+        passed = True
+    except (AssertionError, RuntimeError, ValueError, OSError, lifecycle['Unproven']):
+        pass
+    finally:
+        cleaned = lifecycle['cleanup_run'](run) and (not run.processes or bool(run.namespaces))
+        if cleaned:
+            shutil.rmtree(scratch)
+        else:
+            print('Desktop isolation cleanup unproven. Retained scratch at ' + str(scratch), file=sys.stderr)
+    if not cleaned:
+        return {'ok': False, 'strictState': 'unverified', 'code': 'desktop-policy-cleanup-unproven'}, 1
+    if not passed:
+        return {'ok': False, 'strictState': 'unverified', 'code': 'desktop-policy-evidence-unavailable',
+                'cleanupProven': True}, 1
+    return {'ok': True, 'strictState': 'unverified', 'code': 'desktop-policy-preflight-passed',
+            'vsockCreationDenied': True, 'seccompFilterObserved': True, 'cleanupProven': True}, 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--node', required=True)
@@ -803,6 +833,8 @@ def main():
     parser.add_argument('--protected-launcher', action='store_true',
                         help='require a runtime receipt and also exercise enrollment and peer refusals')
     parser.add_argument('--chrome-sha256', help='exercise the protected window with a pinned Chrome ELF')
+    parser.add_argument('--desktop-isolation-preflight', action='store_true',
+                        help='verify the owned sandbox desktop isolation policy without opening a window')
     args = parser.parse_args()
     if (sys.platform != 'linux' or sys.flags.optimize
             or Path(sys.executable).resolve() != Path('/usr/bin/python3').resolve()
@@ -813,6 +845,13 @@ def main():
     _, _, bwrap_error = pin('/usr/bin/bwrap', args.bwrap_sha256, 'bwrap')
     if node_error or bwrap_error:
         parser.error('fixture executable pin refused')
+    if args.desktop_isolation_preflight:
+        if (args.protected_launcher or args.chrome_sha256 is not None or args.runtime_receipt is not None
+                or args.terminal_worker_sha256 is not None):
+            parser.error('desktop isolation preflight only accepts the executable pins')
+        result, status = desktop_isolation_preflight()
+        print(json.dumps(result))
+        raise SystemExit(status)
     try:
         chrome_pin = args.chrome_sha256
         if chrome_pin is not None:
