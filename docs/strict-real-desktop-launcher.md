@@ -130,9 +130,11 @@ So one of these must hold:
   launcher;
 - **(b, recommended)** The browser runs from a **race-safe verified
   object**: a **kernel-sealed** object executed by descriptor. The launcher
-  copies the ELF into a `memfd`, hashes **that** copy, applies
-  `F_SEAL_WRITE`/`F_SEAL_GROW`/`F_SEAL_SHRINK` (and `F_SEAL_SEAL`), and
-  executes exactly that descriptor (`execveat`/`fexecve`), or uses another
+  copies the ELF into a `memfd`, **first** applies and verifies (`F_GET_SEALS`)
+  `F_SEAL_WRITE`/`F_SEAL_GROW`/`F_SEAL_SHRINK`/`F_SEAL_SEAL`, **then** hashes
+  the sealed object, and executes exactly that same descriptor
+  (`execveat`/`fexecve`). Hashing before sealing would leave a window to
+  change the bytes after the check. Alternatively it uses another
   kernel-enforced read-only backing that executes the exact verified object.
   A read-only file in a 0700 tmpfs directory does **not** qualify: a
   same-UID owner can `chmod` or replace it.
