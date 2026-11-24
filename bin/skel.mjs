@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, refreshReceiptIndex, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
-import { strictStatus, strictStatusLead } from "../lib/strict-status.mjs";
+import { projectStrictStatus, strictStatusLead } from "../lib/strict-status.mjs";
 import { renderPrBody } from "../lib/pr-body.mjs";
 import { PLUGIN_ID, claudeConfigDir, hasLegacyHooks, installStatus, isSkelConfigHook, isSkelHook, pluginEvidence, pluginStatus, registrationNotice, rulePath, skelStopHook } from "../lib/install-status.mjs";
 import { isLegacyCopy, renderLegacy } from "../lib/legacy-copy.mjs";
@@ -854,7 +854,7 @@ const commands = {
     // in this release. There is no way to request strict yet, so the human
     // output has no strict lines; the JSON always carries the field. When
     // strict is requested, the human output leads with them (#229).
-    const strict = await strictStatus({ projectId: root, sessionId: null, requested: false });
+    const strict = await projectStrictStatus(root);
     const strictLead = strictStatusLead(strict);
     const state = readState(root);
     if (!validState(state)) {

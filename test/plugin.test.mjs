@@ -96,9 +96,12 @@ test("plugin manifest and marketplace name skel@skeleton-skills, with a pinned v
   assert.equal(market.plugins[0].source, "./", "the repo root is the plugin root: lib/ must be inside it");
 });
 
-test("hooks.json registers the three hooks in exec form, with install's matchers, at files that exist", () => {
+test("hooks.json registers the four hooks in exec form, with install's matchers, at files that exist", () => {
   const { hooks } = readJson("hooks/hooks.json");
-  assert.deepEqual(Object.keys(hooks).sort(), ["ConfigChange", "PreToolUse", "Stop"]);
+  assert.deepEqual(Object.keys(hooks).sort(), ["ConfigChange", "PreToolUse", "Stop", "UserPromptSubmit"]);
+  // #229: the strict input notice; advisory, so not in PLUGIN_HOOKS (an older plugin root without it isn't a protection gap).
+  assert.deepEqual(hooks.UserPromptSubmit, [{ hooks: [{ type: "command", command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/bin/skel-prompt-hook.mjs"], timeout: 10 }] }]);
+  assert.ok(fs.existsSync(path.join(REPO, "bin", "skel-prompt-hook.mjs")));
   for (const [event, matcher, file] of PLUGIN_HOOKS) {
     assert.equal(hooks[event].length, 1);
     assert.equal(hooks[event][0].matcher, matcher);
@@ -183,6 +186,9 @@ test("each hooks.json entry runs, shell-free, from a plugin root whose path has 
   const cfg = runEntry("ConfigChange", { source: "local_settings", file_path: p.settingsFile });
   assert.equal(JSON.parse(cfg.stdout).decision, "block", "settings reloads are held during a fill");
   fs.writeFileSync(fileOut, "// drift\n// SKEL[1] v\nconst v = 1;\n// /SKEL[1]\n");
+  const prompt = runEntry("UserPromptSubmit", { prompt: "fill the next step", session_id: "s1" });
+  assert.equal(prompt.status, 0, prompt.stderr);
+  assert.equal(prompt.stdout, "", "default mode adds nothing to the prompt");
   const stop = runEntry("Stop", { stop_hook_active: false, session_id: "s1" });
   assert.equal(stop.status, 0, stop.stderr);
   assert.equal(JSON.parse(stop.stdout).decision, "block", "the default mode sends Claude back once");

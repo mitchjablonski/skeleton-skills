@@ -315,7 +315,7 @@ So a script can reach the same direct-prompt path. `command_source=plugin` says 
 
 - **The actual prerequisite.** The hook (unsandboxed) may write the trusted approval, bound to the current snapshot hash, with its block reason shown to the user, only behind a separate entrypoint or origin boundary the agent can't reach. That also needs evidence that the sandbox prevents invoking an equivalent unsandboxed path (§5.15 item 4). Neither has been designed or shown. The spike doesn't report a run from inside the agent's sandboxed Bash.
 - **Untested:** IDE and Desktop invocation. The CLI result doesn't show how they behave, in either direction.
-- **Do not use `UserPromptSubmit`.** It also fires for "a background subagent reporting back" and "a message another session sends", which is agent-authored text.
+- **Do not use `UserPromptSubmit`.** It also fires for "a background subagent reporting back" and "a message another session sends", which is agent-authored text. (The #229 strict input notice, `bin/skel-prompt-hook.mjs`, does run on `UserPromptSubmit`, but only to add fixed context; it never treats a prompt as a human decision, never reads the prompt, and decides nothing.)
 - **Benefit, once that boundary exists:** approval stops depending on the permission mode, PermissionRequest hooks, mods or a word regex. That lets `isPhaseChange` go.
 - **Cost:** a slash command instead of a prompt click, which is arguably *more* deliberate, plus building and demonstrating the boundary.
 
