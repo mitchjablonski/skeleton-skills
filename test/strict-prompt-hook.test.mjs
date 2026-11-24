@@ -73,10 +73,15 @@ test("strict requested: exactly the fixed notice, with strict.next verbatim from
   assert.equal(context(p.hook(STANDIN, { cwd: path.join(p.dir, "src"), prompt: PROMPT })), text);
 });
 
-test("unreadable state while .skeleton/ exists: the fail-closed notice without strict.next", () => {
+test("unreadable state while .skeleton/ exists: a neutral fail-closed notice that doesn't claim strict", () => {
   const p = project();
   fs.writeFileSync(path.join(p.dir, ".skeleton", "state.json"), "{ not json");
-  const want = [...PROMPT_NOTICE, PROMPT_NOTICE_UNREADABLE].join("\n");
+  const want = [
+    "skel couldn't read this project's state, so it can't tell whether strict is requested.",
+    "Until `skel status` reads cleanly, don't approve, reshape or finalize, and never use, repeat or pass on any decision or approval code.",
+  ].join("\n");
+  assert.equal(PROMPT_NOTICE_UNREADABLE.join("\n"), want);
+  assert.doesNotMatch(want, /Strict is requested/);
   assert.equal(context(p.hook(STANDIN)), want);
   assert.equal(context(p.hook(REPO)), want, "fail closed: unreadable state can't show strict wasn't requested");
   assert.doesNotMatch(want, /strict\.next says/);

@@ -6,8 +6,8 @@
 // `skel status --json` reports) says strict was requested. Then it adds a
 // fixed notice as additionalContext: strict isn't active, nothing is decided
 // in this session, never use or repeat a decision code, and strict.next
-// verbatim. If `.skeleton/` exists but its state can't be read, it adds the
-// notice without strict.next plus an "unreadable" line (fail closed).
+// verbatim. If `.skeleton/` exists but its state can't be read, it adds a
+// neutral fail-closed notice instead, without claiming strict is requested.
 //
 // It reads the event only for `cwd`. It never echoes the prompt and never
 // looks for anything code-shaped in it: matching codes would mean handling
