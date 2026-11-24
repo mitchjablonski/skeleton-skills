@@ -129,10 +129,13 @@ So one of these must hold:
   filesystem the agent can't remount. That trust comes from outside the
   launcher;
 - **(b, recommended)** The browser runs from a **race-safe verified
-  object**. The launcher copies the ELF into a private tmpfs or a sealed
-  `memfd`, hashes **that** copy, seals it against writes
-  (`F_SEAL_WRITE`/`F_SEAL_GROW`/`F_SEAL_SHRINK` for memfd, or a read-only
-  file in a 0700 tmpfs directory), and executes exactly that object.
+  object**: a **kernel-sealed** object executed by descriptor. The launcher
+  copies the ELF into a `memfd`, hashes **that** copy, applies
+  `F_SEAL_WRITE`/`F_SEAL_GROW`/`F_SEAL_SHRINK` (and `F_SEAL_SEAL`), and
+  executes exactly that descriptor (`execveat`/`fexecve`), or uses another
+  kernel-enforced read-only backing that executes the exact verified object.
+  A read-only file in a 0700 tmpfs directory does **not** qualify: a
+  same-UID owner can `chmod` or replace it.
 
 (b) is recommended because its check doesn't depend on trusting the
 install tree. Chrome loads sibling resources and libraries (`.pak`, `.so`,
@@ -161,6 +164,8 @@ verified to be the launcher's, or a trusted translation exists. Otherwise
 XRes is reported as `attribution-unavailable`, whatever number it returns.
 - **Under a verified namespace:** equal to the launched PID corroborates
   attribution. Any other non-zero PID refuses (`window-attribution-conflict`).
+  A zero PID, a missing PID mask or a missing XRes extension is
+  `attribution-unavailable`, even after the namespace check passes.
 - **Without one** (expected on WSLg): `attribution-unavailable`. A result
   that happens to equal the launched PID **never** upgrades the other
   evidence, because the number may come from another namespace.
