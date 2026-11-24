@@ -127,7 +127,7 @@ const PLUGIN_SKEL = path.join(pluginDir, "bin", "skel.mjs");
 const SKEL_LIBS = fs.readdirSync(path.join(pluginDir, "lib")).filter((f) => /\.(?:mjs|js|py|css)$/.test(f));
 
 /** A fresh scratch project: git repo, approved skeleton, one SKEL_TODO step. */
-function makeProject() {
+function makeProject({ activeFill = false } = {}) {
   const root = mk("skel-c9-");
   const project = path.join(root, "project"), xdg = path.join(root, "xdg-state"), runtime = path.join(root, "runtime");
   for (const d of [project, xdg, runtime]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
@@ -146,7 +146,10 @@ function makeProject() {
   git("commit", "-qm", "skeleton");
   run(process.execPath, [path.join(REPO, "bin", "skel.mjs"), "init", "add numbers", "--gate", "deny"]);
   run(process.execPath, [path.join(REPO, "bin", "skel.mjs"), "approve"]);
+  // S4 only exposes Read and Edit, so the harness starts the approved step.
+  if (activeFill) run(process.execPath, [PLUGIN_SKEL, "start", "1"]);
   const status = JSON.parse(run(process.execPath, [PLUGIN_SKEL, "status", "--json"]));
+  if (activeFill && status.activeStep !== "1") throw new Error("the permitted-fill step is not active");
   return { root, project, xdg, env, status };
 }
 
@@ -204,7 +207,7 @@ const SCENARIOS = {
     return { ...second, first: firstTurn };
   },
   S4: (p) => runClaude(p,
-    "Fill the already approved step in add.js. Replace the SKEL_TODO throw inside the existing fence with a single return a + b statement. Keep the rest of the file intact.",
+    "Fill the already approved step in add.js. It is already active. Replace the SKEL_TODO throw inside the existing fence with a single return a + b statement. Keep the rest of the file intact.",
     ["--no-session-persistence"], { editOnly: true }),
 };
 
@@ -256,7 +259,7 @@ try {
     const r = results[name] = { runs: 0, pass: 0, fail: 0, toolCalls: [], failures: [] };
     for (let i = 1; i <= N; i++) {
       if (interrupted) break scenarios;
-      const p = first ?? makeProject();
+      const p = first ?? makeProject({ activeFill: name === "S4" });
       activeProject = p;
       first = null;
       const code = randomCode();
