@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers, stripMarkersOf } from "../lib/markers.mjs";
-import { liveNotice, readDeepPairing, recordFenceIds } from "../lib/deeppairing.mjs";
+import { liveNotice, ownsFence, readDeepPairing } from "../lib/deeppairing.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, refreshReceiptIndex, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { projectStrictStatus, strictStatusLead } from "../lib/strict-status.mjs";
@@ -63,7 +63,7 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
   stop-hook [--notify-only|--block]  Stop hook: one corrective continuation on drift, then notify
   migrate [--dry-run] [projectDir]   move this project's records from the old config dir to the state dir
                                      (run skel install and restart Claude Code first; refused during a fill)
-  install [--notify-only|--block] [projectDir]
+  install [--notify-only|--block] [--deeppairing-yield|--no-deeppairing-yield] [projectDir]
                                      protect a project for the skel plugin: deny rules for .skeleton/ state and
                                      skel's state dir, the project's Stop mode, and (once the plugin is
                                      enabled and outside a fill) removal of an older install's hooks and copies
@@ -80,8 +80,8 @@ function deepPairingWarning(root, record) {
   console.error(liveNotice());
   if (dp.unreadable) console.error(`note: ${dp.unreadable} file(s) under .deeppairing/ couldn't be read, so skel can't tell which fences deepPairing's plan uses.`);
   if (record) {
-    const both = [...recordFenceIds(record)].filter((id) => dp.ownedIds.has(id)).length;
-    if (both) console.error(`warning: ${both} fence id(s) just approved are also named by a live deepPairing plan. skel now treats them as its own; give one plan's fences other ids to keep them apart.`);
+    const both = (record.fences ?? []).filter((f) => ownsFence(dp, f.file, f.id)).length;
+    if (both) console.error(`warning: ${both} fence(s) just approved are also named by a live deepPairing plan. skel now treats them as its own; give one plan's fences other ids to keep them apart.`);
   }
 }
 
@@ -420,11 +420,16 @@ function readOwned(target) {
   if (foreign.length) console.log(`warning: install's ownership record ${file} lists ${foreign.length} rule(s) install never writes, so they're left alone: ${foreign.join(", ")}`);
   return strings.filter(ours);
 }
-function writeOwned(target, owned, stopMode = null) {
-  if (!owned.length && !stopMode) return fs.rmSync(ownedStorePath(target), { force: true });
-  writeFileAtomic(ownedStorePath(target), JSON.stringify({ root: realDir(target), ownedDeny: owned, ...(stopMode ? { stopMode } : {}) }, null, 2) + "\n", 0o600);
+function writeOwned(target, owned, stopMode = null, deepPairing = null) {
+  if (!owned.length && !stopMode && !deepPairing) return fs.rmSync(ownedStorePath(target), { force: true });
+  writeFileAtomic(ownedStorePath(target), JSON.stringify({ root: realDir(target), ownedDeny: owned, ...(stopMode ? { stopMode } : {}), ...(deepPairing ? { deepPairing } : {}) }, null, 2) + "\n", 0o600);
 }
 /** The Stop mode in install's ownership record ("notify-only" | "block"), or null. Read after readOwned vetted the file. */
+/** #192: the human's deepPairing opt-in in install's ownership record ("yield"), or null. */
+function readDeepPairingMode(target) {
+  try { return JSON.parse(fs.readFileSync(ownedStorePath(target), "utf-8")).deepPairing === "yield" ? "yield" : null; } catch { return null; }
+}
+
 function readStopMode(target) {
   try {
     const m = JSON.parse(fs.readFileSync(ownedStorePath(target), "utf-8")).stopMode;
@@ -510,7 +515,7 @@ function mergeRules(target, settings) {
 }
 
 /** Write the settings (only when they changed, so a re-run leaves the file as it was), then the ownership record. */
-function writeRules(target, settingsPath, settings, { rules, added, prevOwned }, stopMode) {
+function writeRules(target, settingsPath, settings, { rules, added, prevOwned }, stopMode, deepPairing = readDeepPairingMode(target)) {
   const text = JSON.stringify(settings, null, 2) + "\n";
   let old = null;
   try { old = fs.readFileSync(settingsPath, "utf-8"); } catch {}
@@ -518,7 +523,7 @@ function writeRules(target, settingsPath, settings, { rules, added, prevOwned },
   if (old !== text) writeFileAtomic(settingsPath, text);
   // Ours: what we add now, plus what an earlier install added and still owns.
   // A rule that was already there and isn't recorded stays the user's.
-  writeOwned(target, rules.filter((r) => added.includes(r) || prevOwned?.includes(r)), stopMode);
+  writeOwned(target, rules.filter((r) => added.includes(r) || prevOwned?.includes(r)), stopMode, deepPairing);
   // .skeleton/ is per-run state (and holds the human's feedback): keep it
   // out of commits, so a repo can't ship a verdict.
   const gi = path.join(target, ".gitignore");
@@ -648,7 +653,7 @@ function hooksElsewhere(target) {
  * install's hooks and skill/agent copies out of .claude/ once the plugin's
  * hooks are positively in place, never during a fill.
  */
-async function installForPlugin(dir, mode) {
+async function installForPlugin(dir, mode, deepPairingFlag) {
   const { target, claudeDir, settingsPath, settings } = openProjectSettings(dir, { forInstall: true });
   const rules = mergeRules(target, settings);
   const legacyHooks = hasLegacyHooks(settings);
@@ -683,13 +688,17 @@ async function installForPlugin(dir, mode) {
       }
     }
   }
-  writeRules(target, settingsPath, settings, rules, stopMode);
+  const deepPairing = deepPairingFlag === undefined ? readDeepPairingMode(target) : deepPairingFlag;
+  writeRules(target, settingsPath, settings, rules, stopMode, deepPairing);
   for (const dest of removedCopies) {
     fs.rmSync(dest, { force: true });
     if (path.basename(dest) === "SKILL.md") { try { fs.rmdirSync(path.dirname(dest)); } catch {} } // only if we left it empty
   }
   reportRules(target, settings, rules);
   console.log(`Stop mode for this project: ${stopMode === "notify-only" ? "notify only: warn and let Claude stop if drift remains" : "ask Claude to correct each unchanged drift report once; if the same drift remains, warn and let it stop (default)"}${stopMode ? ` (recorded in ${ownedStorePath(target)})` : ""}`);
+  if (deepPairing || deepPairingFlag !== undefined) console.log(deepPairing
+    ? `deepPairing: skel's gate leaves edits inside a live deepPairing plan's fences to deepPairing's gate, and its Stop hook only notifies for that plan's files (recorded in ${ownedStorePath(target)}; undo with \`skel install --no-deeppairing-yield\`)`
+    : "deepPairing: skel gates every fence and drift as usual (the default)");
   for (const k of kept) console.log(`warning: ${k}`);
   if (removedHooks) console.log(`removed ${removedHooks} hook(s) an older skel install added to ${settingsPath} (your other hooks are untouched)`);
   for (const dest of removedCopies) console.log(`removed ${dest}: an unmodified copy an older skel install wrote (the plugin serves it now)`);
@@ -1409,7 +1418,7 @@ const commands = {
       const record = readSnapshot(root);
       if (!Array.isArray(record?.fences)) die("can't read this skeleton's approval record to tell its fences from deepPairing's; refusing to strip markers");
       own = new Set(record.fences.map((f) => `${f.file}\0${f.id}`));
-      const claimed = scanned.filter((f) => mine(f) && dp.ownedIds.has(f.id));
+      const claimed = scanned.filter((f) => mine(f) && ownsFence(dp, f.file, f.id));
       if (claimed.length) die(`${claimed.length} fence(s) this skeleton approved are also named by a live deepPairing plan, so finalize would strip markers that plan still uses. Finish or close that plan (or give its fences other ids), then finalize again.`);
       fences = scanned.filter(mine);
       skipped = scanned.filter((f) => !mine(f));
@@ -1424,7 +1433,7 @@ const commands = {
       writeFileAtomic(abs, stripped, fs.statSync(abs).mode & 0o777);
     }
     if (skipped.length) {
-      const dpCount = skipped.filter((f) => dp.ownedIds.has(f.id)).length;
+      const dpCount = skipped.filter((f) => ownsFence(dp, f.file, f.id)).length;
       console.log(`left ${skipped.length} fence(s) outside this skeleton's approval record untouched${dpCount ? ` (${dpCount} named by a live deepPairing plan)` : ""}`);
     }
     // The markers are gone after this, so record what they described: the
@@ -1449,8 +1458,11 @@ const commands = {
   },
 
   async install(args) {
-    const usage = "usage: skel install [--legacy] [--notify-only|--block] [projectDir]";
-    const unknown = args.find((a) => a.startsWith("-") && !["--legacy", "--notify-only", "--block"].includes(a));
+    const usage = "usage: skel install [--legacy] [--notify-only|--block] [--deeppairing-yield|--no-deeppairing-yield] [projectDir]";
+    const unknown = args.find((a) => a.startsWith("-") && !["--legacy", "--notify-only", "--block", "--deeppairing-yield", "--no-deeppairing-yield"].includes(a));
+    if (args.includes("--deeppairing-yield") && args.includes("--no-deeppairing-yield")) die(`--deeppairing-yield and --no-deeppairing-yield are mutually exclusive\n${usage}`);
+    const deepPairingFlag = args.includes("--deeppairing-yield") ? "yield" : args.includes("--no-deeppairing-yield") ? null : undefined;
+    if (deepPairingFlag !== undefined && args.includes("--legacy")) die(`--deeppairing-yield is for the plugin install, not --legacy\n${usage}`);
     if (unknown) die(`unknown option ${unknown}\n${usage}`);
     if (args.includes("--notify-only") && args.includes("--block")) die(`--notify-only and --block are mutually exclusive\n${usage}`);
     const dirs = args.filter((a) => !a.startsWith("-"));
@@ -1458,7 +1470,7 @@ const commands = {
     const dir = dirs[0] ?? process.cwd();
     const mode = args.includes("--notify-only") ? "notify-only" : args.includes("--block") ? "block" : null;
     if (args.includes("--legacy")) return installLegacy(dir, mode);
-    return installForPlugin(dir, mode);
+    return installForPlugin(dir, mode, deepPairingFlag);
   },
 
   /**
