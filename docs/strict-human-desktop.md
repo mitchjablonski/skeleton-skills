@@ -35,6 +35,9 @@ It prints one bounded JSON object with fixed labels:
   whether the WSL interop binfmt entry exists, and whether a distro name is
   set.
 - **WSLg:** `stat()` of `/mnt/wslg`, its version file and its log.
+  `x11Anchor` reports whether the fixed `:0` directory and socket refer to
+  the same filesystem objects through both WSLg paths and whether mount
+  metadata shows the expected read-only bind.
 - **Environment:** `DISPLAY` and `WAYLAND_DISPLAY` names (for example `:0`,
   `wayland-0`), and whether `XDG_RUNTIME_DIR`, `PULSE_SERVER` and
   `XAUTHORITY` are set.
@@ -67,6 +70,8 @@ for the Wayland, Pulse and session-bus sockets, the inventory uses only
 - starts no child processes;
 - prints no home paths, user names or socket paths.
 
+The anchor check also reads `/proc/self/mountinfo` for the fixed mount paths.
+
 Exit 0: inventory recorded. Exit 2: unsupported (not Linux, no Chrome or
 Chromium binary, a pin mismatch, or unexpected arguments).
 
@@ -78,6 +83,13 @@ Chromium binary, a pin mismatch, or unexpected arguments).
   emulator handles titles and clipboard escapes;
 - anything about the agent's view of the seat: the agent sandbox is
   separate, see below.
+
+The launcher-side metadata helper keeps the initial filesystem and namespace
+observations private. It can recheck them before readiness and at protected
+restart. A changed or unreadable observation invalidates that binding for
+the rest of its lifetime. This check samples continuity in the calling
+namespace. Server identity, window ownership and human presence need
+separate evidence. The inventory records the initial observation only.
 
 **Measured** on 2026-11-22: WSL2, kernel `6.6.87.2-microsoft-standard-WSL2`,
 x86_64.
