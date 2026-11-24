@@ -14,7 +14,7 @@
     ],
     "UserPromptSubmit": [
       {
-        "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/skel-prompt-hook.mjs"] }]
+        "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/skel-prompt-hook.mjs"], "timeout": 10 }]
       }
     ],
     "ConfigChange": [

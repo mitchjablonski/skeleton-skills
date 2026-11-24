@@ -100,7 +100,7 @@ test("hooks.json registers the four hooks in exec form, with install's matchers,
   const { hooks } = readJson("hooks/hooks.json");
   assert.deepEqual(Object.keys(hooks).sort(), ["ConfigChange", "PreToolUse", "Stop", "UserPromptSubmit"]);
   // #229: the strict input notice; advisory, so not in PLUGIN_HOOKS (an older plugin root without it isn't a protection gap).
-  assert.deepEqual(hooks.UserPromptSubmit, [{ hooks: [{ type: "command", command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/bin/skel-prompt-hook.mjs"] }] }]);
+  assert.deepEqual(hooks.UserPromptSubmit, [{ hooks: [{ type: "command", command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/bin/skel-prompt-hook.mjs"], timeout: 10 }] }]);
   assert.ok(fs.existsSync(path.join(REPO, "bin", "skel-prompt-hook.mjs")));
   for (const [event, matcher, file] of PLUGIN_HOOKS) {
     assert.equal(hooks[event].length, 1);
