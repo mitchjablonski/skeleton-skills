@@ -19,6 +19,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import { parseArgs, finish, Fail, labelOf, createFixture } from "./strict-browser-fixture.mjs";
+import { bindSeatMetadata } from "./strict-seat-metadata.mjs";
 
 /** stat() only, never open: a fixed label for what is at `p`. */
 function statLabel(p) {
@@ -81,6 +82,7 @@ try {
       mount: statLabel("/mnt/wslg"),
       versionFile: statLabel("/mnt/wslg/versions.txt"),
       stderrLog: statLabel("/mnt/wslg/stderr.log"),
+      x11Anchor: bindSeatMetadata().code,
     },
     environment: { DISPLAY: displayName(display), WAYLAND_DISPLAY: waylandName(waylandDisplay),
       XDG_RUNTIME_DIR: runtimeDir === undefined ? "unset" : "set", PULSE_SERVER: process.env.PULSE_SERVER === undefined ? "unset" : "set",
