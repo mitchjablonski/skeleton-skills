@@ -10,7 +10,8 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
+import { scanRepo, searchable, toSteps, stripMarkers, stripMarkersOf } from "../lib/markers.mjs";
+import { liveNotice, readDeepPairing, recordFenceIds } from "../lib/deeppairing.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, refreshReceiptIndex, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { projectStrictStatus, strictStatusLead } from "../lib/strict-status.mjs";
@@ -70,6 +71,19 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
                                      written into the project's .claude/ (kept for one release)
   uninstall [projectDir]             remove what install added (leaves .skeleton/, .gitignore and the plugin alone)
 `;
+
+/** #192: warn while a fresh deepPairing skeleton plan is live; with a record, count the fence ids both claim. */
+function deepPairingWarning(root, record) {
+  let dp;
+  try { dp = readDeepPairing(root); } catch { return; }
+  if (!dp.present || !(dp.fresh || dp.unreadable)) return;
+  console.error(liveNotice());
+  if (dp.unreadable) console.error(`note: ${dp.unreadable} file(s) under .deeppairing/ couldn't be read, so skel can't tell which fences deepPairing's plan uses.`);
+  if (record) {
+    const both = [...recordFenceIds(record)].filter((id) => dp.ownedIds.has(id)).length;
+    if (both) console.error(`warning: ${both} fence id(s) just approved are also named by a live deepPairing plan. skel now treats them as its own; give one plan's fences other ids to keep them apart.`);
+  }
+}
 
 function die(msg) {
   console.error(`skel: ${msg}`);
@@ -821,6 +835,7 @@ const commands = {
       console.error(`skel: warning: couldn't clear the previous skeleton's review sessions and approval record (${err.path ?? err.code ?? err.message}${err.path ? `: ${err.code}` : ""})`);
     }
     console.log(`skel: "${title}" started in ${root} (phase: scaffold, gate: ${gate})`);
+    deepPairingWarning(root);
   },
 
   track(args) {
@@ -1285,6 +1300,7 @@ const commands = {
       await clearStopNotice(root);
     } catch {}
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
+    deepPairingWarning(root, record);
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
     try { if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`); }
     catch (err) { console.error(`note: approval succeeded; storage notice unavailable (${err.message})`); }
@@ -1378,15 +1394,38 @@ const commands = {
     const state = requireState(root);
     const phase = state.phase;
     if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");
-    const { fences, errors, files: fenced } = scanSkeleton(root, state);
+    const { fences: scanned, errors, files: fenced } = scanSkeleton(root, state);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
     await requireNoDrift(root, state, fenced, "finalize");
+    // #192: next to deepPairing, strip only this skeleton's own fences (its
+    // approval record's, outside the project), never one a live deepPairing
+    // plan may still use. Without a .deeppairing/ dir nothing changes.
+    const dp = readDeepPairing(root);
+    let fences = scanned, skipped = [], own = null;
+    const mine = (f) => own.has(`${f.file}\0${f.id}`);
+    if (dp.present) {
+      if (dp.fresh) console.error(liveNotice());
+      if (dp.unreadable) die(`can't tell which fences belong to deepPairing: ${dp.unreadable} file(s) under .deeppairing/ couldn't be read. Refusing to strip markers; repair or remove them, then finalize again.`);
+      const record = readSnapshot(root);
+      if (!Array.isArray(record?.fences)) die("can't read this skeleton's approval record to tell its fences from deepPairing's; refusing to strip markers");
+      own = new Set(record.fences.map((f) => `${f.file}\0${f.id}`));
+      const claimed = scanned.filter((f) => mine(f) && dp.ownedIds.has(f.id));
+      if (claimed.length) die(`${claimed.length} fence(s) this skeleton approved are also named by a live deepPairing plan, so finalize would strip markers that plan still uses. Finish or close that plan (or give its fences other ids), then finalize again.`);
+      fences = scanned.filter(mine);
+      skipped = scanned.filter((f) => !mine(f));
+    }
     const pending = fences.filter((f) => f.status === "todo");
     if (pending.length) die(`still pending: ${pending.map((f) => `${f.id} (${f.file}:${f.openLine})`).join(", ")}`);
     const files = [...new Set(fences.map((f) => f.file))];
     for (const rel of files) {
       const abs = path.join(root, rel);
-      writeFileAtomic(abs, stripMarkers(fs.readFileSync(abs, "utf-8")), fs.statSync(abs).mode & 0o777);
+      const text = fs.readFileSync(abs, "utf-8");
+      const stripped = own ? stripMarkersOf(text, new Set(fences.filter((f) => f.file === rel).map((f) => f.id))) : stripMarkers(text);
+      writeFileAtomic(abs, stripped, fs.statSync(abs).mode & 0o777);
+    }
+    if (skipped.length) {
+      const dpCount = skipped.filter((f) => dp.ownedIds.has(f.id)).length;
+      console.log(`left ${skipped.length} fence(s) outside this skeleton's approval record untouched${dpCount ? ` (${dpCount} named by a live deepPairing plan)` : ""}`);
     }
     // The markers are gone after this, so record what they described: the
     // review page and `skel status` say "all N steps filled" from it.

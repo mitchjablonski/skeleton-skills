@@ -298,6 +298,16 @@ An unreadable store dir by itself does not enroll a project with no skeleton. A 
 
 The Stop continuation protocol was tested on Claude Code CLI 2.1.318: `systemMessage` alone stops; both `decision: "block"` and `additionalContext` continue. The default uses `decision: "block"` only for file drift on an explicitly identified first Stop (`stop_hook_active === false`) and neither continuation field on the next, or on later prompts with the same exterior drift. Unknown flag values and approval-record faults only notify. IDE/Desktop behavior has not been probed separately; the documented hook protocol is the compatibility basis for those clients.
 
+### Next to deepPairing skeleton plans
+
+deepPairing's `/deeppairing:skeleton` plans use the same `SKEL[id]` fences, with their state in `.deeppairing/` (which skel's scan and source baseline already skip). skel reads that state, never writes it:
+
+- `skel init`, `approve` and `finalize` print a note while a deepPairing skeleton plan is live (a scope file under `.deeppairing/skeleton-scopes/`, or an unfinished plan, updated within deepPairing's own 8 hours). `approve` also counts fence ids both plans claim: once approved, they are skel's.
+- `skel finalize` strips only the fences in this skeleton's approval record. It refuses if a live deepPairing plan names one of them, or if `.deeppairing/` files can't be read, and reports other fences it leaves by count.
+- The `PreToolUse` gate leaves an Edit to deepPairing's gate only when it changes nothing but the body of a fence a live, approved deepPairing scope is filling, and that fence id isn't in skel's approval record. The `Stop` hook only notifies, without a corrective continuation, while such a scope is live.
+
+`.deeppairing/` is inside the project, so an agent can write it. That's why a deepPairing claim never covers a fence skel approved (the record lives outside the project), only relaxes a per-edit prompt or an advisory continuation, and never changes `done` or `finalize`'s drift check. Keep the two plans' fences in separate files with distinct ids.
+
 ## Strict tier (in development)
 
 **Strict is not available yet, and nothing in this release enforces it.** Everything above is the default tier: a drift guard for a cooperative agent. The strict tier is being designed and built in [#19](https://github.com/mitchjablonski/skeleton-skills/issues/19).
