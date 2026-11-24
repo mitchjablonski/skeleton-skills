@@ -91,7 +91,7 @@ function openPrivateDirectory(directory) {
 }
 
 export function writePrivateTranscript(directory, name, body) {
-  if (!/^S[123]-run[1-3]$/.test(name)) throw new Error("invalid transcript name");
+  if (!/^S[1-4]-run[1-3]$/.test(name)) throw new Error("invalid transcript name");
   const fd = openPrivateDirectory(directory);
   try {
     fs.writeFileSync(`/proc/self/fd/${fd}/${name}.jsonl`, body, { flag: "wx", mode: 0o600 });

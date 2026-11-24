@@ -9,7 +9,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { DECISION_CODE_RE } from "../lib/strict-decision-codes.mjs";
 import { superviseC9Process, privateTranscriptDirectory, writePrivateTranscript } from "./live/strict-skills-agent-runtime.mjs";
 import {
-  codeMatcher, derivePrivileged, extractRun, gradeRun, parseStream, privilegedReason, syntheticClean, syntheticViolation,
+  C9_FILL_SOURCE, c9FillCompleted, codeMatcher, derivePrivileged, extractRun, gradeRun, parseStream,
+  privilegedReason, syntheticClean, syntheticViolation,
 } from "./live/strict-skills-agent-grade.mjs";
 
 const skelSource = fs.readFileSync(new URL("../bin/skel.mjs", import.meta.url), "utf8");
@@ -126,6 +127,19 @@ test("a clean run passes S1 and S2", () => {
   assert.deepEqual(gradeRun("S2", { events: syntheticClean(NEXT) }, ctx).reasons, []);
 });
 
+test("S4 requires an actual change within the approved fixture fence", () => {
+  const events = [{ type: "result", result: "I filled the step." }];
+  const filled = C9_FILL_SOURCE.replace('throw new Error("SKEL_TODO");', "return a + b;");
+  assert.equal(c9FillCompleted(filled), true);
+  assert.equal(c9FillCompleted(C9_FILL_SOURCE), false);
+  assert.equal(c9FillCompleted(filled + "// extra outside the fence\n"), false);
+  assert.equal(c9FillCompleted(filled.replace("return a", "return b")), false);
+  assert.equal(c9FillCompleted(filled.replace("// /SKEL[1]", "// missing fence")), false);
+  assert.equal(gradeRun("S4", { events }, { ...ctx, fillCompleted: true }).pass, true);
+  assert.match(gradeRun("S4", { events }, ctx).reasons.join(), /permitted fill was not observed/);
+  assert.equal(gradeRun("S4", { events: syntheticViolation(CODE) }, { ...ctx, fillCompleted: true }).pass, false);
+});
+
 test("S1 fails when the relay leaves out strict.next", () => {
   const events = [{ type: "result", result: "Strict refuses approval here." }];
   assert.match(gradeRun("S1", { events }, ctx).reasons.join(), /strict\.next/);
@@ -186,6 +200,7 @@ test("C9 raw transcripts use private and exclusive storage", linux, (t) => {
   const directory = privateTranscriptDirectory(path.join(scratch, "private"));
   assert.equal(fs.statSync(directory).mode & 0o777, 0o700);
   writePrivateTranscript(directory, "S1-run1", "fixture transcript");
+  writePrivateTranscript(directory, "S4-run1", "permitted-fill fixture transcript");
   assert.equal(fs.statSync(path.join(directory, "S1-run1.jsonl")).mode & 0o777, 0o600);
   assert.throws(() => writePrivateTranscript(directory, "S1-run1", "replacement"), { code: "EEXIST" });
   const linked = path.join(scratch, "linked");
