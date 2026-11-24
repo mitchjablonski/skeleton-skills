@@ -39,8 +39,9 @@ node test/live/strict-skills-agent-probe.mjs --live --requested-standin [--n 2] 
 
 The rules apply only when `skel status --json` reports
 `strict.requested: true` with a state that isn't the enforcing one. **This
-release has no way to request strict.** `bin/skel.mjs` calls `strictStatus`
-with `requested: false`, and the design (strict-decision-page.md, "How
+release has no way to request strict.** `projectStrictStatus` in
+`lib/strict-status.mjs` (used by `skel status` and the `UserPromptSubmit`
+notice) calls `strictStatus` with `requested: false`, and the design (strict-decision-page.md, "How
 `requested` is set") reads it only from the launcher's read-only context or
 a host enrollment registry, never from project files, settings or the
 environment. Neither source exists yet.
@@ -57,7 +58,11 @@ So the probe:
    exactly once. Everything else is unchanged: the real classifier and the
    default verifier produce `state: unsupported`,
    `privilegedActions: refused` and the `unsupported:requested` copy for
-   `strict.next`. The output records `requestedVia: "standin"`.
+   `strict.next`. The output records `requestedVia: "standin"`. The copy
+   includes `hooks/hooks.json` and `bin/skel-prompt-hook.mjs`, so the
+   `UserPromptSubmit` strict notice (#229) runs in every probe session; the
+   probe refuses if the hook is missing. The same stand-in
+   (`test/fixtures/strict-standin.mjs`) backs the unit tests.
 
 The stand-in substitutes the missing source of `requested`, not the status.
 No status JSON is written by hand. When the launcher or the enrollment

@@ -9,6 +9,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_VERIFIER, EVIDENCE_REASONS, IN_BOUNDARY_TRANSITIONS, LOCAL_REASONS, MAX_EVIDENCE_AGE_MS, MAX_EVIDENCE_LIFETIME_MS, STRICT_STATES, classifyEvidence, refuseInBoundaryTransition, refusePrivileged, strictLine, strictStatus, strictStatusLead } from "../lib/strict-status.mjs";
+import { makeRequestedStandin } from "./fixtures/strict-standin.mjs";
 import { ACTIVE, CONTEXT, MALFORMED, NEGATIVE, NOW, POSITIVE, PROFILE, PROJECT, SESSION, UNVERIFIED_REASONS, fixtureVerifier, throwingVerifier } from "./fixtures/strict-evidence.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -437,15 +438,9 @@ test("#229: default-mode `skel status` has no strict lines", () => {
 });
 
 test("#229: with strict requested (the C9 probe's stand-in), `skel status` leads with the strict refusal, summary and next", () => {
-  // The C9 probe's stand-in: a copy of bin and lib with the one requested: false call flipped. No real strict switch.
-  const copy = mkTemp("skel-strict-standin-");
-  for (const d of ["bin", "lib"]) fs.cpSync(path.join(HERE, "..", d), path.join(copy, d), { recursive: true });
-  fs.copyFileSync(path.join(HERE, "..", "package.json"), path.join(copy, "package.json"));
+  // The C9 probe's stand-in: a copy with the one requested: false call flipped. No real strict switch.
+  const copy = makeRequestedStandin(path.join(HERE, ".."), mkTemp("skel-strict-standin-"), ["bin", "lib", "package.json"]);
   const skel = path.join(copy, "bin", "skel.mjs");
-  const from = "strictStatus({ projectId: root, sessionId: null, requested: false })";
-  const src = fs.readFileSync(skel, "utf8");
-  assert.equal(src.split(from).length, 2, "the stand-in seam exists exactly once");
-  fs.writeFileSync(skel, src.replace(from, from.replace("false", "true")));
   const run = approvedProject(skel);
   const json = JSON.parse(run("status", "--json").stdout).strict;
   assert.equal(json.requested, true);

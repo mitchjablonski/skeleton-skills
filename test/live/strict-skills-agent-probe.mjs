@@ -21,7 +21,7 @@
 // Strict must be REQUESTED in the scratch project, as the real
 // `skel status --json` reports it (strict.requested true, state not active).
 // This release has no way to request strict (bin/skel.mjs passes
-// requested: false; the design reads it from the launcher's context or a host
+// requested: false in lib/strict-status.mjs projectStrictStatus; the design reads it from the launcher's context or a host
 // enrollment registry, neither of which exists), so by default the probe
 // refuses with exit 2, `strict-request-unsupported`, before any agent runs.
 // --requested-standin copies the plugin to a scratch dir and changes that one
@@ -41,6 +41,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DECISION_CODE_RE } from "../../lib/strict-decision-codes.mjs";
+import { makeRequestedStandin } from "../fixtures/strict-standin.mjs";
 import { derivePrivileged, gradeRun, parseStream, syntheticClean, syntheticViolation } from "./strict-skills-agent-grade.mjs";
 import { privateTranscriptDirectory, superviseC9Process, writePrivateTranscript } from "./strict-skills-agent-runtime.mjs";
 
@@ -115,12 +116,9 @@ let pluginDir = REPO;
 const requestedVia = has("requested-standin") ? "standin" : "release";
 if (requestedVia === "standin") {
   pluginDir = mk("skel-c9-plugin-");
-  for (const p of [".claude-plugin", "bin", "lib", "skills", "agents", "hooks", "package.json"]) fs.cpSync(path.join(REPO, p), path.join(pluginDir, p), { recursive: true });
-  const skelPath = path.join(pluginDir, "bin", "skel.mjs");
-  const src = fs.readFileSync(skelPath, "utf8");
-  const from = "strictStatus({ projectId: root, sessionId: null, requested: false })";
-  if (src.split(from).length !== 2) { cleanup(); refuse("standin-seam-missing", "bin/skel.mjs no longer has the one requested: false call this stand-in replaces"); }
-  fs.writeFileSync(skelPath, src.replace(from, "strictStatus({ projectId: root, sessionId: null, requested: true /* C9 probe stand-in for the launcher's requested */ })"));
+  // The whole plugin, hooks/ and bin/skel-prompt-hook.mjs included.
+  try { makeRequestedStandin(REPO, pluginDir); } catch (err) { cleanup(); refuse("standin-seam-missing", err.message); }
+  if (!fs.existsSync(path.join(pluginDir, "bin", "skel-prompt-hook.mjs"))) { cleanup(); refuse("standin-seam-missing", "the plugin copy has no UserPromptSubmit hook"); }
 }
 const PLUGIN_SKEL = path.join(pluginDir, "bin", "skel.mjs");
 const SKEL_LIBS = fs.readdirSync(path.join(pluginDir, "lib")).filter((f) => /\.(?:mjs|js|py|css)$/.test(f));

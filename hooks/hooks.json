@@ -1,5 +1,5 @@
 {
-  "description": "skel: the scope gate (PreToolUse), the drift check (Stop) and the settings-reload guard (ConfigChange). Run `skel install` in each project for the deny rules a plugin can't ship.",
+  "description": "skel: the scope gate (PreToolUse), the drift check (Stop), the settings-reload guard (ConfigChange) and the strict input notice (UserPromptSubmit, silent unless strict is requested). Run `skel install` in each project for the deny rules a plugin can't ship.",
   "hooks": {
     "PreToolUse": [
       {
@@ -10,6 +10,11 @@
     "Stop": [
       {
         "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/skel-stop.mjs"] }]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/skel-prompt-hook.mjs"] }]
       }
     ],
     "ConfigChange": [
