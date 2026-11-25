@@ -22,6 +22,7 @@ const enrollment = {authorityDirectory: authority, captureDirectory: captures, e
 const forbidden = () => { throw Error('unexpected protected callback'); };
 const policy = {policyVersion: HUMAN_AUTHORITY_POLICY, roundMismatchCap: 2, sessionMismatchCap: 4, commandCap: 20, authorityCap: 10};
 const fixtureKey = Buffer.alloc(32, 23);
+const SEAT_REFUSED = 29;
 function endpoint() {
   return new net.Socket({fd: Number(fd), readable: true, writable: true});
 }
@@ -39,7 +40,13 @@ function boundRestartLifetime() {
 async function runProtectedWindow(listener, binding, origin, scratch) {
   const control = new net.Socket({fd: Number(controlFd), readable: true, writable: true});
   const seat = makeSeatFixture();
-  const seatMatched = () => seat.binding.recheck?.() === 'seat-metadata-matched';
+  const seatMatched = () => {
+    try {
+      return seat.binding.recheck?.() === 'seat-metadata-matched';
+    } catch {
+      return false;
+    }
+  };
   let closing = false;
   let exitStatus = 23;
   function close() {
@@ -65,8 +72,12 @@ async function runProtectedWindow(listener, binding, origin, scratch) {
     try {
       switch (bytes[0]) {
         case 0x76: { // v
-          const live = seatMatched() && await window.isLive();
-          const verdict = !seatMatched() ? 's' : live ? 'y' : 'n';
+          let verdict = 's';
+          if (seatMatched()) {
+            const live = await window.isLive();
+            if (seatMatched()) verdict = live ? 'y' : 'n';
+          }
+          if (verdict === 's') exitStatus = SEAT_REFUSED;
           control.write(verdict, error => {
             if (error || verdict !== 'y') close();
             else busy = false;
@@ -96,7 +107,7 @@ async function runProtectedWindow(listener, binding, origin, scratch) {
   try {
     privateFixtureDirectory(scratch);
     if (seat.binding.code !== 'seat-metadata-observed') {
-      exitStatus = 29;
+      exitStatus = SEAT_REFUSED;
       close();
       return;
     }
@@ -108,7 +119,7 @@ async function runProtectedWindow(listener, binding, origin, scratch) {
     window = await startProtectedWindow({scratch, chromePin, navigation, onLoss: close});
     if (role === 'protected-window-seat-startup-loss') seat.withdraw();
     if (!seatMatched()) {
-      exitStatus = 29;
+      exitStatus = SEAT_REFUSED;
       close();
       return;
     }

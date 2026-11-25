@@ -35,6 +35,7 @@ LISTENER_SCOPE = HERE / 'strict-owned-listener-scope.py'
 LISTENER_SCOPE_TIMEOUT = 12  # Allow the scope's bounded descendant reaping to finish.
 WINDOW_READY_TIMEOUT = 18
 WINDOW_ROOT = Path('/dev/shm')
+SEAT_REFUSED = 29
 WINDOW_STARTUP_REFUSALS = {
     1: 'window-listener-startup-failed',
     23: 'window-worker-startup-refused',
@@ -43,7 +44,7 @@ WINDOW_STARTUP_REFUSALS = {
     26: 'window-display-startup-failed',
     27: 'window-browser-verification-failed',
     28: 'window-not-mapped',
-    29: 'seat-continuity-refused',
+    SEAT_REFUSED: 'seat-continuity-refused',
     125: 'window-listener-scope-unproven',
 }
 
@@ -479,7 +480,8 @@ LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-missing-selected-view'
                      'listener-invalid-readiness', 'listener-exited-before-start',
                      'stale-listener-generation')
 WINDOW_LOSSES = {'window-browser-loss': b'b', 'window-display-loss': b'd'}
-WINDOW_REFUSALS = {'window-wrong-pin': 25, 'window-missing-view': 24, 'window-seat-unreadable-at-readiness': 29}
+WINDOW_REFUSALS = {'window-wrong-pin': 25, 'window-missing-view': 24,
+                   'window-seat-unreadable-at-readiness': SEAT_REFUSED}
 SEAT_RESTART_LOSS = 'window-seat-changed-before-restart'
 STARTUP_FAULTS = ('peer-loss-during-start', 'listener-loss-before-namespace', 'listener-loss-after-namespace')
 REFRESH_FAILURES = {'terminal-refresh-lost': 'refresh-lost', 'terminal-refresh-malformed': 'refresh-malformed',
@@ -770,7 +772,8 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
             scope.stop()
             assert not scope.window.profile.exists()
         if case == SEAT_RESTART_LOSS:
-            launcher.listener.scope.window.replace_fixture_seat()
+            seat_scope = launcher.listener.scope
+            seat_scope.window.replace_fixture_seat()
         next_stage = directory / 'stage-restart'
         if case in ('restart', 'graceful-restart', 'forced-restart', 'window-replaced-generation'):
             assert launcher.admit_capture(selected, fresh, next_stage, stop) == expected
@@ -794,9 +797,9 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
             assert len(launcher.children) == children and not next_stage.exists()
             if case == SEAT_RESTART_LOSS:
                 assert launcher.listener_refusal == 'seat-continuity-refused'
-                scope = launcher.listener.scope
-                scope.stop()
-                assert not scope.window.profile.exists()
+                assert seat_scope.process.wait(LISTENER_SCOPE_TIMEOUT) == SEAT_REFUSED
+                seat_scope.stop()
+                assert not seat_scope.window.profile.exists()
             if case == 'partial-stop':
                 assert not lifecycle['exited'](namespace['members']['escapee']['fd'])
         assert capture['snapshot']((selected,)) == before
