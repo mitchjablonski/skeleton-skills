@@ -40,7 +40,7 @@ const reject = async () => {
 const control = createControlConsole({
   authority: {
     state: () => { stateCalls++; return client.state(); },
-    verifyAndCommit: mode === 'decision' ? client.verifyAndCommit : reject,
+    verifyAndCommit: mode === 'decision' ? (request) => client.verifyAndCommit(request) : reject,
     recapture: reject, endSession: reject,
   },
   newRequestId: () => 'terminal-fixture-only',

@@ -304,7 +304,8 @@ def exercise_decision(launcher):
     assert entry['result'] == {'kind': 'committed', 'action': 'approve', 'requestId': 'terminal-fixture-only',
                                'reviewVersion': state['reviewVersion'], 'captureVersion': state['captureVersion'],
                                'revision': 1, 'at': '2026-01-01T00:00:00.000Z'}
-    assert not any(code in file.read_bytes() for file in root.rglob('*') if file.is_file() and file != record_path)
+    assert not any(code in file.read_bytes() for file in launcher.scratch.rglob('*')
+                   if file.is_file() and file != record_path)
 
 
 def main():
