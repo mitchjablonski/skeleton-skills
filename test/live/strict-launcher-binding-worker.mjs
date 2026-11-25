@@ -12,6 +12,7 @@ import {deriveHumanCode} from '../../lib/strict-human-command.mjs';
 import {createHumanCommandClient} from '../../lib/strict-human-channel.mjs';
 import {recoverHumanAuthorityChild, serveHumanAuthorityChild} from '../../lib/strict-authority-child.mjs';
 import {FIXTURE_CONTEXT, FIXTURE_PLAN, materialize} from './strict-candidate-inner.mjs';
+import {makeSeatFixture} from './strict-seat-metadata-fixture.mjs';
 
 const [role, directory, identity, fd, reportFd, extraFd, refreshReportFd, chromePin, controlFd] = process.argv.slice(2);
 const authority = path.join(directory, 'authority');
@@ -21,6 +22,7 @@ const enrollment = {authorityDirectory: authority, captureDirectory: captures, e
 const forbidden = () => { throw Error('unexpected protected callback'); };
 const policy = {policyVersion: HUMAN_AUTHORITY_POLICY, roundMismatchCap: 2, sessionMismatchCap: 4, commandCap: 20, authorityCap: 10};
 const fixtureKey = Buffer.alloc(32, 23);
+const SEAT_REFUSED = 29;
 function endpoint() {
   return new net.Socket({fd: Number(fd), readable: true, writable: true});
 }
@@ -37,6 +39,14 @@ function boundRestartLifetime() {
 
 async function runProtectedWindow(listener, binding, origin, scratch) {
   const control = new net.Socket({fd: Number(controlFd), readable: true, writable: true});
+  const seat = makeSeatFixture();
+  const seatMatched = () => {
+    try {
+      return seat.binding.recheck?.() === 'seat-metadata-matched';
+    } catch {
+      return false;
+    }
+  };
   let closing = false;
   let exitStatus = 23;
   function close() {
@@ -62,13 +72,25 @@ async function runProtectedWindow(listener, binding, origin, scratch) {
     try {
       switch (bytes[0]) {
         case 0x76: { // v
-          const live = await window.isLive();
-          control.write(live ? 'y' : 'n', error => {
-            if (error || !live) close();
+          let verdict = 's';
+          if (seatMatched()) {
+            const live = await window.isLive();
+            if (seatMatched()) verdict = live ? 'y' : 'n';
+          }
+          if (verdict === 's') exitStatus = SEAT_REFUSED;
+          control.write(verdict, error => {
+            if (error || verdict !== 'y') close();
             else busy = false;
           });
           break;
         }
+        case 0x73: // s: replace the fixture seat before the next verification
+          seat.replace();
+          control.write('a', error => {
+            if (error) close();
+            else busy = false;
+          });
+          break;
         case 0x62: // b
           if (!window.stopBrowser()) close();
           break;
@@ -84,12 +106,23 @@ async function runProtectedWindow(listener, binding, origin, scratch) {
   });
   try {
     privateFixtureDirectory(scratch);
+    if (seat.binding.code !== 'seat-metadata-observed') {
+      exitStatus = SEAT_REFUSED;
+      close();
+      return;
+    }
     const {startProtectedWindow} = await import('./strict-protected-window.mjs');
     const selected = listener.mintWindowNavigation(binding);
     const navigation = role === 'protected-window-missing-view'
       ? {url: listener.mintNavigation(), takeView: selected.takeView}
       : selected;
     window = await startProtectedWindow({scratch, chromePin, navigation, onLoss: close});
+    if (role === 'protected-window-seat-startup-loss') seat.withdraw();
+    if (!seatMatched()) {
+      exitStatus = SEAT_REFUSED;
+      close();
+      return;
+    }
     if (!closing) writeReport(fd, {port: Number(new URL(origin).port)});
   } catch (error) {
     if (error?.label === 'protected-window-view-missing') exitStatus = 24;
@@ -175,7 +208,7 @@ if (role === 'prepare-approved') {
     process.exit(23);
   }
 } else if (['decision-listener', 'listener-missing-selected-view',
-            'protected-window-listener', 'protected-window-missing-view'].includes(role)) {
+            'protected-window-listener', 'protected-window-missing-view', 'protected-window-seat-startup-loss'].includes(role)) {
   const [{createDecisionListener}, {buildStrictCaptureViewModel}] = await Promise.all([
     import('../../lib/strict-decision-listener.mjs'), import('../../lib/strict-capture-view-model.mjs'),
   ]);
@@ -204,7 +237,7 @@ if (role === 'prepare-approved') {
     process.exit(23);
   }
   listener.mintNavigation(); // Revoke the private startup tab.
-  if (role === 'protected-window-listener' || role === 'protected-window-missing-view') {
+  if (role.startsWith('protected-window-')) {
     await runProtectedWindow(listener, binding, origin, refreshReportFd);
   } else {
     writeReport(fd, {port: Number(new URL(origin).port)});
