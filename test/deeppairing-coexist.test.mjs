@@ -54,7 +54,8 @@ function project(t) {
   return { base, root, skel, ok, write, read, hook, stop, optIn, setOpt, readOpt };
 }
 
-const iso = (msAgo = 0) => new Date(Date.now() - msAgo).toISOString();
+// Backdated a few seconds by default, so clock skew can't make "now" look future-dated.
+const iso = (msAgo = 5000) => new Date(Date.now() - msAgo).toISOString();
 const OLD = DP_SCOPE_MAX_AGE_MS + 60_000;
 const dpSession = (root) => [...deepPairingSessionIds(root, SID)][0];
 const plan = ({ id = "plan_1", status = "approved", steps = [{ skelId: "d1", status: "in_progress", files: ["b.js"] }], updatedAt = iso() } = {}) =>
@@ -523,4 +524,25 @@ test("finalize: ownership is by (file, id): a live scope whose plan lists anothe
   deepPairing(q, { sessions: { [dpSession(q.root)]: [plan({ steps: [{ skelId: "1", status: "in_progress", files: ["a.js"] }] })] }, scopes: [scope(q.root, { activeSkelIds: ["1"] })] });
   assert.notEqual(q.skel("finalize").status, 0, "the same file and id: refused");
   assert.match(q.read("a.js"), /SKEL\[1\]/);
+});
+
+test("gate: the opt-in is decided from the edited file's directory, never the cwd", (t) => {
+  // Monorepo: the parent opted in, the nested project explicitly off, the session's cwd at the parent.
+  const p = project(t);
+  gated(p, { optIn: false });
+  const inner = path.join(p.root, "inner");
+  fs.mkdirSync(inner);
+  p.write("inner/b.js", DP_B);
+  deepPairing(p, { sessions: { [dpSession(p.root)]: [plan({ steps: [{ skelId: "d1", status: "in_progress" }] })] } });
+  p.setOpt(p.root, "yield");
+  p.setOpt(inner, "off");
+  const edit = { ...insideB, file_path: path.join(inner, "b.js") };
+  assert.equal(decision(p.hook("Edit", edit, SID, { cwd: p.root, projectDir: p.root })), "deny", "cwd = parent, nested off");
+  // A sibling dir that opted in, used as the cwd, never applies to the edited file.
+  const q = project(t);
+  gated(q, { optIn: false });
+  const sibling = path.join(q.root, "sibling");
+  fs.mkdirSync(sibling);
+  q.setOpt(sibling, "yield");
+  assert.equal(decision(q.hook("Edit", { ...insideB, file_path: path.join(q.root, "b.js") }, SID, { cwd: sibling, projectDir: sibling })), "deny", "sibling yield cwd");
 });
