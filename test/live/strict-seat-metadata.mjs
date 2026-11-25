@@ -17,6 +17,13 @@ function metadata(stat) {
   return [stat.dev, stat.ino, stat.ctimeNs];
 }
 
+// Linux dev_t uses low and high fields for both major and minor.
+function linuxDevice(device) {
+  const major = ((device >> 8n) & 0xfffn) | ((device >> 32n) & 0xfffff000n);
+  const minor = (device & 0xffn) | ((device >> 12n) & 0xffffff00n);
+  return `${major}:${minor}`;
+}
+
 function seatMounts(mountInfo) {
   const mounts = new Map();
   for (const line of mountInfo.split("\n")) {
@@ -33,7 +40,7 @@ function seatMounts(mountInfo) {
   if (!wslg || !local || wslg.id === local.id || wslg.device !== local.device
       || wslg.root !== "/" || local.root !== "/.X11-unix"
       || !local.options.includes("ro") || local.options.includes("rw")) return null;
-  return [wslg.id, local.id, wslg.device];
+  return { ids: [wslg.id, local.id], device: wslg.device };
 }
 
 // A passive, launcher-side observation. It neither opens a desktop socket nor
@@ -57,14 +64,15 @@ function observeSeatMetadata({
     }
     const anchor = lstat(`${WSLG_X11}/X0`);
     const alias = lstat(`${LOCAL_X11}/X0`);
-    if (!anchor.isSocket() || !alias.isSocket() || !sameEntry(anchor, alias)) {
+    if (!anchor.isSocket() || !alias.isSocket() || !sameEntry(anchor, alias)
+        || ![mount, anchorDir, anchor].every((entry) => linuxDevice(entry.dev) === mounts.device)) {
       return { code: "seat-anchor-mismatch" };
     }
     const namespaces = NAMESPACES.map((kind) => readlink(`/proc/self/ns/${kind}`));
     if (!namespaces.every((id, index) => new RegExp(`^${NAMESPACES[index]}:\\[[1-9]\\d*\\]$`).test(id))) {
       return { code: "seat-evidence-unavailable" };
     }
-    const sample = [...mounts, ...metadata(mount), ...metadata(anchorDir), ...metadata(anchor), ...namespaces];
+    const sample = [...mounts.ids, ...metadata(mount), ...metadata(anchorDir), ...metadata(anchor), ...namespaces];
     return { code: "seat-metadata-observed", sample };
   } catch {
     return { code: "seat-evidence-unavailable" };

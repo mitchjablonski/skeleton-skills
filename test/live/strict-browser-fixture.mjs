@@ -260,10 +260,22 @@ export class Fail extends Error {
 }
 export const labelOf = (e) => e instanceof Fail ? e.label : /^E[A-Z]+$/.test(e?.code ?? "") ? `unexpected-error:${e.code}` : "unexpected-error";
 
-export function sha256File(file) {
-  const hash = crypto.createHash("sha256"), fd = fs.openSync(file, "r"), chunk = Buffer.alloc(1 << 20);
-  try { let n; while ((n = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) hash.update(chunk.subarray(0, n)); } finally { fs.closeSync(fd); }
+export function sha256Descriptor(fd, { read = fs.readSync, limit = Infinity } = {}) {
+  const hash = crypto.createHash("sha256");
+  const chunk = Buffer.alloc(1 << 20);
+  let offset = 0;
+  let n;
+  while ((n = read(fd, chunk, 0, chunk.length, offset)) > 0) {
+    offset += n;
+    if (offset > limit) throw new Error("digest input exceeds limit");
+    hash.update(chunk.subarray(0, n));
+  }
   return hash.digest("hex");
+}
+
+export function sha256File(file) {
+  const fd = fs.openSync(file, "r");
+  try { return sha256Descriptor(fd); } finally { fs.closeSync(fd); }
 }
 /** The ELF binary we execute (a wrapper script is resolved to its sibling `chrome`), and its SHA-256. */
 function resolveBrowser(testBrowser) {
