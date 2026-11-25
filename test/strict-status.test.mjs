@@ -396,7 +396,7 @@ test("regression: default-mode skel status output is unchanged, with no strict l
   assert.equal(run("approve").status, 0);
   const fill = run("status");
   assert.equal(fill.status, 0, fill.stderr);
-  assert.match(fill.stdout, /^regress — phase: fill — 0\/1 done\n  · 1     value  \(code\.js:2\)\n  \(this checked only the skeleton's own files: new, deleted or changed files elsewhere are checked against source baseline [0-9a-f]{12} at skel done and skel finalize\)\n$/);
+  assert.match(fill.stdout, /^regress — phase: fill — 0\/1 done\n  · 1     value  \(code\.js:2\)\n  \(this checked the skeleton's own files\. skel done and skel finalize check source baseline [0-9a-f]{12} for new, deleted or changed reviewable source paths\)\n$/);
   for (const out of [scaffold, fill]) assert.doesNotMatch(out.stdout + out.stderr, /strict/i);
   // The default approve path is not gated on strict status.
   assert.equal(JSON.parse(run("status", "--json").stdout).phase, "fill");

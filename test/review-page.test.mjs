@@ -120,7 +120,7 @@ test("#67 B6: skel status says plainly what it didn't check", () => {
   execFileSync("git", ["init", "-q"], { cwd: dir });
   run("init", "T");
   run("approve");
-  assert.match(run("status"), /\(this checked only the skeleton's own files: new, deleted or changed files elsewhere are checked against source baseline [0-9a-f]{12} at skel done and skel finalize\)/);
+  assert.match(run("status"), /\(this checked the skeleton's own files\. skel done and skel finalize check source baseline [0-9a-f]{12} for new, deleted or changed reviewable source paths\)/);
 });
 
 // ---- #69 review (a): notes from the skeleton review are marked once filling ----
