@@ -365,6 +365,48 @@ test("CLI: approve (the hook asks the human first) → next → gate → done �
   assert.throws(() => run("reshape"), /finalized/);
 });
 
+test("#247: --help, -h and help print the quick path to stdout and exit 0", () => {
+  for (const arg of ["--help", "-h", "help"]) {
+    const r = spawnSync("node", [BIN, arg], { encoding: "utf-8", timeout: 60_000 });
+    assert.equal(r.status, 0, arg);
+    assert.equal(r.stderr, "", arg);
+    assert.doesNotMatch(r.stdout, /unknown command/);
+    assert.match(r.stdout, /^skel — [^\n]*\n\nQuick path \(who does each step\):\n/);
+    assert.match(r.stdout, /agent +skel init/);
+    assert.match(r.stdout, /human +skel approve/);
+    assert.match(r.stdout, /agent +skel next → fill → skel done/);
+    assert.match(r.stdout, /human +skel finalize/);
+  }
+  const bad = spawnSync("node", [BIN, "--bogus"], { encoding: "utf-8", timeout: 60_000 });
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /unknown command "--bogus"/);
+});
+
+test("#247: init notes the state dir can be gitignored, unless it already is", () => {
+  const { dir, run } = project();
+  assert.match(run("init", "T"), /note: \.skeleton\/ holds local working state; you can add it to \.gitignore \(skel doesn't edit \.gitignore here\)/);
+  assert.equal(fs.existsSync(path.join(dir, ".gitignore")), false, "init never writes .gitignore");
+  fs.writeFileSync(path.join(dir, ".gitignore"), "node_modules\n.skeleton/\n");
+  assert.doesNotMatch(run("init", "--force", "T2"), /holds local working state/);
+});
+
+test("#247: approve says loudly when no human feedback arrived; done on the last step points to finalize", () => {
+  const { a, run } = project();
+  run("init", "Stroke smoothing");
+  run("review");
+  const approved = run("approve");
+  assert.match(approved, /note: no human feedback was received; this approves the version the review page last rendered\./);
+  assert.match(approved, /skeleton approved: 2 steps, version [0-9a-f]{12} \(the version the review page last showed\)/);
+  run("next");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
+  const first = run("done");
+  assert.match(first, /1 pending; next: 2/);
+  assert.doesNotMatch(first, /skel finalize/);
+  run("next");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
+  assert.match(run("done"), /STEP 2 done\. 0 pending\.\nall steps filled — run the full tests, then `skel finalize` when the human is happy\n/);
+});
+
 test("security H4: serve refuses cross-site posts, bad hosts, and missing tokens", async () => {
   const { dir, run } = project();
   run("init", "T");

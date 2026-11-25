@@ -40,6 +40,15 @@ const CONFIG_HOOK = path.join(PKG_ROOT, "bin", "skel-config-hook.mjs").split(pat
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
+Quick path (who does each step):
+  1. agent   skel init "<title>"          start the skeleton
+  2. agent   write the skeleton            stubs with SKEL[...] fences and SKEL_TODO bodies
+  3. agent   skel review | skel serve      show it; the human reads and replies
+  4. human   skel approve                  enter the fill phase (approval is the human's call)
+  5. agent   skel next → fill → skel done  once per step (done checks drift and SKEL_TODO)
+  6. human   skel finalize                 after the full tests pass: strip markers, phase done
+
+Commands:
   init "<title>" [--gate ask|deny] [--force]
                                      start a skeleton in this project (--force replaces an existing one)
   track <file...>                    show unfenced skeleton files (types, wiring) in the review too
@@ -70,6 +79,13 @@ const HELP = `skel — plan as code skeleton, fill one fenced step at a time
                                      written into the project's .claude/ (kept for one release)
   uninstall [projectDir]             remove what install added (leaves .skeleton/, .gitignore and the plugin alone)
 `;
+
+/** True when the project's top-level .gitignore already has a line for the state dir. */
+function gitignoresStateDir(root) {
+  let text;
+  try { text = fs.readFileSync(path.join(root, ".gitignore"), "utf-8"); } catch { return false; }
+  return text.split(/\r?\n/).some((line) => [STATE_DIR, `${STATE_DIR}/`, `/${STATE_DIR}`, `/${STATE_DIR}/`].includes(line.trim()));
+}
 
 function die(msg) {
   console.error(`skel: ${msg}`);
@@ -821,6 +837,7 @@ const commands = {
       console.error(`skel: warning: couldn't clear the previous skeleton's review sessions and approval record (${err.path ?? err.code ?? err.message}${err.path ? `: ${err.code}` : ""})`);
     }
     console.log(`skel: "${title}" started in ${root} (phase: scaffold, gate: ${gate})`);
+    if (!gitignoresStateDir(root)) console.log(`note: ${STATE_DIR}/ holds local working state; you can add it to .gitignore (skel doesn't edit .gitignore here)`);
   },
 
   track(args) {
@@ -913,7 +930,7 @@ const commands = {
     // Rediscovering the source set takes from a quarter of a second to several
     // seconds on a Windows drive under WSL, too slow for a command agents run
     // constantly: say plainly what this didn't check (#67 B6).
-    if (coverage) console.log(`  (this checked only the skeleton's own files: new, deleted or changed files elsewhere are checked against source baseline ${coverage.id} at skel done and skel finalize)`);
+    if (coverage) console.log(`  (this checked only the skeleton's own files: new, deleted or changed files elsewhere are checked against source baseline ${coverage.id} at skel done and skel finalize, so skel done also reports new files not listed here)`);
     // Diagram nodes named step_<id> that match no step are silently uncolored
     // on the page; say so here.
     for (const d of readDiagrams(root)) {
@@ -1284,6 +1301,7 @@ const commands = {
       const { clearStopNotice } = await import("../lib/stop-notice.mjs");
       await clearStopNotice(root);
     } catch {}
+    if (review?.source === "rendered") console.log("note: no human feedback was received; this approves the version the review page last rendered.");
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
     try { if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`); }
@@ -1358,6 +1376,7 @@ const commands = {
     writeState(root, { ...state, activeStep: null });
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
     console.log(`STEP ${state.activeStep} done. ${pending.length} pending${pending[0] ? `; next: ${pending[0].id} ${pending[0].title}` : ""}.`);
+    if (!pending.length) console.log("all steps filled — run the full tests, then `skel finalize` when the human is happy");
   },
 
   reshape(args) {
@@ -1519,7 +1538,8 @@ const commands = {
   },
 };
 
-const [cmd = "help", ...rest] = process.argv.slice(2);
+const [given = "help", ...rest] = process.argv.slice(2);
+const cmd = given === "--help" || given === "-h" ? "help" : given;
 const run = Object.hasOwn(commands, cmd) ? commands[cmd] : null;
 if (!run) die(`unknown command "${cmd}"\n\n${HELP}`);
 try { await run(rest); } catch (err) { if (isFeedbackError(err)) die(err.message); throw err; }

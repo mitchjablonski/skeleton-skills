@@ -176,18 +176,26 @@ For no HTTP listener, use `skel review` to generate a static HTML file, then reg
 
 ## CLI
 
+`skel help` (or `--help`, `-h`) prints the commands to stdout and exits 0. It leads with a short **quick path** that marks who does each step:
+1. The agent runs `init`.
+2. The agent writes the skeleton.
+3. The agent runs `review` or `serve`.
+4. The human approves with `approve`.
+5. The agent runs `next`, fills the step and runs `done`, once per step.
+6. After the full tests pass, the human runs `finalize`.
+
 | Command | |
 |---|---|
-| `skel init "<title>" [--gate ask\|deny] [--force]` | Start a skeleton (`.skeleton/state.json`); won't replace one in progress without `--force` |
+| `skel init "<title>" [--gate ask\|deny] [--force]` | Start a skeleton (`.skeleton/state.json`); won't replace one in progress without `--force`. Unless `.gitignore` already lists it, notes that `.skeleton/` is local working state you can gitignore (it never edits `.gitignore`) |
 | `skel track <file…>` | Include unfenced skeleton files (e.g. new types) in the review; must be inside the project |
-| `skel status [--json]` | Phase, active step, each step's status, and diagram nodes that match no step |
+| `skel status [--json]` | Phase, active step, each step's status, and diagram nodes that match no step. During a fill it checks only the skeleton's own files for drift. New, deleted or changed files elsewhere aren't listed; `done` and `finalize` check those |
 | `skel pr` | Print a Markdown pull-request body from the plan: the steps with their status and locations, the architecture diagrams, and the approved version and drift result. Read-only; paste it into your PR |
 | `skel serve [--port N] [--send] [--stop]` | Default: live read-only review; copy feedback into chat. `--send` enables direct feedback delivery. Prints the page's URL with its token (`#t=…`). Reuses a server in the same mode, and prints the same URL; uses a stable port per project |
 | `skel review` | Static `.skeleton/review.html` with no HTTP listener; copy feedback into chat |
 | `skel feedback [--wait S]` | Send-mode only: print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise, `READ_ONLY` at once for a read-only server, or `NO_SERVER` when none has answered for 10s) |
-| `skel approve [--reviewed V]` | Enter the fill phase and record the approved skeleton. When the hook is loaded, it requests permission; human confirmation depends on Claude Code's mode and approval integrations. Refuses, with a diff, if the skeleton isn't the version you last reviewed: `--reviewed` names it from the feedback you pasted (else your latest send in Send mode, else the version the review page last rendered, which catches only edits made after it). Also baselines the reviewable source set and prints its counts, policy and exclusions; refuses, naming the file, if discovery fails or a member can't be baselined |
+| `skel approve [--reviewed V]` | Enter the fill phase and record the approved skeleton. When the hook is loaded, it requests permission; human confirmation depends on Claude Code's mode and approval integrations. Refuses, with a diff, if the skeleton isn't the version you last reviewed: `--reviewed` names it from the feedback you pasted (else your latest send in Send mode, else the version the review page last rendered, which catches only edits made after it). In that last case it prints a note that no human feedback was received and that it is approving the version the page last rendered. Also baselines the reviewable source set and prints its counts, policy and exclusions; refuses, naming the file, if discovery fails or a member can't be baselined |
 | `skel reshape` | Back to skeleton review (also asks you) |
-| `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one. `done` refuses on drift from the approved skeleton or a change to the source baseline |
+| `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one. `done` refuses on drift from the approved skeleton or a change to the source baseline. After the last step it points to the full tests and `skel finalize` |
 | `skel finalize` | All filled and no drift: strip the markers |
 | `skel hook` | The `PreToolUse` scope gate |
 | `skel stop-hook [--notify-only|--block]` | The `Stop` drift check (the plugin runs `bin/skel-stop.mjs`; without a flag it uses the project's mode from `skel install`) |
