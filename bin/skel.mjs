@@ -40,6 +40,17 @@ const CONFIG_HOOK = path.join(PKG_ROOT, "bin", "skel-config-hook.mjs").split(pat
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
+Usage: skel <command> [options]
+
+Quick path
+  1. The human sets up the project with skel install.
+  2. The agent runs skel init "<title>", writes fenced stubs, and runs skel serve.
+  3. The human reviews the skeleton and shares the approved version.
+     The agent records it with skel approve --reviewed <version>.
+  4. The agent runs skel next, fills inside the active fences, tests, and
+     runs skel done. Repeat for each step, then run the full project test suite.
+  5. The human runs skel finalize when satisfied.
+
   init "<title>" [--gate ask|deny] [--force]
                                      start a skeleton in this project (--force replaces an existing one)
   track <file...>                    show unfenced skeleton files (types, wiring) in the review too
@@ -1358,6 +1369,7 @@ const commands = {
     writeState(root, { ...state, activeStep: null });
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
     console.log(`STEP ${state.activeStep} done. ${pending.length} pending${pending[0] ? `; next: ${pending[0].id} ${pending[0].title}` : ""}.`);
+    if (!pending.length) console.log("Run the full project test suite, then ask the human to run skel finalize when satisfied.");
   },
 
   reshape(args) {
@@ -1520,6 +1532,7 @@ const commands = {
 };
 
 const [cmd = "help", ...rest] = process.argv.slice(2);
-const run = Object.hasOwn(commands, cmd) ? commands[cmd] : null;
+const command = cmd === "--help" || cmd === "-h" ? "help" : cmd;
+const run = Object.hasOwn(commands, command) ? commands[command] : null;
 if (!run) die(`unknown command "${cmd}"\n\n${HELP}`);
 try { await run(rest); } catch (err) { if (isFeedbackError(err)) die(err.message); throw err; }
