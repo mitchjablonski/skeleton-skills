@@ -49,7 +49,8 @@ Quick path
      The agent records it with skel approve --reviewed <version>.
   4. The agent runs skel next, fills inside the active fences, tests, and
      runs skel done. Repeat for each step, then run the full project test suite.
-  5. When the human says yes, the agent runs skel finalize (the human allows the prompt).
+  5. When the human says yes, the agent runs skel finalize.
+     The human answers any permission prompt.
 
   init "<title>" [--gate ask|deny] [--force]
                                      start a skeleton in this project (--force replaces an existing one)
@@ -82,11 +83,21 @@ Quick path
   uninstall [projectDir]             remove what install added (leaves .skeleton/, .gitignore and the plugin alone)
 `;
 
-/** True when the project's top-level .gitignore already has a line for the state dir. */
+/** Ask Git whether the new state file is ignored. This advisory check is bounded. */
 function gitignoresStateDir(root) {
-  let text;
-  try { text = fs.readFileSync(path.join(root, ".gitignore"), "utf-8"); } catch { return false; }
-  return text.split(/\r?\n/).some((line) => [STATE_DIR, `${STATE_DIR}/`, `/${STATE_DIR}`, `/${STATE_DIR}/`].includes(line.trim()));
+  try {
+    const ignoreFile = fs.lstatSync(path.join(root, ".gitignore"), { throwIfNoEntry: false });
+    if (ignoreFile && !ignoreFile.isFile()) return false;
+    execFileSync("git", ["check-ignore", "-q", "--", `${STATE_DIR}/state.json`], {
+      cwd: root,
+      stdio: "ignore",
+      timeout: 1000,
+      killSignal: "SIGKILL",
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function die(msg) {
@@ -932,7 +943,7 @@ const commands = {
     // Rediscovering the source set takes from a quarter of a second to several
     // seconds on a Windows drive under WSL, too slow for a command agents run
     // constantly: say plainly what this didn't check (#67 B6).
-    if (coverage) console.log(`  (this checked only the skeleton's own files: new, deleted or changed files elsewhere are checked against source baseline ${coverage.id} at skel done and skel finalize, so skel done also reports new files not listed here)`);
+    if (coverage) console.log(`  (this checked the skeleton's own files. skel done and skel finalize check source baseline ${coverage.id} for new, deleted or changed reviewable source paths)`);
     // Diagram nodes named step_<id> that match no step are silently uncolored
     // on the page; say so here.
     for (const d of readDiagrams(root)) {
@@ -1303,7 +1314,7 @@ const commands = {
       const { clearStopNotice } = await import("../lib/stop-notice.mjs");
       await clearStopNotice(root);
     } catch {}
-    if (review?.source === "rendered") console.log("note: no feedback was sent from the review page; this approves the version the page last rendered.");
+    if (review?.source === "rendered") console.log("note: no reviewed version was supplied or found in a Send record for this review round. Approving the version the page last rendered.");
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
     try { if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`); }
@@ -1378,7 +1389,7 @@ const commands = {
     writeState(root, { ...state, activeStep: null });
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
     console.log(`STEP ${state.activeStep} done. ${pending.length} pending${pending[0] ? `; next: ${pending[0].id} ${pending[0].title}` : ""}.`);
-    if (!pending.length) console.log("Run the full project test suite, then ask the human whether to finalize; on a yes, run skel finalize.");
+    if (!pending.length) console.log("Run the full project test suite, then ask the human whether to finalize. If they say yes, run skel finalize.");
   },
 
   reshape(args) {
