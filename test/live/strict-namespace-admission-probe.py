@@ -43,6 +43,7 @@ WINDOW_STARTUP_REFUSALS = {
     26: 'window-display-startup-failed',
     27: 'window-browser-verification-failed',
     28: 'window-not-mapped',
+    29: 'seat-continuity-refused',
     125: 'window-listener-scope-unproven',
 }
 
@@ -118,15 +119,23 @@ class OwnedWindow:
     profile: Path
     control: socket.socket
 
-    def live(self):
+    def refusal(self):
         try:
             self.control.sendall(b'v')
-            if self.control.recv(2) == b'y':
-                return True
+            reply = self.control.recv(2)
+            if reply == b'y':
+                return None
+            if reply == b's':
+                self.control.close()
+                return 'seat-continuity-refused'
         except OSError:
             pass
         self.control.close()
-        return False
+        return 'window-liveness-refused'
+
+    def replace_fixture_seat(self):
+        self.control.sendall(b's')
+        assert self.control.recv(2) == b'a'
 
     def dispose(self):
         slot = self.profile / 'display-slot'
@@ -192,8 +201,10 @@ class Listener:
         window = self.scope.window
         if not self.alive():
             return 'listener-exited'
-        if window is not None and not window.live():
-            return 'window-liveness-refused'
+        if window is not None:
+            refusal = window.refusal()
+            if refusal is not None:
+                return refusal
         connection = HTTPConnection('127.0.0.1', self.port, timeout=0.5)
         try:
             connection.request('GET', '/api/state', headers={'Sec-Fetch-Site': 'same-origin'})
@@ -281,7 +292,8 @@ class NamespaceLauncher(CaptureLauncher):
                 command = [sys.executable, '-I', LISTENER_SCOPE, str(stop_read), str(write_fd)]
                 pass_fds = [stop_read, write_fd]
                 worker_args = []
-                if self.chrome_pin is not None and role in ('decision-listener', 'protected-window-missing-view'):
+                if self.chrome_pin is not None and role in (
+                        'decision-listener', 'protected-window-missing-view', 'protected-window-seat-startup-loss'):
                     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
                     scope_owner.enter_context(parent)
                     child_handles.enter_context(child)
@@ -467,7 +479,8 @@ LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-missing-selected-view'
                      'listener-invalid-readiness', 'listener-exited-before-start',
                      'stale-listener-generation')
 WINDOW_LOSSES = {'window-browser-loss': b'b', 'window-display-loss': b'd'}
-WINDOW_REFUSALS = {'window-wrong-pin': 25, 'window-missing-view': 24}
+WINDOW_REFUSALS = {'window-wrong-pin': 25, 'window-missing-view': 24, 'window-seat-unreadable-at-readiness': 29}
+SEAT_RESTART_LOSS = 'window-seat-changed-before-restart'
 STARTUP_FAULTS = ('peer-loss-during-start', 'listener-loss-before-namespace', 'listener-loss-after-namespace')
 REFRESH_FAILURES = {'terminal-refresh-lost': 'refresh-lost', 'terminal-refresh-malformed': 'refresh-malformed',
                     'terminal-hangup-before-refresh': 'restart'}
@@ -615,7 +628,8 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
             role = {'listener-invalid-readiness': 'invalid-listener-ready',
                     'listener-missing-selected-view': 'listener-missing-selected-view',
                     'listener-crashed-with-detached-child': 'listener-crashed-with-detached-child',
-                    'window-missing-view': 'protected-window-missing-view'}.get(
+                    'window-missing-view': 'protected-window-missing-view',
+                    'window-seat-unreadable-at-readiness': 'protected-window-seat-startup-loss'}.get(
                         case, 'decision-listener')
             launcher.stage_listener(selected, binding=binding, role=role)
             if case == 'listener-store-mismatch':
@@ -637,7 +651,7 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
                 assert scope.process.wait(LISTENER_SCOPE_TIMEOUT) == WINDOW_REFUSALS[case]
                 assert launcher.listener_refusal == WINDOW_STARTUP_REFUSALS[WINDOW_REFUSALS[case]]
                 assert launcher.listener is None
-                assert (scope.window.profile / 'display-slot').exists() == (case == 'window-missing-view')
+                assert (scope.window.profile / 'display-slot').exists() == (case != 'window-wrong-pin')
                 scope.stop()
                 assert not scope.window.profile.exists()
             else:
@@ -755,6 +769,8 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
             assert scope.process.wait(LISTENER_SCOPE_TIMEOUT) == 23
             scope.stop()
             assert not scope.window.profile.exists()
+        if case == SEAT_RESTART_LOSS:
+            launcher.listener.scope.window.replace_fixture_seat()
         next_stage = directory / 'stage-restart'
         if case in ('restart', 'graceful-restart', 'forced-restart', 'window-replaced-generation'):
             assert launcher.admit_capture(selected, fresh, next_stage, stop) == expected
@@ -776,6 +792,11 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
             assert launcher.admit_capture(selected, fresh, next_stage, stop) is None
             assert launcher.fills == [first] and len(launcher.run.namespaces) == count
             assert len(launcher.children) == children and not next_stage.exists()
+            if case == SEAT_RESTART_LOSS:
+                assert launcher.listener_refusal == 'seat-continuity-refused'
+                scope = launcher.listener.scope
+                scope.stop()
+                assert not scope.window.profile.exists()
             if case == 'partial-stop':
                 assert not lifecycle['exited'](namespace['members']['escapee']['fd'])
         assert capture['snapshot']((selected,)) == before
@@ -887,7 +908,8 @@ def main():
         cases += tuple(ACTIVE_FAULTS)
     if chrome_pin is not None:
         cases = ('restart', 'window-replaced-generation', 'listener-store-mismatch',
-                 'stale-listener-generation', 'listener-exited-before-restart', *WINDOW_REFUSALS, *WINDOW_LOSSES)
+                 'stale-listener-generation', 'listener-exited-before-restart', *WINDOW_REFUSALS, *WINDOW_LOSSES,
+                 SEAT_RESTART_LOSS)
     try:
         for case in cases:
             exercise(node, scratch, case, check_runtime, protected=args.protected_launcher, chrome_pin=chrome_pin)
@@ -915,7 +937,8 @@ def main():
     print(json.dumps({'ok': True, 'strictState': 'unverified', 'cases': cases, 'durableBytesUnchanged': True,
                       'runtimeReceiptChecked': check_runtime is not None,
                       'terminalPinChecked': check_runtime is not None and terminal_pin is not None,
-                      **({'protectedWindowChecked': True, 'x11SocketDirectory': x11_slot['socket_directory_label']()}
+                      **({'protectedWindowChecked': True, 'x11SocketDirectory': x11_slot['socket_directory_label'](),
+                          'seatBindingEvidence': 'synthetic'}
                          if chrome_pin is not None else {})}))
 
 
