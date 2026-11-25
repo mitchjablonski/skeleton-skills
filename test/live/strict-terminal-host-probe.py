@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import select
 import shutil
@@ -18,8 +19,10 @@ import tty
 
 HERE = Path(__file__).resolve().parent
 HOST_WORKER = HERE / 'strict-terminal-host-worker.mjs'
+DECISION_AUTHORITY = HERE / 'strict-terminal-decision-authority.mjs'
 capture = runpy.run_path(str(HERE / 'strict-capture-admission-probe.py'))
 Launcher, WORKER, TIMEOUT, snapshot = (capture[key] for key in ('Launcher', 'WORKER', 'TIMEOUT', 'snapshot'))
+Enrollment = capture['Enrollment']
 
 
 def acquire_terminal(terminal):
@@ -80,14 +83,17 @@ class TerminalLauncher(Launcher):
     def __init__(self, node, scratch):
         super().__init__(node, scratch)
         self.terminal = None
+        self.terminal_mode = 'standalone'
 
     def spawn(self, command, fds=()):
+        if self.terminal_mode == 'decision' and command[1:3] == [WORKER, 'managed-authority']:
+            command = [self.node, DECISION_AUTHORITY, 'serve', Path(command[3]).parent, command[5]]
         if command[1:3] != [WORKER, 'restart-console']:
             return super().spawn(command, fds)
         terminal, self.terminal = self.terminal, None
         if terminal is None:
             raise RuntimeError('terminal already used')
-        return spawn_terminal_console(self, command, fds, terminal, 'standalone')
+        return spawn_terminal_console(self, command, fds, terminal, self.terminal_mode)
 
 
 def fd_links(child):
@@ -228,10 +234,86 @@ def refuse_missing_terminal(launcher):
     assert snapshot((enrollment,)) == before
 
 
+def exercise_decision(launcher):
+    root = launcher.scratch / 'decision'
+    root.mkdir(mode=0o700)
+    history = root / 'history'
+    record_path = history / 'authority' / 'human-authority.json'
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, 'rb') as code_pipe, os.fdopen(write_fd, 'wb') as writer:
+        prepare = launcher.spawn([launcher.node, DECISION_AUTHORITY, 'prepare', root, str(write_fd)], (write_fd,))
+        writer.close()
+        assert prepare.wait(TIMEOUT) == 0, 'decision enrollment failed'
+        code = code_pipe.read(10)
+    assert re.fullmatch(rb'[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}', code), 'invalid private code'
+    record = json.loads(record_path.read_bytes())
+    state = record['authority']['state']
+    assert state['phase'] == 'skeleton' and state['revision'] == 0
+    assert record['commands'] == record['authority']['journal'] == []
+    expected = {key: state[key] for key in ('phase', 'revision', 'reviewVersion', 'captureVersion')}
+    expected['admissions'] = 'live'
+    enrollment = Enrollment(history, 'terminal-decision', expected)
+    before = snapshot((enrollment,))
+
+    terminal = FixtureTerminal()
+    try:
+        launcher.terminal = terminal.slave
+        launcher.terminal_mode = 'decision'
+        generation = launcher.stage(enrollment, approved=True)
+        assert generation.report().state == expected
+        check_terminal(terminal.master, terminal.slave, generation)
+        expect_terminal(terminal.master, b'SKELETON STRICT CONTROL\r\n')
+
+        # A pasted newline must not turn the secret-bearing text into a command.
+        command = b'approve ' + code
+        os.write(terminal.master, b'\x1b[200~' + command + b'\rstatus\x1b[201~\r')
+        expect_terminal(terminal.master, b'Input refused: type one line of plain letters, digits, spaces and hyphens. '
+                        b'Text with line breaks or control characters is refused whole, and any pending question is cancelled.\r\n')
+        read_console_status(terminal.master, expected)
+        assert snapshot((enrollment,)) == before, 'rejected input changed durable state'
+
+        os.write(terminal.master, b'\x1b[200~' + command + b'\x1b[201~')
+        assert not select.select([terminal.master], [], [], 0.3)[0], 'paste produced output before Enter'
+        assert snapshot((enrollment,)) == before, 'paste changed durable state before Enter'
+        os.write(terminal.master, b'\r')
+        review, capture_version = (expected[key][:12] + '…' for key in ('reviewVersion', 'captureVersion'))
+        expect_terminal(terminal.master, (f'Recorded: approve · shape {review} · capture {capture_version} · '
+                                         'revision 1 · 2026-01-01T00:00:00.000Z.\r\n').encode())
+        read_console_status(terminal.master, {**expected, 'phase': 'fill', 'revision': 1})
+    finally:
+        terminal.close()
+        launcher.terminal_mode = 'standalone'
+
+    assert generation.console.wait(TIMEOUT) == 0, 'decision console did not close cleanly'
+    assert generation.authority.wait(TIMEOUT) == 0, 'decision authority did not close cleanly'
+    after = snapshot((enrollment,))
+    assert record_path in before and record_path in after and before.pop(record_path) != after.pop(record_path)
+    assert after == before, 'approval changed other durable files'
+
+    committed = json.loads(record_path.read_bytes())
+    assert committed['authority']['state'] == {**state, 'phase': 'fill', 'revision': 1,
+                                               'approvedVersion': state['reviewVersion'],
+                                               'approvedCaptureVersion': state['captureVersion']}
+    assert committed['initial'] == record['initial'] and committed['epochs'] == record['epochs']
+    assert committed['current'] == record['current']
+    entry, = committed['commands']
+    core, = committed['authority']['journal']
+    assert entry['command']['requestId'] == core['intent']['requestId'] == 'terminal-fixture-only'
+    assert entry['command']['action'] == core['intent']['action'] == 'approve'
+    assert entry['command']['code'].encode() == code
+    assert entry['result'] == {'kind': 'committed', 'action': 'approve', 'requestId': 'terminal-fixture-only',
+                               'reviewVersion': state['reviewVersion'], 'captureVersion': state['captureVersion'],
+                               'revision': 1, 'at': '2026-01-01T00:00:00.000Z'}
+    assert not any(code in file.read_bytes() for file in launcher.scratch.rglob('*')
+                   if file.is_file() and file != record_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--node', required=True)
     parser.add_argument('--node-sha256', required=True)
+    parser.add_argument('--protected-decision', action='store_true',
+                        help='exercise synthetic approval over the protected terminal and durable authority')
     args = parser.parse_args()
     if sys.platform != 'linux' or sys.flags.optimize or not sys.flags.isolated:
         parser.error('requires Linux Python -I with assertions enabled')
@@ -244,8 +326,11 @@ def main():
     descriptors = set(os.listdir('/proc/self/fd'))
     try:
         try:
-            exercise(launcher)
-            refuse_missing_terminal(launcher)
+            if args.protected_decision:
+                exercise_decision(launcher)
+            else:
+                exercise(launcher)
+                refuse_missing_terminal(launcher)
         finally:
             launcher.cleanup()
         assert all(child.returncode is not None for child in launcher.children)
@@ -254,9 +339,13 @@ def main():
         print('Terminal fixture failed. Retained scratch at ' + str(scratch), file=sys.stderr)
         raise
     shutil.rmtree(scratch)
-    print(json.dumps({'ok': True, 'strictState': 'unverified', 'durableBytesUnchanged': True,
-                      'cases': ['terminal-status', 'terminal-incomplete', 'terminal-hangup',
-                                'terminal-setup-refused']}))
+    if args.protected_decision:
+        print(json.dumps({'ok': True, 'strictState': 'unverified', 'terminalDecisionCommitted': True,
+                          'cases': ['terminal-multiline-refused', 'terminal-paste-needs-enter', 'terminal-decision']}))
+    else:
+        print(json.dumps({'ok': True, 'strictState': 'unverified', 'durableBytesUnchanged': True,
+                          'cases': ['terminal-status', 'terminal-incomplete', 'terminal-hangup',
+                                    'terminal-setup-refused']}))
 
 
 if __name__ == '__main__':

@@ -74,9 +74,18 @@ descriptors so terminal hangup can complete even on a pinned Node build that
 aborts while restoring hung-up standard streams.
 
 One complete `status` line reaches the enrolled authority over the inherited
-command socket. Incomplete input is discarded, and decision methods refuse
-in the fixture. Readiness uses its own bounded report pipe. A hangup or failed
+command socket. The status case discards incomplete input and refuses decision
+methods. Readiness uses its own bounded report pipe. A hangup or failed
 terminal setup prevents admission, the launcher reaps its owned workers, and
 durable bytes stay unchanged. This fixture uses synthetic input and leaves
 strict `unverified`. A supported terminal emulator, its paste framing, and
 its interaction with the fresh browser profile remain open.
+
+Add `--protected-decision` to exercise the separate #229 approval case.
+The launcher receives a synthetic code through an inherited private pipe.
+A multiline paste refuses. A valid paste waits for Enter before the console
+sends the code over the private command socket. The authority records one
+approval for the exact enrolled capture. The fixture checks the exact
+terminal responses and verifies that durable fixture files contain no copy
+of the code outside the private authority record. It uses an owned PTY and
+runs without a browser or an agent session.

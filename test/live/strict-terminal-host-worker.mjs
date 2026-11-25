@@ -7,7 +7,7 @@ import {createControlConsole} from '../../lib/strict-control-console.mjs';
 import {createHumanCommandClient} from '../../lib/strict-human-channel.mjs';
 
 const [mode, ...fdArgs] = process.argv.slice(2);
-if (!['standalone', 'restart', 'refresh-lost', 'refresh-malformed'].includes(mode)) process.exit(2);
+if (!['standalone', 'decision', 'restart', 'refresh-lost', 'refresh-malformed'].includes(mode)) process.exit(2);
 const fds = fdArgs.map(Number);
 if (fds.length !== 5 || new Set(fds).size !== 5 || !fds.every((fd) => Number.isSafeInteger(fd) && fd > 2)) process.exit(2);
 const [socketFd, reportFd, refreshSignalFd, refreshReportFd, terminalFd] = fds;
@@ -20,7 +20,8 @@ function closeRefreshReport() {
     fs.closeSync(refreshReportFd);
   }
 }
-if (mode === 'standalone') {
+const refreshEnabled = mode !== 'standalone' && mode !== 'decision';
+if (!refreshEnabled) {
   fs.closeSync(refreshSignalFd);
   closeRefreshReport();
 }
@@ -39,7 +40,8 @@ const reject = async () => {
 const control = createControlConsole({
   authority: {
     state: () => { stateCalls++; return client.state(); },
-    verifyAndCommit: reject, recapture: reject, endSession: reject,
+    verifyAndCommit: mode === 'decision' ? (request) => client.verifyAndCommit(request) : reject,
+    recapture: reject, endSession: reject,
   },
   newRequestId: () => 'terminal-fixture-only',
 });
@@ -92,7 +94,7 @@ terminal.on('data', (chunk) => {
 terminal.on('end', finish);
 terminal.on('error', () => finish());
 
-if (mode !== 'standalone') {
+if (refreshEnabled) {
   let requested = false;
   // A pollable stream lets a terminal hangup cancel a pending refresh without
   // waiting for the launcher to write to or close the refresh pipe first.
