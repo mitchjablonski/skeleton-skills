@@ -51,7 +51,7 @@ Rules:
 - **One id can fence several places.** Fence a step's test with the same id (e.g. an `it.todo`/`pytest.skip` body containing `SKEL_TODO`) so filling the step means making that test real.
 - **Wiring into existing code** is its own fenced step, usually the last one. Don't change existing behavior outside a fence.
 - Files with no fences (new type files, for example) go in the review with `skel track <file...>`.
-- If the project has a typechecker or compiler, run it. The skeleton should build.
+- Run the project's existing build or typecheck command when it has one. In a plain JavaScript project, use its syntax or lint check. For Node.js with no such script, run `node --check` on each changed JavaScript file. Behavior tests that call the `SKEL_TODO` stubs belong in the fill phase.
 
 ## 4. Draw the architecture
 
