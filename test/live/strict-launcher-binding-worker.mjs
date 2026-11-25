@@ -37,16 +37,17 @@ function boundRestartLifetime() {
   setTimeout(() => process.exit(1), 45000);
 }
 
-async function runProtectedWindow(listener, binding, origin, scratch) {
+function seatMatched(seat) {
+  try {
+    return seat.binding.code === 'seat-metadata-observed'
+      && seat.binding.recheck?.() === 'seat-metadata-matched';
+  } catch {
+    return false;
+  }
+}
+
+async function runProtectedWindow(listener, binding, origin, scratch, seat) {
   const control = new net.Socket({fd: Number(controlFd), readable: true, writable: true});
-  const seat = makeSeatFixture();
-  const seatMatched = () => {
-    try {
-      return seat.binding.recheck?.() === 'seat-metadata-matched';
-    } catch {
-      return false;
-    }
-  };
   let closing = false;
   let exitStatus = 23;
   function close() {
@@ -73,9 +74,9 @@ async function runProtectedWindow(listener, binding, origin, scratch) {
       switch (bytes[0]) {
         case 0x76: { // v
           let verdict = 's';
-          if (seatMatched()) {
+          if (seatMatched(seat)) {
             const live = await window.isLive();
-            if (seatMatched()) verdict = live ? 'y' : 'n';
+            if (seatMatched(seat)) verdict = live ? 'y' : 'n';
           }
           if (verdict === 's') exitStatus = SEAT_REFUSED;
           control.write(verdict, error => {
@@ -106,19 +107,19 @@ async function runProtectedWindow(listener, binding, origin, scratch) {
   });
   try {
     privateFixtureDirectory(scratch);
-    if (seat.binding.code !== 'seat-metadata-observed') {
+    const {startProtectedWindow} = await import('./strict-protected-window.mjs');
+    if (!seatMatched(seat)) {
       exitStatus = SEAT_REFUSED;
       close();
       return;
     }
-    const {startProtectedWindow} = await import('./strict-protected-window.mjs');
     const selected = listener.mintWindowNavigation(binding);
     const navigation = role === 'protected-window-missing-view'
       ? {url: listener.mintNavigation(), takeView: selected.takeView}
       : selected;
     window = await startProtectedWindow({scratch, chromePin, navigation, onLoss: close});
     if (role === 'protected-window-seat-startup-loss') seat.withdraw();
-    if (!seatMatched()) {
+    if (!seatMatched(seat)) {
       exitStatus = SEAT_REFUSED;
       close();
       return;
@@ -208,7 +209,13 @@ if (role === 'prepare-approved') {
     process.exit(23);
   }
 } else if (['decision-listener', 'listener-missing-selected-view',
-            'protected-window-listener', 'protected-window-missing-view', 'protected-window-seat-startup-loss'].includes(role)) {
+            'protected-window-listener', 'protected-window-missing-view', 'protected-window-seat-startup-loss',
+            'protected-window-seat-prelaunch-loss'].includes(role)) {
+  const seat = role.startsWith('protected-window-') ? makeSeatFixture() : null;
+  if (role === 'protected-window-seat-prelaunch-loss') seat.withdraw();
+  // Bind before opening the listener or minting a navigation. Retain this
+  // same seat for window readiness and restart.
+  if (seat && !seatMatched(seat)) process.exit(SEAT_REFUSED);
   const [{createDecisionListener}, {buildStrictCaptureViewModel}] = await Promise.all([
     import('../../lib/strict-decision-listener.mjs'), import('../../lib/strict-capture-view-model.mjs'),
   ]);
@@ -237,8 +244,8 @@ if (role === 'prepare-approved') {
     process.exit(23);
   }
   listener.mintNavigation(); // Revoke the private startup tab.
-  if (role.startsWith('protected-window-')) {
-    await runProtectedWindow(listener, binding, origin, refreshReportFd);
+  if (seat) {
+    await runProtectedWindow(listener, binding, origin, refreshReportFd, seat);
   } else {
     writeReport(fd, {port: Number(new URL(origin).port)});
     boundRestartLifetime();
