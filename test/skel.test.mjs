@@ -346,7 +346,7 @@ test("CLI: help aliases print the same quick path and unknown commands still fai
   const { status, stdout, stderr } = run("help");
   assert.equal(status, 0);
   assert.equal(stderr, "");
-  assert.match(stdout, /Quick path[\s\S]*The human.*skel install[\s\S]*The agent.*skel init[\s\S]*skel serve[\s\S]*skel approve[\s\S]*skel next[\s\S]*skel done[\s\S]*The human.*skel finalize/);
+  assert.match(stdout, /Quick path[\s\S]*The human.*skel install[\s\S]*The agent.*skel init[\s\S]*skel serve[\s\S]*skel approve[\s\S]*skel next[\s\S]*skel done[\s\S]*the human says yes, the agent runs skel finalize/);
   for (const args of [[], ["--help"], ["-h"]]) {
     const result = run(...args);
     assert.equal(result.status, 0);
