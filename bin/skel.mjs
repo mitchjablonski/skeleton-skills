@@ -262,10 +262,16 @@ function warnLegacyQueue(root) {
 }
 
 function setActive(root, state, step, force = false) {
-  if (step.status !== "todo" && !force) die(`step ${step.id} is already filled; \`skel start ${step.id} --force\` reopens it for rework`);
+  const filled = step.status !== "todo";
+  if (filled && !force) die(`step ${step.id} is already filled; \`skel start ${step.id} --force\` reopens it for rework`);
   writeState(root, { ...state, phase: "fill", activeStep: step.id });
   console.log(`STEP ${step.id} active: ${step.title}`);
-  console.log(`Edit only inside these fences; replace each SKEL_TODO stub. Leave the marker lines in place.`);
+  if (filled) {
+    const action = state.activeStep === step.id ? "Already active" : "Reopened";
+    console.log(`${action} for rework because this step is filled. Edit only inside its fences and leave the marker lines in place. Run skel done again when finished.`);
+  } else {
+    console.log("Edit only inside these fences; replace each SKEL_TODO stub. Leave the marker lines in place.");
+  }
   printFences(step);
 }
 
