@@ -30,6 +30,24 @@ its result is `unverified` and does not authorize a human-desktop launch.
 node test/live/strict-desktop-inventory.mjs [--chrome-sha256 <hex>]
 ```
 
+### Fixed candidate preflight
+
+```sh
+node test/live/strict-desktop-inventory.mjs --real-seat-preflight
+```
+
+This opt-in check samples the x86-64 WSL2 seat before and after inspecting
+the pinned Chrome ELF from the [launcher design](strict-real-desktop-launcher.md).
+It checks the mountinfo device against the seat's filesystem entries and
+the fixed installation path for root ownership, writable group or other
+bits, and symlinks. It hashes the opened regular file and rechecks
+its identity and the path chain. It only reads passive evidence. Root and
+filesystem trust, the isolation preflight, operator conditions and the
+actual window all have separate checks. Success still reports
+`strictState: "unverified"`.
+
+### Inventory fields
+
 It prints one bounded JSON object with fixed labels:
 - **Platform:** machine, kernel release, WSL or not (from `/proc/version`),
   whether the WSL interop binfmt entry exists, and whether a distro name is

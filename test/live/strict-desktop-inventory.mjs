@@ -2,6 +2,7 @@
 // #231 first slice: a READ-ONLY inventory of the candidate human-desktop seat.
 //
 //   node test/live/strict-desktop-inventory.mjs [--chrome-sha256 <hex>]
+//   node test/live/strict-desktop-inventory.mjs --real-seat-preflight
 //
 // It identifies a possible seat only. It observes no window, no input path and
 // no running browser. Safety (an earlier probe crashed WSLg's compositor by
@@ -20,6 +21,7 @@ import fs from "node:fs";
 import os from "node:os";
 import { parseArgs, finish, Fail, labelOf, createFixture } from "./strict-browser-fixture.mjs";
 import { bindSeatMetadata } from "./strict-seat-metadata.mjs";
+import { preflightRealSeat } from "./strict-real-seat-preflight.mjs";
 
 /** stat() only, never open: a fixed label for what is at `p`. */
 function statLabel(p) {
@@ -46,6 +48,12 @@ function sessionBus() {
   if (v === undefined) return { address: "unset", socket: statLabel(`/run/user/${process.getuid()}/bus`) };
   const m = /^unix:path=([^,;]+)/.exec(v);
   return { address: m ? "unix-path" : /^unix:abstract=/.test(v) ? "unix-abstract" : "other", socket: m ? statLabel(m[1]) : "not-a-path" };
+}
+
+if (process.argv.length === 3 && process.argv[2] === "--real-seat-preflight") {
+  const { code } = preflightRealSeat();
+  const ok = code === "real-seat-preflight-passed";
+  finish({ ok, strictState: "unverified", code }, ok ? 0 : 2);
 }
 
 const { supervised, ok, pin: suppliedPin } = parseArgs();

@@ -3,9 +3,66 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { parseUnixSocketTable, x11SocketState, x11SocketStateFromBytes } from "./live/strict-private-display.mjs";
 import { bindSeatMetadata } from "./live/strict-seat-metadata.mjs";
+import { checkPinnedChromeInstallation } from "./live/strict-real-seat-preflight.mjs";
+
+function installationFixture() {
+  const bytes = Buffer.from("fixture executable bytes");
+  const pin = createHash("sha256").update(bytes).digest("hex");
+  const directory = { uid: 0n, mode: 0o755n, dev: 42n, ino: 1n, ctimeNs: 1n, size: 0n,
+    isDirectory: () => true };
+  const file = { ...directory, ino: 2n, size: BigInt(bytes.length), isFile: () => true };
+  const state = { opened: 0, closed: 0, descriptor: file, chunk: 3 };
+  const entries = new Map([["/", directory], ["/opt", directory], ["/opt/google", directory],
+    ["/opt/google/chrome", directory], ["/opt/google/chrome/chrome", file]]);
+  const io = {
+    lstatSync: (path) => entries.get(path),
+    accessSync() {},
+    openSync() { state.opened++; return 42; },
+    fstatSync() { return state.descriptor; },
+    readSync(fd, chunk, start, length, position) {
+      return bytes.copy(chunk, start, position, Math.min(bytes.length, position + state.chunk));
+    },
+    closeSync() { state.closed++; },
+  };
+  return { io, entries, state, pin };
+}
+
+test("the fixed install verifies a digest from the same opened executable", () => {
+  const { io, state, pin } = installationFixture();
+  assert.equal(checkPinnedChromeInstallation(io, pin), "browser-pin-matched");
+  assert.equal(checkPinnedChromeInstallation(io, "0".repeat(64)), "browser-pin-mismatch");
+  assert.equal(state.opened, 2);
+  assert.equal(state.closed, 2);
+});
+
+test("the fixed install refuses untrusted path components, changed identity, and I/O errors", () => {
+  const { io, entries, state, pin } = installationFixture();
+  const parent = entries.get("/opt/google");
+  for (const changed of [{ uid: 1n }, { mode: 0o775n }, { isDirectory: () => false }]) {
+    entries.set("/opt/google", { ...parent, ...changed });
+    assert.equal(checkPinnedChromeInstallation(io, pin), "browser-executable-untrusted");
+  }
+  assert.equal(state.opened, 0);
+  entries.set("/opt/google", parent);
+  const original = state.descriptor;
+  state.descriptor = { ...original, ino: 3n };
+  assert.equal(checkPinnedChromeInstallation(io, pin), "browser-executable-changed");
+
+  state.descriptor = original;
+  const read = io.readSync;
+  io.readSync = (...args) => {
+    entries.set("/opt/google", { ...parent, ctimeNs: 2n });
+    return read(...args);
+  };
+  assert.equal(checkPinnedChromeInstallation(io, pin), "browser-executable-changed");
+  io.readSync = () => { throw new Error("private read detail"); };
+  assert.equal(checkPinnedChromeInstallation(io, pin), "browser-evidence-unavailable");
+  assert.equal(state.opened, state.closed);
+});
 
 function seatFixture() {
   function entry(ino, kind) {
@@ -57,6 +114,8 @@ test("seat metadata binds only the fixed display and matching directory/socket a
   assert.deepEqual(bind(), { code: "seat-anchor-mismatch" });
   state.mounts = [wslg, local.replace("0:38", "0:39")];
   assert.deepEqual(bind(), { code: "seat-anchor-mismatch" });
+  state.mounts = [wslg.replace("0:38", "0:39"), local.replace("0:38", "0:39")];
+  assert.deepEqual(bind(), { code: "seat-anchor-mismatch" });
   state.mounts = [wslg, local, local.replace("128", "129")];
   assert.deepEqual(bind(), { code: "seat-anchor-mismatch" });
   state.mounts = [wslg, local];
@@ -105,6 +164,14 @@ test("seat recheck latches endpoint, mount, namespace, and observation loss", ()
   entries.set(alias, original);
   assert.equal(bind().recheck(), "seat-metadata-matched");
   assert.equal(binding.recheck(), "seat-evidence-unavailable");
+});
+
+test("seat mount devices account for high Linux major and minor fields", () => {
+  const { bind, entries, state } = seatFixture();
+  // Linux dev_t for major 0x1002 and minor 0x301.
+  for (const entry of new Set(entries.values())) entry.dev = 0x100000300201n;
+  state.mounts = state.mounts.map((line) => line.replace("0:38", "4098:769"));
+  assert.equal(bind().recheck?.(), "seat-metadata-matched");
 });
 
 const HEADER = "Num       RefCount Protocol Flags    Type St Inode Path";
