@@ -300,7 +300,7 @@ The Stop continuation protocol was tested on Claude Code CLI 2.1.318: `systemMes
 
 ### Next to deepPairing skeleton plans
 
-deepPairing's `/deeppairing:skeleton` plans use the same `SKEL[id]` fences, with their state in `.deeppairing/` (which skel's scan and source baseline already skip). skel reads that state, never writes it, and reads it bounded (1 MB in total, regular files only, no symlinked dirs, capped counts); anything it can't read counts against deepPairing.
+deepPairing's `/deeppairing:skeleton` plans use the same `SKEL[id]` fences, with their state in `.deeppairing/` (which skel's scan and source baseline already skip). skel reads that state, never writes it, and reads it bounded (1 MB in total, regular files only, no symlinked dirs, capped counts); anything it can't read, including a permission error or a list over its caps, makes ownership unknown, never absent.
 
 Always on, because neither can skip a prompt:
 
@@ -311,10 +311,10 @@ Off unless you opt in, because `.deeppairing/` is inside the project and an agen
 
 ```
 skel install --deeppairing-yield      # opt in (recorded in install's ownership record in skel's state dir)
-skel install --no-deeppairing-yield   # back to the default
+skel install --no-deeppairing-yield   # explicit off, here and below, whatever a parent chose
 ```
 
-`--deeppairing-yield` works only in an interactive terminal (stdin and stdout both TTYs), so run it yourself, not through Claude; the hook also asks before either command runs. Like the Stop mode, the opt-in is looked up from the project upward: one recorded for a parent directory (a monorepo root, say) also covers every project nested inside it. With the opt-in, the `PreToolUse` gate leaves an Edit to deepPairing's gate only when the file isn't part of skel's approved skeleton, the edit changes nothing but the body of a fence (and keeps it in its block), and a fresh scope of an approved deepPairing plan fills that fence for this Claude session's edits inside its `workspaceRoot`, as deepPairing's own gate decides. The `Stop` hook only notifies, without a corrective continuation, when every drifted file is untracked and holds such a fence. A deepPairing claim never covers a fence id in skel's approval record (that record lives outside the project), and `done` and `finalize` still check drift against it. Keep the two plans' fences in separate files with distinct ids.
+`--deeppairing-yield` works only in an interactive terminal (stdin and stdout both TTYs), so run it yourself, not through Claude; the hook also asks before either command runs. The setting is looked up from the project upward and the nearest record that sets it decides: an opt-in recorded for a parent directory (a monorepo root, say) also covers every project nested inside it, unless that project ran `--no-deeppairing-yield`. With the opt-in, the `PreToolUse` gate leaves an Edit to deepPairing's gate only when the file isn't part of skel's approved skeleton, the edit changes nothing but the body of a fence (and keeps it in its block), and a fresh scope of an approved deepPairing plan fills that fence for this Claude session's edits inside its `workspaceRoot` (which must be an existing, absolute, canonical directory), as deepPairing's own gate decides. These checks use the gate's own canonical path, so `..`, symlinks and case variants of skel's files never yield. The `Stop` hook only notifies, without a corrective continuation, when every drifted file is outside skel's approved snapshot altogether and holds such a fence; drift in an approved file is always skel's to correct. A deepPairing claim never covers a fence id in skel's approval record (that record lives outside the project), and `done` and `finalize` still check drift against it. Keep the two plans' fences in separate files with distinct ids.
 
 ## Strict tier (in development)
 

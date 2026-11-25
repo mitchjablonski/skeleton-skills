@@ -10,9 +10,10 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { DP_MAX_SESSIONS, DP_SCOPE_MAX_AGE_MS, deepPairingSessionIds, optInRefusal, ownsFence, readDeepPairing } from "../lib/deeppairing.mjs";
+import { DP_MAX_FILES, DP_MAX_IDS, DP_MAX_SESSIONS, DP_MAX_STEPS, DP_SCOPE_MAX_AGE_MS, deepPairingSessionIds, optInRefusal, ownsFence, readDeepPairing } from "../lib/deeppairing.mjs";
 import { isPhaseChange } from "../lib/phase.mjs";
 import { stripMarkers, stripMarkersOf } from "../lib/markers.mjs";
+import { projectKey } from "../lib/state.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = path.join(REPO, "bin", "skel.mjs");
@@ -39,16 +40,19 @@ function project(t) {
   const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
   const hook = (tool_name, tool_input, session_id = SID) => run([HOOK], JSON.stringify({ cwd: root, session_id, tool_name, tool_input }));
   const stop = () => run([STOP], JSON.stringify({ cwd: root, stop_hook_active: false, session_id: SID, hook_event_name: "Stop" }));
-  // The opt-in needs a TTY (a human's terminal), which tests don't have: run a
-  // plain install, then record the opt-in in its ownership record directly.
-  const optIn = () => {
-    ok("install");
-    const dir = path.join(base, "state", "skel");
-    const file = fs.readdirSync(dir).find((n) => n.endsWith("-install.json"));
-    const rec = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
-    fs.writeFileSync(path.join(dir, file), JSON.stringify({ ...rec, deepPairing: "yield" }));
+  // The opt-in needs a TTY (a human's terminal), which tests don't have, so
+  // tests record it in install's ownership record directly, as install would.
+  const recordFile = (dir) => path.join(base, "state", "skel", `${projectKey(dir)}-install.json`);
+  const readOpt = (dir = root) => { try { return JSON.parse(fs.readFileSync(recordFile(dir), "utf8")).deepPairing; } catch { return undefined; } };
+  const setOpt = (dir, value) => {
+    let rec = { root: dir, ownedDeny: [] };
+    try { rec = JSON.parse(fs.readFileSync(recordFile(dir), "utf8")); } catch {}
+    if (value === undefined) delete rec.deepPairing; else rec.deepPairing = value;
+    fs.mkdirSync(path.dirname(recordFile(dir)), { recursive: true });
+    fs.writeFileSync(recordFile(dir), JSON.stringify(rec));
   };
-  return { base, root, skel, ok, write, read, hook, stop, optIn };
+  const optIn = () => setOpt(root, "yield");
+  return { base, root, skel, ok, write, read, hook, stop, optIn, setOpt, readOpt };
 }
 
 const iso = (msAgo = 0) => new Date(Date.now() - msAgo).toISOString();
@@ -77,7 +81,7 @@ test("the session id is derived as deepPairing derives it", (t) => {
 
 test("readDeepPairing: absent, live, stale, future-dated, old or finished plans, duplicates", (t) => {
   const p = project(t);
-  assert.deepEqual(readDeepPairing(p.root), { present: false, owned: [], fresh: false, gateScopes: [], unreadable: 0 });
+  assert.deepEqual(readDeepPairing(p.root), { status: "absent", present: false, owned: [], fresh: false, gateScopes: [], unreadable: 0 });
   deepPairing(p);
   let dp = readDeepPairing(p.root);
   assert.deepEqual([dp.fresh, dp.unreadable, dp.gateScopes.map((s) => s.activeSkelIds)], [true, 0, [["d1"]]]);
@@ -257,13 +261,14 @@ test("the opt-in needs an interactive terminal; turning it off doesn't", (t) => 
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /needs an interactive terminal/);
   assert.match(r.stderr, /in your own terminal/);
-  const dir = path.join(p.base, "state", "skel");
-  const recorded = () => fs.existsSync(dir) && fs.readdirSync(dir).some((n) => n.endsWith("-install.json") && /"deepPairing"/.test(fs.readFileSync(path.join(dir, n), "utf8")));
-  assert.equal(recorded(), false, "nothing recorded");
+  assert.equal(p.readOpt(), undefined, "nothing recorded");
+  p.ok("install");
   p.optIn();
-  assert.equal(recorded(), true);
+  assert.equal(p.readOpt(), "yield");
   assert.match(p.ok("install", "--no-deeppairing-yield").stdout, /skel gates every fence/);
-  assert.equal(recorded(), false, "turned off without a TTY");
+  assert.equal(p.readOpt(), "off", "turned off without a TTY, as an explicit off");
+  p.ok("install");
+  assert.equal(p.readOpt(), "off", "a plain re-install keeps the choice");
 });
 
 test("optInRefusal: both stdin and stdout must be TTYs", () => {
@@ -360,12 +365,12 @@ test("stop: without the opt-in, a live scope doesn't stop the continuation", (t)
   assert.equal(stopOut(p).decision, "block");
 });
 
-test("stop, opted in: drift only in files a live plan is filling notifies; any other drift still blocks", (t) => {
+test("stop, opted in: a foreign fence appended to an approved file is still skel's drift to correct", (t) => {
   const p = project(t);
   drifted(p, { optIn: true });
   const out = stopOut(p);
-  assert.equal(out.decision, undefined);
-  assert.match(out.systemMessage, /deepPairing skeleton plan is filling/);
+  assert.equal(out.decision, "block", "a.js is in skel's approved snapshot");
+  assert.doesNotMatch(out.systemMessage, /deepPairing skeleton plan is filling/);
 
   const q = project(t);
   drifted(q, { optIn: true });
@@ -376,4 +381,97 @@ test("stop, opted in: drift only in files a live plan is filling notifies; any o
   drifted(r, { optIn: true, live: false });
   deepPairing(r, { sessions: { [dpSession(r.root)]: [plan({ steps: [{ skelId: "d1", status: "in_progress", files: ["a.js"] }] })] }, scopes: [scope(r.root, { updatedAt: iso(-60_000) })] });
   assert.equal(stopOut(r).decision, "block", "a future-dated scope");
+});
+
+// ---- #243 cross-review: lookup failure vs absence ----
+
+test("a permission failure is unreadable, never absent, and finalize refuses", { skip: process.platform === "win32" || process.getuid?.() === 0 }, (t) => {
+  const p = project(t);
+  filled(p);
+  deepPairing(p);
+  const dir = path.join(p.root, ".deeppairing");
+  fs.chmodSync(dir, 0o000);
+  t.after(() => { try { fs.chmodSync(dir, 0o755); } catch {} });
+  const dp = readDeepPairing(p.root);
+  assert.equal(dp.status, "unreadable");
+  const r = p.skel("finalize");
+  fs.chmodSync(dir, 0o755);
+  assert.notEqual(r.status, 0);
+  // Source discovery (git) may refuse first; either way nothing is stripped.
+  assert.match(r.stderr, /can't tell which fences belong to deepPairing|source set/);
+  assert.match(p.read("a.js"), /SKEL\[1\]/);
+});
+
+test("a truncated step, file or active-id list is unreadable, and finalize refuses", (t) => {
+  const p = project(t);
+  const sid = dpSession(p.root);
+  const many = (n, f) => Array.from({ length: n }, (_, i) => f(i));
+  const cases = {
+    steps: { sessions: { [sid]: [plan({ steps: many(DP_MAX_STEPS + 1, (i) => ({ skelId: `x${i}`, status: "pending" })) })] }, scopes: [] },
+    files: { sessions: { [sid]: [plan({ steps: [{ skelId: "d1", status: "pending", files: many(DP_MAX_FILES + 1, (i) => `f${i}.js`) }] })] }, scopes: [] },
+    "active ids": { scopes: [scope(p.root, { activeSkelIds: many(DP_MAX_IDS + 1, (i) => `x${i}`) })] },
+  };
+  for (const [name, dp] of Object.entries(cases)) {
+    resetDp(p);
+    deepPairing(p, dp);
+    assert.equal(readDeepPairing(p.root).status, "unreadable", name);
+  }
+  const q = project(t);
+  filled(q);
+  deepPairing(q, { scopes: [scope(q.root, { activeSkelIds: many(DP_MAX_IDS + 1, (i) => `x${i}`) })] });
+  const r = q.skel("finalize");
+  assert.notEqual(r.status, 0);
+  assert.match(q.read("a.js"), /SKEL\[1\]/);
+});
+
+// ---- #243 cross-review: canonical paths ----
+
+test("gate, opted in: the gate's own canonical path decides; .., symlinks and case variants of skel's files never yield", (t) => {
+  // deepPairing's SKEL[d1] added to a.js, one of skel's approved files.
+  const p = project(t);
+  gated(p, { dp: { sessions: { [dpSession(p.root)]: [plan({ steps: [{ skelId: "d1", status: "in_progress", files: ["a.js"] }] })] } } });
+  p.write("a.js", SKEL_A + DP_B);
+  const inside = (file_path) => ({ file_path, old_string: `  ${TODO}\n  // /SKEL[d1]`, new_string: "  return 2;\n  // /SKEL[d1]" });
+  fs.mkdirSync(path.join(p.root, "sub"));
+  fs.symlinkSync(path.join(p.root, "a.js"), path.join(p.root, "link.js"));
+  for (const target of ["a.js", "sub/../a.js", path.join(p.root, "sub", "..", "a.js"), "link.js"]) assert.equal(decision(p.hook("Edit", inside(target))), "deny", target);
+
+  // A case variant of an approved file holding a foreign fence (case-sensitive filesystems).
+  const q = project(t);
+  gated(q, { dp: { sessions: { [dpSession(q.root)]: [plan({ steps: [{ skelId: "d1", status: "in_progress" }] })] } } });
+  if (!fs.existsSync(path.join(q.root, "A.JS"))) {
+    q.write("A.JS", DP_B);
+    assert.equal(decision(q.hook("Edit", { ...insideB, file_path: "A.JS" })), "deny", "A.JS folds to a.js");
+  }
+  // The yield itself still works through a `..` spelling of a foreign file.
+  assert.equal(decision(q.hook("Edit", { ...insideB, file_path: "sub/../b.js" })), null);
+});
+
+test("gate, opted in: a missing, relative, nonexistent or non-canonical workspaceRoot never yields", (t) => {
+  const alias = (p) => { const l = path.join(p.base, "alias"); fs.symlinkSync(p.root, l); return l; };
+  const cases = {
+    missing: () => ({ workspaceRoot: undefined }),
+    relative: () => ({ workspaceRoot: "proj" }),
+    nonexistent: (p) => ({ workspaceRoot: path.join(p.root, "nope") }),
+    "with ..": (p) => { fs.mkdirSync(path.join(p.root, "x"), { recursive: true }); return { workspaceRoot: `${p.root}/x/..` }; },
+    symlinked: (p) => ({ workspaceRoot: alias(p) }),
+  };
+  for (const [name, over] of Object.entries(cases)) {
+    const p = project(t);
+    gated(p, { dp: { scopes: [scope(p.root, over(p))] } });
+    assert.equal(decision(p.hook("Edit", insideB)), "deny", name);
+  }
+});
+
+// ---- #243 cross-review: a local explicit opt-out beats an ancestor's opt-in ----
+
+test("gate: a parent's opt-in covers a nested project, but the project's explicit opt-out wins", (t) => {
+  const p = project(t);
+  gated(p, { optIn: false });
+  p.setOpt(p.base, "yield");
+  assert.equal(decision(p.hook("Edit", insideB)), null, "inherited from the parent");
+  p.setOpt(p.root, "off");
+  assert.equal(decision(p.hook("Edit", insideB)), "deny", "explicit off beats the parent");
+  p.setOpt(p.root, undefined);
+  assert.equal(decision(p.hook("Edit", insideB)), null, "a record without the field inherits");
 });

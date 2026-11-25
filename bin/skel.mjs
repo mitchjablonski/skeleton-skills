@@ -425,9 +425,9 @@ function writeOwned(target, owned, stopMode = null, deepPairing = null) {
   writeFileAtomic(ownedStorePath(target), JSON.stringify({ root: realDir(target), ownedDeny: owned, ...(stopMode ? { stopMode } : {}), ...(deepPairing ? { deepPairing } : {}) }, null, 2) + "\n", 0o600);
 }
 /** The Stop mode in install's ownership record ("notify-only" | "block"), or null. Read after readOwned vetted the file. */
-/** #192: the human's deepPairing opt-in in install's ownership record ("yield"), or null. */
+/** #192: the human's deepPairing choice in install's ownership record: "yield", an explicit "off", or null (inherit). */
 function readDeepPairingMode(target) {
-  try { return JSON.parse(fs.readFileSync(ownedStorePath(target), "utf-8")).deepPairing === "yield" ? "yield" : null; } catch { return null; }
+  try { const v = JSON.parse(fs.readFileSync(ownedStorePath(target), "utf-8")).deepPairing; return v === "yield" || v === "off" ? v : null; } catch { return null; }
 }
 
 function readStopMode(target) {
@@ -696,9 +696,9 @@ async function installForPlugin(dir, mode, deepPairingFlag) {
   }
   reportRules(target, settings, rules);
   console.log(`Stop mode for this project: ${stopMode === "notify-only" ? "notify only: warn and let Claude stop if drift remains" : "ask Claude to correct each unchanged drift report once; if the same drift remains, warn and let it stop (default)"}${stopMode ? ` (recorded in ${ownedStorePath(target)})` : ""}`);
-  if (deepPairing || deepPairingFlag !== undefined) console.log(deepPairing
+  if (deepPairing || deepPairingFlag !== undefined) console.log(deepPairing === "yield"
     ? `deepPairing: skel's gate leaves edits inside a live deepPairing plan's fences to deepPairing's gate, and its Stop hook only notifies for that plan's files (recorded in ${ownedStorePath(target)}; undo with \`skel install --no-deeppairing-yield\`)`
-    : "deepPairing: skel gates every fence and drift as usual (the default)");
+    : `deepPairing: skel gates every fence and drift as usual${deepPairing === "off" ? `, here and below, whatever a parent directory chose (recorded in ${ownedStorePath(target)})` : " (the default)"}`);
   for (const k of kept) console.log(`warning: ${k}`);
   if (removedHooks) console.log(`removed ${removedHooks} hook(s) an older skel install added to ${settingsPath} (your other hooks are untouched)`);
   for (const dest of removedCopies) console.log(`removed ${dest}: an unmodified copy an older skel install wrote (the plugin serves it now)`);
@@ -1412,9 +1412,9 @@ const commands = {
     const dp = readDeepPairing(root);
     let fences = scanned, skipped = [], own = null;
     const mine = (f) => own.has(`${f.file}\0${f.id}`);
-    if (dp.present) {
+    if (dp.status !== "absent") {
       if (dp.fresh) console.error(liveNotice());
-      if (dp.unreadable) die(`can't tell which fences belong to deepPairing: ${dp.unreadable} file(s) under .deeppairing/ couldn't be read. Refusing to strip markers; repair or remove them, then finalize again.`);
+      if (dp.status === "unreadable") die(`can't tell which fences belong to deepPairing: ${dp.unreadable} file(s) under .deeppairing/ couldn't be read. Refusing to strip markers; repair or remove them, then finalize again.`);
       const record = readSnapshot(root);
       if (!Array.isArray(record?.fences)) die("can't read this skeleton's approval record to tell its fences from deepPairing's; refusing to strip markers");
       own = new Set(record.fences.map((f) => `${f.file}\0${f.id}`));
@@ -1461,7 +1461,8 @@ const commands = {
     const usage = "usage: skel install [--legacy] [--notify-only|--block] [--deeppairing-yield|--no-deeppairing-yield] [projectDir]";
     const unknown = args.find((a) => a.startsWith("-") && !["--legacy", "--notify-only", "--block", "--deeppairing-yield", "--no-deeppairing-yield"].includes(a));
     if (args.includes("--deeppairing-yield") && args.includes("--no-deeppairing-yield")) die(`--deeppairing-yield and --no-deeppairing-yield are mutually exclusive\n${usage}`);
-    const deepPairingFlag = args.includes("--deeppairing-yield") ? "yield" : args.includes("--no-deeppairing-yield") ? null : undefined;
+    // --no-deeppairing-yield records an explicit "off", which beats an ancestor's opt-in.
+    const deepPairingFlag = args.includes("--deeppairing-yield") ? "yield" : args.includes("--no-deeppairing-yield") ? "off" : undefined;
     if (deepPairingFlag !== undefined && args.includes("--legacy")) die(`--deeppairing-yield is for the plugin install, not --legacy\n${usage}`);
     if (deepPairingFlag === "yield") { const why = optInRefusal(); if (why) die(why); }
     if (unknown) die(`unknown option ${unknown}\n${usage}`);
