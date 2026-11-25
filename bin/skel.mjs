@@ -10,7 +10,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { scanRepo, searchable, toSteps, stripMarkers, stripMarkersOf } from "../lib/markers.mjs";
+import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { liveNotice, optInRefusal, ownsFence, readDeepPairing } from "../lib/deeppairing.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, refreshReceiptIndex, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
@@ -1415,38 +1415,27 @@ const commands = {
     const state = requireState(root);
     const phase = state.phase;
     if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");
-    const { fences: scanned, errors, files: fenced } = scanSkeleton(root, state);
+    const { fences, errors, files: fenced } = scanSkeleton(root, state);
     if (errors.length) die(`fix marker errors first:\n  ${errors.join("\n  ")}`);
+    // The approved-snapshot and source-baseline checks run first, unchanged:
+    // after them, every fence finalize strips is one this skeleton approved.
     await requireNoDrift(root, state, fenced, "finalize");
-    // #192: next to deepPairing, strip only this skeleton's own fences (its
-    // approval record's, outside the project), never one a live deepPairing
-    // plan may still use. Without a .deeppairing/ dir nothing changes.
+    // #192: never strip a fence a live deepPairing plan claims (same file and
+    // id), and refuse when its state can't be read. Without a .deeppairing/
+    // dir nothing changes.
     const dp = readDeepPairing(root);
-    let fences = scanned, skipped = [], own = null;
-    const mine = (f) => own.has(`${f.file}\0${f.id}`);
     if (dp.status !== "absent") {
       if (dp.fresh) console.error(liveNotice());
       if (dp.status === "unreadable") die(`can't tell which fences belong to deepPairing: ${dp.unreadable} file(s) under .deeppairing/ couldn't be read. Refusing to strip markers; repair or remove them, then finalize again.`);
-      const record = readSnapshot(root);
-      if (!Array.isArray(record?.fences)) die("can't read this skeleton's approval record to tell its fences from deepPairing's; refusing to strip markers");
-      own = new Set(record.fences.map((f) => `${f.file}\0${f.id}`));
-      const claimed = scanned.filter((f) => mine(f) && ownsFence(dp, f.file, f.id));
-      if (claimed.length) die(`${claimed.length} fence(s) this skeleton approved are also named by a live deepPairing plan, so finalize would strip markers that plan still uses. Finish or close that plan (or give its fences other ids), then finalize again.`);
-      fences = scanned.filter(mine);
-      skipped = scanned.filter((f) => !mine(f));
+      const claimed = fences.filter((f) => ownsFence(dp, f.file, f.id));
+      if (claimed.length) die(`${claimed.length} fence(s) finalize would strip are claimed by a live deepPairing plan (the same file and id), so finalize refuses rather than strip markers that plan still uses. Finish or close that plan, or move its fences elsewhere, then finalize again.`);
     }
     const pending = fences.filter((f) => f.status === "todo");
     if (pending.length) die(`still pending: ${pending.map((f) => `${f.id} (${f.file}:${f.openLine})`).join(", ")}`);
     const files = [...new Set(fences.map((f) => f.file))];
     for (const rel of files) {
       const abs = path.join(root, rel);
-      const text = fs.readFileSync(abs, "utf-8");
-      const stripped = own ? stripMarkersOf(text, new Set(fences.filter((f) => f.file === rel).map((f) => f.id))) : stripMarkers(text);
-      writeFileAtomic(abs, stripped, fs.statSync(abs).mode & 0o777);
-    }
-    if (skipped.length) {
-      const dpCount = skipped.filter((f) => ownsFence(dp, f.file, f.id)).length;
-      console.log(`left ${skipped.length} fence(s) outside this skeleton's approval record untouched${dpCount ? ` (${dpCount} named by a live deepPairing plan)` : ""}`);
+      writeFileAtomic(abs, stripMarkers(fs.readFileSync(abs, "utf-8")), fs.statSync(abs).mode & 0o777);
     }
     // The markers are gone after this, so record what they described: the
     // review page and `skel status` say "all N steps filled" from it.

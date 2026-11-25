@@ -12,7 +12,6 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DP_MAX_FILES, DP_MAX_IDS, DP_MAX_SESSIONS, DP_MAX_STEPS, DP_SCOPE_MAX_AGE_MS, deepPairingSessionIds, optInRefusal, ownsFence, readDeepPairing } from "../lib/deeppairing.mjs";
 import { isPhaseChange } from "../lib/phase.mjs";
-import { stripMarkers, stripMarkersOf } from "../lib/markers.mjs";
 import { projectKey } from "../lib/state.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -33,12 +32,12 @@ function project(t) {
   execFileSync("git", ["init", "-q", root], { stdio: "ignore" });
   const env = { ...process.env, CLAUDE_PROJECT_DIR: root, CLAUDE_CONFIG_DIR: path.join(base, "claude"), XDG_CONFIG_HOME: path.join(base, "config"), XDG_STATE_HOME: path.join(base, "state"), LOCALAPPDATA: path.join(base, "lad") };
   delete env.CLAUDE_PLUGIN_ROOT;
-  const run = (args, input) => spawnSync(process.execPath, args, { cwd: root, env, encoding: "utf8", timeout: 60_000, input });
+  const run = (args, input, { cwd = root, projectDir = root } = {}) => spawnSync(process.execPath, args, { cwd, env: { ...env, CLAUDE_PROJECT_DIR: projectDir }, encoding: "utf8", timeout: 60_000, input });
   const skel = (...args) => run([BIN, ...args]);
   const ok = (...args) => { const r = skel(...args); assert.equal(r.status, 0, r.stderr + r.stdout); return r; };
   const write = (rel, text) => { fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); fs.writeFileSync(path.join(root, rel), text); };
   const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
-  const hook = (tool_name, tool_input, session_id = SID) => run([HOOK], JSON.stringify({ cwd: root, session_id, tool_name, tool_input }));
+  const hook = (tool_name, tool_input, session_id = SID, { cwd = root, projectDir = root } = {}) => run([HOOK], JSON.stringify({ cwd, session_id, tool_name, tool_input }), { cwd, projectDir });
   const stop = () => run([STOP], JSON.stringify({ cwd: root, stop_hook_active: false, session_id: SID, hook_event_name: "Stop" }));
   // The opt-in needs a TTY (a human's terminal), which tests don't have, so
   // tests record it in install's ownership record directly, as install would.
@@ -149,14 +148,6 @@ test("ownsFence compares files as well as ids", () => {
   assert.ok(ownsFence(dp, "a.js", "2"));
 });
 
-test("stripMarkersOf strips only the named fences' marker lines", () => {
-  const text = `${SKEL_A}${DP_B}`.replaceAll(TODO, "return 1;");
-  const out = stripMarkersOf(text, new Set(["1"]));
-  assert.doesNotMatch(out, /SKEL\[1\]/);
-  assert.match(out, /\/\/ SKEL\[d1\] b\n {2}return 1;\n {2}\/\/ \/SKEL\[d1\]/);
-  assert.equal(stripMarkersOf(text, new Set(["1", "d1"])), stripMarkers(text));
-});
-
 // ---- init, approve, finalize ----
 
 test("default (no .deeppairing/): init, approve and finalize say nothing about deepPairing and strip every marker", (t) => {
@@ -209,7 +200,7 @@ test("finalize refuses when a live plan names a fence this skeleton approved, in
   deepPairing(p, { sessions: { [dpSession(p.root)]: [plan({ steps: [{ skelId: "1", status: "in_progress", files: ["a.js"] }] })] }, scopes: [] });
   const r = p.skel("finalize");
   assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /1 fence\(s\) this skeleton approved are also named by a live deepPairing plan/);
+  assert.match(r.stderr, /1 fence\(s\) finalize would strip are claimed by a live deepPairing plan/);
   assert.match(p.read("a.js"), /SKEL\[1\]/, "nothing stripped");
 });
 
@@ -253,13 +244,13 @@ test("gate: without the human's opt-in, a live deepPairing scope changes nothing
   assert.equal(decision(p.hook("Edit", insideB)), "deny");
 });
 
-test("the opt-in needs an interactive terminal; turning it off doesn't", (t) => {
+test("the opt-in needs an interactive invocation; turning it off doesn't", (t) => {
   const p = project(t);
   p.write("a.js", SKEL_A);
   p.ok("init", "t");
   const r = p.skel("install", "--deeppairing-yield");
   assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /needs an interactive terminal/);
+  assert.match(r.stderr, /needs an interactive invocation/);
   assert.match(r.stderr, /in your own terminal/);
   assert.equal(p.readOpt(), undefined, "nothing recorded");
   p.ok("install");
@@ -273,7 +264,7 @@ test("the opt-in needs an interactive terminal; turning it off doesn't", (t) => 
 
 test("optInRefusal: both stdin and stdout must be TTYs", () => {
   assert.equal(optInRefusal({ stdinTTY: true, stdoutTTY: true }), null);
-  for (const tty of [{ stdinTTY: false, stdoutTTY: true }, { stdinTTY: true, stdoutTTY: false }, { stdinTTY: false, stdoutTTY: false }]) assert.match(optInRefusal(tty), /needs an interactive terminal/);
+  for (const tty of [{ stdinTTY: false, stdoutTTY: true }, { stdinTTY: true, stdoutTTY: false }, { stdinTTY: false, stdoutTTY: false }]) assert.match(optInRefusal(tty), /needs an interactive invocation/);
 });
 
 test("gate: the opt-in itself asks the human (defence in depth)", () => {
@@ -359,28 +350,14 @@ function drifted(p, { optIn, live = true }) {
 }
 const stopOut = (p) => { const r = p.stop(); assert.equal(r.status, 0, r.stderr); return JSON.parse(r.stdout); };
 
-test("stop: without the opt-in, a live scope doesn't stop the continuation", (t) => {
-  const p = project(t);
-  drifted(p, { optIn: false });
-  assert.equal(stopOut(p).decision, "block");
-});
-
-test("stop, opted in: a foreign fence appended to an approved file is still skel's drift to correct", (t) => {
-  const p = project(t);
-  drifted(p, { optIn: true });
-  const out = stopOut(p);
-  assert.equal(out.decision, "block", "a.js is in skel's approved snapshot");
-  assert.doesNotMatch(out.systemMessage, /deepPairing skeleton plan is filling/);
-
-  const q = project(t);
-  drifted(q, { optIn: true });
-  q.write("c.js", `// drift\n${q.read("c.js")}`);
-  assert.equal(stopOut(q).decision, "block", "c.js holds no deepPairing fence");
-
-  const r = project(t);
-  drifted(r, { optIn: true, live: false });
-  deepPairing(r, { sessions: { [dpSession(r.root)]: [plan({ steps: [{ skelId: "d1", status: "in_progress", files: ["a.js"] }] })] }, scopes: [scope(r.root, { updatedAt: iso(-60_000) })] });
-  assert.equal(stopOut(r).decision, "block", "a future-dated scope");
+test("stop: a live deepPairing scope never downgrades skel's drift correction, opted in or not", (t) => {
+  for (const optIn of [false, true]) {
+    const p = project(t);
+    drifted(p, { optIn });
+    const out = stopOut(p);
+    assert.equal(out.decision, "block", `optIn ${optIn}`);
+    assert.doesNotMatch(out.systemMessage, /deepPairing/);
+  }
 });
 
 // ---- #243 cross-review: lookup failure vs absence ----
@@ -474,4 +451,76 @@ test("gate: a parent's opt-in covers a nested project, but the project's explici
   assert.equal(decision(p.hook("Edit", insideB)), "deny", "explicit off beats the parent");
   p.setOpt(p.root, undefined);
   assert.equal(decision(p.hook("Edit", insideB)), null, "a record without the field inherits");
+});
+
+// ---- #243 re-review: one target, nearest opt-out, bounded listing, finalize ----
+
+test("gate, opted in: the hook and the gate resolve a relative edit path against the event's cwd", (t) => {
+  const p = project(t);
+  gated(p, { dp: { sessions: { [dpSession(p.root)]: [plan({ steps: [{ skelId: "d1", status: "in_progress", files: ["sub/b.js"] }] })] } } });
+  p.write("sub/b.js", DP_B);
+  // What a root-relative resolution would read instead: a fence no live scope fills, so it would deny.
+  const other = DP_B.replaceAll("SKEL[d1]", "SKEL[zz]");
+  p.write("b.js", other);
+  const sub = path.join(p.root, "sub");
+  assert.equal(decision(p.hook("Edit", insideB, SID, { cwd: sub })), null, "sub/b.js, as Claude Code resolves it");
+  assert.equal(decision(p.hook("Edit", insideB)), "deny", "from the root, b.js is the other file");
+});
+
+test("gate: a nested Claude project's explicit off beats an enclosing skeleton's yield", (t) => {
+  const p = project(t);
+  gated(p, { optIn: false });
+  const inner = path.join(p.root, "inner");
+  fs.mkdirSync(inner);
+  p.write("inner/b.js", DP_B);
+  p.setOpt(p.root, "yield");
+  p.setOpt(inner, "off");
+  const edit = { ...insideB, file_path: path.join(inner, "b.js") };
+  const live = { sessions: { [dpSession(p.root)]: [plan({ steps: [{ skelId: "d1", status: "in_progress" }] })] } };
+  deepPairing(p, live);
+  assert.equal(decision(p.hook("Edit", edit, SID, { cwd: inner, projectDir: inner })), "deny", "the nearer explicit off wins");
+  p.setOpt(inner, undefined);
+  assert.equal(decision(p.hook("Edit", edit, SID, { cwd: inner, projectDir: inner })), null, "without it, the enclosing yield applies");
+});
+
+test("directory listing is bounded: one entry past a cap is unreadable", (t) => {
+  const p = project(t);
+  for (let i = 0; i <= 64; i++) p.write(`.deeppairing/skeleton-scopes/s${String(i).padStart(3, "0")}.json`, "{}");
+  const t0 = Date.now();
+  assert.equal(readDeepPairing(p.root).status, "unreadable");
+  assert.ok(Date.now() - t0 < 5000);
+});
+
+test("finalize: a live deepPairing fence in a separate untracked file is never stripped", (t) => {
+  // b.js appears after approval: the source-baseline check refuses before anything is stripped.
+  const p = project(t);
+  filled(p);
+  p.write("b.js", DP_B);
+  deepPairing(p);
+  const r = p.skel("finalize");
+  assert.notEqual(r.status, 0);
+  assert.match(p.read("a.js"), /SKEL\[1\]/, "a.js untouched");
+  assert.equal(p.read("b.js"), DP_B, "b.js untouched");
+  // A gitignored b.js is outside skel's scan and baseline: a.js is stripped, b.js left as it is.
+  const q = project(t);
+  q.write(".gitignore", "b.js\n");
+  filled(q);
+  q.write("b.js", DP_B);
+  deepPairing(q);
+  q.ok("finalize");
+  assert.doesNotMatch(q.read("a.js"), /SKEL/);
+  assert.equal(q.read("b.js"), DP_B);
+});
+
+test("finalize: ownership is by (file, id): a live scope whose plan lists another file doesn't block", (t) => {
+  const p = project(t);
+  filled(p);
+  deepPairing(p, { sessions: { [dpSession(p.root)]: [plan({ steps: [{ skelId: "1", status: "in_progress", files: ["b.js"] }] })] }, scopes: [scope(p.root, { activeSkelIds: ["1"] })] });
+  p.ok("finalize");
+  assert.doesNotMatch(p.read("a.js"), /SKEL/);
+  const q = project(t);
+  filled(q);
+  deepPairing(q, { sessions: { [dpSession(q.root)]: [plan({ steps: [{ skelId: "1", status: "in_progress", files: ["a.js"] }] })] }, scopes: [scope(q.root, { activeSkelIds: ["1"] })] });
+  assert.notEqual(q.skel("finalize").status, 0, "the same file and id: refused");
+  assert.match(q.read("a.js"), /SKEL\[1\]/);
 });
