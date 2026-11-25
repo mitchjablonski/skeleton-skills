@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { bindRealSeat } from "./strict-real-seat-preflight.mjs";
 
 const INVOCATION_REFUSED = "real-desktop-invocation-invalid";
+const EVIDENCE_UNAVAILABLE = "seat-rehearsal-evidence-unavailable";
 const ATTESTATIONS = [
   ["Did you personally start this command in a fresh dedicated terminal tab with no other jobs?", "operator-initiation-not-attested"],
   ["Are all other unsandboxed agents and automation for your user stopped on Windows and WSL?", "unsandboxed-agent-not-excluded"],
@@ -75,25 +76,56 @@ export function confirmAtTerminal(input, output, prompt, timeout = 120_000) {
   });
 }
 
-export async function rehearseRealSeat({ interactive, confirm, bind = bindRealSeat }) {
+// Keep the terminal and seat checks together so readiness and restart use the
+// same evidence captured after the operator confirmed the session conditions.
+export async function bindOperatorSeat({ interactive, confirm, bind = bindRealSeat }) {
   try {
     for (const [prompt, refusal] of ATTESTATIONS) {
-      if (!interactive()) return INVOCATION_REFUSED;
-      if (await confirm(prompt) !== true) return refusal;
+      if (interactive() !== true) return { code: INVOCATION_REFUSED };
+      if (await confirm(prompt) !== true) return { code: refusal };
     }
-    if (!interactive()) return INVOCATION_REFUSED;
+    if (interactive() !== true) return { code: INVOCATION_REFUSED };
     const binding = bind();
+    if (binding.code !== "real-seat-preflight-passed") return { code: binding.code };
+    if (interactive() !== true) return { code: INVOCATION_REFUSED };
+    let refusal;
+    const sample = () => {
+      if (interactive() !== true) return INVOCATION_REFUSED;
+      const code = binding.recheck();
+      if (interactive() !== true) return INVOCATION_REFUSED;
+      return typeof code === "string" && code ? code : EVIDENCE_UNAVAILABLE;
+    };
+    return Object.freeze({
+      code: binding.code,
+      recheck() {
+        if (refusal) return refusal;
+        try {
+          const code = sample();
+          if (code === "seat-metadata-matched") return code;
+          refusal = code;
+        } catch {
+          refusal = EVIDENCE_UNAVAILABLE;
+        }
+        return refusal;
+      },
+    });
+  } catch {
+    return { code: EVIDENCE_UNAVAILABLE };
+  }
+}
+
+export async function rehearseRealSeat(options) {
+  try {
+    const binding = await bindOperatorSeat(options);
     if (binding.code !== "real-seat-preflight-passed") return binding.code;
-    if (!interactive()) return INVOCATION_REFUSED;
     const ready = binding.recheck();
     if (ready !== "seat-metadata-matched") return ready;
-    if (await confirm("The passive readiness check passed. Do all of your attestations still hold for the restart check?") !== true) {
+    if (await options.confirm("The passive readiness check passed. Do all of your attestations still hold for the restart check?") !== true) {
       return "operator-restart-not-attested";
     }
-    if (!interactive()) return INVOCATION_REFUSED;
     const restart = binding.recheck();
     return restart === "seat-metadata-matched" ? "real-seat-rehearsal-passed" : restart;
   } catch {
-    return "seat-rehearsal-evidence-unavailable";
+    return EVIDENCE_UNAVAILABLE;
   }
 }

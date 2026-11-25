@@ -54,13 +54,12 @@ node test/live/strict-desktop-inventory.mjs --real-seat-rehearsal
 
 The rehearsal checks that standard input and output refer to the same
 control terminal and asks for the operator attestations in the launcher
-design. It retains one real passive seat binding and the pinned Chrome
-installation identity through readiness and the restart check. The
-retained check samples install metadata under the trusted-root
-assumption. A terminal change, negative response, missing evidence or
-changed seat or executable refuses. It collects operator statements and reports
-`strictState: "unverified"`. It starts no browser, changes no desktop
-settings and performs no decision.
+design. It carries the same terminal, seat and pinned Chrome installation
+identity through readiness and the restart check. It samples install
+metadata under the trusted-root assumption. A terminal change, negative
+response, missing evidence or changed seat or executable refuses. Once
+a bound check refuses, a later match cannot revive that binding. The
+rehearsal collects operator statements and reports `strictState: "unverified"`.
 
 ### Inventory fields
 
