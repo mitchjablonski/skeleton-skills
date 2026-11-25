@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { parseUnixSocketTable, x11SocketState, x11SocketStateFromBytes } from "./live/strict-private-display.mjs";
 import { bindSeatMetadata } from "./live/strict-seat-metadata.mjs";
 import { bindPinnedChromeInstallation, checkPinnedChromeInstallation } from "./live/strict-real-seat-preflight.mjs";
-import { bindControlTerminal, confirmAtTerminal, rehearseRealSeat } from "./live/strict-real-seat-rehearsal.mjs";
+import { bindControlTerminal, bindOperatorSeat, confirmAtTerminal, rehearseRealSeat } from "./live/strict-real-seat-rehearsal.mjs";
 
 test("the rehearsal requires one unchanged control terminal", () => {
   const left = { isTTY: true, fd: 0 };
@@ -76,6 +76,28 @@ test("rehearsal refusal stops at invocation or the first missing attestation", a
   assert.equal(prompts, 0);
   assert.equal(await rehearseRealSeat({ interactive: () => true, confirm, bind }), "unsandboxed-agent-not-excluded");
   assert.equal(prompts, 2);
+});
+
+test("the operator handoff refuses a terminal change during a seat check and keeps that refusal", async () => {
+  let terminal = true;
+  let samples = 0;
+  const binding = await bindOperatorSeat({
+    interactive: () => terminal,
+    confirm: async () => true,
+    bind: () => ({
+      code: "real-seat-preflight-passed",
+      recheck() {
+        if (++samples === 2) terminal = false;
+        return "seat-metadata-matched";
+      },
+    }),
+  });
+  assert.equal(binding.code, "real-seat-preflight-passed");
+  assert.equal(binding.recheck(), "seat-metadata-matched");
+  assert.equal(binding.recheck(), "real-desktop-invocation-invalid");
+  terminal = true;
+  assert.equal(binding.recheck(), "real-desktop-invocation-invalid");
+  assert.equal(samples, 2, "a new check cannot revive the refused handoff");
 });
 
 function installationFixture() {
