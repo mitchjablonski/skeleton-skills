@@ -194,7 +194,7 @@ For no HTTP listener, use `skel review` to generate a static HTML file, then reg
 | `skel hook` | The `PreToolUse` scope gate |
 | `skel stop-hook [--notify-only|--block]` | The `Stop` drift check (the plugin runs `bin/skel-stop.mjs`; without a flag it uses the project's mode from `skel install`) |
 | `skel migrate [--dry-run] [dir]` | Move a project's records from the old config dir to the state dir, outside a fill ([Upgrading](#upgrading-skels-state-moved)) |
-| `skel install [--notify-only\|--block] [--deeppairing-yield\|--no-deeppairing-yield] [dir]` | Add the deny rules and the project's Stop mode; migrate an older install's hooks and copies once the plugin is in place ([Install](#install)). `--deeppairing-yield` opts in to deferring to a live deepPairing plan ([Next to deepPairing](#next-to-deeppairing-skeleton-plans)) |
+| `skel install [--notify-only\|--block] [dir]` | Add the deny rules and the project's Stop mode. Migrate an older install's hooks and copies once the plugin is in place ([Install](#install)) |
 | `skel install --legacy [dir]` | The pre-plugin install: skills, filler, hooks and rules written into the project's `.claude/` (one more release) |
 | `skel uninstall [dir]` | Remove what install added (not the plugin) |
 
@@ -302,21 +302,10 @@ The Stop continuation protocol was tested on Claude Code CLI 2.1.318: `systemMes
 
 ### Next to deepPairing skeleton plans
 
-deepPairing's `/deeppairing:skeleton` plans use the same `SKEL[id]` fences, with their state in `.deeppairing/` (which skel's scan and source baseline already skip). skel reads that state, never writes it, and reads it bounded (1 MB in total, regular files only, no symlinked dirs, capped counts); anything it can't read, including a permission error or a list over its caps, makes ownership unknown, never absent.
+Use `/deeppairing:skeleton` for deepPairing plans and `/skel:skeleton` for skel plans. Both use `SKEL[id]` fences. Give their fences separate files and distinct IDs.
 
-Always on, because neither can skip a prompt:
-
-- `skel init`, `approve` and `finalize` print a note while a deepPairing skeleton plan is live: a scope file under `.deeppairing/skeleton-scopes/`, or an unfinished plan, updated within deepPairing's own 8 hours (a future timestamp doesn't count). `approve` also counts fences both plans claim (same id, and the plan's step lists that file or none): once approved, they are skel's.
-- `skel finalize` keeps its approved-snapshot and source-baseline checks, so it only ever strips fences this skeleton approved (a deepPairing fence added to a scanned file after approval is drift, and finalize refuses). When `.deeppairing/` exists, it also refuses if a live plan claims a fence it would strip (the same file and id, from the plan step's `files`), or if `.deeppairing/` can't be read. A deepPairing fence in a file skel doesn't scan (gitignored, say) is never touched.
-
-Off unless you opt in, because `.deeppairing/` is inside the project and an agent can write it:
-
-```
-skel install --deeppairing-yield      # opt in (recorded in install's ownership record in skel's state dir)
-skel install --no-deeppairing-yield   # explicit off, here and below, whatever a parent chose
-```
-
-`--deeppairing-yield` requires an interactive invocation (stdin and stdout both TTYs), which Claude Code's Bash tool doesn't provide; that is a check on how it was invoked, not proof that a human authorized it. The hook also asks before either command runs. The setting is looked up from the edited file's directory upward (never from the session's cwd), and the nearest record that sets it decides: an opt-in recorded for a parent directory (a monorepo root, say) also covers every project nested inside it, unless that project ran `--no-deeppairing-yield`. With the opt-in, the `PreToolUse` gate leaves an Edit to deepPairing's gate only when the file isn't part of skel's approved skeleton, the edit changes nothing but the body of a fence (and keeps it in its block), and a fresh scope of an approved deepPairing plan fills that fence for this Claude session's edits inside its `workspaceRoot` (which must be an existing, absolute, canonical directory), as deepPairing's own gate decides. These checks use the gate's own canonical path, so `..`, symlinks and case variants of skel's files never yield. The `Stop` hook is unchanged: it never defers to deepPairing, so drift from skel's approved snapshot always gets its corrective continuation. A deepPairing claim never covers a fence id in skel's approval record (that record lives outside the project), and `done` and `finalize` still check drift against it. Keep the two plans' fences in separate files with distinct ids.
+- `skel init`, `approve` and `finalize` report live deepPairing plans and ambiguous ownership. The check reads up to 1 MiB of project-local plan and scope metadata under `.deeppairing/`. Edit permissions and Stop drift correction follow skel's normal checks.
+- `skel finalize` checks the approved snapshot and source baseline before removing markers. It refuses when a live deepPairing plan claims a file and fence ID it would strip, or when it cannot establish ownership. An active reshape can restore prior fences, so finish or close the reshape before retrying finalize.
 
 ## Strict tier (in development)
 
