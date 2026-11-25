@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { DP_MAX_SESSIONS, DP_SCOPE_MAX_AGE_MS, deepPairingSessionIds, ownsFence, readDeepPairing } from "../lib/deeppairing.mjs";
+import { DP_MAX_SESSIONS, DP_SCOPE_MAX_AGE_MS, deepPairingSessionIds, optInRefusal, ownsFence, readDeepPairing } from "../lib/deeppairing.mjs";
 import { isPhaseChange } from "../lib/phase.mjs";
 import { stripMarkers, stripMarkersOf } from "../lib/markers.mjs";
 
@@ -39,7 +39,15 @@ function project(t) {
   const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
   const hook = (tool_name, tool_input, session_id = SID) => run([HOOK], JSON.stringify({ cwd: root, session_id, tool_name, tool_input }));
   const stop = () => run([STOP], JSON.stringify({ cwd: root, stop_hook_active: false, session_id: SID, hook_event_name: "Stop" }));
-  const optIn = () => ok("install", "--deeppairing-yield");
+  // The opt-in needs a TTY (a human's terminal), which tests don't have: run a
+  // plain install, then record the opt-in in its ownership record directly.
+  const optIn = () => {
+    ok("install");
+    const dir = path.join(base, "state", "skel");
+    const file = fs.readdirSync(dir).find((n) => n.endsWith("-install.json"));
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+    fs.writeFileSync(path.join(dir, file), JSON.stringify({ ...rec, deepPairing: "yield" }));
+  };
   return { base, root, skel, ok, write, read, hook, stop, optIn };
 }
 
@@ -241,7 +249,29 @@ test("gate: without the human's opt-in, a live deepPairing scope changes nothing
   assert.equal(decision(p.hook("Edit", insideB)), "deny");
 });
 
-test("gate: the opt-in itself asks the human", () => {
+test("the opt-in needs an interactive terminal; turning it off doesn't", (t) => {
+  const p = project(t);
+  p.write("a.js", SKEL_A);
+  p.ok("init", "t");
+  const r = p.skel("install", "--deeppairing-yield");
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /needs an interactive terminal/);
+  assert.match(r.stderr, /in your own terminal/);
+  const dir = path.join(p.base, "state", "skel");
+  const recorded = () => fs.existsSync(dir) && fs.readdirSync(dir).some((n) => n.endsWith("-install.json") && /"deepPairing"/.test(fs.readFileSync(path.join(dir, n), "utf8")));
+  assert.equal(recorded(), false, "nothing recorded");
+  p.optIn();
+  assert.equal(recorded(), true);
+  assert.match(p.ok("install", "--no-deeppairing-yield").stdout, /skel gates every fence/);
+  assert.equal(recorded(), false, "turned off without a TTY");
+});
+
+test("optInRefusal: both stdin and stdout must be TTYs", () => {
+  assert.equal(optInRefusal({ stdinTTY: true, stdoutTTY: true }), null);
+  for (const tty of [{ stdinTTY: false, stdoutTTY: true }, { stdinTTY: true, stdoutTTY: false }, { stdinTTY: false, stdoutTTY: false }]) assert.match(optInRefusal(tty), /needs an interactive terminal/);
+});
+
+test("gate: the opt-in itself asks the human (defence in depth)", () => {
   for (const cmd of ["skel install --deeppairing-yield", "node bin/skel.mjs install --no-deeppairing-yield ."]) assert.equal(isPhaseChange(cmd), "coexist", cmd);
 });
 

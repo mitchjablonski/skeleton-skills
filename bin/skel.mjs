@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers, stripMarkersOf } from "../lib/markers.mjs";
-import { liveNotice, ownsFence, readDeepPairing } from "../lib/deeppairing.mjs";
+import { liveNotice, optInRefusal, ownsFence, readDeepPairing } from "../lib/deeppairing.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, refreshReceiptIndex, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
 import { projectStrictStatus, strictStatusLead } from "../lib/strict-status.mjs";
@@ -1463,6 +1463,7 @@ const commands = {
     if (args.includes("--deeppairing-yield") && args.includes("--no-deeppairing-yield")) die(`--deeppairing-yield and --no-deeppairing-yield are mutually exclusive\n${usage}`);
     const deepPairingFlag = args.includes("--deeppairing-yield") ? "yield" : args.includes("--no-deeppairing-yield") ? null : undefined;
     if (deepPairingFlag !== undefined && args.includes("--legacy")) die(`--deeppairing-yield is for the plugin install, not --legacy\n${usage}`);
+    if (deepPairingFlag === "yield") { const why = optInRefusal(); if (why) die(why); }
     if (unknown) die(`unknown option ${unknown}\n${usage}`);
     if (args.includes("--notify-only") && args.includes("--block")) die(`--notify-only and --block are mutually exclusive\n${usage}`);
     const dirs = args.filter((a) => !a.startsWith("-"));
