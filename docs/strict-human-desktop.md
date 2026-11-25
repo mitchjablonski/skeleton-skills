@@ -46,6 +46,20 @@ filesystem trust, the isolation preflight, operator conditions and the
 actual window all have separate checks. Success still reports
 `strictState: "unverified"`.
 
+### Interactive rehearsal
+
+```sh
+node test/live/strict-desktop-inventory.mjs --real-seat-rehearsal
+```
+
+The rehearsal checks that standard input and output refer to the same
+control terminal and asks for the operator attestations in the launcher
+design. It retains one real passive seat binding through readiness and the
+restart check. A terminal change, negative response, missing evidence or
+seat change refuses. It collects operator statements and reports
+`strictState: "unverified"`. It starts no browser, changes no desktop
+settings and performs no decision.
+
 ### Inventory fields
 
 It prints one bounded JSON object with fixed labels:
