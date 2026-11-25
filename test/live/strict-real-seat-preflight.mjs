@@ -29,26 +29,47 @@ function sameEntry(first, second) {
 
 // Sample option (a) of the launcher design. Root and the filesystem still
 // need to be trusted by the operator. This does not execute the ELF.
-export function checkPinnedChromeInstallation(io = fs, pin = CHROME_PIN) {
+export function bindPinnedChromeInstallation(io = fs, pin = CHROME_PIN) {
   try {
     const initial = trustedPath(io);
-    if (!initial) return "browser-executable-untrusted";
+    if (!initial) return { code: "browser-executable-untrusted" };
+    const pathMatches = () => {
+      const current = trustedPath(io);
+      return current && initial.every((entry, index) => sameEntry(entry, current[index]));
+    };
     io.accessSync(CHROME_PATH, fs.constants.X_OK);
     const fd = io.openSync(CHROME_PATH, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     try {
       const executable = initial.at(-1);
-      if (!sameEntry(executable, io.fstatSync(fd, { bigint: true }))) return "browser-executable-changed";
+      if (!sameEntry(executable, io.fstatSync(fd, { bigint: true }))) return { code: "browser-executable-changed" };
       const digest = sha256Descriptor(fd, { read: io.readSync, limit: Number(executable.size) });
-      const after = trustedPath(io);
-      if (!after || !initial.every((entry, index) => sameEntry(entry, after[index]))
-          || !sameEntry(executable, io.fstatSync(fd, { bigint: true }))) return "browser-executable-changed";
-      return digest === pin ? "browser-pin-matched" : "browser-pin-mismatch";
+      if (!pathMatches() || !sameEntry(executable, io.fstatSync(fd, { bigint: true }))) {
+        return { code: "browser-executable-changed" };
+      }
+      if (digest !== pin) return { code: "browser-pin-mismatch" };
     } finally {
       io.closeSync(fd);
     }
+    let failure;
+    return Object.freeze({
+      code: "browser-pin-matched",
+      recheck() {
+        if (failure) return failure;
+        try {
+          if (!pathMatches()) failure = "browser-executable-changed";
+        } catch {
+          failure = "browser-evidence-unavailable";
+        }
+        return failure ?? "browser-pin-matched";
+      },
+    });
   } catch {
-    return "browser-evidence-unavailable";
+    return { code: "browser-evidence-unavailable" };
   }
+}
+
+export function checkPinnedChromeInstallation(io, pin) {
+  return bindPinnedChromeInstallation(io, pin).code;
 }
 
 // Read-only composition for the fixed WSLg candidate. Window attribution,
@@ -59,11 +80,24 @@ export function bindRealSeat() {
       || !uid || uid !== process.geteuid?.()) return { code: "seat-platform-unsupported" };
   const seat = bindSeatMetadata();
   if (seat.code !== "seat-metadata-observed") return { code: seat.code };
-  const browser = checkPinnedChromeInstallation();
-  if (browser !== "browser-pin-matched") return { code: browser };
-  const current = seat.recheck();
+  const browser = bindPinnedChromeInstallation();
+  if (browser.code !== "browser-pin-matched") return { code: browser.code };
+  let failure;
+  const check = () => {
+    const before = seat.recheck();
+    if (before !== "seat-metadata-matched") return before;
+    const pinned = browser.recheck();
+    return pinned === "browser-pin-matched" ? seat.recheck() : pinned;
+  };
+  const recheck = () => {
+    if (failure) return failure;
+    const current = check();
+    if (current !== "seat-metadata-matched") failure = current;
+    return current;
+  };
+  const current = recheck();
   if (current !== "seat-metadata-matched") return { code: current };
-  return Object.freeze({ code: "real-seat-preflight-passed", recheck: seat.recheck });
+  return Object.freeze({ code: "real-seat-preflight-passed", recheck });
 }
 
 export function preflightRealSeat() {

@@ -8,7 +8,7 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { parseUnixSocketTable, x11SocketState, x11SocketStateFromBytes } from "./live/strict-private-display.mjs";
 import { bindSeatMetadata } from "./live/strict-seat-metadata.mjs";
-import { checkPinnedChromeInstallation } from "./live/strict-real-seat-preflight.mjs";
+import { bindPinnedChromeInstallation, checkPinnedChromeInstallation } from "./live/strict-real-seat-preflight.mjs";
 import { bindControlTerminal, confirmAtTerminal, rehearseRealSeat } from "./live/strict-real-seat-rehearsal.mjs";
 
 test("the rehearsal requires one unchanged control terminal", () => {
@@ -47,7 +47,7 @@ test("terminal confirmation accepts one exact line, bounds input and resumes for
 });
 
 test("rehearsal checks the same seat before ready and after the restart prompt", async () => {
-  for (const restart of ["seat-metadata-matched", "seat-changed"]) {
+  for (const restart of ["seat-metadata-matched", "seat-changed", "browser-executable-changed"]) {
     const samples = ["seat-metadata-matched", restart];
     let binds = 0;
     let prompts = 0;
@@ -62,7 +62,7 @@ test("rehearsal checks the same seat before ready and after the restart prompt",
         return { code: "real-seat-preflight-passed", recheck: () => samples.shift() };
       },
     });
-    assert.equal(result, restart === "seat-changed" ? "seat-changed" : "real-seat-rehearsal-passed");
+    assert.equal(result, restart === "seat-metadata-matched" ? "real-seat-rehearsal-passed" : restart);
     assert.equal(binds, 1);
     assert.equal(prompts, 8);
   }
@@ -106,6 +106,25 @@ test("the fixed install verifies a digest from the same opened executable", () =
   assert.equal(checkPinnedChromeInstallation(io, "0".repeat(64)), "browser-pin-mismatch");
   assert.equal(state.opened, 2);
   assert.equal(state.closed, 2);
+});
+
+test("the pinned installation keeps its original path identity and latches loss", () => {
+  for (const code of ["browser-executable-changed", "browser-evidence-unavailable"]) {
+    const { io, entries, state, pin } = installationFixture();
+    const file = "/opt/google/chrome/chrome";
+    const original = entries.get(file);
+    const binding = bindPinnedChromeInstallation(io, pin);
+    assert.equal(binding.code, "browser-pin-matched");
+    assert.equal(binding.recheck(), "browser-pin-matched");
+
+    if (code === "browser-executable-changed") entries.set(file, { ...original, ino: 3n });
+    else entries.delete(file);
+    assert.equal(binding.recheck(), code);
+    entries.set(file, original);
+    assert.equal(binding.recheck(), code);
+    assert.equal(state.opened, 1);
+    assert.equal(state.closed, 1);
+  }
 });
 
 test("the fixed install refuses untrusted path components, changed identity, and I/O errors", () => {
