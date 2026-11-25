@@ -341,6 +341,24 @@ test("serve reuses the same mode and restarts when feedback mode changes", async
   } finally { await readonly.stop(); }
 });
 
+test("CLI: help aliases print the same quick path and unknown commands still fail", () => {
+  const run = (...args) => spawnSync(process.execPath, [BIN, ...args], { encoding: "utf-8" });
+  const { status, stdout, stderr } = run("help");
+  assert.equal(status, 0);
+  assert.equal(stderr, "");
+  assert.match(stdout, /Quick path[\s\S]*The human.*skel install[\s\S]*The agent.*skel init[\s\S]*skel serve[\s\S]*skel approve[\s\S]*skel next[\s\S]*skel done[\s\S]*The human.*skel finalize/);
+  for (const args of [[], ["--help"], ["-h"]]) {
+    const result = run(...args);
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, stdout);
+    assert.equal(result.stderr, "");
+  }
+  const unknown = run("not-a-command");
+  assert.equal(unknown.status, 1);
+  assert.equal(unknown.stdout, "");
+  assert.equal(unknown.stderr, `skel: unknown command "not-a-command"\n\n${stdout}`);
+});
+
 test("CLI: approve (the hook asks the human first) → next → gate → done → finalize", () => {
   const { dir, a, run, hook } = project();
   run("init", "Stroke smoothing");
@@ -354,12 +372,16 @@ test("CLI: approve (the hook asks the human first) → next → gate → done �
   const out = JSON.parse(hook({ tool_name: "Edit", tool_input: { file_path: a, old_string: "import", new_string: "x" } }));
   assert.equal(out.hookSpecificOutput.permissionDecision, "ask");
 
-  assert.throws(() => run("done"), /still has SKEL_TODO/);
+  assert.throws(() => run("done"), (error) => {
+    assert.match(error.stderr, /still has SKEL_TODO/);
+    assert.equal(error.stdout, "");
+    return true;
+  });
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
-  assert.match(run("done"), /next: 2/);
+  assert.equal(run("done"), "STEP 1 done. 1 pending; next: 2 catmull-rom between a and b.\n");
   assert.match(run("next"), /STEP 2 active/);
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
-  run("done");
+  assert.equal(run("done"), "STEP 2 done. 0 pending.\nRun the full project test suite, then ask the human to run skel finalize when satisfied.\n");
   assert.match(run("finalize"), /stripped markers from 1 file/);
   assert.ok(!fs.readFileSync(a, "utf-8").includes("SKEL"));
   assert.throws(() => run("reshape"), /finalized/);
