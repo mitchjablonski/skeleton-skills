@@ -74,8 +74,26 @@ test("readDeepPairing: absent, live, stale, future-dated, old or finished plans,
   assert.deepEqual(readDeepPairing(p.root).owned, [], "a finished plan owns nothing");
 
   resetDp(p);
-  deepPairing(p, { sessions: { [sid]: [plan({ status: "rejected" }), plan({ status: "approved" })] } });
-  assert.deepEqual(readDeepPairing(p.root).owned, [{ id: "d1", files: ["b.js"] }], "a scope can name a fence even before status is settled");
+  deepPairing(p, { sessions: { [sid]: [plan({ status: "rejected" }), plan({ status: "approved" })] }, scopes: [] });
+  assert.deepEqual(readDeepPairing(p.root).owned, [{ id: "d1", files: ["b.js"] }], "a later live duplicate still claims its files");
+});
+
+test("uncertain plan or scope records never read as absent ownership", (t) => {
+  const p = project(t);
+  for (const [record, expected] of [
+    [plan({ updatedAt: iso(-60_000) }), [true, "present"]],
+    [plan({ updatedAt: "unknown" }), [false, "unreadable"]],
+    [plan({ status: "unknown" }), [false, "unreadable"]],
+    [{ ...plan(), content: {} }, [false, "unreadable"]],
+    [plan({ steps: [{ skelId: 1 }] }), [false, "unreadable"]],
+  ]) {
+    deepPairing(p, { sessions: { [SID]: [record] }, scopes: [] });
+    const dp = readDeepPairing(p.root);
+    assert.deepEqual([dp.ambiguous, dp.status], expected);
+  }
+  resetDp(p);
+  deepPairing(p, { scopes: [scope(p.root, { activeSkelIds: [1] })] });
+  assert.equal(readDeepPairing(p.root).status, "unreadable");
 });
 
 test("readDeepPairing fails closed: malformed, symlinked, FIFO, over budget, too many or badly named", (t) => {
@@ -129,6 +147,7 @@ test("structured and repeated plan declarations preserve every claimed file", (t
       { skelId: "d2", status: "pending", files: ["src/c.js"] },
       { skelId: "d2", status: "pending" },
     ] })] },
+    scopes: [],
   });
   const dp = readDeepPairing(p.root);
   assert.equal(dp.status, "present");
@@ -293,15 +312,13 @@ test("finalize: a live deepPairing fence in a separate untracked file is never s
   assert.equal(q.read("b.js"), DP_B);
 });
 
-test("finalize: ownership is by (file, id): a live scope whose plan lists another file doesn't block", (t) => {
+test("finalize protects an ID in a live scope even when its plan lists a separate file", (t) => {
   const p = project(t);
   filled(p);
   deepPairing(p, { sessions: { [SID]: [plan({ steps: [{ skelId: "1", status: "in_progress", files: ["b.js"] }] })] }, scopes: [scope(p.root, { activeSkelIds: ["1"] })] });
+  assert.notEqual(p.skel("finalize").status, 0);
+  assert.match(p.read("a.js"), /SKEL\[1\]/);
+  deepPairing(p, { scopes: [scope(p.root, { activeSkelIds: ["1"], updatedAt: iso(OLD) })], sessions: { [SID]: [plan({ steps: [{ skelId: "1", status: "in_progress", files: ["b.js"] }] })] } });
   p.ok("finalize");
   assert.doesNotMatch(p.read("a.js"), /SKEL/);
-  const q = project(t);
-  filled(q);
-  deepPairing(q, { sessions: { [SID]: [plan({ steps: [{ skelId: "1", status: "in_progress", files: ["a.js"] }] })] }, scopes: [scope(q.root, { activeSkelIds: ["1"] })] });
-  assert.notEqual(q.skel("finalize").status, 0, "the same file and id: refused");
-  assert.match(q.read("a.js"), /SKEL\[1\]/);
 });

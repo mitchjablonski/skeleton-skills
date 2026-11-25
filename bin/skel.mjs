@@ -1336,7 +1336,7 @@ const commands = {
     warnDeepPairing(dp);
     if (dp.status === "present" && !dp.ambiguous) {
       const shared = record.fences.filter((f) => ownsFence(dp, f.file, f.id)).length;
-      if (shared) console.error(`warning: a live deepPairing plan also claims ${shared} fence(s) just approved. Move the overlapping fences to separate files before finalizing.`);
+      if (shared) console.error(`warning: a live deepPairing plan also claims ${shared} fence(s) just approved. Use separate files and distinct IDs before finalizing.`);
     }
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
     try { if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`); }
