@@ -346,7 +346,7 @@ test("CLI: help aliases print the same quick path and unknown commands still fai
   const { status, stdout, stderr } = run("help");
   assert.equal(status, 0);
   assert.equal(stderr, "");
-  assert.match(stdout, /Quick path[\s\S]*The human.*skel install[\s\S]*The agent.*skel init[\s\S]*skel serve[\s\S]*skel approve[\s\S]*skel next[\s\S]*skel done[\s\S]*The human.*skel finalize/);
+  assert.match(stdout, /Quick path[\s\S]*The human.*skel install[\s\S]*The agent.*skel init[\s\S]*skel serve[\s\S]*skel approve[\s\S]*skel next[\s\S]*skel done[\s\S]*When the human says yes, the agent runs skel finalize/);
   for (const args of [[], ["--help"], ["-h"]]) {
     const result = run(...args);
     assert.equal(result.status, 0);
@@ -381,10 +381,31 @@ test("CLI: approve (the hook asks the human first) → next → gate → done �
   assert.equal(run("done"), "STEP 1 done. 1 pending; next: 2 catmull-rom between a and b.\n");
   assert.match(run("next"), /STEP 2 active/);
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
-  assert.equal(run("done"), "STEP 2 done. 0 pending.\nRun the full project test suite, then ask the human to run skel finalize when satisfied.\n");
+  assert.equal(run("done"), "STEP 2 done. 0 pending.\nRun the full project test suite, then ask the human whether to finalize. If they say yes, run skel finalize.\n");
   assert.match(run("finalize"), /stripped markers from 1 file/);
   assert.ok(!fs.readFileSync(a, "utf-8").includes("SKEL"));
   assert.throws(() => run("reshape"), /finalized/);
+});
+
+test("#247: init notes the state dir can be gitignored, unless it already is", () => {
+  const { dir, run } = project();
+  execFileSync("git", ["init", "-q", dir]);
+  assert.match(run("init", "T"), /note: \.skeleton\/ holds local working state; you can add it to \.gitignore \(skel doesn't edit \.gitignore here\)/);
+  assert.equal(fs.existsSync(path.join(dir, ".gitignore")), false, "init never writes .gitignore");
+  const ignore = path.join(dir, ".gitignore");
+  fs.writeFileSync(ignore, "node_modules\n/.skeleton/*\n");
+  assert.doesNotMatch(run("init", "--force", "T2"), /holds local working state/);
+  fs.appendFileSync(ignore, "!/.skeleton/state.json\n");
+  assert.match(run("init", "--force", "T3"), /holds local working state/);
+});
+
+test("#247: approve explains when it falls back to the last rendered version", () => {
+  const { run } = project();
+  run("init", "Stroke smoothing");
+  run("review");
+  const approved = run("approve");
+  assert.match(approved, /note: no reviewed version was supplied or found in a Send record for this review round\. Approving the version the page last rendered\./);
+  assert.match(approved, /skeleton approved: 2 steps, version [0-9a-f]{12} \(the version the review page last showed\)/);
 });
 
 test("security H4: serve refuses cross-site posts, bad hosts, and missing tokens", async () => {
@@ -721,11 +742,15 @@ test("UX #10/#11: init won't replace a skeleton silently; start won't abandon on
   assert.throws(() => run("start", "9"), /no step 9; steps are 1, 2/);
   const out = run("start", "2");
   assert.match(out, /out of build order; 1 still pending/);
+  assert.doesNotMatch(out, /rework/);
   assert.throws(() => run("start", "1"), /step 2 is still active with SKEL_TODO/);
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(/throw new Error\("SKEL_TODO"\);(\n  \/\/ \/SKEL\[2\])/, "return [a, b];$1"));
   run("done");
   assert.throws(() => run("start", "2"), /already filled; `skel start 2 --force` reopens it/);
-  assert.match(run("start", "2", "--force"), /STEP 2 active/);
+  const reopened = run("start", "2", "--force");
+  assert.match(reopened, /STEP 2 active[^\n]*\nReopened for rework because this step is filled\.[^\n]*skel done again/);
+  assert.doesNotMatch(reopened, /replace each SKEL_TODO stub/);
+  assert.match(run("start", "2", "--force"), /Already active for rework/);
   assert.throws(() => run("approve"), /already approved and being filled/);
 });
 

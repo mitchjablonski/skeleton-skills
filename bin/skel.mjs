@@ -50,7 +50,8 @@ Quick path
      The agent records it with skel approve --reviewed <version>.
   4. The agent runs skel next, fills inside the active fences, tests, and
      runs skel done. Repeat for each step, then run the full project test suite.
-  5. The human runs skel finalize when satisfied.
+  5. When the human says yes, the agent runs skel finalize.
+     The human answers any permission prompt.
 
   init "<title>" [--gate ask|deny] [--force]
                                      start a skeleton in this project (--force replaces an existing one)
@@ -93,6 +94,23 @@ function deepPairingWarning(root, record) {
   if (record) {
     const both = (record.fences ?? []).filter((f) => ownsFence(dp, f.file, f.id)).length;
     if (both) console.error(`warning: ${both} fence(s) just approved are also named by a live deepPairing plan. skel now treats them as its own; give one plan's fences other ids to keep them apart.`);
+  }
+}
+
+/** Ask Git whether the new state file is ignored. This advisory check is bounded. */
+function gitignoresStateDir(root) {
+  try {
+    const ignoreFile = fs.lstatSync(path.join(root, ".gitignore"), { throwIfNoEntry: false });
+    if (ignoreFile && !ignoreFile.isFile()) return false;
+    execFileSync("git", ["check-ignore", "-q", "--", `${STATE_DIR}/state.json`], {
+      cwd: root,
+      stdio: "ignore",
+      timeout: 1000,
+      killSignal: "SIGKILL",
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -276,10 +294,16 @@ function warnLegacyQueue(root) {
 }
 
 function setActive(root, state, step, force = false) {
-  if (step.status !== "todo" && !force) die(`step ${step.id} is already filled; \`skel start ${step.id} --force\` reopens it for rework`);
+  const filled = step.status !== "todo";
+  if (filled && !force) die(`step ${step.id} is already filled; \`skel start ${step.id} --force\` reopens it for rework`);
   writeState(root, { ...state, phase: "fill", activeStep: step.id });
   console.log(`STEP ${step.id} active: ${step.title}`);
-  console.log(`Edit only inside these fences; replace each SKEL_TODO stub. Leave the marker lines in place.`);
+  if (filled) {
+    const action = state.activeStep === step.id ? "Already active" : "Reopened";
+    console.log(`${action} for rework because this step is filled. Edit only inside its fences and leave the marker lines in place. Run skel done again when finished.`);
+  } else {
+    console.log("Edit only inside these fences; replace each SKEL_TODO stub. Leave the marker lines in place.");
+  }
   printFences(step);
 }
 
@@ -856,6 +880,7 @@ const commands = {
     }
     console.log(`skel: "${title}" started in ${root} (phase: scaffold, gate: ${gate})`);
     deepPairingWarning(root);
+    if (!gitignoresStateDir(root)) console.log(`note: ${STATE_DIR}/ holds local working state; you can add it to .gitignore (skel doesn't edit .gitignore here)`);
   },
 
   track(args) {
@@ -948,7 +973,7 @@ const commands = {
     // Rediscovering the source set takes from a quarter of a second to several
     // seconds on a Windows drive under WSL, too slow for a command agents run
     // constantly: say plainly what this didn't check (#67 B6).
-    if (coverage) console.log(`  (this checked only the skeleton's own files: new, deleted or changed files elsewhere are checked against source baseline ${coverage.id} at skel done and skel finalize)`);
+    if (coverage) console.log(`  (this checked the skeleton's own files. skel done and skel finalize check source baseline ${coverage.id} for new, deleted or changed reviewable source paths)`);
     // Diagram nodes named step_<id> that match no step are silently uncolored
     // on the page; say so here.
     for (const d of readDiagrams(root)) {
@@ -1319,6 +1344,7 @@ const commands = {
       const { clearStopNotice } = await import("../lib/stop-notice.mjs");
       await clearStopNotice(root);
     } catch {}
+    if (review?.source === "rendered") console.log("note: no reviewed version was supplied or found in a Send record for this review round. Approving the version the page last rendered.");
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
     deepPairingWarning(root, record);
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
@@ -1394,7 +1420,7 @@ const commands = {
     writeState(root, { ...state, activeStep: null });
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
     console.log(`STEP ${state.activeStep} done. ${pending.length} pending${pending[0] ? `; next: ${pending[0].id} ${pending[0].title}` : ""}.`);
-    if (!pending.length) console.log("Run the full project test suite, then ask the human to run skel finalize when satisfied.");
+    if (!pending.length) console.log("Run the full project test suite, then ask the human whether to finalize. If they say yes, run skel finalize.");
   },
 
   reshape(args) {

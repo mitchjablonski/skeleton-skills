@@ -176,18 +176,20 @@ For no HTTP listener, use `skel review` to generate a static HTML file, then reg
 
 ## CLI
 
+`skel help` (or `--help`, `-h`) prints the commands to stdout and exits 0, led by a short **quick path** that says who does each step.
+
 | Command | |
 |---|---|
-| `skel init "<title>" [--gate ask\|deny] [--force]` | Start a skeleton (`.skeleton/state.json`); won't replace one in progress without `--force` |
+| `skel init "<title>" [--gate ask\|deny] [--force]` | Start a skeleton (`.skeleton/state.json`). Use `--force` to replace one in progress. When Git cannot confirm that the state file is ignored, the command suggests adding `.skeleton/` to `.gitignore` |
 | `skel track <file…>` | Include unfenced skeleton files (e.g. new types) in the review; must be inside the project |
-| `skel status [--json]` | Phase, active step, each step's status, and diagram nodes that match no step |
+| `skel status [--json]` | Phase, active step, each step's status, and diagram nodes that match no step. During a fill it checks the skeleton's own files for drift. `done` and `finalize` also check the source baseline for new, deleted or changed reviewable source paths |
 | `skel pr` | Print a Markdown pull-request body from the plan: the steps with their status and locations, the architecture diagrams, and the approved version and drift result. Read-only; paste it into your PR |
 | `skel serve [--port N] [--send] [--stop]` | Default: live read-only review; copy feedback into chat. `--send` enables direct feedback delivery. Prints the page's URL with its token (`#t=…`). Reuses a server in the same mode, and prints the same URL; uses a stable port per project |
 | `skel review` | Static `.skeleton/review.html` with no HTTP listener; copy feedback into chat |
 | `skel feedback [--wait S]` | Send-mode only: print and archive the human's feedback (waits up to 110s; prints `NO_FEEDBACK` otherwise, `READ_ONLY` at once for a read-only server, or `NO_SERVER` when none has answered for 10s) |
-| `skel approve [--reviewed V]` | Enter the fill phase and record the approved skeleton. When the hook is loaded, it requests permission; human confirmation depends on Claude Code's mode and approval integrations. Refuses, with a diff, if the skeleton isn't the version you last reviewed: `--reviewed` names it from the feedback you pasted (else your latest send in Send mode, else the version the review page last rendered, which catches only edits made after it). Also baselines the reviewable source set and prints its counts, policy and exclusions; refuses, naming the file, if discovery fails or a member can't be baselined |
+| `skel approve [--reviewed V]` | Enter the fill phase and record the approved skeleton. The loaded hook requests permission. Who answers depends on Claude Code's permission mode and integrations. The command compares the current skeleton with the supplied version, then falls back to a versioned Send record for the current round or the last rendered page if needed. It reports when it uses the rendered version and refuses with a diff if the versions differ. It also records the reviewable source baseline and refuses if discovery or recording fails |
 | `skel reshape` | Back to skeleton review (also asks you) |
-| `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one. `done` refuses on drift from the approved skeleton or a change to the source baseline |
+| `skel next` / `skel start <id> [--force]` / `skel done` | Run steps. `--force` abandons an unfinished step or reopens a filled one. `done` refuses on drift from the approved skeleton or a change to the source baseline. After the last step, the agent runs the full project test suite and asks the human whether to finalize. If they agree, the agent runs `skel finalize` |
 | `skel finalize` | All filled and no drift: strip the markers |
 | `skel hook` | The `PreToolUse` scope gate |
 | `skel stop-hook [--notify-only|--block]` | The `Stop` drift check (the plugin runs `bin/skel-stop.mjs`; without a flag it uses the project's mode from `skel install`) |
