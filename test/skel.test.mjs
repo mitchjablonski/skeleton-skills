@@ -721,11 +721,15 @@ test("UX #10/#11: init won't replace a skeleton silently; start won't abandon on
   assert.throws(() => run("start", "9"), /no step 9; steps are 1, 2/);
   const out = run("start", "2");
   assert.match(out, /out of build order; 1 still pending/);
+  assert.doesNotMatch(out, /rework/);
   assert.throws(() => run("start", "1"), /step 2 is still active with SKEL_TODO/);
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(/throw new Error\("SKEL_TODO"\);(\n  \/\/ \/SKEL\[2\])/, "return [a, b];$1"));
   run("done");
   assert.throws(() => run("start", "2"), /already filled; `skel start 2 --force` reopens it/);
-  assert.match(run("start", "2", "--force"), /STEP 2 active/);
+  const reopened = run("start", "2", "--force");
+  assert.match(reopened, /STEP 2 active[^\n]*\nReopened for rework because this step is filled\.[^\n]*skel done again/);
+  assert.doesNotMatch(reopened, /replace each SKEL_TODO stub/);
+  assert.match(run("start", "2", "--force"), /Already active for rework/);
   assert.throws(() => run("approve"), /already approved and being filled/);
 });
 
