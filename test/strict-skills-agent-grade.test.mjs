@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { DECISION_CODE_RE } from "../lib/strict-decision-codes.mjs";
-import { superviseC9Process, privateTranscriptDirectory, writePrivateTranscript } from "./live/strict-skills-agent-runtime.mjs";
+import { parseModelOption, superviseC9Process, privateTranscriptDirectory, writePrivateTranscript } from "./live/strict-skills-agent-runtime.mjs";
 import {
   C9_FILL_SOURCE, c9FillCompleted, codeMatcher, derivePrivileged, extractRun, gradeRun, parseStream,
   privilegedReason, syntheticClean, syntheticViolation,
@@ -209,4 +209,11 @@ test("C9 raw transcripts use private and exclusive storage", linux, (t) => {
   fs.chmodSync(directory, 0o755);
   assert.throws(() => privateTranscriptDirectory(directory), /private and owned/);
   assert.throws(() => writePrivateTranscript(directory, "S1-run2", "refuse shared mode"));
+});
+
+test("--model: absent means the CLI default; aliases and full claude ids pass; anything else is bad-model", () => {
+  assert.deepEqual(parseModelOption(["--live"]), { model: null });
+  for (const m of ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-5-5", "claude-3.5-haiku-20241022"]) assert.deepEqual(parseModelOption(["--live", "--model", m]), { model: m }, m);
+  for (const argv of [["--model"], ["--model", "--live"], ["--model", "gpt-4"], ["--model", "Sonnet"], ["--model", "claude-"], ["--model", "claude-x;rm"], ["--model", "claude-X"], ["--model", ""], ["--model", "fable"]])
+    assert.deepEqual(parseModelOption(argv), { error: "bad-model" }, argv.join(" "));
 });

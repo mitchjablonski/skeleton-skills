@@ -10,7 +10,7 @@
 // on the caller's own Claude Code login, so it never runs from `npm test` and
 // refuses without --live. See docs/strict-skills-agent.md.
 //
-//   node test/live/strict-skills-agent-probe.mjs --live [--n 2] [--requested-standin] [--positive-control]
+//   node test/live/strict-skills-agent-probe.mjs --live [--n 2] [--requested-standin] [--positive-control] [--model sonnet|opus|haiku|claude-…]
 //        [--transcripts <dir>] [--claude <path>] [--timeout-s 300] [--max-turns 20]
 //
 // Scenarios (each N times, default 2, at most 3; a fresh scratch project per run):
@@ -44,7 +44,7 @@ import { fileURLToPath } from "node:url";
 import { DECISION_CODE_RE } from "../../lib/strict-decision-codes.mjs";
 import { makeRequestedStandin } from "../fixtures/strict-standin.mjs";
 import { C9_FILL_SOURCE, c9FillCompleted, derivePrivileged, gradeRun, parseStream, syntheticClean, syntheticViolation } from "./strict-skills-agent-grade.mjs";
-import { privateTranscriptDirectory, superviseC9Process, writePrivateTranscript } from "./strict-skills-agent-runtime.mjs";
+import { parseModelOption, privateTranscriptDirectory, superviseC9Process, writePrivateTranscript } from "./strict-skills-agent-runtime.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const argv = process.argv.slice(2);
@@ -62,6 +62,8 @@ const refuse = (reason, detail) => out({ probe: "strict-skills-agent", result: "
 if (!has("live")) refuse("live-flag-missing", "This probe runs real agents and spends API usage. Pass --live to run it.");
 if (process.platform !== "linux" || !fs.existsSync("/usr/bin/python3")) refuse("linux-scope-unavailable");
 if (!Number.isInteger(N) || N < 1 || N > 3) refuse("bad-n", "--n must be 1, 2 or 3");
+const MODEL = parseModelOption(argv);
+if (MODEL.error) refuse("bad-model", "--model takes sonnet, opus, haiku or a full claude-… model id");
 if (!Number.isSafeInteger(TIMEOUT_MS) || TIMEOUT_MS < 1 || TIMEOUT_MS > 2 ** 31 - 1 ||
     !Number.isSafeInteger(Number(MAX_TURNS)) || Number(MAX_TURNS) < 1) refuse("bad-limits");
 let transcriptsDir = null;
@@ -179,6 +181,7 @@ function claudeArgs(project, prompt, extra, { editOnly = false } = {}) {
     "--disallowed-tools", "Bash(skel serve*)", `Bash(node ${skelAbs} serve*)`, `Bash(node "${skelAbs}" serve*)`, "WebFetch", "WebSearch",
     "--permission-prompts", "none",
     "--max-turns", MAX_TURNS,
+    ...(MODEL.model ? ["--model", MODEL.model] : []),
     ...extra,
   ];
 }
@@ -310,6 +313,7 @@ out({
   evidence: "model-behaviour, live, sampled runs; not enforcement",
   result: allPass ? "pass" : "fail",
   claudeVersion: version.stdout.trim().slice(0, 60),
+  requestedModel: MODEL.model,
   model,
   pluginLoaded,
   n: N,
