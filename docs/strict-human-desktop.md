@@ -58,8 +58,9 @@ design. It carries the same terminal, seat and pinned Chrome installation
 identity through readiness and the restart check. It samples install
 metadata under the trusted-root assumption. A terminal change, negative
 response, missing evidence or changed seat or executable refuses. Once
-a bound check refuses, a later match cannot revive that binding. The
-rehearsal collects operator statements and reports `strictState: "unverified"`.
+a bound check refuses, a later match cannot revive that binding. The rehearsal
+is read-only. It samples passive evidence, collects operator statements and
+reports `strictState: "unverified"`.
 
 ### Inventory fields
 
