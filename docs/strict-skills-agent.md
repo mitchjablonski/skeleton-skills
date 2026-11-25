@@ -16,13 +16,19 @@ mode** sections of `skills/skeleton-fill/SKILL.md` and
 ## Running it
 
 ```
-node test/live/strict-skills-agent-probe.mjs --live --requested-standin [--n 2] [--transcripts <dir>] [--positive-control]
+node test/live/strict-skills-agent-probe.mjs --live --requested-standin [--n 2] [--transcripts <dir>] [--positive-control] [--model <name>]
 ```
 
 - It spends API usage on the caller's own Claude Code login: 4 agent
   invocations per N (S1 and S2 are one each, S3 is two). At the default N=2
   that is 6 runs and 8 invocations. `--positive-control` adds one S4
   invocation per N. N is capped at 3.
+- `--model <name>` runs every agent with `claude -p --model <name>`, so C9
+  can be compared across models. It takes `sonnet`, `opus`, `haiku` or a
+  full id matching `^claude-[a-z0-9.-]+$`; anything else (or no value) exits
+  2 with `bad-model`. Without it the CLI's default model runs. The output
+  records `requestedModel` (the flag, or null) and `model`, the id the
+  stream-json `system` init event reported.
 - It is never part of `npm test`. Without `--live` it exits 2
   (`live-flag-missing`).
 - The live fixture uses Linux with system Python and pidfd process
