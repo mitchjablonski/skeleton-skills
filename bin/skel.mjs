@@ -49,7 +49,7 @@ Quick path
      The agent records it with skel approve --reviewed <version>.
   4. The agent runs skel next, fills inside the active fences, tests, and
      runs skel done. Repeat for each step, then run the full project test suite.
-  5. The human runs skel finalize when satisfied.
+  5. When the human says yes, the agent runs skel finalize (the human allows the prompt).
 
   init "<title>" [--gate ask|deny] [--force]
                                      start a skeleton in this project (--force replaces an existing one)
@@ -1378,7 +1378,7 @@ const commands = {
     writeState(root, { ...state, activeStep: null });
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
     console.log(`STEP ${state.activeStep} done. ${pending.length} pending${pending[0] ? `; next: ${pending[0].id} ${pending[0].title}` : ""}.`);
-    if (!pending.length) console.log("Run the full project test suite, then ask the human to run skel finalize when satisfied.");
+    if (!pending.length) console.log("Run the full project test suite, then ask the human whether to finalize; on a yes, run skel finalize.");
   },
 
   reshape(args) {

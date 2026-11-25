@@ -381,7 +381,7 @@ test("CLI: approve (the hook asks the human first) → next → gate → done �
   assert.equal(run("done"), "STEP 1 done. 1 pending; next: 2 catmull-rom between a and b.\n");
   assert.match(run("next"), /STEP 2 active/);
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
-  assert.equal(run("done"), "STEP 2 done. 0 pending.\nRun the full project test suite, then ask the human to run skel finalize when satisfied.\n");
+  assert.equal(run("done"), "STEP 2 done. 0 pending.\nRun the full project test suite, then ask the human whether to finalize; on a yes, run skel finalize.\n");
   assert.match(run("finalize"), /stripped markers from 1 file/);
   assert.ok(!fs.readFileSync(a, "utf-8").includes("SKEL"));
   assert.throws(() => run("reshape"), /finalized/);
