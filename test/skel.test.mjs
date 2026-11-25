@@ -408,6 +408,54 @@ test("#247: approve explains when it falls back to the last rendered version", (
   assert.match(approved, /skeleton approved: 2 steps, version [0-9a-f]{12} \(the version the review page last showed\)/);
 });
 
+test("#247: next and done note an earlier step filled without being started; the normal path has no note", () => {
+  const { a, run } = project();
+  run("init", "Stroke smoothing");
+  run("approve");
+  // Step 1 is filled straight away, never started: progress comes from the code, so next moves on to step 2.
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
+  const next = run("next");
+  assert.match(next, /^note: step 1 was filled without being started, so `skel done` never checked it; `skel start 1 --force` reopens it for `skel done` to check\nSTEP 2 active/);
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
+  const done = run("done");
+  assert.match(done, /^STEP 2 done\. 0 pending\.\nnote: step 1 was filled without being started[^\n]*\nRun the full project test suite/);
+  // Reopening it records it as started: the note goes away.
+  run("start", "1", "--force");
+  run("done");
+  assert.doesNotMatch(run("next"), /note:/);
+
+  const normal = project();
+  normal.run("init", "Stroke smoothing");
+  normal.run("approve");
+  const first = normal.run("next");
+  assert.doesNotMatch(first, /note:/);
+  fs.writeFileSync(normal.a, fs.readFileSync(normal.a, "utf-8").replace(STUB, "return raw;"));
+  assert.equal(normal.run("done"), "STEP 1 done. 1 pending; next: 2 catmull-rom between a and b.\n");
+  assert.doesNotMatch(normal.run("next"), /note:/);
+});
+
+test("#247: docs/quickstart.md is the default-mode path the help points to, with no strict text", () => {
+  const doc = fs.readFileSync(path.join(path.dirname(BIN), "..", "docs", "quickstart.md"), "utf-8");
+  assert.doesNotMatch(doc, /strict/i);
+  for (const cmd of ["skel install", "skel init", "skel serve", "skel approve --reviewed", "skel next", "skel done", "skel finalize", "skel reshape", "skel start <id> --force"])
+    assert.ok(doc.includes(cmd), cmd);
+  assert.ok(doc.split("\n").length <= 40, "stays short");
+  const help = spawnSync(process.execPath, [BIN, "help"], { encoding: "utf-8" }).stdout;
+  assert.match(help, /See docs\/quickstart\.md/);
+});
+
+test("#247: a fill approved without a started-steps record gets no skipped-step note", () => {
+  const { dir, a, run } = project();
+  run("init", "Stroke smoothing");
+  run("approve");
+  const statePath = path.join(dir, ".skeleton", "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  delete state.startedSteps;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
+  assert.doesNotMatch(run("next"), /note:/);
+});
+
 test("security H4: serve refuses cross-site posts, bad hosts, and missing tokens", async () => {
   const { dir, run } = project();
   run("init", "T");
