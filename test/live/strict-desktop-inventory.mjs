@@ -3,6 +3,7 @@
 //
 //   node test/live/strict-desktop-inventory.mjs [--chrome-sha256 <hex>]
 //   node test/live/strict-desktop-inventory.mjs --real-seat-preflight
+//   node test/live/strict-desktop-inventory.mjs --real-seat-rehearsal
 //
 // It identifies a possible seat only. It observes no window, no input path and
 // no running browser. Safety (an earlier probe crashed WSLg's compositor by
@@ -22,6 +23,7 @@ import os from "node:os";
 import { parseArgs, finish, Fail, labelOf, createFixture } from "./strict-browser-fixture.mjs";
 import { bindSeatMetadata } from "./strict-seat-metadata.mjs";
 import { preflightRealSeat } from "./strict-real-seat-preflight.mjs";
+import { bindControlTerminal, confirmAtTerminal, rehearseRealSeat } from "./strict-real-seat-rehearsal.mjs";
 
 /** stat() only, never open: a fixed label for what is at `p`. */
 function statLabel(p) {
@@ -53,6 +55,14 @@ function sessionBus() {
 if (process.argv.length === 3 && process.argv[2] === "--real-seat-preflight") {
   const { code } = preflightRealSeat();
   const ok = code === "real-seat-preflight-passed";
+  finish({ ok, strictState: "unverified", code }, ok ? 0 : 2);
+}
+if (process.argv.length === 3 && process.argv[2] === "--real-seat-rehearsal") {
+  const code = await rehearseRealSeat({
+    interactive: bindControlTerminal(process.stdin, process.stdout),
+    confirm: (prompt) => confirmAtTerminal(process.stdin, process.stdout, prompt),
+  });
+  const ok = code === "real-seat-rehearsal-passed";
   finish({ ok, strictState: "unverified", code }, ok ? 0 : 2);
 }
 

@@ -53,7 +53,7 @@ export function checkPinnedChromeInstallation(io = fs, pin = CHROME_PIN) {
 
 // Read-only composition for the fixed WSLg candidate. Window attribution,
 // the operator boundary and the sandbox policy have their own proofs.
-export function preflightRealSeat() {
+export function bindRealSeat() {
   const uid = process.getuid?.();
   if (process.platform !== "linux" || process.arch !== "x64" || !/microsoft-standard-WSL2$/i.test(os.release())
       || !uid || uid !== process.geteuid?.()) return { code: "seat-platform-unsupported" };
@@ -63,5 +63,9 @@ export function preflightRealSeat() {
   if (browser !== "browser-pin-matched") return { code: browser };
   const current = seat.recheck();
   if (current !== "seat-metadata-matched") return { code: current };
-  return { code: "real-seat-preflight-passed" };
+  return Object.freeze({ code: "real-seat-preflight-passed", recheck: seat.recheck });
+}
+
+export function preflightRealSeat() {
+  return { code: bindRealSeat().code };
 }

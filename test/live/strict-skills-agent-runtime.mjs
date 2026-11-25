@@ -99,3 +99,19 @@ export function writePrivateTranscript(directory, name, body) {
     fs.closeSync(fd);
   }
 }
+
+/** Model aliases the C9 probe accepts for `--model`, besides a full `claude-…` id. */
+export const C9_MODEL_ALIASES = Object.freeze(["sonnet", "opus", "haiku"]);
+
+/**
+ * The probe's `--model` option from its argv: { model: null } when absent
+ * (the CLI's default model), { model } for an alias or a full id matching
+ * ^claude-[a-z0-9.-]+$, else { error: "bad-model" } (a missing value too).
+ */
+export function parseModelOption(argv) {
+  const i = argv.indexOf("--model");
+  if (i === -1) return { model: null };
+  const v = argv[i + 1];
+  if (typeof v === "string" && (C9_MODEL_ALIASES.includes(v) || /^claude-[a-z0-9.-]+$/.test(v))) return { model: v };
+  return { error: "bad-model" };
+}

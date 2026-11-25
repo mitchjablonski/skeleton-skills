@@ -4,10 +4,79 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { parseUnixSocketTable, x11SocketState, x11SocketStateFromBytes } from "./live/strict-private-display.mjs";
 import { bindSeatMetadata } from "./live/strict-seat-metadata.mjs";
 import { checkPinnedChromeInstallation } from "./live/strict-real-seat-preflight.mjs";
+import { bindControlTerminal, confirmAtTerminal, rehearseRealSeat } from "./live/strict-real-seat-rehearsal.mjs";
+
+test("the rehearsal requires one unchanged control terminal", () => {
+  const left = { isTTY: true, fd: 0 };
+  const right = { isTTY: true, fd: 1 };
+  const terminals = [5n, 5n];
+  const stat = (fd) => ({ dev: 1n, ino: terminals[fd], rdev: 3n, isCharacterDevice: () => true });
+  const available = bindControlTerminal(left, right, stat);
+  assert.equal(available(), true);
+  terminals[1] = 6n;
+  assert.equal(available(), false);
+  terminals[0] = 6n;
+  assert.equal(available(), false);
+  right.isTTY = false;
+  assert.equal(bindControlTerminal(left, right, stat)(), false);
+});
+
+test("terminal confirmation accepts one exact line, bounds input and resumes for a later prompt", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const answer = async (parts) => {
+    const pending = confirmAtTerminal(input, output, "Test question", 1000);
+    for (const part of parts) input.write(part);
+    return pending;
+  };
+  assert.equal(await answer(["y", "es\r\n"]), true);
+  assert.equal(await answer(["yes\n"]), true);
+  assert.equal(await answer(["yes\nno\n"]), false);
+  assert.equal(await answer(["private fixture value\n"]), false);
+  assert.equal(await answer([Buffer.from([0xf9, 101, 115, 10])]), false);
+  assert.doesNotMatch(output.read().toString(), /private fixture value/);
+  assert.equal(await confirmAtTerminal(input, output, "Timeout question", 5), false);
+  const eof = confirmAtTerminal(input, output, "End question", 1000);
+  input.end();
+  assert.equal(await eof, false);
+});
+
+test("rehearsal checks the same seat before ready and after the restart prompt", async () => {
+  for (const restart of ["seat-metadata-matched", "seat-changed"]) {
+    const samples = ["seat-metadata-matched", restart];
+    let binds = 0;
+    let prompts = 0;
+    const result = await rehearseRealSeat({
+      interactive: () => true,
+      confirm: async () => {
+        if (++prompts === 8) assert.deepEqual(samples, [restart]);
+        return true;
+      },
+      bind: () => {
+        binds++;
+        return { code: "real-seat-preflight-passed", recheck: () => samples.shift() };
+      },
+    });
+    assert.equal(result, restart === "seat-changed" ? "seat-changed" : "real-seat-rehearsal-passed");
+    assert.equal(binds, 1);
+    assert.equal(prompts, 8);
+  }
+});
+
+test("rehearsal refusal stops at invocation or the first missing attestation", async () => {
+  let prompts = 0;
+  const confirm = async () => ++prompts === 1;
+  const bind = () => assert.fail("refusal must happen before seat access");
+  assert.equal(await rehearseRealSeat({ interactive: () => false, confirm, bind }), "real-desktop-invocation-invalid");
+  assert.equal(prompts, 0);
+  assert.equal(await rehearseRealSeat({ interactive: () => true, confirm, bind }), "unsandboxed-agent-not-excluded");
+  assert.equal(prompts, 2);
+});
 
 function installationFixture() {
   const bytes = Buffer.from("fixture executable bytes");

@@ -40,15 +40,17 @@ const CONFIG_HOOK = path.join(PKG_ROOT, "bin", "skel-config-hook.mjs").split(pat
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
-Quick path (who does each step):
-  1. agent   skel init "<title>"          start the skeleton
-  2. agent   write the skeleton            stubs with SKEL[...] fences and SKEL_TODO bodies
-  3. agent   skel review | skel serve      show it; the human reads and replies
-  4. human   skel approve                  enter the fill phase (approval is the human's call)
-  5. agent   skel next → fill → skel done  once per step (done checks drift and SKEL_TODO)
-  6. human   skel finalize                 after the full tests pass: strip markers, phase done
+Usage: skel <command> [options]
 
-Commands:
+Quick path
+  1. The human sets up the project with skel install.
+  2. The agent runs skel init "<title>", writes fenced stubs, and runs skel serve.
+  3. The human reviews the skeleton and shares the approved version.
+     The agent records it with skel approve --reviewed <version>.
+  4. The agent runs skel next, fills inside the active fences, tests, and
+     runs skel done. Repeat for each step, then run the full project test suite.
+  5. The human runs skel finalize when satisfied.
+
   init "<title>" [--gate ask|deny] [--force]
                                      start a skeleton in this project (--force replaces an existing one)
   track <file...>                    show unfenced skeleton files (types, wiring) in the review too
@@ -1301,7 +1303,7 @@ const commands = {
       const { clearStopNotice } = await import("../lib/stop-notice.mjs");
       await clearStopNotice(root);
     } catch {}
-    if (review?.source === "rendered") console.log("note: no human feedback was received; this approves the version the review page last rendered.");
+    if (review?.source === "rendered") console.log("note: no feedback was sent from the review page; this approves the version the page last rendered.");
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
     try { if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`); }
@@ -1376,7 +1378,7 @@ const commands = {
     writeState(root, { ...state, activeStep: null });
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
     console.log(`STEP ${state.activeStep} done. ${pending.length} pending${pending[0] ? `; next: ${pending[0].id} ${pending[0].title}` : ""}.`);
-    if (!pending.length) console.log("all steps filled — run the full tests, then `skel finalize` when the human is happy");
+    if (!pending.length) console.log("Run the full project test suite, then ask the human to run skel finalize when satisfied.");
   },
 
   reshape(args) {
@@ -1538,8 +1540,8 @@ const commands = {
   },
 };
 
-const [given = "help", ...rest] = process.argv.slice(2);
-const cmd = given === "--help" || given === "-h" ? "help" : given;
-const run = Object.hasOwn(commands, cmd) ? commands[cmd] : null;
+const [cmd = "help", ...rest] = process.argv.slice(2);
+const command = cmd === "--help" || cmd === "-h" ? "help" : cmd;
+const run = Object.hasOwn(commands, command) ? commands[command] : null;
 if (!run) die(`unknown command "${cmd}"\n\n${HELP}`);
 try { await run(rest); } catch (err) { if (isFeedbackError(err)) die(err.message); throw err; }
