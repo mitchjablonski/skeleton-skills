@@ -2,6 +2,8 @@
 
 **Write the plan as code. Review the plan's shape. Then fill it in one fenced step at a time.**
 
+New here? [docs/quickstart.md](docs/quickstart.md) gives the short path: who does what, the commands in order, and what to do when skel refuses.
+
 Two Claude Code skills and a small CLI that bring back the feeling of building with an AI pair one function at a time, with strong opinions about where code lives:
 
 1. **`/skel:skeleton`**: Claude writes the feature as a *skeleton*: real files, real types and signatures, real wiring, plus an architecture diagram. Every body is an empty, fenced stub. You review the skeleton in a local page, comment on lines or on the diagram, and approve.

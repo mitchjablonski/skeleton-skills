@@ -60,6 +60,7 @@ Quick path
      runs skel done. Repeat for each step, then run the full project test suite.
   5. When the human says yes, the agent runs skel finalize.
      The human answers any permission prompt.
+  See docs/quickstart.md for what to do when skel refuses.
 
   init "<title>" [--gate ask|deny] [--force]
                                      start a skeleton in this project (--force replaces an existing one)
@@ -288,10 +289,33 @@ function warnLegacyQueue(root) {
   }
 }
 
+/**
+ * Progress is derived from the code (a step is filled once its fences hold no SKEL_TODO),
+ * so a step filled without being started never ran \`skel done\`'s checks. Since #247 the
+ * fill records each step started (\`startedSteps\`: empty at a first approve, carried over
+ * on re-approval after reshape for steps whose title and bodies didn't change). The skeleton version doesn't cover fence bodies, so a body
+ * filled before approval is noted too. A fill approved before that has no record (and keeps
+ * none through reshape, \`legacyFill\`), and gets no notice rather than a wrong one.
+ */
+/** A step's title and every fence (file, title, body): what \`skel done\` checked. */
+function stepPrint(step) {
+  return crypto.createHash("sha256").update(JSON.stringify([step.id, step.title, step.fences.map((f) => [f.file, f.title, f.body])])).digest("hex");
+}
+
+function skippedStepsNote(state, candidates) {
+  if (!Array.isArray(state.startedSteps)) return;
+  const skipped = candidates.filter((s) => s.status === "filled" && s.id !== state.activeStep && !state.startedSteps.includes(s.id));
+  if (!skipped.length) return;
+  const ids = skipped.map((s) => s.id).join(", ");
+  const one = skipped.length === 1;
+  console.log(`note: step${one ? "" : "s"} ${ids} ${one ? "is" : "are"} filled but ${one ? "was" : "were"} never started (filled before approval, or without \`skel next\`), so \`skel done\` never checked ${one ? "it" : "them"}; \`skel start ${skipped[0].id} --force\` reopens ${one ? "it" : "one"} for \`skel done\` to check`);
+}
+
 function setActive(root, state, step, force = false) {
   const filled = step.status !== "todo";
   if (filled && !force) die(`step ${step.id} is already filled; \`skel start ${step.id} --force\` reopens it for rework`);
-  writeState(root, { ...state, phase: "fill", activeStep: step.id });
+  const startedSteps = Array.isArray(state.startedSteps) ? [...new Set([...state.startedSteps, step.id])] : state.startedSteps;
+  writeState(root, { ...state, phase: "fill", activeStep: step.id, ...(startedSteps ? { startedSteps } : {}) });
   console.log(`STEP ${step.id} active: ${step.title}`);
   if (filled) {
     const action = state.activeStep === step.id ? "Already active" : "Reopened";
@@ -1315,7 +1339,18 @@ const commands = {
       for (const line of describeCoverage(source.coverage, Object.keys(record.files).length)) console.log(line);
       const sourceTook = Date.now() - sourceStart;
       if (sourceTook > 3000) console.log(`  note: reading the source set took ${(sourceTook / 1000).toFixed(1)}s. \`done\` and \`finalize\` re-read it.`);
-      const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now() };
+      // Started steps: none on a first approval. The version covers the code outside the
+      // fences, not the bodies, so a body already filled here was never checked by
+      // `skel done` and the note should say so. On re-approval after reshape, the steps
+      // started in the earlier round stay started only if the step is unchanged since the
+      // reshape (`startedPrints`: title and fence bodies), since bodies can change in a
+      // reshape without changing the version. A fill from before #247 that was reshaped
+      // (`legacyFill`) stays without a record.
+      const prints = state.startedPrints && typeof state.startedPrints === "object" ? state.startedPrints : {};
+      const kept = new Set(steps.filter((s) => prints[s.id] === stepPrint(s)).map((s) => s.id));
+      const startedSteps = Array.isArray(state.startedSteps) ? state.startedSteps.filter((id) => kept.has(id)) : state.legacyFill ? undefined : [];
+      const { startedSteps: _prior, startedPrints: _prints, ...rest } = state;
+      const next = { ...rest, phase: "fill", activeStep: null, reviewEpoch: Date.now(), ...(startedSteps ? { startedSteps } : {}) };
       try {
         writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at }, source.coverage);
       } catch (err) {
@@ -1357,6 +1392,7 @@ const commands = {
       }
     }
     const step = steps.find((s) => s.status === "todo");
+    skippedStepsNote(state, step ? steps.slice(0, steps.indexOf(step)) : steps);
     if (!step) {
       console.log("all steps filled — run `skel finalize` when the human is happy");
       return;
@@ -1411,6 +1447,7 @@ const commands = {
     writeState(root, { ...state, activeStep: null });
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
     console.log(`STEP ${state.activeStep} done. ${pending.length} pending${pending[0] ? `; next: ${pending[0].id} ${pending[0].title}` : ""}.`);
+    skippedStepsNote(state, pending.length ? steps.slice(0, steps.indexOf(step)) : steps); // the last done checks every step (Codex, #256)
     if (!pending.length) console.log("Run the full project test suite, then ask the human whether to finalize. If they say yes, run skel finalize.");
   },
 
@@ -1419,7 +1456,12 @@ const commands = {
     return withFeedbackLock(root, () => {
       const state = requireState(root);
       if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
-      writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now(), reviewRound: crypto.randomUUID() });
+      let record = { legacyFill: true };
+      if (Array.isArray(state.startedSteps)) {
+        const started = new Set(state.startedSteps);
+        record = { startedPrints: Object.fromEntries(snapshot(root, state).steps.filter((s) => started.has(s.id)).map((s) => [s.id, stepPrint(s)])) };
+      }
+      writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now(), reviewRound: crypto.randomUUID(), ...record });
       // The record is of the shape being reopened; approve writes the new one.
       clearSnapshot(root);
       clearConfigNotices(root);
