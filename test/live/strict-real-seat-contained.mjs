@@ -42,7 +42,8 @@ function prepareReview(scratch) {
     phase: "skeleton", revision: 0, reviewVersion: capture.shapeVersion, captureVersion: capture.captureVersion,
     approvedVersion: null, approvedCaptureVersion: null,
   });
-  const binding = Object.freeze({ ...state, phase: "scaffold", pendingNotes: false });
+  const { revision, ...viewState } = state;
+  const binding = Object.freeze({ ...viewState, phase: "scaffold", pendingNotes: false });
   const policy = { policyVersion: HUMAN_AUTHORITY_POLICY, roundMismatchCap: 2, sessionMismatchCap: 4,
     commandCap: 20, authorityCap: 10 };
   const key = randomBytes(32);
@@ -51,7 +52,7 @@ function prepareReview(scratch) {
       captureStore, observeUnderLock: observe, keyBytes: () => key,
     });
     const approve = Object.freeze({ code: deriveHumanCode(state, "approve", key),
-      revision: 0, reviewVersion: binding.reviewVersion, captureVersion: binding.captureVersion });
+      revision, reviewVersion: binding.reviewVersion, captureVersion: binding.captureVersion });
     return { binding, capture, authority, approve };
   } finally {
     key.fill(0);
@@ -118,13 +119,18 @@ async function runNamespace({ scratch, receipt, terminalPin, review, output, con
   }
 }
 
-export function configureContainedRun(receipt, terminalPin) {
-  if (!path.isAbsolute(receipt ?? "") || !/^[0-9a-f]{64}$/.test(terminalPin ?? ""))
+export function configureContainedRun(workspace, receipt, terminalPin) {
+  if (!/^\/tmp\/skel-wslg-state-[a-z0-9_]{8}$/.test(workspace ?? "")
+      || !path.isAbsolute(receipt ?? "") || !/^[0-9a-f]{64}$/.test(terminalPin ?? ""))
     throw new Fail("contained-runtime-selection-invalid");
   return {
     success: SUCCESS,
-    prepare({ scratch, input, output, interactive }) {
-      const review = prepareReview(scratch);
+    prepare({ input, output, interactive }) {
+      const entry = fs.lstatSync(workspace);
+      if (!entry.isDirectory() || entry.uid !== process.getuid() || (entry.mode & 0o7777) !== 0o700
+          || fs.realpathSync(workspace) !== workspace || fs.readdirSync(workspace).length !== 0)
+        throw new Fail("contained-workspace-untrusted");
+      const review = prepareReview(workspace);
       const { authority, binding, capture, approve } = review;
       let committed = false;
       return {
@@ -152,7 +158,7 @@ export function configureContainedRun(receipt, terminalPin) {
           });
           if (!accepted) throw new Fail("protected-operator-approval-refused");
           output.write("Approval recorded for the selected capture.\n");
-          await runNamespace({ scratch, receipt, terminalPin, review, output, control });
+          await runNamespace({ scratch: workspace, receipt, terminalPin, review, output, control });
         },
       };
     },

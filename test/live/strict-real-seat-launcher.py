@@ -73,11 +73,15 @@ def run(argv):
     for name in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(name, mark_interrupted)
     scratch = tempfile.mkdtemp(prefix="skel-wslg-", dir="/dev/shm")
+    workspace = None
     child = None
     timed_out = False
     terminal_lost = False
     try:
         try:
+            if flag == "--supervised-wslg-contained":
+                workspace = tempfile.mkdtemp(prefix="skel-wslg-state-", dir="/tmp")
+                args = [workspace, *args]
             child = subprocess.Popen(
                 [node, str(directory / "strict-real-seat-launcher.mjs"), flag, scratch, *args],
                 env={"DISPLAY": os.environ.get("DISPLAY", ""), "PATH": "/usr/bin:/bin"},
@@ -136,6 +140,8 @@ def run(argv):
     if not cleanup or packet == (UNPROVEN + "\n").encode("ascii"):
         return UNPROVEN
     try:
+        if workspace is not None:
+            shutil.rmtree(workspace)
         shutil.rmtree(scratch)
     except OSError:
         return UNPROVEN

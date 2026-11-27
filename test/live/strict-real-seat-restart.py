@@ -108,7 +108,7 @@ def main(args):
         return 1
     root, node, runtime = map(Path, args[:3])
     if (not all(path.is_absolute() for path in (root, node, runtime))
-            or not re.fullmatch(r"/dev/shm/skel-wslg-[a-z0-9_]{8}", str(root))
+            or not re.fullmatch(r"/tmp/skel-wslg-state-[a-z0-9_]{8}", str(root)) or root.resolve() != root
             or not all(re.fullmatch(r"[0-9a-f]{64}", digest) for digest in args[3:])):
         return 1
     status = root.lstat()

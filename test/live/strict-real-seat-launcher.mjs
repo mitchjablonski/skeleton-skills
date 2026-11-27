@@ -183,7 +183,7 @@ async function run(scratch, input, output, contained) {
     });
     if (cancelled.signal.aborted) return "real-seat-interrupted";
     requireCode(seat.code, "real-seat-preflight-passed");
-    const options = contained ? await contained.prepare({ scratch, input, output, interactive }) : {};
+    const options = contained ? contained.prepare({ input, output, interactive }) : {};
     await launchWindowCheckpoint({ seat, scratch, signal: cancelled.signal, environment: WSLG_ENV, ...options });
     return cancelled.signal.aborted ? "real-seat-interrupted" : contained?.success ?? SUCCESS;
   } catch (error) {
@@ -196,14 +196,15 @@ async function run(scratch, input, output, contained) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [flag, scratch, receipt, terminalPin] = process.argv.slice(2);
-  const full = flag === "--supervised-wslg-contained" && process.argv.length === 6;
+  const [flag, scratch, workspace, receipt, terminalPin] = process.argv.slice(2);
+  const full = flag === "--supervised-wslg-contained" && process.argv.length === 7;
   if (!full && (process.argv.length !== 4 || flag !== "--supervised-wslg-window")) process.exit(2);
   let code;
   let success = SUCCESS;
   try {
     if (!fs.fstatSync(2).isFIFO()) process.exit(2);
-    const contained = full ? (await import("./strict-real-seat-contained.mjs")).configureContainedRun(receipt, terminalPin) : null;
+    const contained = full
+      ? (await import("./strict-real-seat-contained.mjs")).configureContainedRun(workspace, receipt, terminalPin) : null;
     success = contained?.success ?? SUCCESS;
     code = await run(scratch, process.stdin, process.stdout, contained);
   } catch {

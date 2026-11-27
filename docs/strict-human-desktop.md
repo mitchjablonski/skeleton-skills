@@ -353,7 +353,7 @@ worker_pin=$(git show HEAD:test/live/strict-launcher-binding-worker.mjs | sha256
 terminal_pin=$(git show HEAD:test/live/strict-terminal-host-worker.mjs | sha256sum | cut -d ' ' -f 1)
 /usr/bin/python3 -I test/live/strict-runtime-receipt.py observe-node-channel \
   --node "$node" --node-sha256 "$node_pin" --bwrap-sha256 "$bwrap_pin" \
-  --binding-worker-sha256 "$worker_pin" --scratch-root /dev/shm > "$receipt"
+  --binding-worker-sha256 "$worker_pin" --scratch-root /tmp > "$receipt"
 wc -l /mnt/wslg/stderr.log
 /usr/bin/python3 -I test/live/strict-real-seat-launcher.py --real-seat-contained "$receipt" "$terminal_pin"
 wc -l /mnt/wslg/stderr.log
