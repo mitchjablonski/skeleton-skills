@@ -15,6 +15,7 @@ from pathlib import Path
 import select
 import subprocess
 import sys
+import time
 
 
 PYTHON = "/usr/bin/python3"
@@ -22,6 +23,7 @@ BWRAP = "/usr/bin/bwrap"
 PROC = Path("/proc")
 YAMA = PROC / "sys/kernel/yama/ptrace_scope"
 TIMEOUT = 5
+MAX_REPORT = 1024
 STATUS_KEYS = ("NSpid", "PPid", "Uid", "CapEff", "NoNewPrivs", "Seccomp")
 
 
@@ -43,6 +45,27 @@ def status_of(pid="self"):
 def ns_id(pid, kind):
     identity = os.stat(PROC / str(pid) / "ns" / kind)
     return [identity.st_dev, identity.st_ino]
+
+
+def read_line(stream):
+    """One report line from the raw fd, bounded in size and time: a partial or
+    oversized line refuses instead of blocking on a worker that waits for us."""
+    fd, data, deadline = stream.fileno(), b"", time.monotonic() + TIMEOUT
+    while b"\n" not in data:
+        left = deadline - time.monotonic()
+        if left <= 0 or len(data) > MAX_REPORT:
+            raise Refused("worker-evidence-missing")
+        ready, _, _ = select.select([fd], [], [], left)
+        if not ready:
+            continue
+        chunk = os.read(fd, MAX_REPORT + 1 - len(data))
+        if not chunk:
+            raise Refused("worker-evidence-missing")
+        data += chunk
+    line, _, rest = data.partition(b"\n")
+    if rest or len(line) > MAX_REPORT:
+        raise Refused("worker-evidence-missing")
+    return line
 
 
 def worker():
@@ -116,14 +139,12 @@ def measure(report):
     proc = subprocess.Popen(
         sandbox() + ["--ro-bind", str(Path(__file__).resolve()), "/fixture.py",
                      "--", PYTHON, "-I", "/fixture.py", "--worker"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, bufsize=0,
     )
     try:
-        ready, _, _ = select.select([proc.stdout], [], [], TIMEOUT)
-        line = proc.stdout.readline() if ready else b""
-        if not line or len(line) > 1024:
+        inner = json.loads(read_line(proc.stdout))
+        if not isinstance(inner, dict):
             raise Refused("worker-evidence-missing")
-        inner = json.loads(line)
         for key in ("pid", "nspid", "pidns", "userns", "capeff", "nnp"):
             if key not in inner:
                 raise Refused("worker-evidence-missing")
@@ -131,6 +152,8 @@ def measure(report):
         outside = status_of(host)
         checks = {
             # The worker's own view and the launcher's view name the same namespaces.
+            # locate() matched the PID namespace already; re-reading it here fails
+            # closed if the pid was reused in between.
             "pidns_agrees": ns_id(host, "pid") == inner["pidns"],
             "userns_agrees": ns_id(host, "user") == inner["userns"],
             # Both are new namespaces, not the launcher's.
@@ -145,6 +168,8 @@ def measure(report):
         }
         report["checks"] = checks
         report["seccomp"] = outside["Seccomp"][0]
+        # --unshare-cgroup-try skips silently where unsupported: observed, not required.
+        report["cgroupns_private"] = ns_id(host, "cgroup") != ns_id(me, "cgroup")
         alive = proc.poll() is None
     finally:
         try:

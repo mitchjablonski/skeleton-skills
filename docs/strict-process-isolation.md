@@ -9,7 +9,8 @@ sandbox. Strict stays `unverified` after a pass.
 /usr/bin/python3 -I test/live/strict-process-isolation-probe.py
 ```
 
-The launcher starts one worker (user, PID, IPC, net, UTS and cgroup namespaces,
+The launcher starts one worker (user, PID, IPC, net and UTS namespaces, a cgroup
+namespace where available,
 `--die-with-parent`, `--new-session`, an empty environment). The worker reports
 its own PID, `NSpid`, PID and user namespace identities, `CapEff` and
 `NoNewPrivs`, then waits for EOF so the launcher can look at it while it runs.
@@ -19,11 +20,13 @@ the Bubblewrap process whose innermost `NSpid` equals the reported PID and
 whose PID namespace identity equals the reported one. It refuses with
 `ownership-ambiguous` if more than one process matches, `worker-not-found` if
 none does, and `worker-evidence-missing` or `status-field-missing` if any
-report or `/proc` field is absent. It then requires:
+report or `/proc` field is absent. The report is read from the raw pipe with
+the fixture timeout and a 1 KiB cap, so a partial or oversized line refuses
+instead of hanging. It then requires:
 
 | Check | Meaning |
 | --- | --- |
-| `pidns_agrees`, `userns_agrees` | The worker's view and the launcher's view name the same namespaces |
+| `pidns_agrees`, `userns_agrees` | The worker's view and the launcher's view name the same namespaces. The worker is located by its PID namespace, so `pidns_agrees` is a re-read that fails closed if the pid was reused in between |
 | `pidns_private`, `userns_private` | Both differ from the launcher's |
 | `nspid_levels` | The host sees two PID levels, the worker only its own |
 | `capeff_zero` | No effective capabilities, from both views |
@@ -31,7 +34,8 @@ report or `/proc` field is absent. It then requires:
 | `same_host_uid` | Every host uid of the worker is the launcher's |
 | `single_uid_map` | Exactly one uid mapping, onto the launcher's uid, count 1 |
 
-`yama_ptrace_scope` and the worker's `Seccomp` mode are recorded as
+`yama_ptrace_scope`, the worker's `Seccomp` mode and `cgroupns_private`
+(`--unshare-cgroup-try` skips silently where unsupported) are recorded as
 observations. Neither is required: the private PID namespace is the gate the
 fixture relies on (see [PID visibility](strict-process-reach.md)).
 
