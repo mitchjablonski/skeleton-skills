@@ -440,6 +440,10 @@ test("#247: docs/quickstart.md is the default-mode path the help points to, with
   for (const cmd of ["skel install", "skel init", "skel serve", "skel approve --reviewed", "skel next", "skel done", "skel finalize", "skel reshape", "skel start <id> --force"])
     assert.ok(doc.includes(cmd), cmd);
   assert.ok(doc.split("\n").length <= 40, "stays short");
+  assert.match(doc, /restart\s+Claude Code/);
+  assert.match(doc, /README\.md#install/);
+  assert.match(doc, /`skel approve`: bare when they said yes in chat/);
+  assert.match(doc, /permission prompt only after explicitly agreeing to finalize/);
   const help = spawnSync(process.execPath, [BIN, "help"], { encoding: "utf-8" }).stdout;
   assert.match(help, /See docs\/quickstart\.md/);
 });

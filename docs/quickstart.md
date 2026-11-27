@@ -3,7 +3,9 @@
 Default mode, for agents and humans. The agent runs every `skel` command; the
 human reviews, decides, and answers Claude Code's permission prompts.
 
-1. **Human:** set up the project once with `skel install`.
+1. **Human:** set up the project once with `skel install`, then restart
+   Claude Code so it loads the hooks and deny rules (see
+   [Install](../README.md#install)).
 2. **Agent:** `skel init "<title>"`, write the skeleton (real files and
    signatures, every body a fenced `SKEL_TODO` stub), then `skel serve` and
    give the human the whole URL, including `#t=…` (`skel review` writes a
@@ -11,13 +13,15 @@ human reviews, decides, and answers Claude Code's permission prompts.
 3. **Human:** review the page and paste the copied feedback, or say yes in
    chat.
 4. **Agent:** apply every comment. After the human approves, run
-   `skel approve --reviewed <version>`, taking the version from their pasted
-   feedback. Its permission prompt is the human's approval, so run it only
-   after their yes.
+   `skel approve`: bare when they said yes in chat, or
+   `skel approve --reviewed <version>` with the version from the feedback
+   they pasted. Never pass a version the human didn't give you. Its
+   permission prompt is the human's approval, so run it only after their yes.
 5. **Agent, per step:** `skel next`, fill only inside the active fences,
    test, then `skel done`.
 6. **Agent:** run the full project test suite, then ask the human whether to
-   finalize. **Human:** yes. **Agent:** `skel finalize`.
+   finalize. **Human:** yes. **Agent:** `skel finalize`. The human answers
+   its permission prompt only after explicitly agreeing to finalize.
 
 When skel refuses:
 - **`done`, `SKEL_TODO` left:** finish that step's fences.
