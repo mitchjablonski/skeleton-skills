@@ -167,6 +167,8 @@ def main():
         agent(desktop_policy=True)
     elif args == ["agent-capture-desktop-policy"]:
         agent(capture=True, desktop_policy=True)
+    elif args == ["agent-capture-cooperative-desktop-policy"]:
+        agent(capture=True, stop_mode="cooperative", desktop_policy=True)
     elif args == ["agent-capture"]:
         agent(capture=True)
     elif args == ["agent-cooperative"]:

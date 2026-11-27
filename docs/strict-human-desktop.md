@@ -1,7 +1,7 @@
 # Human desktop qualification (#231, first slice)
 
-Status: read-only inventory, real WSLg operator runs with a fixed synthetic
-capture and worker, and the qualification plan. Human observation is pending.
+Status: read-only inventory, an operator runbook for real WSLg with a fixed
+synthetic capture and worker, and the qualification plan. Human observation is pending.
 Strict remains `unverified`.
 
 This is the human-desktop part of #79. Codex owns the separate readiness and
@@ -335,16 +335,15 @@ starts the launcher as its protected decision terminal. It runs the fixed
 synthetic worker in its own Bubblewrap namespace. It uses only its own
 temporary source, history, profiles and stages.
 
-Prepare the runtime selection on the same WSL distribution. The following
-example uses the measured Node 22 candidate. Record the commit, empty
+Prepare the runtime selection on the same WSL distribution with the pinned
+Node 22 candidate on your PATH. Record the commit, empty
 working-tree status, Windows Terminal and Node versions, and the WSLg
 log line count before beginning.
 
 ```bash
 git rev-parse HEAD
 git status --porcelain
-node=/home/mitch/.nvm/versions/node/v22.23.2/bin/node
-export PATH="${node%/*}:$PATH"
+node=$(command -v node)
 "$node" --version
 receipt=$(mktemp /dev/shm/skel-wslg-runtime.XXXXXXXX)
 node_pin=3517c2df0b2f8cd7f422b4b8450ef81c6889f08eb03e281d6de9079b15e6a327
@@ -354,13 +353,15 @@ terminal_pin=$(git show HEAD:test/live/strict-terminal-host-worker.mjs | sha256s
 /usr/bin/python3 -I test/live/strict-runtime-receipt.py observe-node-channel \
   --node "$node" --node-sha256 "$node_pin" --bwrap-sha256 "$bwrap_pin" \
   --binding-worker-sha256 "$worker_pin" --scratch-root /tmp > "$receipt"
+```
+
+Continue only after the runtime receipt command succeeds.
+
+```bash
 wc -l /mnt/wslg/stderr.log
 /usr/bin/python3 -I test/live/strict-real-seat-launcher.py --real-seat-contained "$receipt" "$terminal_pin"
 wc -l /mnt/wslg/stderr.log
-rm -- "$receipt"
 ```
-
-Continue to launch only after the runtime receipt command succeeds.
 
 1. Answer the attestations yourself. Compare the phrase and capture on the
    single new Chrome window with the control terminal. Confirm the fresh
@@ -376,13 +377,15 @@ Continue to launch only after the runtime receipt command succeeds.
    other windows in place. Save the final JSON. The success code is
    `real-seat-contained-restart-passed`.
 5. In a separate run, close only the owned Chrome window after the new
-   worker message and before answering. Record the refusal, the owned
-   window teardown, and the before/after WSLg log counts. Keep approval
-   codes, phrases and private navigation data out of #79.
+   worker message and before answering. Expect `wslg-owned-window-lost`.
+   Record the refusal, the owned-window teardown, and the before/after
+   WSLg log counts. When both runs are recorded, remove the receipt with
+   `rm -- "$receipt"`. Keep approval codes, phrases and private navigation
+   data out of #79.
 
 The supervisor requires fresh readiness from the same protected generation,
-proves the first namespace stopped, and starts a different namespace from
-the approved stored bytes. It checks desktop-policy and control-terminal
+proves the first namespace stopped after a graceful shutdown, and starts a
+different namespace from the approved stored bytes. It checks desktop-policy and control-terminal
 separation evidence in both namespaces. Report human observations and
 fixture evidence separately in #79. The interactive Claude CLI, its agent
 pane input/output and clipboard/title checks, and the broader #79 matrix

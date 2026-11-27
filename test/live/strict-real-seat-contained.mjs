@@ -74,7 +74,7 @@ async function runNamespace({ scratch, receipt, terminalPin, review, output, con
   const { signal, windowCurrent, confirmRestart, confirmRetained } = control;
   const { reviewVersion, captureVersion } = review.binding;
   const child = spawn("/usr/bin/python3", ["-I", DRIVER, scratch, process.execPath, receipt,
-    terminalPin, reviewVersion, captureVersion], { env: {}, stdio: ["pipe", "pipe", "ignore"] });
+    terminalPin, reviewVersion, captureVersion], { detached: true, env: {}, stdio: ["pipe", "pipe", "ignore"] });
   const exited = new Promise((resolve) => {
     child.once("error", () => resolve({ code: 1 }));
     child.once("close", (code) => resolve({ code }));
@@ -86,6 +86,7 @@ async function runNamespace({ scratch, receipt, terminalPin, review, output, con
   const steps = ["1", "R", "2"];
   let phase = 0;
   let permitted = 0;
+  let status;
   try {
     for await (const data of child.stdout) {
       const step = data.toString("latin1");
@@ -111,12 +112,11 @@ async function runNamespace({ scratch, receipt, terminalPin, review, output, con
   } finally {
     signal.removeEventListener("abort", stop);
     stop();
-    const status = await waitForExit(exited, 25_000);
+    status = await waitForExit(exited, 25_000);
     if (!status || status.code === 125 || status.code === null)
       throw new Fail("real-seat-cleanup-unproven");
-    if (status.code !== 0 || phase !== steps.length)
-      throw new Fail("contained-restart-refused");
   }
+  if (status.code !== 0 || phase !== steps.length) throw new Fail("contained-restart-refused");
 }
 
 export function configureContainedRun(workspace, receipt, terminalPin) {

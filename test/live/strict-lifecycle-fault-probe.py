@@ -102,9 +102,9 @@ def bwrap_argv(stage=None, *, stop_mode=None, silent_child=False, desktop_filter
         assert stage is None and stop_mode is None
         mode = "agent-silent-child"
     if desktop_filter is not None:
-        assert stop_mode is None and not silent_child
+        assert not silent_child and (stop_mode is None or (stage is not None and stop_mode == "cooperative"))
         argv += ["--seccomp", str(desktop_filter)]
-        mode = "agent-capture-desktop-policy" if stage is not None else "agent-desktop-policy"
+        mode += "-desktop-policy"
     return argv + ["--", "/usr/bin/python3", "-I", "/helper.py", mode]
 
 

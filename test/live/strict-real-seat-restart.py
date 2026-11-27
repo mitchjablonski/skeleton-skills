@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import runpy
 import select
+import signal
 import stat
 import sys
 import time
@@ -17,6 +18,7 @@ Enrollment = admission["capture"]["Enrollment"]
 NamespaceLauncher = admission["NamespaceLauncher"]
 MEMBERS = admission["capture"]["MEMBERS"]
 WORKER = admission["capture"]["WORKER"]
+interrupted = False
 
 
 class Refused(Exception):
@@ -28,15 +30,20 @@ def require(condition):
         raise Refused()
 
 
+def interrupt(_number, _frame):
+    global interrupted
+    interrupted = True
+
+
 def ask(step, *, timeout=8, live=lambda: True):
     deadline = time.monotonic() + timeout
     os.write(1, step)
-    while live():
+    while not interrupted and live():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
         if select.select([0], [], [], min(0.15, remaining))[0]:
-            return os.read(0, 2) == b"y" and live()
+            return os.read(0, 2) == b"y" and not interrupted and live()
     return False
 
 
@@ -54,7 +61,8 @@ class OperatorLauncher(NamespaceLauncher):
 def exercise(root, node, runtime, terminal_pin, review, capture):
     selection = admission["read_runtime_selection"](runtime)
     verify_runtime = admission["runtime_check"](selection, node, root, terminal_pin=terminal_pin)
-    launcher = OperatorLauncher(node, root, verify_runtime, protected=True, terminal_mode="operator-restart",
+    launcher = OperatorLauncher(node, root, verify_runtime, stop_mode="cooperative",
+                                protected=True, terminal_mode="operator-restart",
                                 desktop_policy=True)
     result = 1
     try:
@@ -75,8 +83,8 @@ def exercise(root, node, runtime, terminal_pin, review, capture):
             return launcher.active is fill and fill.child.poll() is None and launcher.peers_live(generation)
 
         require(ask(b"1", live=lambda: active(first)))
-        stop = launcher.supervisor.stop(first.namespace)
-        require(first.child.poll() is not None)
+        stop, observation = launcher.stop_planned(first.namespace)
+        require(first.child.poll() is not None and observation.get("workerAcknowledgedTerm") is True)
         (first_dir / "plan.js").write_text("changed synthetic first stage\n", encoding="utf-8")
         require(ask(b"R", timeout=130, live=lambda: launcher.peers_live(generation)))
         report = launcher.refresh(generation)
@@ -86,19 +94,19 @@ def exercise(root, node, runtime, terminal_pin, review, capture):
                 and second.namespace["pidNs"] != first.namespace["pidNs"])
         require(all(not os.path.samefile(first_dir / name, second_dir / name) for name in MEMBERS))
         require(ask(b"2", timeout=130, live=lambda: active(second)))
-        launcher.supervisor.stop(second.namespace)
+        launcher.stop_planned(second.namespace)
         require(second.child.poll() is not None and launcher.peers_live(generation))
         require(admission["capture"]["snapshot"]((enrollment,)) == before)
         result = 0
     except admission["RuntimeRefused"] as exc:
         if str(exc) == "runtime-observation-cleanup-unproven":
             result = 125
-    except (AssertionError, OSError, RuntimeError, ValueError, Refused):
+    except (AssertionError, OSError, RuntimeError, ValueError, Refused, admission["lifecycle"]["Unproven"]):
         pass
     finally:
         try:
             launcher.cleanup()
-        except (AssertionError, OSError, RuntimeError, ValueError):
+        except Exception:
             result = 125
     return result
 
@@ -117,6 +125,8 @@ def main(args):
     modes = [os.fstat(fd).st_mode for fd in (0, 1)]
     if not all(stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) for mode in modes):
         return 1
+    for name in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+        signal.signal(name, interrupt)
     return exercise(root, node, runtime, *args[3:])
 
 

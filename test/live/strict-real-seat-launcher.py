@@ -77,6 +77,7 @@ def run(argv):
     child = None
     timed_out = False
     terminal_lost = False
+    terminal_restore_unproven = False
     try:
         try:
             if flag == "--supervised-wslg-contained":
@@ -122,12 +123,12 @@ def run(argv):
             try:
                 if termios.tcgetattr(0) != terminal_settings:
                     if foreground_terminal() != terminal:
-                        cleanup = False
+                        terminal_restore_unproven = True
                     else:
                         termios.tcsetattr(0, termios.TCSANOW, terminal_settings)
                         os.write(1, b"\x1b[?2004l")
             except (OSError, termios.error):
-                cleanup = False
+                terminal_restore_unproven = True
     packet = b""
     if child is not None:
         with child.stderr as report:
@@ -144,6 +145,8 @@ def run(argv):
             shutil.rmtree(workspace)
         shutil.rmtree(scratch)
     except OSError:
+        return UNPROVEN
+    if terminal_restore_unproven:
         return UNPROVEN
     if timed_out:
         return "real-seat-timeout"
