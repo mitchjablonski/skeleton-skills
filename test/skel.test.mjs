@@ -444,6 +444,25 @@ test("#247: docs/quickstart.md is the default-mode path the help points to, with
   assert.match(help, /See docs\/quickstart\.md/);
 });
 
+test("#247: a step already filled in the approved skeleton is never reported as skipped", () => {
+  const { dir, a, run } = project();
+  run("init", "Stroke smoothing");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;")); // SKEL[1] approved as filled content
+  run("approve");
+  const status = JSON.parse(run("status", "--json"));
+  assert.deepEqual(status.startedSteps, ["1"]);
+  const next = run("next");
+  assert.doesNotMatch(next, /note:/);
+  assert.match(next, /^STEP 2 active/);
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
+  assert.doesNotMatch(run("done"), /note:/);
+  // After a reshape and re-approval, the seed is taken again from the approved skeleton.
+  run("reshape");
+  run("approve");
+  assert.deepEqual(JSON.parse(run("status", "--json")).startedSteps, ["1", "2"]);
+  assert.doesNotMatch(run("next"), /note:/);
+});
+
 test("#247: a fill approved without a started-steps record gets no skipped-step note", () => {
   const { dir, a, run } = project();
   run("init", "Stroke smoothing");
