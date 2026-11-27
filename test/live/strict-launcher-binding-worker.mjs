@@ -225,6 +225,8 @@ if (role === 'prepare-approved') {
     pendingNotes: false};
   const capture = openCaptureStore(directory).get(captureVersion);
   const model = buildStrictCaptureViewModel({binding, capture});
+  // This injected loss must reach the seat refusal before listener setup.
+  assert.notEqual(role, 'protected-window-seat-prelaunch-loss');
   const listener = createDecisionListener({provider: {read: () => ({binding, capture})}});
   const {origin} = await listener.start();
   const startupView = listener.mintWindowNavigation(binding);
