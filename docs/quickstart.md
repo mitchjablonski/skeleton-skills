@@ -1,7 +1,7 @@
 # skel quickstart
 
-Default mode, for agents and humans. The agent runs every `skel` command; the
-human reviews, decides, and answers Claude Code's permission prompts.
+In default mode, the human sets up the project and reviews decisions. The
+agent runs the review and fill commands.
 
 1. **Human:** set up the project once with `skel install`, then restart
    Claude Code so it loads the hooks and deny rules (see
@@ -20,8 +20,8 @@ human reviews, decides, and answers Claude Code's permission prompts.
 5. **Agent, per step:** `skel next`, fill only inside the active fences,
    test, then `skel done`.
 6. **Agent:** run the full project test suite, then ask the human whether to
-   finalize. **Human:** yes. **Agent:** `skel finalize`. The human answers
-   its permission prompt only after explicitly agreeing to finalize.
+   finalize. If they agree, run `skel finalize`. The human answers any
+   permission prompt.
 
 When skel refuses:
 - **`done`, `SKEL_TODO` left:** finish that step's fences.

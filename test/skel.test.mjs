@@ -434,6 +434,18 @@ test("#247: next and done note an earlier step filled without being started; the
   assert.doesNotMatch(normal.run("next"), /note:/);
 });
 
+test("#247: the final done notice checks for an unstarted later step", () => {
+  const { a, run } = project();
+  run("init", "Stroke smoothing");
+  run("approve");
+  assert.match(run("next"), /^STEP 1 active/);
+  const filled = fs.readFileSync(a, "utf-8").replace(STUB, "return raw;").replace(STUB, "return [a, b];");
+  fs.writeFileSync(a, filled);
+  const done = run("done");
+  assert.match(done, /^STEP 1 done\. 0 pending\.\nnote: step 2 is filled but was never started[^\n]*\nRun the full project test suite/);
+  assert.doesNotMatch(done, /note: step 1/);
+});
+
 test("#247: docs/quickstart.md is the default-mode path the help points to, with no strict text", () => {
   const doc = fs.readFileSync(path.join(path.dirname(BIN), "..", "docs", "quickstart.md"), "utf-8");
   assert.doesNotMatch(doc, /strict/i);
@@ -443,7 +455,8 @@ test("#247: docs/quickstart.md is the default-mode path the help points to, with
   assert.match(doc, /restart\s+Claude Code/);
   assert.match(doc, /README\.md#install/);
   assert.match(doc, /`skel approve`: bare when they said yes in chat/);
-  assert.match(doc, /permission prompt only after explicitly agreeing to finalize/);
+  assert.match(doc, /If they agree, run `skel finalize`\. The human answers any\s+permission prompt/);
+  assert.match(doc, /Never pass a version the human didn't give you/);
   const help = spawnSync(process.execPath, [BIN, "help"], { encoding: "utf-8" }).stdout;
   assert.match(help, /See docs\/quickstart\.md/);
 });
