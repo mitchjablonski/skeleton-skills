@@ -93,6 +93,10 @@ class AgentRelay:
             pid, uid, _ = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
             if uid != os.getuid() or pid <= 0 or self.pane is not None:
                 return
+            with open(f"/proc/{pid}/stat", "rb") as record:
+                fields = record.read(4096).rsplit(b")", 1)[-1].split()
+            if len(fields) < 6 or fields[4] == b"0" or fields[2] != fields[5]:
+                return
             pair = [terminal_identity(os.stat(f"/proc/{pid}/fd/{fd}")) for fd in (0, 1)]
             if pair[0] is None or pair[0] != pair[1] or pair[0] == self.control_identity:
                 return

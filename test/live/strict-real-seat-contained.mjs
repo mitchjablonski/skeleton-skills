@@ -109,8 +109,9 @@ async function runNamespace({ scratch, receipt, terminalPin, review, output, con
         await confirmRetained();
       }
       if (client && (step === "1" || step === "2")) {
-        output.write(`In a separate WSL tab run: node test/live/strict-real-seat-agent-pane.mjs ${scratch}/agent.sock\n`);
-        if (!await confirmAgent("Did the separate agent pane show LOCAL-FIXTURE-REPLY?", signal))
+        const node = "'" + process.execPath.replaceAll("'", "'\\''") + "'";
+        output.write(`In a separate WSL tab run: ${node} test/live/strict-real-seat-agent-pane.mjs ${scratch}/agent.sock\n`);
+        if (!await confirmAgent("Did the separate agent pane show its expected reply?", signal))
           throw new Fail("interactive-agent-witness-refused");
       }
       if (signal.aborted || !windowCurrent()) throw new Fail("wslg-owned-window-lost");

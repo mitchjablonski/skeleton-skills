@@ -10,22 +10,34 @@ const filter = createStrictPtyOutput();
 const socket = net.createConnection(path);
 let answer = "";
 let sent = false;
+let received = false;
 function stop() {
   process.stdin.pause();
   socket.destroy();
 }
 socket.on("error", () => { process.exitCode = 1; stop(); });
-socket.on("close", () => { filter.end(); stop(); });
+socket.on("close", () => {
+  filter.end();
+  if (!received) {
+    process.exitCode = 1;
+    process.stdout.write("Agent pane did not attach. Use the launcher command in a separate foreground tab.\n");
+  }
+  stop();
+});
 socket.on("connect", () => {
   process.stdout.write("Agent witness pane. After Claude opens, type witness and press Enter once.\n");
   process.stdin.resume();
 });
 socket.on("data", (bytes) => {
+  received = true;
+  let backpressure = false;
   for (let offset = 0; offset < bytes.length; offset += PTY_OUTPUT_MAX_CHUNK) {
-    if (!process.stdout.write(filter.push(bytes.subarray(offset, offset + PTY_OUTPUT_MAX_CHUNK)))) {
-      socket.pause();
-      process.stdout.once("drain", () => socket.resume());
-    }
+    if (!process.stdout.write(filter.push(bytes.subarray(offset, offset + PTY_OUTPUT_MAX_CHUNK))))
+      backpressure = true;
+  }
+  if (backpressure) {
+    socket.pause();
+    process.stdout.once("drain", () => socket.resume());
   }
 });
 process.stdin.on("data", (bytes) => {

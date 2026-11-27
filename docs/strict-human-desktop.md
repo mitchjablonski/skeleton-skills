@@ -425,7 +425,7 @@ arbitrary prompt input are outside this run.
    agent tab, clipboard and report.
 3. When the control tab prints the attach command, run it in a **separate
    foreground WSL tab** from the same checkout. Wait for Claude's startup
-   transcript, type `witness`, and press Enter once. Check that the
+   transcript, record the displayed version, type `witness`, and press Enter once. Check that the
    agent pane shows `DESKTOP-WITNESS` and `LOCAL-FIXTURE-REPLY`. Check
    that the typed marker and reply never appear as agent output in the
    control tab or decision page. Leave the agent pane attached until the
