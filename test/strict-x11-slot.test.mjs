@@ -485,3 +485,44 @@ test("Python dispose parser agrees on every raw-byte case", { skip: process.plat
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(JSON.parse(r.stdout), BYTE_CASES.map((c) => c.want));
 });
+
+test("#270: the restart driver reports unproven cleanup whatever the exercise raised", { skip: process.platform !== "linux" }, () => {
+  const entry = fileURLToPath(new URL("./live/strict-real-seat-restart.py", import.meta.url));
+  // Load the driver without running main, stub the launcher and the runtime
+  // check, and drive exercise() through each failure type.
+  const script = `
+import runpy, subprocess, sys, json
+g = runpy.run_path(sys.argv[1], run_name="restart_under_test")
+ex = g["exercise"]
+G = ex.__globals__
+adm = G["admission"]
+out = {}
+for label, error, cleanup_fails in [
+    ("attr-ok", AttributeError, False), ("attr-fail", AttributeError, True),
+    ("key-fail", KeyError, True), ("type-fail", TypeError, True),
+    ("timeout-fail", lambda m: subprocess.TimeoutExpired("probe", 1), True), ("refused-fail", G["Refused"], True), ("kbint-fail", KeyboardInterrupt, True),
+    ("refused-ok", G["Refused"], False), ("unproven-ok", "unproven", False),
+]:
+    class Launcher:
+        def __init__(self, *a, **k): pass
+        def cleanup(self):
+            if cleanup_fails: raise OSError("namespace survived")
+    def runtime_check(*a, **k):
+        def verify():
+            if error == "unproven": raise adm["RuntimeRefused"]("runtime-observation-cleanup-unproven")
+            raise error("injected")
+        return verify
+    G["OperatorLauncher"] = Launcher
+    adm["read_runtime_selection"] = lambda runtime: None
+    adm["runtime_check"] = runtime_check
+    out[label] = ex("/root", "/node", "/runtime", "0" * 64, "r", "c")
+print(json.dumps(out))
+`;
+  const child = spawnSync("/usr/bin/python3", ["-I", "-c", script, entry], { encoding: "utf8", timeout: 20000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), {
+    "attr-ok": 1, "attr-fail": 125, "key-fail": 125, "type-fail": 125,
+    "timeout-fail": 125, "refused-fail": 125, "kbint-fail": 125, "refused-ok": 1, "unproven-ok": 125,
+  });
+});
