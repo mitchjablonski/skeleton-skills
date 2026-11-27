@@ -1,0 +1,49 @@
+# Process isolation evidence fixture (#172 / #124 / #75)
+
+This opt-in development fixture collects passive evidence that a Bubblewrap
+worker runs under the isolation controls the launcher intends. It attempts no
+attach, memory read or descriptor take, and signals nothing but its own
+sandbox. Strict stays `unverified` after a pass.
+
+```sh
+/usr/bin/python3 -I test/live/strict-process-isolation-probe.py
+```
+
+The launcher starts one worker (user, PID, IPC, net, UTS and cgroup namespaces,
+`--die-with-parent`, `--new-session`, an empty environment). The worker reports
+its own PID, `NSpid`, PID and user namespace identities, `CapEff` and
+`NoNewPrivs`, then waits for EOF so the launcher can look at it while it runs.
+
+The launcher identifies the worker's host process: the **one** descendant of
+the Bubblewrap process whose innermost `NSpid` equals the reported PID and
+whose PID namespace identity equals the reported one. It refuses with
+`ownership-ambiguous` if more than one process matches, `worker-not-found` if
+none does, and `worker-evidence-missing` or `status-field-missing` if any
+report or `/proc` field is absent. It then requires:
+
+| Check | Meaning |
+| --- | --- |
+| `pidns_agrees`, `userns_agrees` | The worker's view and the launcher's view name the same namespaces |
+| `pidns_private`, `userns_private` | Both differ from the launcher's |
+| `nspid_levels` | The host sees two PID levels, the worker only its own |
+| `capeff_zero` | No effective capabilities, from both views |
+| `no_new_privs` | Set, from both views |
+| `same_host_uid` | Every host uid of the worker is the launcher's |
+| `single_uid_map` | Exactly one uid mapping, onto the launcher's uid, count 1 |
+
+`yama_ptrace_scope` and the worker's `Seccomp` mode are recorded as
+observations. Neither is required: the private PID namespace is the gate the
+fixture relies on (see [PID visibility](strict-process-reach.md)).
+
+Mutation checks on WSL2 each fail for the expected reason: no `--unshare-pid`
+gives `worker-not-found`, `--cap-add CAP_SYS_PTRACE` fails `capeff_zero`, a
+duplicated match gives `ownership-ambiguous`, and a report missing a field
+gives `worker-evidence-missing`.
+
+The output is one JSON object with fixture status labels. Exit 0 means every
+check and cleanup succeeded, 1 means a check failed or evidence was refused,
+and 2 means the platform is unsupported or Bubblewrap couldn't start.
+
+This is evidence about the fixture's own sandbox configuration. It says
+nothing about the real launcher profile, the console or the authority, and it
+doesn't test whether any access attempt is refused.
