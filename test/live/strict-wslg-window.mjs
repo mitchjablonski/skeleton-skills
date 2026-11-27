@@ -29,7 +29,8 @@ export function bindDecisionWindows(seat, environment) {
     if (seat.recheck() !== "seat-metadata-matched") return null;
     const result = spawnSync(file, args, {
       env: { ...environment, LC_ALL: "C", PATH: "/usr/bin:/bin" },
-      stdio: ["ignore", "pipe", "ignore"], encoding: "utf8", timeout: 800, maxBuffer: 256 * 1024,
+      stdio: ["ignore", "pipe", "ignore"], encoding: "utf8",
+      timeout: 800, killSignal: "SIGKILL", maxBuffer: 256 * 1024,
     });
     return result.status === 0 && seat.recheck() === "seat-metadata-matched" ? result.stdout : null;
   };

@@ -91,8 +91,9 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
     try {
       const result = await confirm(watchdog);
       interrupted();
-      if (watchdog.aborted || !isCurrent()) throw new Fail("wslg-owned-window-lost");
+      if (watchdog.aborted) throw new Fail("wslg-owned-window-lost");
       requireCode(result);
+      if (!isCurrent()) throw new Fail("wslg-owned-window-lost");
     } finally {
       clearInterval(timer);
     }
