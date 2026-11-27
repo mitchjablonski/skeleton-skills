@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { scanRepo, searchable, toSteps, stripMarkers } from "../lib/markers.mjs";
 import { STATE_DIR, findRoot, readState, writeState, initState, insideRoot, legacyConfigDir, projectKey, realish, refreshReceiptIndex, skelStateDir, storePath, writeFileAtomic } from "../lib/state.mjs";
 import { clearConfigNotice, readConfigNotice } from "../lib/config-notice.mjs";
-import { projectStrictStatus, strictStatusLead } from "../lib/strict-status.mjs";
+import { projectStrictStatus, refuseInBoundaryTransition, strictStatusLead } from "../lib/strict-status.mjs";
 import { renderPrBody } from "../lib/pr-body.mjs";
 import { PLUGIN_ID, claudeConfigDir, hasLegacyHooks, installStatus, isSkelConfigHook, isSkelHook, pluginEvidence, pluginStatus, registrationNotice, rulePath, skelStopHook } from "../lib/install-status.mjs";
 import { isLegacyCopy, renderLegacy } from "../lib/legacy-copy.mjs";
@@ -108,6 +108,14 @@ function gitignoresStateDir(root) {
   } catch {
     return false;
   }
+}
+
+// #78 / C15: in a project that requested strict, approve, reshape and
+// finalize never run from inside the session, whatever status says. Default
+// mode (every project in this release) gets null and runs unchanged.
+async function refuseInStrict(root, action) {
+  const refusal = refuseInBoundaryTransition(await projectStrictStatus(root), action);
+  if (refusal) die(refusal);
 }
 
 function die(msg) {
@@ -1292,6 +1300,7 @@ const commands = {
     const given = flag(args, "reviewed", null);
     if (given !== null && !isVersion(given)) die('--reviewed takes the 12-character version the human reviewed (the "Reviewed skeleton version: …" line of their feedback)');
     const root = requireRoot();
+    await refuseInStrict(root, "approve");
     let state = requireState(root);
     if (state.phase !== "scaffold") die(`the skeleton is already ${state.phase === "fill" ? "approved and being filled" : "finalized"}`);
     const { steps, errors, files } = snapshot(root);
@@ -1451,8 +1460,9 @@ const commands = {
     if (!pending.length) console.log("Run the full project test suite, then ask the human whether to finalize. If they say yes, run skel finalize.");
   },
 
-  reshape(args) {
+  async reshape(args) {
     const root = requireRoot();
+    await refuseInStrict(root, "reshape");
     return withFeedbackLock(root, () => {
       const state = requireState(root);
       if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
@@ -1471,6 +1481,7 @@ const commands = {
 
   async finalize() {
     const root = requireRoot();
+    await refuseInStrict(root, "finalize");
     const state = requireState(root);
     const phase = state.phase;
     if (phase !== "fill") die(phase === "done" ? "already finalized" : "the skeleton hasn't been approved and filled yet");

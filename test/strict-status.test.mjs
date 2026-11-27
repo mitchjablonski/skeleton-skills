@@ -198,7 +198,7 @@ test("unverified and ended copy says refused only when strict was requested", ()
   for (const e of evidence) {
     const on = classifyEvidence(e, CONTEXT), off = classifyEvidence(e, { ...CONTEXT, requested: false });
     const label = `${on.state}:${on.reason}`;
-    assert.match(on.next, /Approve, reshape and finalize are refused until status shows active\.$/, label);
+    assert.match(on.next, /Approve, reshape and finalize are refused in this session\. In strict mode they go only through the protected decision page, opened from the strict launcher's control window\.$/, label);
     assert.doesNotMatch(off.next, /refused/, label);
     assert.match(off.next, /Strict wasn't requested for this project, so default mode applies unchanged\.$/, label);
     assert.equal(on.summary, off.summary, label);
@@ -313,9 +313,11 @@ test("in-boundary transitions: the action name is sanitized before it reaches th
   assert.match(refuseInBoundaryTransition(strictActive, "finalize"), /^refused: finalize /);
 });
 
-test("in-boundary transitions: the helper isn't wired into the CLI", () => {
+test("in-boundary transitions: the CLI gates approve, reshape and finalize with the in-boundary helper, never refusePrivileged", () => {
   const bin = fs.readFileSync(BIN, "utf-8");
-  assert.doesNotMatch(bin, /refuseInBoundaryTransition|refusePrivileged/);
+  assert.doesNotMatch(bin, /refusePrivileged/, "refusePrivileged allows when active; it is display copy, not a gate");
+  assert.match(bin, /refuseInBoundaryTransition\(await projectStrictStatus\(root\), action\)/);
+  for (const action of IN_BOUNDARY_TRANSITIONS) assert.match(bin, new RegExp(`await refuseInStrict\\(root, "${action}"\\);`), action);
 });
 
 test("the human strict line is one line with the state, reason and next step", () => {
@@ -427,7 +429,7 @@ function approvedProject(bin) {
   const run = (b, ...args) => spawnSync(process.execPath, [b, ...args], { cwd: dir, env, encoding: "utf8", timeout: 60_000 });
   assert.equal(run(BIN, "init", "t", "--gate", "deny").status, 0);
   assert.equal(run(BIN, "approve").status, 0);
-  return (...args) => run(bin, ...args);
+  return Object.assign((...args) => run(bin, ...args), { dir, real: (...args) => run(BIN, ...args) });
 }
 
 test("#229: default-mode `skel status` has no strict lines", () => {
@@ -449,6 +451,30 @@ test("#229: with strict requested (the C9 probe's stand-in), `skel status` leads
   assert.match(lines[0], /^strict: unsupported — strict was requested, so approve, reshape and finalize are refused/);
   assert.match(lines[2], /^Next: .*Use a release with strict support/);
   assert.match(lines[3], /^t — phase: fill/, "the strict lines come before anything else");
+});
+
+test("C15: with strict requested (stand-in), approve, reshape and finalize refuse in the CLI and change nothing; default mode still runs them", () => {
+  const copy = makeRequestedStandin(path.join(HERE, ".."), mkTemp("skel-strict-c15-"), ["bin", "lib", "package.json"]);
+  const strictSkel = path.join(copy, "bin", "skel.mjs");
+  const strict = approvedProject(strictSkel); // approved by the real CLI, then run through the stand-in
+  const { dir } = strict;
+  const stateFile = path.join(dir, ".skeleton", "state.json");
+  const refuses = (action) => {
+    const before = fs.readFileSync(stateFile, "utf8");
+    const out = strict(action);
+    assert.notEqual(out.status, 0, `${action} must refuse`);
+    assert.match(out.stderr, new RegExp(`refused: ${action} can't run from inside the session in a strict project`));
+    assert.match(out.stderr, /protected human decision page/);
+    assert.match(out.stderr, /\(strict status is unsupported\)/, "the stand-in status was read, not refused as unreadable");
+    assert.equal(fs.readFileSync(stateFile, "utf8"), before, `${action} must not touch state`);
+  };
+  refuses("reshape");
+  refuses("finalize");
+  // Back to scaffold through the real CLI: approve is refused there too.
+  const { real } = strict;
+  assert.equal(real("reshape").status, 0, "default mode reshape still runs");
+  refuses("approve");
+  assert.equal(real("approve").status, 0, "default mode approve still runs");
 });
 
 test("operator guide: links resolve, anchors exist, every state and reason is covered", () => {
