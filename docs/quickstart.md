@@ -32,6 +32,7 @@ When skel refuses:
 - **The hook asks about, or refuses, an edit outside the fence:** that's a
   skeleton change. Propose it, and don't retry it another way.
 - **`approve`, a diff since the reviewed version:** tell the human what
-  changed, have them look again, and use the new `--reviewed`.
+  changed and have them reload the page and look again. Then approve with the
+  new `--reviewed` from their paste, or bare after a new yes in chat.
 - **A step filled without `skel next`:** `skel start <id> --force` reopens it,
   so `skel done` can check it.

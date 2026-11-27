@@ -292,9 +292,10 @@ function warnLegacyQueue(root) {
 /**
  * Progress is derived from the code (a step is filled once its fences hold no SKEL_TODO),
  * so a step filled without being started never ran \`skel done\`'s checks. Since #247 the
- * fill records each step started (\`startedSteps\`, seeded at approve with the steps the
- * approved skeleton already had filled); a fill approved
- * before that has no record, and gets no notice rather than a wrong one.
+ * fill records each step started (\`startedSteps\`: empty at a first approve, carried over
+ * on re-approval after reshape). The skeleton version doesn't cover fence bodies, so a body
+ * filled before approval is noted too. A fill approved before that has no record (and keeps
+ * none through reshape, \`legacyFill\`), and gets no notice rather than a wrong one.
  */
 function skippedStepsNote(state, earlier) {
   if (!Array.isArray(state.startedSteps)) return;
@@ -302,7 +303,7 @@ function skippedStepsNote(state, earlier) {
   if (!skipped.length) return;
   const ids = skipped.map((s) => s.id).join(", ");
   const one = skipped.length === 1;
-  console.log(`note: step${one ? "" : "s"} ${ids} ${one ? "was" : "were"} filled without being started, so \`skel done\` never checked ${one ? "it" : "them"}; \`skel start ${skipped[0].id} --force\` reopens ${one ? "it" : "one"} for \`skel done\` to check`);
+  console.log(`note: step${one ? "" : "s"} ${ids} ${one ? "is" : "are"} filled but ${one ? "was" : "were"} never started (filled before approval, or without \`skel next\`), so \`skel done\` never checked ${one ? "it" : "them"}; \`skel start ${skipped[0].id} --force\` reopens ${one ? "it" : "one"} for \`skel done\` to check`);
 }
 
 function setActive(root, state, step, force = false) {
@@ -1333,9 +1334,15 @@ const commands = {
       for (const line of describeCoverage(source.coverage, Object.keys(record.files).length)) console.log(line);
       const sourceTook = Date.now() - sourceStart;
       if (sourceTook > 3000) console.log(`  note: reading the source set took ${(sourceTook / 1000).toFixed(1)}s. \`done\` and \`finalize\` re-read it.`);
-      // Steps whose fences were already filled in the approved skeleton count as started:
-      // that content was reviewed and approved, so it is never "filled without being started".
-      const next = { ...state, phase: "fill", activeStep: null, reviewEpoch: Date.now(), startedSteps: steps.filter((s) => s.status === "filled").map((s) => s.id) };
+      // Started steps: none on a first approval. The version covers the code outside the
+      // fences, not the bodies, so a body already filled here was never checked by
+      // `skel done` and the note should say so. On re-approval after reshape, the steps
+      // started in the earlier round stay started (those still in the skeleton); a fill
+      // from before #247 that was reshaped (`legacyFill`) stays without a record.
+      const ids = new Set(steps.map((s) => s.id));
+      const startedSteps = Array.isArray(state.startedSteps) ? state.startedSteps.filter((id) => ids.has(id)) : state.legacyFill ? undefined : [];
+      const { startedSteps: _prior, ...rest } = state;
+      const next = { ...rest, phase: "fill", activeStep: null, reviewEpoch: Date.now(), ...(startedSteps ? { startedSteps } : {}) };
       try {
         writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at }, source.coverage);
       } catch (err) {
@@ -1441,7 +1448,7 @@ const commands = {
     return withFeedbackLock(root, () => {
       const state = requireState(root);
       if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
-      writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now(), reviewRound: crypto.randomUUID() });
+      writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now(), reviewRound: crypto.randomUUID(), ...(Array.isArray(state.startedSteps) ? {} : { legacyFill: true }) });
       // The record is of the shape being reopened; approve writes the new one.
       clearSnapshot(root);
       clearConfigNotices(root);

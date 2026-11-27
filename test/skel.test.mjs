@@ -415,10 +415,10 @@ test("#247: next and done note an earlier step filled without being started; the
   // Step 1 is filled straight away, never started: progress comes from the code, so next moves on to step 2.
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
   const next = run("next");
-  assert.match(next, /^note: step 1 was filled without being started, so `skel done` never checked it; `skel start 1 --force` reopens it for `skel done` to check\nSTEP 2 active/);
+  assert.match(next, /^note: step 1 is filled but was never started \(filled before approval, or without `skel next`\), so `skel done` never checked it; `skel start 1 --force` reopens it for `skel done` to check\nSTEP 2 active/);
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
   const done = run("done");
-  assert.match(done, /^STEP 2 done\. 0 pending\.\nnote: step 1 was filled without being started[^\n]*\nRun the full project test suite/);
+  assert.match(done, /^STEP 2 done\. 0 pending\.\nnote: step 1 is filled but was never started[^\n]*\nRun the full project test suite/);
   // Reopening it records it as started: the note goes away.
   run("start", "1", "--force");
   run("done");
@@ -448,22 +448,43 @@ test("#247: docs/quickstart.md is the default-mode path the help points to, with
   assert.match(help, /See docs\/quickstart\.md/);
 });
 
-test("#247: a step already filled in the approved skeleton is never reported as skipped", () => {
-  const { dir, a, run } = project();
+test("#247: a body filled before approval is noted (the version doesn't cover bodies); reshape keeps the steps started earlier", () => {
+  const { a, run } = project();
   run("init", "Stroke smoothing");
-  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;")); // SKEL[1] approved as filled content
+  run("review"); // the page shows stubs; the version is the same once a body is filled
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;")); // SKEL[1] filled after review, before approve
   run("approve");
-  const status = JSON.parse(run("status", "--json"));
-  assert.deepEqual(status.startedSteps, ["1"]);
+  assert.deepEqual(JSON.parse(run("status", "--json")).startedSteps, []);
   const next = run("next");
-  assert.doesNotMatch(next, /note:/);
-  assert.match(next, /^STEP 2 active/);
+  assert.match(next, /^note: step 1 is filled but was never started \(filled before approval/);
+  assert.match(next, /STEP 2 active/);
   fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return [a, b];"));
-  assert.doesNotMatch(run("done"), /note:/);
-  // After a reshape and re-approval, the seed is taken again from the approved skeleton.
+  assert.match(run("done"), /note: step 1 is filled/);
+  // Reshape and re-approve: step 2, started and checked in the earlier round, stays started;
+  // step 1 is still unchecked and still noted.
   run("reshape");
   run("approve");
-  assert.deepEqual(JSON.parse(run("status", "--json")).startedSteps, ["1", "2"]);
+  assert.deepEqual(JSON.parse(run("status", "--json")).startedSteps, ["2"]);
+  run("start", "1", "--force");
+  run("done");
+  run("reshape");
+  run("approve");
+  assert.deepEqual(JSON.parse(run("status", "--json")).startedSteps, ["2", "1"]);
+  assert.doesNotMatch(run("status"), /note: step/);
+});
+
+test("#247: a fill from before started-steps records stays without notices through reshape", () => {
+  const { dir, a, run } = project();
+  run("init", "Stroke smoothing");
+  run("approve");
+  const statePath = path.join(dir, ".skeleton", "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  delete state.startedSteps;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace(STUB, "return raw;"));
+  run("reshape");
+  run("approve");
+  assert.equal(JSON.parse(run("status", "--json")).startedSteps, undefined);
   assert.doesNotMatch(run("next"), /note:/);
 });
 
