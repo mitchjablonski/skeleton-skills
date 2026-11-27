@@ -148,6 +148,53 @@ test("two overlapping restart requests cannot share one operator answer", async 
   assert.equal(await first, "operator-restart-not-attested");
 });
 
+test("an operator compares one selected window and keeps its phrase through restart", async () => {
+  const prompts = [];
+  let current = true;
+  let replaceOnAnswer = false;
+  const seat = await bindOperatorSeat({
+    interactive: () => true,
+    confirm: async (prompt) => {
+      prompts.push(prompt);
+      if (replaceOnAnswer) current = false;
+      return true;
+    },
+    bind: () => ({ code: "real-seat-preflight-passed", recheck: () => "seat-metadata-matched" }),
+  });
+  const binding = { captureVersion: "a".repeat(64) };
+  let minted = 0;
+  let used = false;
+  let pagePhrase;
+  const listener = { mintWindowNavigation(value, { windowPhrase }) {
+    assert.equal(value, binding);
+    minted++;
+    pagePhrase = windowPhrase;
+    return {
+      url: "fixture",
+      takeView() {
+        if (used) return false;
+        used = true;
+        return true;
+      },
+      isCurrent: () => current,
+    };
+  } };
+  const presentation = seat.prepareWindow(listener, binding);
+  assert.equal(presentation.comparison(), null);
+  assert.equal(presentation.navigation.takeView(), true);
+  assert.equal(presentation.navigation.takeView(), false);
+  assert.equal(await presentation.confirmMatch(), "seat-metadata-matched");
+  assert.ok(prompts.at(-1).includes(pagePhrase));
+  assert.ok(prompts.at(-1).includes(binding.captureVersion));
+  const before = presentation.comparison();
+  assert.equal(await seat.confirmRestart(), "seat-metadata-matched");
+  assert.equal(presentation.comparison(), before);
+  assert.equal(minted, 1);
+  replaceOnAnswer = true;
+  assert.equal(await presentation.confirmMatch(), "discriminating-phrase-mismatch");
+  assert.equal(presentation.comparison(), null);
+});
+
 function installationFixture() {
   const bytes = Buffer.from("fixture executable bytes");
   const pin = createHash("sha256").update(bytes).digest("hex");

@@ -13,6 +13,7 @@ import {createHumanCommandClient} from '../../lib/strict-human-channel.mjs';
 import {recoverHumanAuthorityChild, serveHumanAuthorityChild} from '../../lib/strict-authority-child.mjs';
 import {FIXTURE_CONTEXT, FIXTURE_PLAN, materialize} from './strict-candidate-inner.mjs';
 import {makeSeatFixture} from './strict-seat-metadata-fixture.mjs';
+import {prepareSeatWindow} from './strict-real-seat-window.mjs';
 
 const [role, directory, identity, fd, reportFd, extraFd, refreshReportFd, chromePin, controlFd] = process.argv.slice(2);
 const authority = path.join(directory, 'authority');
@@ -63,6 +64,7 @@ async function runProtectedWindow(listener, binding, origin, scratch, seat) {
   // Leave time for the full restart, but also close on a stalled fixture.
   setTimeout(close, 45000);
   let window;
+  let presentation;
   let busy = false;
   control.on('data', async bytes => {
     if (closing || !window || busy || bytes.length !== 1) {
@@ -72,6 +74,15 @@ async function runProtectedWindow(listener, binding, origin, scratch, seat) {
     busy = true;
     try {
       switch (bytes[0]) {
+        case 0x70: { // p: read the comparison on the private launcher channel
+          const proof = presentation?.comparison();
+          if (!proof) { close(); break; }
+          control.write(JSON.stringify(proof) + '\n', error => {
+            if (error) close();
+            else busy = false;
+          });
+          break;
+        }
         case 0x76: { // v
           let verdict = 's';
           if (seatMatched(seat)) {
@@ -113,7 +124,13 @@ async function runProtectedWindow(listener, binding, origin, scratch, seat) {
       close();
       return;
     }
-    const selected = listener.mintWindowNavigation(binding);
+    presentation = prepareSeatWindow({listener, binding, recheck: seat.binding.recheck});
+    if (!presentation) {
+      exitStatus = SEAT_REFUSED;
+      close();
+      return;
+    }
+    const selected = presentation.navigation;
     const navigation = role === 'protected-window-missing-view'
       ? {url: listener.mintNavigation(), takeView: selected.takeView}
       : selected;

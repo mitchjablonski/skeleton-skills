@@ -66,10 +66,13 @@ The retained binding's `confirmRestart()` checks the seat, asks the operator
 to confirm the conditions for that restart, and checks the same seat again.
 A refused confirmation ends that binding.
 
-The decision listener can deliver a launcher-supplied window phrase with
-the selected capture. The page shows it above the capture and clears it
-when re-reading. The operator compares it with the phrase in the control
-terminal during a real-seat run.
+The operator binding's `prepareWindow()` generates one phrase for the
+selected capture and its navigation. After the selected page loads,
+`confirmMatch()` shows the phrase and capture version on the operator
+terminal and asks the operator to compare them with the browser. The
+same navigation must still be current after the operator answers.
+The private-window fixture verifies that the phrase and capture version
+stay the same across restart.
 
 ### Inventory fields
 

@@ -138,6 +138,13 @@ class OwnedWindow:
         self.control.sendall(b's')
         assert self.control.recv(2) == b'a'
 
+    def comparison(self):
+        self.control.sendall(b'p')
+        with self.control.makefile('rb') as stream:
+            line = stream.readline(256)
+        assert line.endswith(b'\n')
+        return json.loads(line)
+
     def dispose(self):
         slot = self.profile / 'display-slot'
         if os.path.lexists(slot):
@@ -697,6 +704,11 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
             assert capture['snapshot']((selected,)) == before
             return
         initial_listener = launcher.listener
+        window_comparison = None
+        if case == 'restart' and initial_listener is not None and initial_listener.scope.window is not None:
+            window_comparison = initial_listener.scope.window.comparison()
+            assert window_comparison['captureVersion'] == selected.expected['captureVersion']
+            assert len(window_comparison['phrase'].split()) == 5
         admitted = launcher.admit_capture(selected, initial, first_stage)
         if case in STARTUP_FAULTS:
             assert admitted is None and not launcher.fills and launcher.active is None
@@ -788,6 +800,8 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
             if protected:
                 assert launcher.listener is initial_listener
                 assert launcher.terminal is terminal and launcher.listener_ready(generation)
+                if window_comparison is not None:
+                    assert launcher.listener.scope.window.comparison() == window_comparison
                 terminal_host['read_console_status'](terminal.master, selected.expected,
                                                     terminal=terminal, phase='post-restart-status')
             for name in capture['MEMBERS']:
