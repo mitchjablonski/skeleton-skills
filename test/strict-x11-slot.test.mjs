@@ -100,6 +100,54 @@ test("the operator handoff refuses a terminal change during a seat check and kee
   assert.equal(samples, 2, "a new check cannot revive the refused handoff");
 });
 
+test("an unavailable seat refuses a restart before asking the operator", async () => {
+  let prompts = 0;
+  const binding = await bindOperatorSeat({
+    interactive: () => true,
+    confirm: async () => { prompts++; return true; },
+    bind: () => ({ code: "real-seat-preflight-passed", recheck: () => "browser-executable-changed" }),
+  });
+  const setupPrompts = prompts;
+  assert.equal(await binding.confirmRestart(), "browser-executable-changed");
+  assert.equal(prompts, setupPrompts);
+});
+
+test("a declined restart confirmation closes the retained binding", async () => {
+  let answer = true;
+  let samples = 0;
+  const binding = await bindOperatorSeat({
+    interactive: () => true,
+    confirm: async () => answer,
+    bind: () => ({
+      code: "real-seat-preflight-passed",
+      recheck() { samples++; return "seat-metadata-matched"; },
+    }),
+  });
+  answer = false;
+  assert.equal(await binding.confirmRestart(), "operator-restart-not-attested");
+  answer = true;
+  assert.equal(await binding.confirmRestart(), "operator-restart-not-attested");
+  assert.equal(binding.recheck(), "operator-restart-not-attested");
+  assert.equal(samples, 1);
+});
+
+test("two overlapping restart requests cannot share one operator answer", async () => {
+  let prompt = () => true;
+  const binding = await bindOperatorSeat({
+    interactive: () => true,
+    confirm: () => prompt(),
+    bind: () => ({ code: "real-seat-preflight-passed", recheck: () => "seat-metadata-matched" }),
+  });
+  let answer;
+  prompt = () => new Promise((resolve) => { answer = resolve; });
+  const first = binding.confirmRestart();
+  const acceptFirst = answer;
+  assert.equal(await binding.confirmRestart(), "operator-restart-not-attested");
+  assert.equal(answer, acceptFirst);
+  acceptFirst(true);
+  assert.equal(await first, "operator-restart-not-attested");
+});
+
 function installationFixture() {
   const bytes = Buffer.from("fixture executable bytes");
   const pin = createHash("sha256").update(bytes).digest("hex");
