@@ -62,6 +62,10 @@ a bound check refuses, a later match cannot revive that binding. The rehearsal
 is read-only. It samples passive evidence, collects operator statements and
 reports `strictState: "unverified"`.
 
+The retained binding's `confirmRestart()` checks the seat, asks the operator
+to confirm the conditions for that restart, and checks the same seat again.
+A refused confirmation ends that binding.
+
 ### Inventory fields
 
 It prints one bounded JSON object with fixed labels:
