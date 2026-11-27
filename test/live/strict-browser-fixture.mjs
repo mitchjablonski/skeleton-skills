@@ -460,8 +460,8 @@ export function createFixture({ prefix }) {
   /**
    * Headless, Chrome's default sandbox (never --no-sandbox), own session, no display variables,
    * HOME = the scratch root. `existingDir` reuses another launch's directory (singleton
-   * handoff only); `wrap` prefixes the argv (test only). `display` (#222) is only ever the
-   * fixture's own private Xvfb display: its DISPLAY/XAUTHORITY replace headless mode.
+   * handoff only); `wrap` prefixes the argv (test only). The caller binds the display first:
+   * private Xvfb for fixtures or the attested WSLg seat for the operator launcher.
    */
   function launch(name, args, { primary = false, existingDir = null, wrap = null, display = null } = {}) {
     const { dir, check } = existingDir ? { dir: existingDir, check: null } : makeDataDir(name);

@@ -129,15 +129,24 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
     if (!isCurrent() || !presentation.comparison()) throw new Fail("wslg-owned-window-lost");
     interrupted();
   } finally {
-    await listener.close();
-    if (browser && browser.exit === null) {
-      browser.proc.kill("SIGTERM");
-      const deadline = performance.now() + 4000;
-      while (browser.exit === null && performance.now() < deadline) await sleep(50);
+    try {
+      await listener.close();
+    } finally {
+      if (browser && browser.exit === null) {
+        browser.proc.kill("SIGTERM");
+        const deadline = performance.now() + 4000;
+        while (browser.exit === null && performance.now() < deadline) await sleep(50);
+      }
     }
   }
-  if (browser.exit === null || windows.decisionWindows()?.length !== 0)
-    throw new Fail("wslg-window-teardown-unproven");
+  const deadline = performance.now() + 2000;
+  while (browser.exit !== null && performance.now() < deadline) {
+    const remaining = windows.decisionWindows();
+    if (remaining?.length === 0) return;
+    if (!remaining) break;
+    await sleep(50);
+  }
+  throw new Fail("wslg-window-teardown-unproven");
 }
 
 async function run(scratch, input, output) {
@@ -165,18 +174,15 @@ async function run(scratch, input, output) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [flag, scratch, descriptor] = process.argv.slice(2);
-  if (process.argv.length !== 5 || flag !== "--supervised-wslg-window"
-      || !/^\d{1,5}$/.test(descriptor ?? "") || Number(descriptor) < 3) process.exit(2);
-  const report = Number(descriptor);
+  const [flag, scratch] = process.argv.slice(2);
+  if (process.argv.length !== 4 || flag !== "--supervised-wslg-window") process.exit(2);
   let code;
   try {
-    if (!fs.fstatSync(report).isFIFO()) process.exit(2);
+    if (!fs.fstatSync(2).isFIFO()) process.exit(2);
     code = await run(scratch, process.stdin, process.stdout);
   } catch {
     code = "real-seat-evidence-unavailable";
   }
-  fs.writeSync(report, code + "\n");
-  fs.closeSync(report);
+  fs.writeSync(2, code + "\n");
   process.exit(code === SUCCESS ? 0 : 1);
 }

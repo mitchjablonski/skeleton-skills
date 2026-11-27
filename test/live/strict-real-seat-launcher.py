@@ -38,28 +38,30 @@ def run(argv):
     for name in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(name, mark_interrupted)
     scratch = tempfile.mkdtemp(prefix="skel-wslg-", dir="/dev/shm")
-    read_fd, write_fd = os.pipe()
     child = None
-    cleanup = False
+    timed_out = False
     try:
         try:
             child = subprocess.Popen(
                 [node, str(directory / "strict-real-seat-launcher.mjs"), "--supervised-wslg-window",
-                 scratch, str(write_fd)],
+                 scratch],
                 env={"DISPLAY": os.environ.get("DISPLAY", ""), "PATH": "/usr/bin:/bin"},
                 # This single-threaded wrapper keeps supervision as a fallback
                 # while the Node child samples its own adopted Chrome helpers.
                 preexec_fn=helpers["enable_child_supervision"],
-                pass_fds=(write_fd,), stderr=subprocess.DEVNULL,
+                # Chrome and the X tools each replace stderr. Hand off no
+                # additional descriptor for them to inherit.
+                stderr=subprocess.PIPE,
             )
-        finally:
-            os.close(write_fd)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
         watchdog = time.monotonic() + 19 * 60
         forwarded = False
-        while child.poll() is None:
+        while child is not None and child.poll() is None:
             now = time.monotonic()
-            if now >= watchdog:
+            if now >= watchdog and interrupted_at is None:
+                timed_out = True
                 mark_interrupted(None, None)
             if interrupted_at is not None:
                 if now >= interrupted_at + 8:
@@ -69,16 +71,25 @@ def run(argv):
                     forwarded = True
             time.sleep(0.05)
     finally:
-        try:
-            cleanup = helpers["stop_owned_children"](child)
-            if cleanup:
+        cleanup = helpers["stop_owned_children"](child)
+        if cleanup:
+            try:
                 shutil.rmtree(scratch)
-            os.set_blocking(read_fd, False)
-            packet = os.read(read_fd, 192)
-        finally:
-            os.close(read_fd)
+            except OSError:
+                cleanup = False
+    packet = b""
+    if child is not None:
+        with child.stderr as report:
+            if cleanup and interrupted_at is None:
+                os.set_blocking(report.fileno(), False)
+                try:
+                    packet = os.read(report.fileno(), 192)
+                except BlockingIOError:
+                    pass
     if not cleanup:
         return "real-seat-cleanup-unproven"
+    if timed_out:
+        return "real-seat-timeout"
     if interrupted_at is not None:
         return "real-seat-interrupted"
     if not re.fullmatch(rb"[a-z][a-z0-9-]{0,95}\n", packet):
@@ -92,6 +103,8 @@ def run(argv):
 if __name__ == "__main__":
     try:
         code = run(sys.argv[1:])
+    except KeyboardInterrupt:
+        code = "real-seat-interrupted"
     except (OSError, RuntimeError, ValueError):
         code = "real-seat-evidence-unavailable"
     print(json.dumps({

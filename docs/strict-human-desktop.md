@@ -1,7 +1,8 @@
 # Human desktop qualification (#231, first slice)
 
-Status: a read-only inventory plus the qualification plan. No window has been
-observed and no human step has been run. Strict remains `unverified`.
+Status: read-only inventory, an operator launcher for the synthetic window
+checkpoint, and the qualification plan. Human observation is pending.
+Strict remains `unverified`.
 
 This is the human-desktop part of #79. Codex owns the separate readiness and
 load slice (#230). Xvfb evidence (the
@@ -283,22 +284,35 @@ the WSL Node installation on your PATH and the pinned Chrome installation
 from the [launcher design](strict-real-desktop-launcher.md).
 
 ```bash
+git rev-parse HEAD
+git status --porcelain
+node --version
 wc -l /mnt/wslg/stderr.log
+```
+
+Use the reviewed commit in a clean checkout. An empty `git status --porcelain`
+confirms the checkout is clean. Then run the launcher and record the final
+WSLg log line count.
+
+```bash
 python3 -I test/live/strict-real-seat-launcher.py --real-seat-launcher
 wc -l /mnt/wslg/stderr.log
 ```
 
-Answer each attestation yourself. Once Chrome opens, check that a single
-new review window is visible, the profile is fresh, and your other browser
+Answer each attestation yourself with the literal `yes` only if it holds.
+Once Chrome opens, check that a single new review window is visible, the
+profile is fresh, and your other browser
 windows are unchanged. Compare the phrase and capture version on the page
 with the values in the control terminal. At the restart checkpoint, repeat
-the comparison and check that the same window stayed open. After the
-launcher returns, confirm its window is gone and your existing windows
-are still present.
+the comparison and check that the same window stayed open. The second
+prompt rehearses the restart check with the original process still running.
+After the launcher returns, confirm its window is gone and your existing
+windows are still present.
 
-Post the final JSON result, Windows Terminal and Node versions, and WSLg
-log line counts before and after to #79. Include which visual comparisons
-and cleanup checks you could witness. Keep the phrase and any private
+Post the final JSON result, commit SHA, clean-checkout status, Windows
+Terminal and Node versions, and WSLg log line counts before and after to
+#79. Include which visual comparisons and cleanup checks you could witness.
+Keep the phrase and any private
 navigation data out of the issue. If the runner refuses, record its code
 and whether the owned window closed. A refusal or an increase in WSLg log
 lines needs investigation before trying again.
@@ -307,7 +321,9 @@ The success code is `real-seat-window-checkpoint-passed`. This command
 serves a fixed synthetic capture with no decision codes. It checks the
 retained window, capture and phrase at the restart checkpoint. Full #79
 qualification still needs the controlled agent restart, real decision
-terminal and desktop isolation checks above. The result stays
+terminal and desktop isolation checks above. A contained agent run also
+depends on the private PID isolation in #172 to protect Chrome's navigation
+argument from agent-visible process metadata. The result stays
 `strictState: unverified` with `attribution-unavailable` because WSLg's
 X server PID namespace has no verified translation.
 
