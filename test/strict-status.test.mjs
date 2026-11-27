@@ -198,7 +198,7 @@ test("unverified and ended copy says refused only when strict was requested", ()
   for (const e of evidence) {
     const on = classifyEvidence(e, CONTEXT), off = classifyEvidence(e, { ...CONTEXT, requested: false });
     const label = `${on.state}:${on.reason}`;
-    assert.match(on.next, /Approve, reshape and finalize are refused until status shows active\.$/, label);
+    assert.match(on.next, /Approve, reshape and finalize are refused in this session\. In strict mode they go only through the protected decision page, opened from the strict launcher's control window\.$/, label);
     assert.doesNotMatch(off.next, /refused/, label);
     assert.match(off.next, /Strict wasn't requested for this project, so default mode applies unchanged\.$/, label);
     assert.equal(on.summary, off.summary, label);
@@ -429,7 +429,7 @@ function approvedProject(bin) {
   const run = (b, ...args) => spawnSync(process.execPath, [b, ...args], { cwd: dir, env, encoding: "utf8", timeout: 60_000 });
   assert.equal(run(BIN, "init", "t", "--gate", "deny").status, 0);
   assert.equal(run(BIN, "approve").status, 0);
-  return Object.assign((...args) => run(bin, ...args), { dir });
+  return Object.assign((...args) => run(bin, ...args), { dir, real: (...args) => run(BIN, ...args) });
 }
 
 test("#229: default-mode `skel status` has no strict lines", () => {
@@ -465,12 +465,13 @@ test("C15: with strict requested (stand-in), approve, reshape and finalize refus
     assert.notEqual(out.status, 0, `${action} must refuse`);
     assert.match(out.stderr, new RegExp(`refused: ${action} can't run from inside the session in a strict project`));
     assert.match(out.stderr, /protected human decision page/);
+    assert.match(out.stderr, /\(strict status is unsupported\)/, "the stand-in status was read, not refused as unreadable");
     assert.equal(fs.readFileSync(stateFile, "utf8"), before, `${action} must not touch state`);
   };
   refuses("reshape");
   refuses("finalize");
   // Back to scaffold through the real CLI: approve is refused there too.
-  const real = (...a) => spawnSync(process.execPath, [BIN, ...a], { cwd: dir, env: { ...process.env, XDG_STATE_HOME: path.join(dir, ".xdg"), CLAUDE_PROJECT_DIR: "" }, encoding: "utf8", timeout: 60_000 });
+  const { real } = strict;
   assert.equal(real("reshape").status, 0, "default mode reshape still runs");
   refuses("approve");
   assert.equal(real("approve").status, 0, "default mode approve still runs");

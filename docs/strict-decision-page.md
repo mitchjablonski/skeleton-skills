@@ -299,7 +299,7 @@ Recovery copy, per state:
 **In-boundary privileged CLI transitions always refuse in strict, even when active.** `skel approve`, `skel reshape` and `skel finalize` inside the boundary are never a strict writer, so in a strict project they refuse whatever status says. The only strict transition path is the decision page.
 
 - **Required code change for integration:** `refusePrivileged` in lib/strict-status.mjs returns `null` (allow) when status is active. Production wiring must not use it as the gate for in-boundary CLI transitions. Those need an unconditional strict refusal, and `refusePrivileged` stays a copy helper for status display.
-- The current copy ("refused until status shows active") must change to point at the decision page.
+- The status copy points at the decision page, and `skel approve`, `skel reshape` and `skel finalize` refuse through `refuseInBoundaryTransition` (matrix C15).
 
 **Who produces evidence.**
 
