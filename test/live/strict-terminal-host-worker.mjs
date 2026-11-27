@@ -28,7 +28,7 @@ if (!refreshEnabled) {
 setTimeout(() => {
   closeRefreshReport();
   process.exit(3);
-}, mode === 'operator-restart' ? 300000 : 15000);
+}, mode === 'operator-restart' ? 540000 : 15000);
 
 const client = createHumanCommandClient(new net.Socket({fd: socketFd, readable: true, writable: true}));
 let stateCalls = 0;

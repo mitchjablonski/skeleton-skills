@@ -383,9 +383,13 @@ class NamespaceLauncher(CaptureLauncher):
             return None
         namespace = lifecycle['start_namespace'](self.run, label, stage=stage,
                                                  stop_mode=self.stop_mode if stage is not None else None,
-                                                 desktop_policy=self.desktop_policy)
+                                                 desktop_policy=self.desktop_policy,
+                                                 interactive=self.interactive_client(stage))
         self.supervisor.own(namespace, namespace['process'])
         return namespace
+
+    def interactive_client(self, stage):
+        return None
 
     def start_fill(self, generation, stage):
         namespace = self.start_owned_namespace(generation, stage.name, stage=stage)

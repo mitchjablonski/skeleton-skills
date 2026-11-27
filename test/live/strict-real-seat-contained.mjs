@@ -18,6 +18,7 @@ import { readOperatorApproval } from "./strict-operator-terminal-input.mjs";
 const DRIVER = fileURLToPath(new URL("./strict-real-seat-restart.py", import.meta.url));
 const REFUSED = Object.freeze({ kind: "rejected", code: "unavailable" });
 const SUCCESS = "real-seat-contained-restart-passed";
+const INTERACTIVE_SUCCESS = "real-seat-interactive-restart-passed";
 
 function prepareReview(scratch) {
   const candidate = path.join(scratch, "candidate");
@@ -70,11 +71,12 @@ async function waitForExit(exited, ms) {
   }
 }
 
-async function runNamespace({ scratch, receipt, terminalPin, review, output, control }) {
+async function runNamespace({ scratch, receipt, terminalPin, review, output, control, client, terminal, confirmAgent }) {
   const { signal, windowCurrent, confirmRestart, confirmRetained } = control;
   const { reviewVersion, captureVersion } = review.binding;
+  const clientArgs = client ? [client.path, client.pin, terminal] : [];
   const child = spawn("/usr/bin/python3", ["-I", DRIVER, scratch, process.execPath, receipt,
-    terminalPin, reviewVersion, captureVersion], { detached: true, env: {}, stdio: ["pipe", "pipe", "ignore"] });
+    terminalPin, reviewVersion, captureVersion, ...clientArgs], { detached: true, env: {}, stdio: ["pipe", "pipe", "ignore"] });
   const exited = new Promise((resolve) => {
     child.once("error", () => resolve({ code: 1 }));
     child.once("close", (code) => resolve({ code }));
@@ -106,6 +108,11 @@ async function runNamespace({ scratch, receipt, terminalPin, review, output, con
         output.write("A new contained worker is running from the same approved capture.\n");
         await confirmRetained();
       }
+      if (client && (step === "1" || step === "2")) {
+        output.write(`In a separate WSL tab run: node test/live/strict-real-seat-agent-pane.mjs ${scratch}/agent.sock\n`);
+        if (!await confirmAgent("Did the separate agent pane show Local fixture response complete.?", signal))
+          throw new Fail("interactive-agent-witness-refused");
+      }
       if (signal.aborted || !windowCurrent()) throw new Fail("wslg-owned-window-lost");
       child.stdin.write("y");
     }
@@ -119,19 +126,25 @@ async function runNamespace({ scratch, receipt, terminalPin, review, output, con
   if (status.code !== 0 || phase !== steps.length) throw new Fail("contained-restart-refused");
 }
 
-export function configureContainedRun(workspace, receipt, terminalPin) {
+export function configureContainedRun(workspace, receipt, terminalPin, client = null) {
   if (!/^\/tmp\/skel-wslg-state-[a-z0-9_]{8}$/.test(workspace ?? "")
-      || !path.isAbsolute(receipt ?? "") || !/^[0-9a-f]{64}$/.test(terminalPin ?? ""))
+      || !path.isAbsolute(receipt ?? "") || !/^[0-9a-f]{64}$/.test(terminalPin ?? "")
+      || (client && (!path.isAbsolute(client.path ?? "") || !/^[0-9a-f]{64}$/.test(client.pin ?? ""))))
     throw new Fail("contained-runtime-selection-invalid");
   return {
-    success: SUCCESS,
-    prepare({ input, output, interactive }) {
+    success: client ? INTERACTIVE_SUCCESS : SUCCESS,
+    prepare({ input, output, interactive, confirmAgent }) {
       const entry = fs.lstatSync(workspace);
       if (!entry.isDirectory() || entry.uid !== process.getuid() || (entry.mode & 0o7777) !== 0o700
           || fs.realpathSync(workspace) !== workspace || fs.readdirSync(workspace).length !== 0)
         throw new Fail("contained-workspace-untrusted");
       const review = prepareReview(workspace);
       const { authority, binding, capture, approve } = review;
+      let terminal;
+      if (client) {
+        const fd = fs.fstatSync(input.fd, { bigint: true });
+        terminal = `${fd.dev}:${fd.ino}:${fd.rdev}`;
+      }
       let committed = false;
       return {
         review: { binding, read: () => ({ binding, capture, codes: committed ? {} : { approve } }) },
@@ -158,7 +171,8 @@ export function configureContainedRun(workspace, receipt, terminalPin) {
           });
           if (!accepted) throw new Fail("protected-operator-approval-refused");
           output.write("Approval recorded for the selected capture.\n");
-          await runNamespace({ scratch: workspace, receipt, terminalPin, review, output, control });
+          await runNamespace({ scratch: workspace, receipt, terminalPin, review, output, control,
+            client, terminal, confirmAgent });
         },
       };
     },

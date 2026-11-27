@@ -42,7 +42,7 @@ def acknowledge_term(signum, frame):
     raise SystemExit(0)
 
 
-def agent(capture=False, stop_mode=None, silent_child=False, desktop_policy=False):
+def agent(capture=False, stop_mode=None, silent_child=False, desktop_policy=False, interactive=False):
     if desktop_policy:
         # Creation and close only. No endpoint is contacted.
         try:
@@ -108,6 +108,10 @@ def agent(capture=False, stop_mode=None, silent_child=False, desktop_policy=Fals
             record["controlTerminalAbsent"] = True
     sys.stdout.write(json.dumps(record, sort_keys=True) + "\n")
     sys.stdout.flush()
+    if interactive:
+        import runpy
+        runpy.run_path("/opt/interactive-pty.py")["run"]()
+        raise SystemExit(7)
     sleep_forever()
 
 
@@ -169,6 +173,8 @@ def main():
         agent(capture=True, desktop_policy=True)
     elif args == ["agent-capture-cooperative-desktop-policy"]:
         agent(capture=True, stop_mode="cooperative", desktop_policy=True)
+    elif args == ["agent-capture-cooperative-desktop-policy-interactive"]:
+        agent(capture=True, stop_mode="cooperative", desktop_policy=True, interactive=True)
     elif args == ["agent-capture"]:
         agent(capture=True)
     elif args == ["agent-cooperative"]:
