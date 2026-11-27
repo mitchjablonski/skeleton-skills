@@ -56,9 +56,15 @@ def pane_process_matches(pid, node_identity, script, sock):
         exe = os.stat(f"/proc/{pid}/exe")
         with open(f"/proc/{pid}/cmdline", "rb") as record:
             argv = record.read(8193)
+        with open(f"/proc/{pid}/environ", "rb") as record:
+            environ = record.read(1024 * 1024 + 1)
     except OSError:
         return False
     if (exe.st_dev, exe.st_ino) != node_identity or len(argv) > 8192 or not argv.endswith(b"\0"):
+        return False
+    # NODE_OPTIONS (--require, --import, --inspect) would run other code in
+    # the pane without showing in its argv.
+    if len(environ) > 1024 * 1024 or any(entry.startswith(b"NODE_OPTIONS=") for entry in environ.split(b"\0")):
         return False
     args = argv[:-1].split(b"\0")
     return (len(args) == 3 and args[1] == os.fsencode(script)
