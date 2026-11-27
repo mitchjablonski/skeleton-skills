@@ -216,6 +216,39 @@ lt("window navigation observes a finished matching view exactly once", async (t)
   assert.equal(navigation.takeView(), false);
 });
 
+lt("the window phrase is delivered only with its selected capture", async (t) => {
+  const cap = realCapture();
+  const binding = bindingFor(cap);
+  let provided = binding;
+  const s = await setup(t, { provider: { read: () => ({ binding: provided, capture: cap }) } });
+  const phrase = "amber harbor cedar";
+  assert.throws(() => s.l.mintWindowNavigation(binding, { windowPhrase: "bad format" }), TypeError);
+  const selected = s.l.mintWindowNavigation(binding, { windowPhrase: phrase });
+  assert.ok(!selected.url.includes(phrase));
+  const shell = await s.req("GET", "/", s.doc);
+  assert.match(shell.text, /id="window-phrase" hidden/);
+  assert.ok(!shell.text.includes(phrase));
+  const bind = async (url) => {
+    const res = await s.bind(s.nonceOf(url));
+    assert.equal(res.status, 200);
+    assert.ok(!res.text.includes(phrase));
+    return { ...s.api, [TAB_HEADER]: JSON.parse(res.text).tab };
+  };
+  const headers = await bind(selected.url);
+  const read = async (route, tab = headers) => {
+    const res = await s.req("GET", route, tab);
+    assert.equal(res.status, 200);
+    return JSON.parse(res.text);
+  };
+  assert.equal((await read("/api/state")).windowPhrase, undefined);
+  assert.equal((await read("/api/view")).windowPhrase, phrase);
+  provided = { ...binding, reviewRoundId: "another-round" };
+  assert.equal((await read("/api/view")).windowPhrase, undefined);
+  provided = binding;
+  const plainHeaders = await bind(s.l.mintNavigation());
+  assert.equal((await read("/api/view", plainHeaders)).windowPhrase, undefined);
+});
+
 lt("new mismatched or failed views clear an untaken window observation", async (t) => {
   const cap = realCapture();
   const binding = bindingFor(cap);
