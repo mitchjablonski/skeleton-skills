@@ -3,6 +3,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createHash } from "node:crypto";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -484,4 +487,50 @@ test("Python dispose parser agrees on every raw-byte case", { skip: process.plat
   const r = spawnSync("/usr/bin/python3", ["-I", script], { input: JSON.stringify(input), encoding: "utf8", timeout: 10000 });
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(JSON.parse(r.stdout), BYTE_CASES.map((c) => c.want));
+});
+
+test("#270: the agent relay accepts only the pinned Node running the absolute pane script on its socket", { skip: process.platform !== "linux" }, (t) => {
+  const relayPath = fileURLToPath(new URL("./live/strict-interactive-claude-relay.py", import.meta.url));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "skel-pane-pin-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const pane = path.join(dir, "pane.mjs"), other = path.join(dir, "other.mjs");
+  for (const file of [pane, other]) fs.writeFileSync(file, "setTimeout(() => {}, 20000);\n");
+  const script = `
+import json, os, runpy, subprocess, sys, time
+relay = runpy.run_path(sys.argv[1])
+node, pane, other, root = sys.argv[2:6]
+sock = os.path.join(root, "agent.sock")
+st = os.stat(node)
+ident = (st.st_dev, st.st_ino)
+match = relay["pane_process_matches"]
+def check(argv, script=pane, socket_path=sock):
+    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(0.3)
+        return match(child.pid, ident, script, socket_path)
+    finally:
+        child.kill(); child.wait()
+out = {
+    "exact": check([node, pane, sock]),
+    "other-script": check([node, other, sock]),
+    "relative-script": check([node, os.path.relpath(pane), sock], script=pane),
+    "extra-arg": check([node, pane, sock, "x"]),
+    "other-socket": check([node, pane, os.path.join(root, "else.sock")]),
+    "other-exe": check(["/usr/bin/python3", "-c", "import time; time.sleep(20)", pane, sock]),
+    "gone": match(2 ** 22 + 7, ident, pane, sock),
+}
+try:
+    relay["AgentRelay"](__import__("pathlib").Path(root), None, node, "relative/pane.mjs")
+    out["relative-refused"] = False
+except RuntimeError as error:
+    out["relative-refused"] = str(error) == "interactive-agent-pane-path-refused"
+print(json.dumps(out))
+`;
+  const child = spawnSync("/usr/bin/python3", ["-I", "-c", script, relayPath, process.execPath, pane, other, dir], { encoding: "utf8", timeout: 30000, cwd: dir });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), {
+    exact: true, "other-script": false, "relative-script": false, "extra-arg": false,
+    "other-socket": false, "other-exe": false, gone: false, "relative-refused": true,
+  });
 });

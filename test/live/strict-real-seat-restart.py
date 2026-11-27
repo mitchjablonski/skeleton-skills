@@ -82,7 +82,8 @@ def exercise(root, node, runtime, terminal_pin, review, capture, profile=None):
         if profile is not None:
             client, expected_pin, control_identity = profile
             pinned = interactive["pin_client"](client, expected_pin, root)
-            relay = interactive["AgentRelay"](root, control_identity)
+            relay = interactive["AgentRelay"](root, control_identity, node,
+                                              HERE / "strict-real-seat-agent-pane.mjs")
             launcher.agent = relay, pinned
         expected = {"phase": "fill", "revision": 1, "reviewVersion": review, "captureVersion": capture,
                     "admissions": "live"}

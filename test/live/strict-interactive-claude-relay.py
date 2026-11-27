@@ -47,10 +47,33 @@ def pin_client(source, expected, root):
     return target
 
 
+def pane_process_matches(pid, node_identity, script, sock):
+    """True only for the reviewed pane filter: the pinned Node executable
+    running exactly [absolute pane script, this relay's socket] (#270). The
+    relay sends raw agent bytes to the pane, so anything else that connects
+    (another checkout's script, socat) must be refused."""
+    try:
+        exe = os.stat(f"/proc/{pid}/exe")
+        with open(f"/proc/{pid}/cmdline", "rb") as record:
+            argv = record.read(8193)
+    except OSError:
+        return False
+    if (exe.st_dev, exe.st_ino) != node_identity or len(argv) > 8192 or not argv.endswith(b"\0"):
+        return False
+    args = argv[:-1].split(b"\0")
+    return (len(args) == 3 and args[1] == os.fsencode(script)
+            and os.path.realpath(os.fsdecode(args[2])) == os.path.realpath(sock))
+
+
 class AgentRelay:
-    def __init__(self, root, control_identity):
+    def __init__(self, root, control_identity, node, pane_script):
         self.path = root / "agent.sock"
         self.control_identity = control_identity
+        node_stat = os.stat(node)
+        self.node_identity = node_stat.st_dev, node_stat.st_ino
+        self.pane_script = str(pane_script)
+        if not os.path.isabs(self.pane_script):
+            raise RuntimeError("interactive-agent-pane-path-refused")
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self.listener.bind(str(self.path))
@@ -96,6 +119,8 @@ class AgentRelay:
             with open(f"/proc/{pid}/stat", "rb") as record:
                 fields = record.read(4096).rsplit(b")", 1)[-1].split()
             if len(fields) < 6 or fields[4] == b"0" or fields[2] != fields[5]:
+                return
+            if not pane_process_matches(pid, self.node_identity, self.pane_script, self.path):
                 return
             pair = [terminal_identity(os.stat(f"/proc/{pid}/fd/{fd}")) for fd in (0, 1)]
             if pair[0] is None or pair[0] != pair[1] or pair[0] == self.control_identity:
