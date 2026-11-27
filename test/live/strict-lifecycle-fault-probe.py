@@ -292,6 +292,8 @@ def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, s
     members = {"init": {"pid": init_pid, "fd": init_fd}}
     namespace = {"pidNs": pid_ns, "members": members, "process": process, "since": since,
                  "outer": outer, "outerFd": outer_fd}
+    if interactive is not None:
+        namespace["interactive"] = True
     run.namespaces.append(namespace)
     assert record["pidNs"] == pid_ns
     roles = {1: "init", record["worker"]: "worker", record["child"]: "child", record["escapee"]: "escapee"}
@@ -430,7 +432,21 @@ def alive_at_fault(namespace):
     """No-fault observation: until the fault, every member is alive and the namespace is intact."""
     dead = [role for role, m in namespace["members"].items() if exited(m["fd"])]
     recorded_pids = sorted(m["pid"] for m in namespace["members"].values())
-    assert not dead and scan(namespace["pidNs"], namespace["since"]) == recorded_pids, "namespace changed before the fault"
+    live = scan(namespace["pidNs"], namespace["since"])
+    assert not dead
+    if not namespace.get("interactive"):
+        assert live == recorded_pids, "namespace changed before the fault"
+        return
+    # Interactive startup follows the initial census. Every later process
+    # must still descend from the verified worker inside the same namespace.
+    pending = set(live) - set(recorded_pids)
+    assert set(recorded_pids) <= set(live) and len(pending) <= 32
+    owned = {namespace["members"]["worker"]["pid"]}
+    while pending:
+        children = {pid for pid in pending if parent_of(pid) in owned}
+        assert children, "unaccounted interactive descendant"
+        owned.update(children)
+        pending.difference_update(children)
 
 
 def selective_child_stop(namespace):

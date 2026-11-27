@@ -11,7 +11,7 @@ if (process.platform !== 'linux' || process.cwd() !== '/work' ||
 }
 const statusValue = process.env.STRICT_INTERACTIVE_STATUS_FD;
 const statusFd = Number(statusValue);
-if (!Number.isSafeInteger(statusFd) || statusFd < 3) {
+if (!Number.isSafeInteger(statusFd) || statusFd < 3 || statusFd > 64 || !fs.fstatSync(statusFd).isFIFO()) {
   throw Error('invalid private status FD');
 }
 const status = event => {
@@ -112,8 +112,15 @@ const args = ['--model', 'claude-sonnet-4-5', '--tools', '',
   '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
   '--setting-sources', '', '--settings', '{"disableAllHooks":true,"enabledPlugins":{}}',
   '--disable-slash-commands'];
-// Inherit the exact PTY descriptors. No pipes, print mode, or terminal proxy.
-child = spawn('/opt/claude', args, { cwd: '/work', env, stdio: [0, 1, 2] });
+// Inherit the PTY, and replace the inherited status descriptor in the
+// native process. Only this mock adapter can report a completed turn.
+const nullFd = fs.openSync('/dev/null', 'r');
+try {
+  const stdio = Array.from({ length: statusFd + 1 }, (_, index) => index < 3 ? index : nullFd);
+  child = spawn('/opt/claude', args, { cwd: '/work', env, stdio });
+} finally {
+  fs.closeSync(nullFd);
+}
 for (const signal of ['SIGTERM', 'SIGHUP', 'SIGINT']) process.on(signal, stop);
 const timeout = setTimeout(stop, 260000);
 try {
