@@ -98,13 +98,13 @@ test("withheld() reports an unterminated control string to the launcher, outside
     const filter = createStrictPtyOutput();
     assert.equal(filter.withheld(), null);
     assert.equal(filter.push(raw("visible\n" + start)), "visible\n");
-    assert.deepEqual(filter.withheld(), { kind, bytes: 0 });
+    assert.deepEqual(filter.withheld(), { kind, bytes: start.length });
     assert.equal(filter.push(raw("tail the human never sees\n")), "");
     const pending = filter.withheld();
-    assert.deepEqual(pending, { kind, bytes: 26 });
+    assert.deepEqual(pending, { kind, bytes: start.length + 26 });
     assert.ok(Object.isFrozen(pending));
     assert.equal(filter.end(), "");
-    assert.deepEqual(filter.withheld(), { kind, bytes: 26 }, "still readable after end()");
+    assert.deepEqual(filter.withheld(), { kind, bytes: start.length + 26 }, "still readable after end()");
   }
   // A terminated string clears it, and later text is visible again.
   const filter = createStrictPtyOutput();
@@ -116,17 +116,21 @@ test("withheld() reports an unterminated control string to the launcher, outside
   // final byte, so numeric output (progress, counters) can vanish: it is reported too.
   const csi = createStrictPtyOutput();
   assert.equal(csi.push(raw("ok\n" + ESC + "[" + "100% 42/42 3.14\n".repeat(1000))), "ok\n");
-  assert.deepEqual(csi.withheld(), { kind: "csi", bytes: 16000 });
+  assert.deepEqual(csi.withheld(), { kind: "csi", bytes: 16002 });
   csi.end();
-  assert.deepEqual(csi.withheld(), { kind: "csi", bytes: 16000 });
+  assert.deepEqual(csi.withheld(), { kind: "csi", bytes: 16002 });
   const rawCsi = createStrictPtyOutput();
   rawCsi.push(raw("\x9b12;"));
-  assert.deepEqual(rawCsi.withheld(), { kind: "csi", bytes: 3 });
+  assert.deepEqual(rawCsi.withheld(), { kind: "csi", bytes: 4 });
   assert.equal(rawCsi.push(raw("mnext\n")), "next\n");
   assert.equal(rawCsi.withheld(), null);
   const esc = createStrictPtyOutput();
   assert.equal(esc.push(raw("ok\n" + ESC + " " + "  \n".repeat(100))), "ok\n");
-  assert.deepEqual(esc.withheld(), { kind: "escape", bytes: 301 });
+  assert.deepEqual(esc.withheld(), { kind: "escape", bytes: 302 });
+  // Re-arming an unfinished CSI doesn't reset the count: only emitted text does.
+  const rearm = createStrictPtyOutput();
+  assert.equal(rearm.push(raw("ok\n" + (ESC + "[100% 42/42\n").repeat(1000))), "ok\n");
+  assert.deepEqual(rearm.withheld(), { kind: "csi", bytes: 13000 });
   // A UTF-8-encoded U+009D is a character, not an OSC introducer.
   const utf8 = createStrictPtyOutput();
   utf8.push(Buffer.from("\u009d", "utf-8"));
@@ -139,6 +143,6 @@ test("withheld() is independent of how the stream is split", () => {
     const filter = createStrictPtyOutput();
     filter.push(bytes.subarray(0, split));
     filter.push(bytes.subarray(split));
-    assert.deepEqual(filter.withheld(), { kind: "dcs", bytes: bytes.length - 3 }, `split at ${split}`);
+    assert.deepEqual(filter.withheld(), { kind: "dcs", bytes: bytes.length - 1 }, `split at ${split}`);
   }
 });
