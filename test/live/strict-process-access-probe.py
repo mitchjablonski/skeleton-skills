@@ -15,9 +15,11 @@ import json
 import os
 from pathlib import Path
 import secrets
+import select
 import signal
 import subprocess
 import sys
+import time
 
 
 PYTHON = "/usr/bin/python3"
@@ -164,7 +166,9 @@ def ping(stand_in):
     os.kill(stand_in.pid, signal.SIGCONT)  # undo a stop left by a control attach
     stand_in.stdin.write(b"ping\n")
     stand_in.stdin.flush()
-    return stand_in.stdout.readline() == b"pong\n"
+    # Bounded: a stand-in left stopped or wedged must fail the fixture, not hang it.
+    ready, _, _ = select.select([stand_in.stdout], [], [], TIMEOUT)
+    return bool(ready) and stand_in.stdout.readline() == b"pong\n"
 
 
 DENIED_KEYS = ("process_vm_readv", "proc_mem", "pidfd_getfd", "ptrace_attach")
@@ -212,8 +216,14 @@ def control(stand_in, target, secret, inode):
     attached = attach(lib, pid)
     if attached == "succeeded":
         # The stand-in stops with SIGSTOP; the launcher is its parent, so it can wait and detach.
-        _, status = os.waitpid(pid, 0)
-        stopped = os.WIFSTOPPED(status)
+        status, deadline = None, time.monotonic() + TIMEOUT
+        while status is None and time.monotonic() < deadline:
+            got, raw = os.waitpid(pid, os.WNOHANG)
+            if got == pid:
+                status = raw
+            else:
+                time.sleep(0.01)
+        stopped = status is not None and os.WIFSTOPPED(status)
         detached = lib.ptrace(PTRACE_DETACH, pid, None, None) == 0
         attached = "attached-and-detached" if stopped and detached else "detach-failed"
     return {
@@ -258,7 +268,8 @@ def measure(report):
     agent = report["agent"]
     agent_denied = agent.get("status") == "measured" and agent.get("visible") is False and all(
         agent.get(k) not in (None, "succeeded") for k in DENIED_KEYS + ("pidfd_open",))
-    shared_visible = report["shared_control"].get("visible") is True
+    shared = report["shared_control"]
+    shared_visible = shared.get("visible") is True and shared.get("pidfd_open") == "succeeded"
     launcher = report["launcher_control"]
     launcher_ok = launcher["ptrace_attach"] == "attached-and-detached" and all(
         launcher[k] == "matched" for k in ("process_vm_readv", "proc_mem", "pidfd_getfd"))
