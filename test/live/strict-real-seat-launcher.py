@@ -8,19 +8,54 @@ import re
 import runpy
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 
 
 SUCCESS = "real-seat-window-checkpoint-passed"
+CONTAINED_SUCCESS = "real-seat-contained-restart-passed"
 REFUSED = "real-desktop-invocation-invalid"
+UNPROVEN = "real-seat-cleanup-unproven"
+
+
+def operation(argv):
+    if argv == ["--real-seat-launcher"]:
+        return "--supervised-wslg-window", SUCCESS, []
+    if (len(argv) == 3 and argv[0] == "--real-seat-contained"
+            and Path(argv[1]).is_absolute() and re.fullmatch(r"[0-9a-f]{64}", argv[2])):
+        return "--supervised-wslg-contained", CONTAINED_SUCCESS, argv[1:]
+    return None
+
+
+def foreground_terminal():
+    left, right = (os.fstat(fd) for fd in (0, 1))
+    if (not stat.S_ISCHR(left.st_mode) or not stat.S_ISCHR(right.st_mode)
+            or (left.st_dev, left.st_ino, left.st_rdev) != (right.st_dev, right.st_ino, right.st_rdev)
+            or os.tcgetpgrp(0) != os.getpgrp()):
+        return None
+    return left.st_dev, left.st_ino, left.st_rdev
 
 
 def run(argv):
-    if argv != ["--real-seat-launcher"] or not (sys.stdin.isatty() and sys.stdout.isatty()):
+    selected = operation(argv)
+    if selected is None or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return REFUSED
+    flag, success, args = selected
+    terminal = None
+    terminal_settings = None
+    if flag == "--supervised-wslg-contained":
+        try:
+            terminal = foreground_terminal()
+            if terminal is not None:
+                terminal_settings = termios.tcgetattr(0)
+        except OSError:
+            return REFUSED
+        if terminal is None:
+            return REFUSED
     node = shutil.which("node")
     if not node or not os.path.isabs(node):
         return "real-seat-node-unavailable"
@@ -40,11 +75,11 @@ def run(argv):
     scratch = tempfile.mkdtemp(prefix="skel-wslg-", dir="/dev/shm")
     child = None
     timed_out = False
+    terminal_lost = False
     try:
         try:
             child = subprocess.Popen(
-                [node, str(directory / "strict-real-seat-launcher.mjs"), "--supervised-wslg-window",
-                 scratch],
+                [node, str(directory / "strict-real-seat-launcher.mjs"), flag, scratch, *args],
                 env={"DISPLAY": os.environ.get("DISPLAY", ""), "PATH": "/usr/bin:/bin"},
                 # This single-threaded wrapper keeps supervision as a fallback
                 # while the Node child samples its own adopted Chrome helpers.
@@ -56,10 +91,17 @@ def run(argv):
         except (OSError, subprocess.SubprocessError):
             pass
 
-        watchdog = time.monotonic() + 19 * 60
+        watchdog = time.monotonic() + (24 if flag == "--supervised-wslg-contained" else 19) * 60
         forwarded = False
         while child is not None and child.poll() is None:
             now = time.monotonic()
+            if terminal is not None and interrupted_at is None:
+                try:
+                    terminal_lost = foreground_terminal() != terminal
+                except OSError:
+                    terminal_lost = True
+                if terminal_lost:
+                    mark_interrupted(None, None)
             if now >= watchdog and interrupted_at is None:
                 timed_out = True
                 mark_interrupted(None, None)
@@ -72,35 +114,48 @@ def run(argv):
             time.sleep(0.05)
     finally:
         cleanup = helpers["stop_owned_children"](child)
-        if cleanup:
+        if terminal_settings is not None:
             try:
-                shutil.rmtree(scratch)
-            except OSError:
+                if termios.tcgetattr(0) != terminal_settings:
+                    if foreground_terminal() != terminal:
+                        cleanup = False
+                    else:
+                        termios.tcsetattr(0, termios.TCSANOW, terminal_settings)
+                        os.write(1, b"\x1b[?2004l")
+            except (OSError, termios.error):
                 cleanup = False
     packet = b""
     if child is not None:
         with child.stderr as report:
-            if cleanup and interrupted_at is None:
+            if cleanup:
                 os.set_blocking(report.fileno(), False)
                 try:
                     packet = os.read(report.fileno(), 192)
                 except BlockingIOError:
                     pass
-    if not cleanup:
-        return "real-seat-cleanup-unproven"
+    if not cleanup or packet == (UNPROVEN + "\n").encode("ascii"):
+        return UNPROVEN
+    try:
+        shutil.rmtree(scratch)
+    except OSError:
+        return UNPROVEN
     if timed_out:
         return "real-seat-timeout"
+    if terminal_lost:
+        return "protected-control-terminal-lost"
     if interrupted_at is not None:
         return "real-seat-interrupted"
     if not re.fullmatch(rb"[a-z][a-z0-9-]{0,95}\n", packet):
         return "real-seat-evidence-unavailable"
     result = packet.decode("ascii").strip()
-    if (result == SUCCESS) != (child.returncode == 0):
+    if (result == success) != (child.returncode == 0):
         return "real-seat-evidence-unavailable"
     return result
 
 
 if __name__ == "__main__":
+    contained = sys.argv[1:2] == ["--real-seat-contained"]
+    success = CONTAINED_SUCCESS if contained else SUCCESS
     try:
         code = run(sys.argv[1:])
     except KeyboardInterrupt:
@@ -108,7 +163,8 @@ if __name__ == "__main__":
     except (OSError, RuntimeError, ValueError):
         code = "real-seat-evidence-unavailable"
     print(json.dumps({
-        "ok": code == SUCCESS, "strictState": "unverified", "code": code,
-        "scope": "synthetic-window-checkpoint", "windowAttribution": "attribution-unavailable",
+        "ok": code == success, "strictState": "unverified", "code": code,
+        "scope": "synthetic-contained-restart" if contained else "synthetic-window-checkpoint",
+        "windowAttribution": "attribution-unavailable",
     }), flush=True)
-    sys.exit(0 if code == SUCCESS else 2 if code == REFUSED else 1)
+    sys.exit(0 if code == success else 2 if code == REFUSED else 1)

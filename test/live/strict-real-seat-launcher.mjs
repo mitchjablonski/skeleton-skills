@@ -44,14 +44,14 @@ function requireCode(code, expected = MATCHED) {
   if (code !== expected) throw new Fail(code);
 }
 
-export async function launchWindowCheckpoint({ seat, scratch, signal, environment }) {
+export async function launchWindowCheckpoint({ seat, scratch, signal, environment, review, exercise }) {
   const windows = bindDecisionWindows(seat, environment);
   const before = windows.decisionWindows();
   if (!before) throw new Fail("wslg-window-inventory-unavailable");
   if (before.length) throw new Fail("wslg-decision-window-already-present");
 
-  const fixed = captureFixture(scratch);
-  const listener = createDecisionListener({ provider: { read: () => fixed } });
+  const fixed = review ?? captureFixture(scratch);
+  const listener = createDecisionListener({ provider: { read: fixed.read ?? (() => fixed) } });
   const fixture = createFixture({ prefix: "skel-wslg-" });
   fixture.state.scratch = scratch;
   fixture.state.binary = CHROME_PATH;
@@ -82,18 +82,22 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
     if (!result.ranClean || !sample.privateDisplayMatched || fixture.failures.length || !isOwned())
       throw new Fail("wslg-browser-verification-failed");
   };
-  const confirmWhileOwned = async (confirm) => {
+  const whileOwned = async (operation) => {
     if (!isCurrent()) throw new Fail("wslg-owned-window-lost");
     const watchdog = AbortSignal.any([signal, windowLoss.signal]);
     const timer = setInterval(() => {
       if (!isCurrent()) windowLoss.abort();
     }, 500);
     try {
-      const result = await confirm(watchdog);
+      await operation(watchdog);
       interrupted();
       if (watchdog.aborted) throw new Fail("wslg-owned-window-lost");
-      requireCode(result);
       if (!isCurrent()) throw new Fail("wslg-owned-window-lost");
+    } catch (error) {
+      if (error?.label === "real-seat-cleanup-unproven") throw error;
+      interrupted();
+      if (watchdog.aborted) throw new Fail("wslg-owned-window-lost");
+      throw error;
     } finally {
       clearInterval(timer);
     }
@@ -121,11 +125,27 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
     if (!windowId) throw new Fail("wslg-owned-window-not-mapped");
     if (!selected || presentation.navigation.takeView()) throw new Fail("wslg-selected-view-unverified");
 
-    await confirmWhileOwned(presentation.confirmMatch);
-    process.stdout.write("Checking the retained window at the restart checkpoint.\n");
-    await sampleBrowser(600);
-    await confirmWhileOwned(presentation.confirmRestart);
-    await sampleBrowser(600);
+    const compare = async (confirm, ownedSignal) => requireCode(await confirm(ownedSignal));
+    await whileOwned((ownedSignal) => compare(presentation.confirmMatch, ownedSignal));
+    if (exercise) {
+      await whileOwned((ownedSignal) => exercise({
+        signal: ownedSignal,
+        windowCurrent: () => isCurrent() && Boolean(presentation.comparison()),
+        async confirmRestart() {
+          await sampleBrowser(600);
+          await compare(presentation.confirmRestart, ownedSignal);
+        },
+        async confirmRetained() {
+          await sampleBrowser(600);
+          await compare(presentation.confirmMatch, ownedSignal);
+        },
+      }));
+    } else {
+      process.stdout.write("Checking the retained window at the restart checkpoint.\n");
+      await sampleBrowser(600);
+      await whileOwned((ownedSignal) => compare(presentation.confirmRestart, ownedSignal));
+      await sampleBrowser(600);
+    }
     if (!isCurrent() || !presentation.comparison()) throw new Fail("wslg-owned-window-lost");
     interrupted();
   } finally {
@@ -149,7 +169,7 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
   throw new Fail("wslg-window-teardown-unproven");
 }
 
-async function run(scratch, input, output) {
+async function run(scratch, input, output, contained) {
   const interactive = bindControlTerminal(input, output);
   if (!interactive() || !isPrivateScratch(scratch)) return INVOCATION_REFUSED;
   const cancelled = new AbortController();
@@ -163,10 +183,12 @@ async function run(scratch, input, output) {
     });
     if (cancelled.signal.aborted) return "real-seat-interrupted";
     requireCode(seat.code, "real-seat-preflight-passed");
-    await launchWindowCheckpoint({ seat, scratch, signal: cancelled.signal, environment: WSLG_ENV });
-    return cancelled.signal.aborted ? "real-seat-interrupted" : SUCCESS;
+    const options = contained ? await contained.prepare({ scratch, input, output, interactive }) : {};
+    await launchWindowCheckpoint({ seat, scratch, signal: cancelled.signal, environment: WSLG_ENV, ...options });
+    return cancelled.signal.aborted ? "real-seat-interrupted" : contained?.success ?? SUCCESS;
   } catch (error) {
-    return cancelled.signal.aborted ? "real-seat-interrupted"
+    return error?.label === "real-seat-cleanup-unproven" ? error.label
+      : cancelled.signal.aborted ? "real-seat-interrupted"
       : error instanceof Fail ? error.label : "real-seat-evidence-unavailable";
   } finally {
     for (const name of signalNames) process.off(name, abort);
@@ -174,15 +196,19 @@ async function run(scratch, input, output) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [flag, scratch] = process.argv.slice(2);
-  if (process.argv.length !== 4 || flag !== "--supervised-wslg-window") process.exit(2);
+  const [flag, scratch, receipt, terminalPin] = process.argv.slice(2);
+  const full = flag === "--supervised-wslg-contained" && process.argv.length === 6;
+  if (!full && (process.argv.length !== 4 || flag !== "--supervised-wslg-window")) process.exit(2);
   let code;
+  let success = SUCCESS;
   try {
     if (!fs.fstatSync(2).isFIFO()) process.exit(2);
-    code = await run(scratch, process.stdin, process.stdout);
+    const contained = full ? (await import("./strict-real-seat-contained.mjs")).configureContainedRun(receipt, terminalPin) : null;
+    success = contained?.success ?? SUCCESS;
+    code = await run(scratch, process.stdin, process.stdout, contained);
   } catch {
     code = "real-seat-evidence-unavailable";
   }
   fs.writeSync(2, code + "\n");
-  process.exit(code === SUCCESS ? 0 : 1);
+  process.exit(code === success ? 0 : 1);
 }

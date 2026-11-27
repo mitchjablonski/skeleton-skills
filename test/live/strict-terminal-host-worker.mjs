@@ -7,7 +7,7 @@ import {createControlConsole} from '../../lib/strict-control-console.mjs';
 import {createHumanCommandClient} from '../../lib/strict-human-channel.mjs';
 
 const [mode, ...fdArgs] = process.argv.slice(2);
-if (!['standalone', 'decision', 'restart', 'refresh-lost', 'refresh-malformed'].includes(mode)) process.exit(2);
+if (!['standalone', 'decision', 'restart', 'operator-restart', 'refresh-lost', 'refresh-malformed'].includes(mode)) process.exit(2);
 const fds = fdArgs.map(Number);
 if (fds.length !== 5 || new Set(fds).size !== 5 || !fds.every((fd) => Number.isSafeInteger(fd) && fd > 2)) process.exit(2);
 const [socketFd, reportFd, refreshSignalFd, refreshReportFd, terminalFd] = fds;
@@ -28,7 +28,7 @@ if (!refreshEnabled) {
 setTimeout(() => {
   closeRefreshReport();
   process.exit(3);
-}, 15000);
+}, mode === 'operator-restart' ? 300000 : 15000);
 
 const client = createHumanCommandClient(new net.Socket({fd: socketFd, readable: true, writable: true}));
 let stateCalls = 0;
@@ -114,7 +114,7 @@ if (refreshEnabled) {
     }
     queue(async () => {
       try {
-        if (mode === 'restart') {
+        if (mode === 'restart' || mode === 'operator-restart') {
           const state = await client.state();
           if (!finishing) fs.writeFileSync(refreshReportFd, JSON.stringify(state));
         } else if (mode === 'refresh-malformed') {

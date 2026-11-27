@@ -33,9 +33,9 @@ function boundFixtureLifetime(stream) {
   setTimeout(() => { stream.destroy(); process.exitCode = 1; }, 12000);
 }
 
-function boundRestartLifetime() {
+function boundRestartLifetime(operator = false) {
   // Keep the endpoint owner alive during fixture mutations, even after its link closes.
-  setTimeout(() => process.exit(1), 45000);
+  setTimeout(() => process.exit(1), operator ? 300000 : 45000);
 }
 
 function seatMatched(seat) {
@@ -303,11 +303,11 @@ if (role === 'prepare-approved') {
     fs.writeFileSync(path.join(directory, 'recovery.json'), JSON.stringify({request, result}), {mode: 0o600, flag: 'wx'});
   }
   fs.writeFileSync(path.join(directory, 'expected.json'), JSON.stringify({...expected, admissions: 'live'}), {mode: 0o600, flag: 'wx'});
-} else if (role === 'authority' || role === 'managed-authority') {
+} else if (['authority', 'managed-authority', 'operator-managed-authority'].includes(role)) {
   const stream = endpoint();
   try {
     let selected = enrollment;
-    if (role === 'managed-authority') {
+    if (role !== 'authority') {
       const paths = reopenFixtureHistory(directory);
       selected = {authorityDirectory: paths.authority, captureDirectory: paths.captures, expectedContext: context};
     }
@@ -315,7 +315,7 @@ if (role === 'prepare-approved') {
   } catch {
     process.exit(23);
   }
-  if (role === 'managed-authority') boundRestartLifetime();
+  if (role !== 'authority') boundRestartLifetime(role === 'operator-managed-authority');
   else boundFixtureLifetime(stream);
 } else if (role === 'recover') {
   const result = await recoverHumanAuthorityChild(endpoint(), enrollment);
