@@ -8,6 +8,12 @@ Use a fresh `createStrictPtyOutput()` instance for each stream. Each `push(chunk
 - CSI is discarded through its final byte in the range 0x40–0x7E. Ordinary ESC sequences are discarded through a final byte in the range 0x30–0x7E. While either is pending, unsupported bytes are discarded and a new recognized introducer takes precedence. CAN and SUB do not end a string. A stray raw C1 string introducer can hide the rest of a transcript if no matching terminator arrives before EOF.
 - UTF-8 prefix state distinguishes continuation bytes from raw C1 bytes, including across reads. A byte in a recognized continuation position is discarded as Unicode. A byte that breaks the continuation is classified afresh. For example, UTF-8 encoding of U+009D is discarded as a character. Since it does not open an OSC string, printable bytes following it can appear. Ambiguous or malformed input may also hide adjacent text. Do not use this filter to redact content.
 
+## Withheld output
+
+An unterminated control string hides everything after it, and the transcript alone can't show that anything is missing. `withheld()` returns `null`, or a frozen `{ kind, bytes }` while a string is open: `kind` is `osc`, `dcs`, `apc`, `pm` or `sos`, and `bytes` counts the bytes discarded since the introducer. It stays readable after `end()`, so it also reports a string left open at EOF. CSI and ordinary escape sequences are never reported. They end at the next final byte, so they can't hide a tail.
+
+The launcher should read it after each push and at `end()`. When it isn't `null` (at EOF, or past a threshold the launcher chooses while the stream is idle), the launcher shows the indication in its own chrome, for example "output withheld: unterminated OSC, 4,096 bytes". It must never insert the indication into the transcript text, where agent output could imitate it. The kind and count come from the launcher's parser state, not from the agent's bytes. Showing this in each real terminal emulator is part of the manual N6 acceptance (#78).
+
 This filter treats plain ASCII as data and makes no claims about the text's origin or trustworthiness. N6 still requires manual acceptance in each real terminal emulator before deployment. That acceptance must cover the full output path and confirm that downstream rendering treats the result as plain text.
 
 Run the focused tests with `node --test test/strict-pty-output.test.mjs`.

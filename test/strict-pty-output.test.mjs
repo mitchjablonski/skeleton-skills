@@ -92,3 +92,42 @@ test("invalid batches permanently close the stream without exposing pending payl
     assert.throws(() => filter.push(raw("still hidden")), /closed/);
   }
 });
+
+test("withheld() reports an unterminated control string to the launcher, outside the text", () => {
+  for (const [start, kind] of [[ESC + "]", "osc"], ["\x90", "dcs"], [ESC + "_", "apc"], ["\x9e", "pm"], [ESC + "X", "sos"]]) {
+    const filter = createStrictPtyOutput();
+    assert.equal(filter.withheld(), null);
+    assert.equal(filter.push(raw("visible\n" + start)), "visible\n");
+    assert.deepEqual(filter.withheld(), { kind, bytes: 0 });
+    assert.equal(filter.push(raw("tail the human never sees\n")), "");
+    const pending = filter.withheld();
+    assert.deepEqual(pending, { kind, bytes: 26 });
+    assert.ok(Object.isFrozen(pending));
+    assert.equal(filter.end(), "");
+    assert.deepEqual(filter.withheld(), { kind, bytes: 26 }, "still readable after end()");
+  }
+  // A terminated string clears it, and later text is visible again.
+  const filter = createStrictPtyOutput();
+  filter.push(raw(ESC + "]0;title"));
+  assert.equal(filter.withheld().kind, "osc");
+  assert.equal(filter.push(raw(BEL + "after\n")), "after\n");
+  assert.equal(filter.withheld(), null);
+  // CSI and plain escapes are not strings and are never reported.
+  const csi = createStrictPtyOutput();
+  csi.push(raw(ESC + "[12"));
+  assert.equal(csi.withheld(), null);
+  // A UTF-8-encoded U+009D is a character, not an OSC introducer.
+  const utf8 = createStrictPtyOutput();
+  utf8.push(Buffer.from("\u009d", "utf-8"));
+  assert.equal(utf8.withheld(), null);
+});
+
+test("withheld() is independent of how the stream is split", () => {
+  const bytes = raw("a" + ESC + "Pq#0;2;0;0;0" + "z".repeat(40));
+  for (let split = 0; split <= bytes.length; split++) {
+    const filter = createStrictPtyOutput();
+    filter.push(bytes.subarray(0, split));
+    filter.push(bytes.subarray(split));
+    assert.deepEqual(filter.withheld(), { kind: "dcs", bytes: bytes.length - 3 }, `split at ${split}`);
+  }
+});
