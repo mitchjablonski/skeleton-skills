@@ -22,7 +22,8 @@ whose PID namespace identity equals the reported one. It refuses with
 none does, and `worker-evidence-missing` or `status-field-missing` if any
 report or `/proc` field is absent. The report is read from the raw pipe with
 the fixture timeout and a 1 KiB cap, so a partial or oversized line refuses
-instead of hanging. It then requires:
+instead of hanging. Any output after the report line fails the run
+(`worker_exit: extra-output`), whenever it was written. It then requires:
 
 | Check | Meaning |
 | --- | --- |

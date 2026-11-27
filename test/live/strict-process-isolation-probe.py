@@ -179,9 +179,12 @@ def measure(report):
             proc.kill()
             proc.wait(timeout=TIMEOUT)
             clean = False
+        # Exactly one report line: once the sandbox has exited, the pipe must be empty,
+        # however late any extra bytes were written.
+        extra = bool(clean and os.read(proc.stdout.fileno(), 1))
         proc.stdout.close()
-    report["worker_exit"] = "clean" if clean else "failed"
-    return alive and clean and all(checks.values())
+    report["worker_exit"] = "clean" if clean and not extra else "extra-output" if extra else "failed"
+    return alive and clean and not extra and all(checks.values())
 
 
 def main():
