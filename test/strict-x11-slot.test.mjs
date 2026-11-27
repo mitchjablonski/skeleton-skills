@@ -187,11 +187,13 @@ test("an operator compares one selected window and keeps its phrase through rest
   assert.ok(prompts.at(-1).includes(pagePhrase));
   assert.ok(prompts.at(-1).includes(binding.captureVersion));
   const before = presentation.comparison();
-  assert.equal(await seat.confirmRestart(), "seat-metadata-matched");
+  assert.equal(await presentation.confirmRestart(), "seat-metadata-matched");
+  assert.ok(prompts.at(-1).includes(pagePhrase));
+  assert.ok(prompts.at(-1).includes("attestations still hold"));
   assert.equal(presentation.comparison(), before);
   assert.equal(minted, 1);
   replaceOnAnswer = true;
-  assert.equal(await presentation.confirmMatch(), "discriminating-phrase-mismatch");
+  assert.equal(await presentation.confirmRestart(), "discriminating-phrase-mismatch");
   assert.equal(presentation.comparison(), null);
 });
 

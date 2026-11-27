@@ -144,17 +144,26 @@ export async function bindOperatorSeat({ interactive, confirm, bind = bindRealSe
       prepareWindow(listener, captureBinding) {
         const window = prepareSeatWindow({ listener, binding: captureBinding, recheck });
         if (!window) return null;
+        let matched = false;
+        async function confirmWindow(restart) {
+          const expected = window.comparison();
+          if (!expected || (restart && !matched)) {
+            refusal ??= WINDOW_REFUSED;
+            return refusal;
+          }
+          const comparison = `Match the review window phrase “${expected.phrase}” and capture ${expected.captureVersion}.`;
+          const prompt = restart
+            ? `${comparison} Do both still match, and do all your attestations still hold for this restart?`
+            : `${comparison} Do both match?`;
+          const result = await confirmOnSeat(prompt, WINDOW_REFUSED,
+            () => window.comparison() === expected ? SEAT_MATCHED : WINDOW_REFUSED);
+          matched = result === SEAT_MATCHED;
+          return result;
+        }
         return Object.freeze({
           ...window,
-          async confirmMatch() {
-            const expected = window.comparison();
-            if (!expected) {
-              refusal ??= WINDOW_REFUSED;
-              return refusal;
-            }
-            const prompt = `Match the review window phrase “${expected.phrase}” and capture ${expected.captureVersion}. Do both match?`;
-            return confirmOnSeat(prompt, WINDOW_REFUSED, () => window.comparison() === expected ? SEAT_MATCHED : WINDOW_REFUSED);
-          },
+          confirmMatch: () => confirmWindow(false),
+          confirmRestart: () => confirmWindow(true),
         });
       },
     });

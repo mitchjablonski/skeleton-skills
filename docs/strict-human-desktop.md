@@ -71,8 +71,10 @@ selected capture and its navigation. After the selected page loads,
 `confirmMatch()` shows the phrase and capture version on the operator
 terminal and asks the operator to compare them with the browser. The
 same navigation must still be current after the operator answers.
-The private-window fixture verifies that the phrase and capture version
-stay the same across restart.
+The prepared window's `confirmRestart()` repeats the comparison and
+rechecks the operator attestations. It requires a successful initial
+comparison. The private-window fixture verifies that the phrase and
+capture version stay the same across restart.
 
 ### Inventory fields
 
