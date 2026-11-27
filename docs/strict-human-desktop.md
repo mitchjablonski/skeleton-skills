@@ -366,14 +366,15 @@ wc -l /mnt/wslg/stderr.log
 1. Answer the attestations yourself. Compare the phrase and capture on the
    single new Chrome window with the control terminal. Confirm the fresh
    profile and check that your existing browser windows are unchanged.
-2. Reveal the approval command on the page. Type it in the control
-   terminal and press Enter. Type it; don't paste it. The prompt reads raw
-   keystrokes without echo. It refuses a paste only when the terminal
-   marks it with bracketed-paste sequences, which Windows Terminal does. On
-   a terminal that doesn't, a pasted line that arrives as one chunk can't
-   be told apart from fast typing. Ctrl-C cancels, and the run reports
-   that as an approval refusal, not an interrupt. The browser page stays
-   read-only. Wait for the approval and first-worker
+2. Reveal the approval command on the page. Type it (don't paste it) in
+   the control terminal and press Enter. The prompt reads raw keystrokes
+   without echo. It refuses a paste only when the terminal marks it with
+   bracketed-paste sequences, which Windows Terminal does. On a terminal
+   that doesn't, a paste can't be told apart from typing. You get one
+   attempt: Backspace and Ctrl-U edit, but a mistyped line, an arrow or
+   other escape key, or the 120 s timeout ends the prompt as a refusal.
+   Ctrl-C cancels, and the run reports that as an approval refusal, not an
+   interrupt. The browser page stays read-only. Wait for the approval and first-worker
    messages.
 3. When the launcher reports that the first worker stopped, compare the
    retained window and attest again. After the **new worker** message,
