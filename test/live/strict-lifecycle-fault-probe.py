@@ -334,6 +334,7 @@ def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, s
                 or not desktop_policy_verified(record.get("desktopIsolation"),
                                                seccomp_filter_count(owned_worker["pid"]), parent_filters)
                 or (stage is not None and record.get("controlTerminalAbsent") is not True)
+                or (interactive is not None and record.get("desktopEndpointsAbsent") is not True)
                 or exited(owned_worker["fd"])):
             raise RuntimeError("desktop policy proof unavailable")
     if stop_mode is not None:

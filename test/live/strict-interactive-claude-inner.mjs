@@ -10,15 +10,13 @@ if (process.platform !== 'linux' || process.cwd() !== '/work' ||
   throw Error('private Linux /work controlling PTY required');
 }
 const statusValue = process.env.STRICT_INTERACTIVE_STATUS_FD;
-const statusFd = statusValue === undefined ? null : Number(statusValue);
-if (statusFd !== null && (!Number.isSafeInteger(statusFd) || statusFd < 3)) {
+const statusFd = Number(statusValue);
+if (!Number.isSafeInteger(statusFd) || statusFd < 3) {
   throw Error('invalid private status FD');
 }
 const status = event => {
-  if (statusFd !== null) {
-    try { fs.writeSync(statusFd, JSON.stringify({ event }) + '\n'); }
-    catch { stop('status-channel-closed'); }
-  }
+  try { fs.writeSync(statusFd, JSON.stringify({ event }) + '\n'); }
+  catch { stop(); }
 };
 const key = 'sk-ant-local-dummy-only';
 fs.mkdirSync('/home/agent/.claude', { recursive: true, mode: 0o700 });
@@ -34,7 +32,7 @@ for (const file of ['/home/agent/.claude.json', '/home/agent/.claude/.claude.jso
 const MAX_BODY = 1024 * 1024;
 const MAX_REQUESTS = 32;
 let requests = 0, turns = 0, child, stopping = false, killTimer;
-function stop(reason) {
+function stop() {
   if (stopping) return;
   stopping = true;
   if (child) {
@@ -43,7 +41,7 @@ function stop(reason) {
   }
 }
 function reply(res, stream) {
-  const text = 'Local fixture response complete.';
+  const text = 'LOCAL-FIXTURE-REPLY';
   const message = { id: `msg_fixture_${turns}`, type: 'message', role: 'assistant',
     model: 'claude-sonnet-4-5', content: [{ type: 'text', text }],
     stop_reason: 'end_turn', stop_sequence: null,
@@ -84,7 +82,11 @@ const server = http.createServer((req, res) => {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end('{"input_tokens":1}'); return;
       }
-      if (!Array.isArray(body.messages) || (body.tools?.length ?? 0) !== 0 || turns >= 8) {
+      const last = Array.isArray(body.messages) ? body.messages.at(-1) : null;
+      const text = typeof last?.content === 'string' ? [last.content]
+        : Array.isArray(last?.content) ? last.content.filter(part => part.type === 'text').map(part => part.text) : [];
+      if (last?.role !== 'user' || !text.includes('Desktop witness message: DESKTOP-WITNESS')
+          || (body.tools?.length ?? 0) !== 0 || turns !== 0) {
         res.writeHead(400); res.end('{}'); return;
       }
       ++turns;
@@ -112,8 +114,8 @@ const args = ['--model', 'claude-sonnet-4-5', '--tools', '',
   '--disable-slash-commands'];
 // Inherit the exact PTY descriptors. No pipes, print mode, or terminal proxy.
 child = spawn('/opt/claude', args, { cwd: '/work', env, stdio: [0, 1, 2] });
-for (const signal of ['SIGTERM', 'SIGHUP', 'SIGINT']) process.on(signal, () => stop(signal));
-const timeout = setTimeout(() => stop('deadline'), 260000);
+for (const signal of ['SIGTERM', 'SIGHUP', 'SIGINT']) process.on(signal, stop);
+const timeout = setTimeout(stop, 260000);
 try {
   const result = await new Promise(resolve => {
     child.once('spawn', () => status('ready'));

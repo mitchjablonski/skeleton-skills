@@ -106,6 +106,13 @@ def agent(capture=False, stop_mode=None, silent_child=False, desktop_policy=Fals
                 os.close(terminal)
                 raise SystemExit(7)
             record["controlTerminalAbsent"] = True
+    if interactive:
+        desktop_vars = {"DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+                        "WSL_INTEROP", "WSLENV", "PULSE_SERVER"}
+        desktop_paths = ("/tmp/.X11-unix", "/mnt/wslg", "/run/WSL", "/proc/sys/fs/binfmt_misc/WSLInterop")
+        if desktop_vars.intersection(os.environ) or any(os.path.lexists(p) for p in desktop_paths):
+            raise SystemExit(7)
+        record["desktopEndpointsAbsent"] = True
     sys.stdout.write(json.dumps(record, sort_keys=True) + "\n")
     sys.stdout.flush()
     if interactive:
