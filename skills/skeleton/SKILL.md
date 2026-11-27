@@ -1,6 +1,6 @@
 ---
 name: skeleton
-description: Plan a feature as a code skeleton (real files, types, signatures, wiring, with fenced SKEL_TODO bodies) and have the human review it in a local page before any logic is written. Use when the user says /skel:skeleton, "skeleton first", "plan it as stubs", or wants to see and shape the structure before code gets written. Never put decision or approval codes in this skill's arguments.
+description: For skeleton-skills (.skeleton/): plan a feature as a code skeleton (real files, types, signatures, wiring, with fenced SKEL_TODO bodies) and have the human review it in a local page before any logic is written. Use when the user says /skel:skeleton, "skeleton first", "plan it as stubs", or wants to see and shape the structure before code gets written. If the project uses deepPairing skeleton plans (.deeppairing/), use /deeppairing:skeleton instead. Never put decision or approval codes in this skill's arguments.
 ---
 
 # Skeleton: the plan is the code's shape

@@ -194,7 +194,7 @@ For no HTTP listener, use `skel review` to generate a static HTML file, then reg
 | `skel hook` | The `PreToolUse` scope gate |
 | `skel stop-hook [--notify-only|--block]` | The `Stop` drift check (the plugin runs `bin/skel-stop.mjs`; without a flag it uses the project's mode from `skel install`) |
 | `skel migrate [--dry-run] [dir]` | Move a project's records from the old config dir to the state dir, outside a fill ([Upgrading](#upgrading-skels-state-moved)) |
-| `skel install [--notify-only\|--block] [dir]` | Add the deny rules and the project's Stop mode; migrate an older install's hooks and copies once the plugin is in place ([Install](#install)) |
+| `skel install [--notify-only\|--block] [dir]` | Add the deny rules and the project's Stop mode. Migrate an older install's hooks and copies once the plugin is in place ([Install](#install)) |
 | `skel install --legacy [dir]` | The pre-plugin install: skills, filler, hooks and rules written into the project's `.claude/` (one more release) |
 | `skel uninstall [dir]` | Remove what install added (not the plugin) |
 
@@ -299,6 +299,13 @@ An internal PreToolUse fault during a detected fill denies the call until repair
 An unreadable store dir by itself does not enroll a project with no skeleton. A stale positive approval record at a re-used project path does count as prior enrollment; the diagnostic explains that possibility and `skel init --force "<title>"` starts a new review. Malformed unrelated ancestors above the session project do not enroll every child project. A prior approved-skeleton record can identify a corrupted owner outside the session boundary; without such evidence, launching in a subdirectory cannot reliably distinguish that broken ancestor from an unrelated file. Start Claude at the project root when relying on this recovery check. If local enrollment evidence is missing or unrecognizable and the external receipt store is also unreadable, the hook can leave a former fill unenrolled; it cannot safely distinguish that double fault from a new project. Corrupt state at the session root still denies. These controls do not make settings or executables immutable, authenticate human approval, or establish the proposed strict tier. If an agent tool call cannot repair the hook, use a separate terminal or Claude Code’s [! shell mode](https://code.claude.com/docs/en/interactive-mode#shell-mode-with--prefix): for a healthy checkout, run `skel reshape` from the project, or repair/replace the named state with `skel init --force "<title>"`. For damaged installation code, repair the trusted checkout from that shell first; the CLI no longer imports the gate just to run recovery commands. `/hooks` is a read-only browser, not an escape switch. Product-module import failures deny or block during enrolled fills through the launcher fallback; launcher syntax errors, a broken `node` and hanging imports remain outside it, and Stop requests at most one corrective continuation by default.
 
 The Stop continuation protocol was tested on Claude Code CLI 2.1.318: `systemMessage` alone stops; both `decision: "block"` and `additionalContext` continue. The default uses `decision: "block"` only for file drift on an explicitly identified first Stop (`stop_hook_active === false`) and neither continuation field on the next, or on later prompts with the same exterior drift. Unknown flag values and approval-record faults only notify. IDE/Desktop behavior has not been probed separately; the documented hook protocol is the compatibility basis for those clients.
+
+### Next to deepPairing skeleton plans
+
+Use `/deeppairing:skeleton` for deepPairing plans and `/skel:skeleton` for skel plans. Both use `SKEL[id]` fences. Give their fences separate files and distinct IDs.
+
+- `skel init`, `approve` and `finalize` report live deepPairing plans and ambiguous ownership. The check reads up to 1 MiB of project-local plan and scope metadata under `.deeppairing/`. Edit permissions and Stop drift correction follow skel's normal checks.
+- `skel finalize` checks the approved snapshot and source baseline before removing markers. It refuses on a shared file and fence ID, any ID in a live deepPairing edit scope, or ambiguous ownership. An active reshape can restore prior fences, so finish or close the reshape before retrying finalize.
 
 ## Strict tier (in development)
 

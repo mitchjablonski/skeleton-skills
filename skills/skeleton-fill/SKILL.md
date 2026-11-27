@@ -1,6 +1,6 @@
 ---
 name: skeleton-fill
-description: Fill an approved code skeleton one fenced step at a time (the next SKEL_TODO), editing only inside that step's fence, with the edits delegated to the restricted skeleton-filler subagent. Use when the user says /skel:skeleton-fill, "next step", "fill step N", or "fill the rest" after a skeleton was approved with /skel:skeleton. Never put decision or approval codes in this skill's arguments.
+description: For skeleton-skills (.skeleton/): fill an approved code skeleton one fenced step at a time (the next SKEL_TODO), editing only inside that step's fence, with the edits delegated to the restricted skeleton-filler subagent. Use when the user says /skel:skeleton-fill, "next step", "fill step N", or "fill the rest" after a skeleton was approved with /skel:skeleton. For a deepPairing skeleton plan, use deepPairing's own flow instead. Never put decision or approval codes in this skill's arguments.
 ---
 
 # Fill the skeleton
