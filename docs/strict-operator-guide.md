@@ -33,7 +33,7 @@ negative state live in `lib/strict-status.mjs` and are tested in
 
 | State | Meaning | Approve, reshape, finalize (strict requested) |
 | --- | --- | --- |
-| `active` | Fresh evidence for this project and session | Never through the in-boundary CLI; only the protected human flow would decide |
+| `active` | Fresh evidence for this project and session | Never through the in-boundary CLI; only the protected human flow would decide (finalize: not offered in v1, see section 4) |
 | `unverified` + reason | `launcher-absent`, `profile-unsupported`, `evidence-stale`, `evidence-unreadable`, `dependency-missing` or `evidence-mismatch` | Refused, with a next step |
 | `unsupported` | This release has no strict enforcement | Refused if strict was requested; skel never falls back to default mode on its own |
 | `ended` | The strict session is over | Refused until a new launcher session starts |
@@ -84,7 +84,7 @@ See [strict-checkpoint-ux.md](strict-checkpoint-ux.md),
 
 | Situation | What the human would see | Where |
 | --- | --- | --- |
-| The stop is in doubt (a writer survived, or teardown is unproven) | The control window says a session process may still be running and refuses capture, checks and restart. The only actions are show details and end session, and ending doesn't prove every process is gone. The agent's terminal shows only "Stopped by the strict launcher. Wait for the human." | [strict-checkpoint-ux.md, refusals](strict-checkpoint-ux.md#refusals) |
+| The stop is in doubt (`teardown-unproven`, `writer-survived`, `restart-unproven`, or a capture refused because files changed or couldn't be listed) | The control window says a session process may still be running and refuses capture, checks and restart. The only actions are show details and end session, and ending doesn't prove every process is gone. The agent's terminal shows only "Stopped by the strict launcher. Wait for the human." | [strict-checkpoint-ux.md, refusals](strict-checkpoint-ux.md#refusals) |
 | The authority stalls or exits during a stop | The physical stop doesn't depend on the authority, and the fixture shows the stop is still proven. | [strict-lifecycle-fault.md](strict-lifecycle-fault.md) |
 | The strict record is missing or corrupt | Every decision is refused, in this session and new ones, until the record is recovered outside the session. Deleting or editing `.skeleton/` changes nothing. | [strict-decision-page.md (d), R3](strict-decision-page.md#d-requestid-retention-and-recovery-ux-requirements-for-sols-journal) |
 | The workspace changed after the capture was shown | The page never live-reloads, and Approve names only the capture the tab drew. Only the human can ask for a new capture (Recapture): a changed capture moves the page and discards any kept intent, after a warning if a Retry is pending, and an unchanged one keeps the revision. Recapture is refused during fill, and no listener offers it yet. | [strict-decision-page.md (c), C4](strict-decision-page.md#c-what-the-human-sees-versus-what-gets-approved), [strict-recapture.md](strict-recapture.md) |
