@@ -453,20 +453,34 @@ test("#229: with strict requested (the C9 probe's stand-in), `skel status` leads
 
 test("operator guide: links resolve, anchors exist, every state and reason is covered", () => {
   const docs = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "docs");
-  const guide = fs.readFileSync(path.join(docs, "strict-operator-guide.md"), "utf8");
-  const slug = (h) => h.trim().toLowerCase().replace(/[^\p{L}\p{N} _-]/gu, "").replace(/ /g, "-");
+  const guidePath = path.join(docs, "strict-operator-guide.md");
+  const guide = fs.readFileSync(guidePath, "utf8");
+  // GitHub-style slugs for headings outside fenced code; duplicates get -1, -2.
+  const anchors = (text) => {
+    const seen = new Map(), out = new Set();
+    let fenced = false;
+    for (const line of text.split("\n")) {
+      if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
+      if (fenced || !/^#{1,6} /.test(line)) continue;
+      const base = line.replace(/^#+ /, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").trim().toLowerCase()
+        .replace(/[^\p{L}\p{N} _-]/gu, "").replace(/ /g, "-");
+      const n = seen.get(base) ?? 0;
+      seen.set(base, n + 1);
+      out.add(n ? `${base}-${n}` : base);
+    }
+    return out;
+  };
   const links = [...guide.matchAll(/\]\(([^)\s]+)\)/g)].map((m) => m[1]).filter((l) => !/^https?:/.test(l));
   assert.ok(links.length > 10);
   for (const link of links) {
     const [file, anchor] = link.split("#");
-    const target = path.join(docs, file);
-    assert.ok(fs.existsSync(target), `missing ${link}`);
-    if (anchor) {
-      const headings = fs.readFileSync(target, "utf8").split("\n").filter((l) => /^#{1,6} /.test(l)).map((l) => slug(l.replace(/^#+ /, "")));
-      assert.ok(headings.includes(anchor), `missing anchor ${link}`);
-    }
+    const target = file ? path.join(docs, file) : guidePath;
+    assert.ok(fs.existsSync(target) && fs.statSync(target).isFile(), `missing ${link}`);
+    if (anchor) assert.ok(anchors(fs.readFileSync(target, "utf8")).has(anchor), `missing anchor ${link}`);
   }
   for (const s of STRICT_STATES) assert.ok(guide.includes(`\`${s}\``), s);
   for (const r of [...EVIDENCE_REASONS, ...LOCAL_REASONS]) assert.ok(guide.includes(`\`${r}\``), r);
-  assert.match(guide, /Strict is not available in this\nrelease and nothing here enforces it\./);
+  const flat = guide.replace(/\s+/g, " ");
+  assert.ok(flat.includes("Strict is not available in this release and nothing here enforces it."));
+  assert.ok(flat.includes("Finalize is not offered in the proposed v1"));
 });
