@@ -304,6 +304,8 @@ The Stop continuation protocol was tested on Claude Code CLI 2.1.318: `systemMes
 
 Use `/deeppairing:skeleton` for deepPairing plans and `/skel:skeleton` for skel plans. Both use `SKEL[id]` fences. Give their fences separate files and distinct IDs.
 
+Start a Claude Code session in the project with both plugins enabled before reviewing or approving the skeleton. DeepPairing's daemon adds `.deeppairing/` to `.gitignore` if the entry is missing. Skel includes `.gitignore` in the approved source baseline.
+
 - `skel init`, `approve` and `finalize` report live deepPairing plans and ambiguous ownership. The check reads up to 1 MiB of project-local plan and scope metadata under `.deeppairing/`. Edit permissions and Stop drift correction follow skel's normal checks.
 - `skel finalize` checks the approved snapshot and source baseline before removing markers. It refuses on a shared file and fence ID, any ID in a live deepPairing edit scope, or ambiguous ownership. An active reshape can restore prior fences, so finish or close the reshape before retrying finalize.
 
