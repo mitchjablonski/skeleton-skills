@@ -71,11 +71,11 @@ class Run:
         self.fds.append(value)
         return value
 
-    def launch(self, argv, label, pass_fds=(), stdout=None):
+    def launch(self, argv, label, pass_fds=(), stdout=None, stdin=subprocess.DEVNULL):
         err = (self.root / (label + ".err")).open("wb")
         try:
             process = subprocess.Popen(
-                argv, stdin=subprocess.DEVNULL,
+                argv, stdin=stdin,
                 stdout=stdout if stdout is not None else subprocess.DEVNULL,
                 stderr=err, pass_fds=pass_fds, env={}, start_new_session=True,
                 preexec_fn=limits)
@@ -85,7 +85,7 @@ class Run:
         return process
 
 
-def bwrap_argv(stage=None, *, stop_mode=None, silent_child=False, desktop_filter=None):
+def bwrap_argv(stage=None, *, stop_mode=None, silent_child=False, desktop_filter=None, interactive=None):
     argv = ["/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
             "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib"]
     if pathlib.Path("/lib64").exists():
@@ -105,6 +105,19 @@ def bwrap_argv(stage=None, *, stop_mode=None, silent_child=False, desktop_filter
         assert not silent_child and (stop_mode is None or (stage is not None and stop_mode == "cooperative"))
         argv += ["--seccomp", str(desktop_filter)]
         mode += "-desktop-policy"
+    if interactive is not None:
+        assert stage is not None and desktop_filter is not None and stop_mode == "cooperative"
+        home = stage.with_name(stage.name + "-home")
+        home.mkdir(mode=0o700)
+        for source, target in (
+            (interactive["client"], "/opt/claude"), (interactive["node"], "/opt/node"),
+            (HERE / "strict-interactive-claude-inner.mjs", "/opt/interactive-claude.mjs"),
+            (HERE / "strict-interactive-claude-pty.py", "/opt/interactive-pty.py"),
+        ):
+            argv += ["--ro-bind", str(source), target]
+        argv += ["--bind", str(home), "/home/agent", "--ro-bind", str(stage), "/work",
+                 "--tmpfs", "/tmp", "--chdir", "/work"]
+        mode += "-interactive"
     return argv + ["--", "/usr/bin/python3", "-I", "/helper.py", mode]
 
 
@@ -219,7 +232,7 @@ def scan(pid_ns, since):
 
 
 def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, silent_child=False,
-                    desktop_policy=False):
+                    desktop_policy=False, interactive=None):
     """Start the agent namespace, directly or under a launcher stand-in."""
     read_end, write_end = os.pipe()
     run.fd(read_end)
@@ -234,9 +247,12 @@ def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, s
                 compiled.write(policy["seccomp_program"]())
                 compiled.seek(0)
                 fd = compiled.fileno()
-                argv = bwrap_argv(stage, stop_mode=stop_mode, silent_child=silent_child, desktop_filter=fd)
-                process = run.launch(argv, label, pass_fds=(fd,), stdout=write_end)
+                argv = bwrap_argv(stage, stop_mode=stop_mode, silent_child=silent_child, desktop_filter=fd,
+                                 interactive=interactive)
+                process = run.launch(argv, label, pass_fds=(fd,), stdout=write_end,
+                                     stdin=interactive["channel"] if interactive is not None else subprocess.DEVNULL)
         else:
+            assert interactive is None
             argv = bwrap_argv(stage, stop_mode=stop_mode, silent_child=silent_child)
             if launcher:
                 argv = ["/usr/bin/python3", "-I", str(HELPER), "launcher", "--"] + argv
@@ -276,6 +292,8 @@ def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, s
     members = {"init": {"pid": init_pid, "fd": init_fd}}
     namespace = {"pidNs": pid_ns, "members": members, "process": process, "since": since,
                  "outer": outer, "outerFd": outer_fd}
+    if interactive is not None:
+        namespace["interactive"] = True
     run.namespaces.append(namespace)
     assert record["pidNs"] == pid_ns
     roles = {1: "init", record["worker"]: "worker", record["child"]: "child", record["escapee"]: "escapee"}
@@ -318,6 +336,7 @@ def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, s
                 or not desktop_policy_verified(record.get("desktopIsolation"),
                                                seccomp_filter_count(owned_worker["pid"]), parent_filters)
                 or (stage is not None and record.get("controlTerminalAbsent") is not True)
+                or (interactive is not None and record.get("desktopEndpointsAbsent") is not True)
                 or exited(owned_worker["fd"])):
             raise RuntimeError("desktop policy proof unavailable")
     if stop_mode is not None:
@@ -413,7 +432,21 @@ def alive_at_fault(namespace):
     """No-fault observation: until the fault, every member is alive and the namespace is intact."""
     dead = [role for role, m in namespace["members"].items() if exited(m["fd"])]
     recorded_pids = sorted(m["pid"] for m in namespace["members"].values())
-    assert not dead and scan(namespace["pidNs"], namespace["since"]) == recorded_pids, "namespace changed before the fault"
+    live = scan(namespace["pidNs"], namespace["since"])
+    assert not dead
+    if not namespace.get("interactive"):
+        assert live == recorded_pids, "namespace changed before the fault"
+        return
+    # Interactive startup follows the initial census. Every later process
+    # must still descend from the verified worker inside the same namespace.
+    pending = set(live) - set(recorded_pids)
+    assert set(recorded_pids) <= set(live) and len(pending) <= 32
+    owned = {namespace["members"]["worker"]["pid"]}
+    while pending:
+        children = {pid for pid in pending if parent_of(pid) in owned}
+        assert children, "unaccounted interactive descendant"
+        owned.update(children)
+        pending.difference_update(children)
 
 
 def selective_child_stop(namespace):

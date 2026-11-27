@@ -42,7 +42,7 @@ def acknowledge_term(signum, frame):
     raise SystemExit(0)
 
 
-def agent(capture=False, stop_mode=None, silent_child=False, desktop_policy=False):
+def agent(capture=False, stop_mode=None, silent_child=False, desktop_policy=False, interactive=False):
     if desktop_policy:
         # Creation and close only. No endpoint is contacted.
         try:
@@ -106,8 +106,19 @@ def agent(capture=False, stop_mode=None, silent_child=False, desktop_policy=Fals
                 os.close(terminal)
                 raise SystemExit(7)
             record["controlTerminalAbsent"] = True
+    if interactive:
+        desktop_vars = {"DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+                        "WSL_INTEROP", "WSLENV", "PULSE_SERVER"}
+        desktop_paths = ("/tmp/.X11-unix", "/mnt/wslg", "/run/WSL", "/proc/sys/fs/binfmt_misc/WSLInterop")
+        if desktop_vars.intersection(os.environ) or any(os.path.lexists(p) for p in desktop_paths):
+            raise SystemExit(7)
+        record["desktopEndpointsAbsent"] = True
     sys.stdout.write(json.dumps(record, sort_keys=True) + "\n")
     sys.stdout.flush()
+    if interactive:
+        import runpy
+        runpy.run_path("/opt/interactive-pty.py")["run"]()
+        raise SystemExit(7)
     sleep_forever()
 
 
@@ -169,6 +180,8 @@ def main():
         agent(capture=True, desktop_policy=True)
     elif args == ["agent-capture-cooperative-desktop-policy"]:
         agent(capture=True, stop_mode="cooperative", desktop_policy=True)
+    elif args == ["agent-capture-cooperative-desktop-policy-interactive"]:
+        agent(capture=True, stop_mode="cooperative", desktop_policy=True, interactive=True)
     elif args == ["agent-capture"]:
         agent(capture=True)
     elif args == ["agent-cooperative"]:

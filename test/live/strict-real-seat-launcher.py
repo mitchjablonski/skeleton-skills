@@ -18,6 +18,7 @@ import time
 
 SUCCESS = "real-seat-window-checkpoint-passed"
 CONTAINED_SUCCESS = "real-seat-contained-restart-passed"
+INTERACTIVE_SUCCESS = "real-seat-interactive-restart-passed"
 REFUSED = "real-desktop-invocation-invalid"
 UNPROVEN = "real-seat-cleanup-unproven"
 
@@ -28,6 +29,10 @@ def operation(argv):
     if (len(argv) == 3 and argv[0] == "--real-seat-contained"
             and Path(argv[1]).is_absolute() and re.fullmatch(r"[0-9a-f]{64}", argv[2])):
         return "--supervised-wslg-contained", CONTAINED_SUCCESS, argv[1:]
+    if (len(argv) == 5 and argv[0] == "--real-seat-interactive"
+            and all(Path(value).is_absolute() for value in (argv[1], argv[3]))
+            and all(re.fullmatch(r"[0-9a-f]{64}", value) for value in (argv[2], argv[4]))):
+        return "--supervised-wslg-interactive", INTERACTIVE_SUCCESS, argv[1:]
     return None
 
 
@@ -47,7 +52,7 @@ def run(argv):
     flag, success, args = selected
     terminal = None
     terminal_settings = None
-    if flag == "--supervised-wslg-contained":
+    if flag != "--supervised-wslg-window":
         try:
             terminal = foreground_terminal()
             if terminal is not None:
@@ -80,7 +85,7 @@ def run(argv):
     terminal_restore_unproven = False
     try:
         try:
-            if flag == "--supervised-wslg-contained":
+            if flag != "--supervised-wslg-window":
                 workspace = tempfile.mkdtemp(prefix="skel-wslg-state-", dir="/tmp")
                 args = [workspace, *args]
             child = subprocess.Popen(
@@ -96,7 +101,9 @@ def run(argv):
         except (OSError, subprocess.SubprocessError):
             pass
 
-        watchdog = time.monotonic() + (24 if flag == "--supervised-wslg-contained" else 19) * 60
+        minutes = {"--supervised-wslg-window": 19, "--supervised-wslg-contained": 24,
+                   "--supervised-wslg-interactive": 29}[flag]
+        watchdog = time.monotonic() + minutes * 60
         forwarded = False
         while child is not None and child.poll() is None:
             now = time.monotonic()
@@ -163,8 +170,10 @@ def run(argv):
 
 
 if __name__ == "__main__":
-    contained = sys.argv[1:2] == ["--real-seat-contained"]
-    success = CONTAINED_SUCCESS if contained else SUCCESS
+    scope, success = {
+        "--real-seat-contained": ("synthetic-contained-restart", CONTAINED_SUCCESS),
+        "--real-seat-interactive": ("interactive-cli-local-fixture", INTERACTIVE_SUCCESS),
+    }.get(next(iter(sys.argv[1:2]), ""), ("synthetic-window-checkpoint", SUCCESS))
     try:
         code = run(sys.argv[1:])
     except KeyboardInterrupt:
@@ -173,7 +182,7 @@ if __name__ == "__main__":
         code = "real-seat-evidence-unavailable"
     print(json.dumps({
         "ok": code == success, "strictState": "unverified", "code": code,
-        "scope": "synthetic-contained-restart" if contained else "synthetic-window-checkpoint",
+        "scope": scope,
         "windowAttribution": "attribution-unavailable",
     }), flush=True)
     sys.exit(0 if code == success else 2 if code == REFUSED else 1)

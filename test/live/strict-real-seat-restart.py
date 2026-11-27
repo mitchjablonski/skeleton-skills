@@ -18,6 +18,7 @@ Enrollment = admission["capture"]["Enrollment"]
 NamespaceLauncher = admission["NamespaceLauncher"]
 MEMBERS = admission["capture"]["MEMBERS"]
 WORKER = admission["capture"]["WORKER"]
+interactive = runpy.run_path(str(HERE / "strict-interactive-claude-relay.py"))
 interrupted = False
 
 
@@ -35,19 +36,23 @@ def interrupt(_number, _frame):
     interrupted = True
 
 
-def ask(step, *, timeout=8, live=lambda: True):
+def ask(step, *, timeout=8, live=lambda: True, relay=None):
     deadline = time.monotonic() + timeout
     os.write(1, step)
     while not interrupted and live():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
-        if select.select([0], [], [], min(0.15, remaining))[0]:
+        interval = min(0.15, remaining)
+        readable = relay.poll(interval) if relay is not None else select.select([0], [], [], interval)[0]
+        if readable:
             return os.read(0, 2) == b"y" and not interrupted and live()
     return False
 
 
 class OperatorLauncher(NamespaceLauncher):
+    agent = None
+
     def spawn(self, command, fds=()):
         if command[1:3] == [WORKER, "managed-authority"]:
             command = [*command[:2], "operator-managed-authority", *command[3:]]
@@ -57,16 +62,28 @@ class OperatorLauncher(NamespaceLauncher):
         return (generation is self.current and generation is not None
                 and self.peers_live(generation) and ask(b"W") and self.peers_live(generation))
 
+    def interactive_client(self, stage):
+        if self.agent is None:
+            return None
+        relay, client = self.agent
+        return {"client": client, "node": self.node, "channel": relay.prepare()}
 
-def exercise(root, node, runtime, terminal_pin, review, capture):
+
+def exercise(root, node, runtime, terminal_pin, review, capture, profile=None):
     selection = admission["read_runtime_selection"](runtime)
     verify_runtime = admission["runtime_check"](selection, node, root, terminal_pin=terminal_pin)
     launcher = OperatorLauncher(node, root, verify_runtime, stop_mode="cooperative",
                                 protected=True, terminal_mode="operator-restart",
                                 desktop_policy=True)
     result = 1
+    relay = None
     try:
         verify_runtime()
+        if profile is not None:
+            client, expected_pin, control_identity = profile
+            pinned = interactive["pin_client"](client, expected_pin, root)
+            relay = interactive["AgentRelay"](root, control_identity)
+            launcher.agent = relay, pinned
         expected = {"phase": "fill", "revision": 1, "reviewVersion": review, "captureVersion": capture,
                     "admissions": "live"}
         enrollment = Enrollment(root / "history", "selected", expected)
@@ -82,9 +99,14 @@ def exercise(root, node, runtime, terminal_pin, review, capture):
         def active(fill):
             return launcher.active is fill and fill.child.poll() is None and launcher.peers_live(generation)
 
-        require(ask(b"1", live=lambda: active(first)))
+        if relay is not None:
+            relay.owned_namespace()
+        require(ask(b"1", timeout=130 if relay else 8, live=lambda: active(first), relay=relay))
+        require(relay is None or relay.verified_turn())
         stop, observation = launcher.stop_planned(first.namespace)
         require(first.child.poll() is not None and observation.get("workerAcknowledgedTerm") is True)
+        if relay is not None:
+            relay.end_generation()
         (first_dir / "plan.js").write_text("changed synthetic first stage\n", encoding="utf-8")
         require(ask(b"R", timeout=130, live=lambda: launcher.peers_live(generation)))
         report = launcher.refresh(generation)
@@ -93,7 +115,10 @@ def exercise(root, node, runtime, terminal_pin, review, capture):
         require(second.generation is generation and second.child is not first.child
                 and second.namespace["pidNs"] != first.namespace["pidNs"])
         require(all(not os.path.samefile(first_dir / name, second_dir / name) for name in MEMBERS))
-        require(ask(b"2", timeout=130, live=lambda: active(second)))
+        if relay is not None:
+            relay.owned_namespace()
+        require(ask(b"2", timeout=250 if relay else 130, live=lambda: active(second), relay=relay))
+        require(relay is None or relay.verified_turn())
         launcher.stop_planned(second.namespace)
         require(second.child.poll() is not None and launcher.peers_live(generation))
         require(admission["capture"]["snapshot"]((enrollment,)) == before)
@@ -108,16 +133,18 @@ def exercise(root, node, runtime, terminal_pin, review, capture):
             launcher.cleanup()
         except Exception:
             result = 125
+        if relay is not None:
+            relay.close()
     return result
 
 
 def main(args):
-    if len(args) != 6 or sys.flags.optimize or sys.executable != "/usr/bin/python3":
+    if len(args) not in (6, 9) or sys.flags.optimize or sys.executable != "/usr/bin/python3":
         return 1
     root, node, runtime = map(Path, args[:3])
     if (not all(path.is_absolute() for path in (root, node, runtime))
             or not re.fullmatch(r"/tmp/skel-wslg-state-[a-z0-9_]{8}", str(root)) or root.resolve() != root
-            or not all(re.fullmatch(r"[0-9a-f]{64}", digest) for digest in args[3:])):
+            or not all(re.fullmatch(r"[0-9a-f]{64}", digest) for digest in args[3:6])):
         return 1
     status = root.lstat()
     if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid() or stat.S_IMODE(status.st_mode) != 0o700:
@@ -127,7 +154,14 @@ def main(args):
         return 1
     for name in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
         signal.signal(name, interrupt)
-    return exercise(root, node, runtime, *args[3:])
+    profile = None
+    if len(args) == 9:
+        client, client_pin, terminal = args[6:]
+        if (not Path(client).is_absolute() or not re.fullmatch(r"[0-9a-f]{64}", client_pin)
+                or not re.fullmatch(r"[0-9]{1,20}:[0-9]{1,20}:[0-9]{1,20}", terminal)):
+            return 1
+        profile = client, client_pin, tuple(map(int, terminal.split(":")))
+    return exercise(root, node, runtime, *args[3:6], profile)
 
 
 if __name__ == "__main__":

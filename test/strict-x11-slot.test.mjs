@@ -48,6 +48,14 @@ test("the operator WSLg entry refuses redirected input and output", { skip: proc
     ok: false, strictState: "unverified", code: "real-desktop-invocation-invalid",
     scope: "synthetic-contained-restart", windowAttribution: "attribution-unavailable",
   });
+  const interactive = spawnSync("/usr/bin/python3", ["-I", entry, "--real-seat-interactive",
+    "/dev/null", "0".repeat(64), "/usr/bin/false", "0".repeat(64)], {
+    input: "yes\n", encoding: "utf8", timeout: 5000,
+  });
+  assert.ifError(interactive.error);
+  assert.equal(interactive.status, 2, interactive.stderr);
+  assert.equal(JSON.parse(interactive.stdout).code, "real-desktop-invocation-invalid");
+  assert.equal(JSON.parse(interactive.stdout).scope, "interactive-cli-local-fixture");
 });
 
 test("the rehearsal requires one unchanged control terminal", () => {

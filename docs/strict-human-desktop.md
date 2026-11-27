@@ -391,6 +391,64 @@ fixture evidence separately in #79. The interactive Claude CLI, its agent
 pane input/output and clipboard/title checks, and the broader #79 matrix
 remain separate qualification work. The result keeps `strictState: unverified`.
 
+## Operator run for the interactive Claude CLI
+
+Use the foreground WSL control tab and the pinned runtime receipt from the
+previous section. Select the reviewed native Claude executable by its
+resolved absolute path and independent SHA-256. Record both the candidate
+version and pin. On the measured WSL seat the candidate was Claude Code
+2.1.332 with SHA-256
+`a2df1f41bb00250992926420d0063f89b127cb81abdd284dbefb80c50ff1d026`.
+
+```bash
+claude=$(readlink -f "$(command -v claude)")
+claude_pin=a2df1f41bb00250992926420d0063f89b127cb81abdd284dbefb80c50ff1d026
+wc -l /mnt/wslg/stderr.log
+/usr/bin/python3 -I test/live/strict-real-seat-launcher.py --real-seat-interactive \
+  "$receipt" "$terminal_pin" "$claude" "$claude_pin"
+wc -l /mnt/wslg/stderr.log
+```
+
+The launcher starts the pinned interactive CLI on its own private PTY in
+each admitted namespace. The agent pane shows an ASCII transcript with
+terminal controls removed. Display endpoints, session-bus settings and
+WSL interop paths are absent from the worker's environment and filesystem.
+Both turns use the same predetermined prompt, a disposable HOME, and a
+local API fixture. Personal credentials, user settings, tools, plugins and
+arbitrary prompt input are outside this run.
+
+1. Before launch, note the control and agent tab titles and put a harmless
+   marker on your clipboard using an empty scratch editor. Keep terminal
+   broadcast and pane synchronization off.
+2. Compare the browser phrase and capture in the control tab. Enter the
+   approval there only. Keep the approval code and phrase out of the
+   agent tab, clipboard and report.
+3. When the control tab prints the attach command, run it in a **separate
+   foreground WSL tab** from the same checkout. Wait for Claude's startup
+   transcript, record the displayed version, type `witness`, and press Enter once. Check that the
+   agent pane shows `DESKTOP-WITNESS` and `LOCAL-FIXTURE-REPLY`. Check
+   that the typed marker and reply never appear as agent output in the
+   control tab or decision page. Leave the agent pane attached until the
+   launcher closes it. Confirm the observed reply in the control tab.
+4. Confirm the retained review after the first namespace stops. Repeat
+   the agent-pane exchange with the replacement namespace and confirm the
+   same browser window, capture and phrase.
+5. Check that both tab titles stayed as expected and that a paste into
+   your empty scratch editor still shows your own clipboard marker.
+   Check that the owned browser and agent connections close and that
+   existing windows stay open. In a separate run, close the owned browser
+   during the second agent exchange to witness refusal and teardown.
+6. Report the checkout, runtime pins, terminal version, window and
+   clipboard observations, WSLg log counts, and final JSON under #79.
+   Success reports `real-seat-interactive-restart-passed`. Keep the
+   run's approval code, phrase and private navigation data out of the
+   report.
+
+The local fixture exercises the real CLI and terminal path on the candidate
+seat. The remaining #79 matrix covers upstream authentication, tools,
+general client behavior, and additional profiles. Strict remains
+`unverified`.
+
 ## Not shown yet
 
 - Any real-desktop window, input or clipboard observation.

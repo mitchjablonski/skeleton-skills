@@ -35,7 +35,7 @@ function boundFixtureLifetime(stream) {
 
 function boundRestartLifetime(operator = false) {
   // Keep the endpoint owner alive during fixture mutations, even after its link closes.
-  setTimeout(() => process.exit(1), operator ? 300000 : 45000);
+  setTimeout(() => process.exit(1), operator ? 540000 : 45000);
 }
 
 function seatMatched(seat) {
