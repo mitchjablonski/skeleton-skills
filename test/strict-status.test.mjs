@@ -450,3 +450,23 @@ test("#229: with strict requested (the C9 probe's stand-in), `skel status` leads
   assert.match(lines[2], /^Next: .*Use a release with strict support/);
   assert.match(lines[3], /^t — phase: fill/, "the strict lines come before anything else");
 });
+
+test("operator guide: links resolve, anchors exist, every state and reason is covered", () => {
+  const docs = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "docs");
+  const guide = fs.readFileSync(path.join(docs, "strict-operator-guide.md"), "utf8");
+  const slug = (h) => h.trim().toLowerCase().replace(/[^\p{L}\p{N} _-]/gu, "").replace(/ /g, "-");
+  const links = [...guide.matchAll(/\]\(([^)\s]+)\)/g)].map((m) => m[1]).filter((l) => !/^https?:/.test(l));
+  assert.ok(links.length > 10);
+  for (const link of links) {
+    const [file, anchor] = link.split("#");
+    const target = path.join(docs, file);
+    assert.ok(fs.existsSync(target), `missing ${link}`);
+    if (anchor) {
+      const headings = fs.readFileSync(target, "utf8").split("\n").filter((l) => /^#{1,6} /.test(l)).map((l) => slug(l.replace(/^#+ /, "")));
+      assert.ok(headings.includes(anchor), `missing anchor ${link}`);
+    }
+  }
+  for (const s of STRICT_STATES) assert.ok(guide.includes(`\`${s}\``), s);
+  for (const r of [...EVIDENCE_REASONS, ...LOCAL_REASONS]) assert.ok(guide.includes(`\`${r}\``), r);
+  assert.match(guide, /Strict is not available in this\nrelease and nothing here enforces it\./);
+});
