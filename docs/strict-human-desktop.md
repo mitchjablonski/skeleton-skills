@@ -66,6 +66,11 @@ The retained binding's `confirmRestart()` checks the seat, asks the operator
 to confirm the conditions for that restart, and checks the same seat again.
 A refused confirmation ends that binding.
 
+The decision listener can deliver a launcher-supplied window phrase with
+the selected capture. The page shows it above the capture and clears it
+when re-reading. The operator compares it with the phrase in the control
+terminal during a real-seat run.
+
 ### Inventory fields
 
 It prints one bounded JSON object with fixed labels:
