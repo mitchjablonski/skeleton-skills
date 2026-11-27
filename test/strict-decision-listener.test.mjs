@@ -245,6 +245,13 @@ lt("the window phrase is delivered only with its selected capture", async (t) =>
   provided = { ...binding, reviewRoundId: "another-round" };
   assert.equal((await read("/api/view")).windowPhrase, undefined);
   provided = binding;
+  const replacementPhrase = "copper forest robin";
+  const replacement = s.l.mintWindowNavigation(binding, { windowPhrase: replacementPhrase });
+  const replacementHeaders = await bind(replacement.url);
+  const replaced = await s.req("GET", "/api/view", headers);
+  assert.equal(replaced.status, 403);
+  assert.equal(JSON.parse(replaced.text).windowPhrase, undefined);
+  assert.equal((await read("/api/view", replacementHeaders)).windowPhrase, replacementPhrase);
   const plainHeaders = await bind(s.l.mintNavigation());
   assert.equal((await read("/api/view", plainHeaders)).windowPhrase, undefined);
 });
