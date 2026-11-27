@@ -202,6 +202,7 @@ lt("window navigation observes a finished matching view exactly once", async (t)
   assert.ok(Object.isFrozen(navigation));
   binding.reviewRoundId = "changed-after-mint";
   assert.equal(navigation.takeView(), false);
+  assert.equal(navigation.isCurrent(), false);
 
   const bound = await s.bind(s.nonceOf(navigation.url));
   assert.equal(bound.status, 200);
@@ -211,6 +212,7 @@ lt("window navigation observes a finished matching view exactly once", async (t)
   assert.equal(navigation.takeView(), false);
   assert.equal((await s.req("GET", "/api/view", headers)).status, 200);
   assert.equal(navigation.takeView(), true);
+  assert.equal(navigation.isCurrent(), true);
   assert.equal(navigation.takeView(), false);
   assert.equal((await s.req("GET", "/api/view", headers)).status, 200);
   assert.equal(navigation.takeView(), false);
@@ -274,6 +276,7 @@ lt("new mismatched or failed views clear an untaken window observation", async (
   providedBinding = { ...binding, reviewRoundId: "another-round" };
   assert.equal((await getView()).status, 200);
   assert.equal(navigation.takeView(), false);
+  assert.equal(navigation.isCurrent(), false);
 
   providedBinding = binding;
   assert.equal((await getView()).status, 200);

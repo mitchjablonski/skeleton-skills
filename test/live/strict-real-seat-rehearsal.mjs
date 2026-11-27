@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import { bindRealSeat } from "./strict-real-seat-preflight.mjs";
+import { prepareSeatWindow } from "./strict-real-seat-window.mjs";
 
 const INVOCATION_REFUSED = "real-desktop-invocation-invalid";
 const EVIDENCE_UNAVAILABLE = "seat-rehearsal-evidence-unavailable";
 const SEAT_MATCHED = "seat-metadata-matched";
 const RESTART_REFUSED = "operator-restart-not-attested";
+const WINDOW_REFUSED = "discriminating-phrase-mismatch";
 const ATTESTATIONS = [
   ["Did you personally start this command in a fresh dedicated terminal tab with no other jobs?", "operator-initiation-not-attested"],
   ["Are all other unsandboxed agents and automation for your user stopped on Windows and WSL?", "unsandboxed-agent-not-excluded"],
@@ -91,7 +93,7 @@ export async function bindOperatorSeat({ interactive, confirm, bind = bindRealSe
     if (binding.code !== "real-seat-preflight-passed") return { code: binding.code };
     if (interactive() !== true) return { code: INVOCATION_REFUSED };
     let refusal;
-    let confirmingRestart = false;
+    let confirming = false;
     const sample = () => {
       if (interactive() !== true) return INVOCATION_REFUSED;
       const code = binding.recheck();
@@ -109,27 +111,62 @@ export async function bindOperatorSeat({ interactive, confirm, bind = bindRealSe
       }
       return refusal;
     };
-    async function confirmRestart() {
+    async function confirmOnSeat(prompt, refused, check = recheck) {
       if (refusal) return refusal;
-      if (confirmingRestart) {
-        refusal = RESTART_REFUSED;
+      if (confirming) {
+        refusal = refused;
         return refusal;
       }
       const ready = recheck();
       if (ready !== SEAT_MATCHED) return ready;
-      confirmingRestart = true;
+      confirming = true;
       try {
-        const confirmed = await confirm("The seat check passed. Do all of your attestations still hold for this restart?");
-        if (confirmed === true) return recheck();
-        refusal ??= RESTART_REFUSED;
+        const confirmed = await confirm(prompt);
+        if (confirmed === true && !refusal) {
+          const current = check();
+          if (current === SEAT_MATCHED) return current;
+          refusal ??= current;
+        } else {
+          refusal ??= refused;
+        }
       } catch {
         refusal ??= EVIDENCE_UNAVAILABLE;
       } finally {
-        confirmingRestart = false;
+        confirming = false;
       }
       return refusal;
     }
-    return Object.freeze({ code: binding.code, recheck, confirmRestart });
+    return Object.freeze({
+      code: binding.code, recheck,
+      confirmRestart() {
+        return confirmOnSeat("The seat check passed. Do all of your attestations still hold for this restart?", RESTART_REFUSED);
+      },
+      prepareWindow(listener, captureBinding) {
+        const window = prepareSeatWindow({ listener, binding: captureBinding, recheck });
+        if (!window) return null;
+        let matched = false;
+        async function confirmWindow(restart) {
+          const expected = window.comparison();
+          if (!expected || (restart && !matched)) {
+            refusal ??= WINDOW_REFUSED;
+            return refusal;
+          }
+          const comparison = `Match the review window phrase “${expected.phrase}” and capture ${expected.captureVersion}.`;
+          const prompt = restart
+            ? `${comparison} Do both still match, and do all your attestations still hold for this restart?`
+            : `${comparison} Do both match?`;
+          const result = await confirmOnSeat(prompt, WINDOW_REFUSED,
+            () => window.comparison() === expected ? SEAT_MATCHED : WINDOW_REFUSED);
+          matched = result === SEAT_MATCHED;
+          return result;
+        }
+        return Object.freeze({
+          ...window,
+          confirmMatch: () => confirmWindow(false),
+          confirmRestart: () => confirmWindow(true),
+        });
+      },
+    });
   } catch {
     return { code: EVIDENCE_UNAVAILABLE };
   }
