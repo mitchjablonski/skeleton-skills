@@ -297,9 +297,9 @@ function warnLegacyQueue(root) {
  * filled before approval is noted too. A fill approved before that has no record (and keeps
  * none through reshape, \`legacyFill\`), and gets no notice rather than a wrong one.
  */
-function skippedStepsNote(state, earlier) {
+function skippedStepsNote(state, candidates) {
   if (!Array.isArray(state.startedSteps)) return;
-  const skipped = earlier.filter((s) => s.status === "filled" && s.id !== state.activeStep && !state.startedSteps.includes(s.id));
+  const skipped = candidates.filter((s) => s.status === "filled" && s.id !== state.activeStep && !state.startedSteps.includes(s.id));
   if (!skipped.length) return;
   const ids = skipped.map((s) => s.id).join(", ");
   const one = skipped.length === 1;
@@ -1439,7 +1439,7 @@ const commands = {
     writeState(root, { ...state, activeStep: null });
     const pending = steps.filter((s) => s.status === "todo" && s.id !== state.activeStep);
     console.log(`STEP ${state.activeStep} done. ${pending.length} pending${pending[0] ? `; next: ${pending[0].id} ${pending[0].title}` : ""}.`);
-    skippedStepsNote({ ...state, activeStep: null }, steps.slice(0, steps.indexOf(step)));
+    skippedStepsNote(state, pending.length ? steps.slice(0, steps.indexOf(step)) : steps);
     if (!pending.length) console.log("Run the full project test suite, then ask the human whether to finalize. If they say yes, run skel finalize.");
   },
 
