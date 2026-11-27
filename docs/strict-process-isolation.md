@@ -15,14 +15,16 @@ namespace where available,
 its own PID, `NSpid`, PID and user namespace identities, `CapEff` and
 `NoNewPrivs`, then waits for EOF so the launcher can look at it while it runs.
 
-The launcher identifies the worker's host process: the **one** descendant of
-the Bubblewrap process whose innermost `NSpid` equals the reported PID and
-whose PID namespace identity equals the reported one. It refuses with
+The launcher follows the children named by the owned Bubblewrap process
+and its single-threaded descendants. It checks parentage at each step and
+reads each process through its opened proc directory. Exactly one worker
+must match the reported inner PID and PID namespace. It refuses with
 `ownership-ambiguous` if more than one process matches, `worker-not-found` if
 none does, and `worker-evidence-missing` or `status-field-missing` if any
 report or `/proc` field is absent. The report is read from the raw pipe with
 the fixture timeout and a 1 KiB cap, so a partial or oversized line refuses
-instead of hanging. It then requires:
+instead of hanging. Extra output or a report writer that remains open
+after the wrapper exits also fails the check. It then requires:
 
 | Check | Meaning |
 | --- | --- |
@@ -36,7 +38,8 @@ instead of hanging. It then requires:
 
 `yama_ptrace_scope`, the worker's `Seccomp` mode and `cgroupns_private`
 (`--unshare-cgroup-try` skips silently where unsupported) are recorded as
-observations. Neither is required: the private PID namespace is the gate the
+observations. If cgroup namespace metadata is unavailable,
+`cgroupns_private` is null. The private PID namespace is the gate the
 fixture relies on (see [PID visibility](strict-process-reach.md)).
 
 Mutation checks on WSL2 each fail for the expected reason: no `--unshare-pid`
@@ -44,9 +47,11 @@ gives `worker-not-found`, `--cap-add CAP_SYS_PTRACE` fails `capeff_zero`, a
 duplicated match gives `ownership-ambiguous`, and a report missing a field
 gives `worker-evidence-missing`.
 
-The output is one JSON object with fixture status labels. Exit 0 means every
-check and cleanup succeeded, 1 means a check failed or evidence was refused,
-and 2 means the platform is unsupported or Bubblewrap couldn't start.
+The output is one JSON object with fixture status labels. `wrapper_exit`
+records the subprocess reap, including on refusal. Exit 0 requires the
+checks, clean wrapper exit and EOF on the report pipe. Exit 1 means a
+check failed or evidence was refused. Exit 2 means the platform is
+unsupported or Bubblewrap couldn't start.
 
 This is evidence about the fixture's own sandbox configuration. It says
 nothing about the real launcher profile, the console or the authority, and it

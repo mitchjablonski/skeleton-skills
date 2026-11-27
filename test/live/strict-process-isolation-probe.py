@@ -11,6 +11,7 @@ descriptor take, and sends no signal to anything but its own sandbox.
 """
 import json
 import os
+from contextlib import ExitStack
 from pathlib import Path
 import select
 import subprocess
@@ -24,16 +25,26 @@ PROC = Path("/proc")
 YAMA = PROC / "sys/kernel/yama/ptrace_scope"
 TIMEOUT = 5
 MAX_REPORT = 1024
-STATUS_KEYS = ("NSpid", "PPid", "Uid", "CapEff", "NoNewPrivs", "Seccomp")
+MAX_PROCESSES = 16
+STATUS_KEYS = ("NSpid", "PPid", "Uid", "CapEff", "NoNewPrivs", "Seccomp", "Threads")
 
 
 class Refused(Exception):
     """A required piece of evidence is missing or ambiguous."""
 
 
-def status_of(pid="self"):
+def proc_text(pid, name, process_fd=None, limit=65536):
+    fd = os.open(PROC / str(pid) / name if process_fd is None else name, os.O_RDONLY, dir_fd=process_fd)
+    with os.fdopen(fd, encoding="ascii") as stream:
+        text = stream.read(limit + 1)
+    if len(text) > limit:
+        raise Refused("process-evidence-oversized")
+    return text
+
+
+def status_of(pid="self", *, process_fd=None):
     fields = {}
-    for line in (PROC / str(pid) / "status").read_text().splitlines():
+    for line in proc_text(pid, "status", process_fd).splitlines():
         key, _, value = line.partition(":")
         if key in STATUS_KEYS:
             fields[key] = value.split()
@@ -42,8 +53,9 @@ def status_of(pid="self"):
     return fields
 
 
-def ns_id(pid, kind):
-    identity = os.stat(PROC / str(pid) / "ns" / kind)
+def ns_id(pid, kind, *, process_fd=None):
+    name = "ns/" + kind
+    identity = os.stat(PROC / str(pid) / name if process_fd is None else name, dir_fd=process_fd)
     return [identity.st_dev, identity.st_ino]
 
 
@@ -92,43 +104,40 @@ def sandbox():
     return args + ["--symlink", "usr/bin", "/bin", "--proc", "/proc", "--dev", "/dev"]
 
 
-def descendants(root):
-    """Host pids whose parent chain reaches root (root excluded), read once."""
-    parents = {}
-    for entry in os.scandir(PROC):
-        if entry.name.isdecimal():
-            try:
-                parents[int(entry.name)] = int(status_of(entry.name)["PPid"][0])
-            except (OSError, Refused, ValueError):
-                continue
-    found = []
-    for pid in parents:
-        seen, cur = set(), pid
-        while cur in parents and cur not in seen and cur != root:
-            seen.add(cur)
-            cur = parents[cur]
-        if cur == root and pid != root:
-            found.append(pid)
-    return found
+def locate(scope, bwrap_pid, inner_pid, pidns):
+    """Open only the owned root and descendants named by their parent."""
+    def pin(pid):
+        fd = os.open(PROC / str(pid), os.O_RDONLY | os.O_DIRECTORY)
+        scope.callback(os.close, fd)
+        return fd
 
-
-def locate(bwrap_pid, inner_pid, pidns):
-    """The one descendant of bwrap whose innermost NSpid and PID namespace match the report."""
+    pending = [(bwrap_pid, os.getpid())]
+    seen = set()
     matches = []
-    for pid in descendants(bwrap_pid):
-        try:
-            nspid = status_of(pid)["NSpid"]
-            if len(nspid) >= 2 and nspid[-1] == str(inner_pid) and ns_id(pid, "pid") == pidns:
-                matches.append(pid)
-        except (OSError, Refused):
-            continue
+    while pending:
+        pid, parent = pending.pop()
+        if pid in seen or len(seen) == MAX_PROCESSES:
+            raise Refused("ownership-ambiguous")
+        seen.add(pid)
+        fd = pin(pid)
+        status = status_of(process_fd=fd)
+        if status["PPid"] != [str(parent)] or status["Threads"] != ["1"]:
+            raise Refused("ownership-ambiguous")
+        nspid = status["NSpid"]
+        if pid != bwrap_pid and len(nspid) >= 2 and nspid[-1] == str(inner_pid):
+            if ns_id(pid, "pid", process_fd=fd) == pidns:
+                matches.append((fd, parent))
+        children = proc_text(pid, f"task/{pid}/children", fd, limit=1024).split()
+        if len(seen) + len(pending) + len(children) > MAX_PROCESSES:
+            raise Refused("ownership-ambiguous")
+        pending.extend((int(child), pid) for child in children)
     if len(matches) != 1:
         raise Refused("ownership-ambiguous" if matches else "worker-not-found")
     return matches[0]
 
 
-def uid_map(pid):
-    lines = [line.split() for line in (PROC / str(pid) / "uid_map").read_text().splitlines() if line.strip()]
+def uid_map(process_fd):
+    lines = [line.split() for line in proc_text(None, "uid_map", process_fd).splitlines() if line.strip()]
     return [[int(v) for v in line] for line in lines]
 
 
@@ -148,39 +157,58 @@ def measure(report):
         for key in ("pid", "nspid", "pidns", "userns", "capeff", "nnp"):
             if key not in inner:
                 raise Refused("worker-evidence-missing")
-        host = locate(proc.pid, inner["pid"], inner["pidns"])
-        outside = status_of(host)
-        checks = {
-            # The worker's own view and the launcher's view name the same namespaces.
-            # locate() matched the PID namespace already; re-reading it here fails
-            # closed if the pid was reused in between.
-            "pidns_agrees": ns_id(host, "pid") == inner["pidns"],
-            "userns_agrees": ns_id(host, "user") == inner["userns"],
-            # Both are new namespaces, not the launcher's.
-            "pidns_private": inner["pidns"] != my_pidns,
-            "userns_private": inner["userns"] != my_userns,
-            # The host sees two PID levels; the worker sees only its own.
-            "nspid_levels": len(outside["NSpid"]) == 2 and len(inner["nspid"]) == 1,
-            "capeff_zero": int(outside["CapEff"][0], 16) == 0 and int(inner["capeff"], 16) == 0,
-            "no_new_privs": outside["NoNewPrivs"][0] == "1" and inner["nnp"] == "1",
-            "same_host_uid": all(u == str(my_uid) for u in outside["Uid"]),
-            "single_uid_map": len(uid_map(host)) == 1 and uid_map(host)[0][1:] == [my_uid, 1],
-        }
-        report["checks"] = checks
-        report["seccomp"] = outside["Seccomp"][0]
-        # --unshare-cgroup-try skips silently where unsupported: observed, not required.
-        report["cgroupns_private"] = ns_id(host, "cgroup") != ns_id(me, "cgroup")
-        alive = proc.poll() is None
+        if proc.poll() is not None:
+            raise Refused("worker-not-found")
+        with ExitStack() as scope:
+            host_fd, parent = locate(scope, proc.pid, inner["pid"], inner["pidns"])
+            outside = status_of(process_fd=host_fd)
+            if outside["PPid"] != [str(parent)]:
+                raise Refused("ownership-ambiguous")
+            mapping = uid_map(host_fd)
+            checks = {
+                "pidns_agrees": ns_id(None, "pid", process_fd=host_fd) == inner["pidns"],
+                "userns_agrees": ns_id(None, "user", process_fd=host_fd) == inner["userns"],
+                "pidns_private": inner["pidns"] != my_pidns,
+                "userns_private": inner["userns"] != my_userns,
+                "nspid_levels": len(outside["NSpid"]) == 2 and len(inner["nspid"]) == 1,
+                "capeff_zero": int(outside["CapEff"][0], 16) == 0 and int(inner["capeff"], 16) == 0,
+                "no_new_privs": outside["NoNewPrivs"][0] == "1" and inner["nnp"] == "1",
+                "same_host_uid": len(outside["Uid"]) == 4 and all(u == str(my_uid) for u in outside["Uid"]),
+                "single_uid_map": len(mapping) == 1 and mapping[0][1:] == [my_uid, 1],
+            }
+            report["checks"] = checks
+            report["seccomp"] = outside["Seccomp"][0]
+            try:
+                report["cgroupns_private"] = ns_id(None, "cgroup", process_fd=host_fd) != ns_id(me, "cgroup")
+            except OSError:
+                report["cgroupns_private"] = None
+            alive = proc.poll() is None
     finally:
+        report["wrapper_exit"] = "unproven"
         try:
-            proc.stdin.close()
-            clean = proc.wait(timeout=TIMEOUT) == 0
-        except (OSError, subprocess.TimeoutExpired):
-            proc.kill()
-            proc.wait(timeout=TIMEOUT)
-            clean = False
-        proc.stdout.close()
-    report["worker_exit"] = "clean" if clean else "failed"
+            try:
+                proc.stdin.close()
+                clean = proc.wait(timeout=TIMEOUT) == 0
+                report["wrapper_exit"] = "clean" if clean else "nonzero"
+            except (OSError, subprocess.TimeoutExpired):
+                proc.kill()
+                proc.wait(timeout=TIMEOUT)
+                report["wrapper_exit"] = "forced"
+                clean = False
+            if clean:
+                # A clean wrapper exit must leave a closed report pipe with no extra bytes.
+                # Avoid a blocking read if a process unexpectedly still holds the writer.
+                os.set_blocking(proc.stdout.fileno(), False)
+                try:
+                    extra = os.read(proc.stdout.fileno(), 1)
+                except BlockingIOError:
+                    report["report_end"] = "pipe-open"
+                    clean = False
+                else:
+                    report["report_end"] = "extra-output" if extra else "eof"
+                    clean = not extra
+        finally:
+            proc.stdout.close()
     return alive and clean and all(checks.values())
 
 
