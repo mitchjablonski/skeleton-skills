@@ -141,13 +141,13 @@ and restart. A healthy same-generation restart preserves the window and
 the selected-view proof. A replacement generation disposes the old scope
 and must obtain its own proof.
 
-The worker also keeps one seat binding from before browser startup through
-the readiness report and later window checks. These cases inject fixed
-synthetic seat metadata and report `seatBindingEvidence: "synthetic"`.
-Unreadable metadata before the readiness report refuses it. A changed
-seat before restart refuses admission before the replacement is staged.
-Both cases prove owned window and profile cleanup. WSLg operator and
-seat qualification are separate requirements.
+The worker keeps one seat binding from before listener startup through the
+readiness report and restart checks. If the seat is already unreadable, it
+refuses before opening the listener or minting a navigation. The fixture
+checks that this refusal creates no display slot and removes the owned
+profile. It also checks loss before readiness and a changed seat before
+restart. The result reports `seatBindingEvidence: "synthetic"`. Human
+qualification uses the [real-seat checklist](strict-human-desktop.md).
 
 The cases cover refusal for a stale generation, a stored view mismatch, a
 wrong browser pin, and a mapped window without the selected navigation

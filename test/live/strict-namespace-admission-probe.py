@@ -294,7 +294,8 @@ class NamespaceLauncher(CaptureLauncher):
                 pass_fds = [stop_read, write_fd]
                 worker_args = []
                 if self.chrome_pin is not None and role in (
-                        'decision-listener', 'protected-window-missing-view', 'protected-window-seat-startup-loss'):
+                        'decision-listener', 'protected-window-missing-view', 'protected-window-seat-startup-loss',
+                        'protected-window-seat-prelaunch-loss'):
                     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
                     scope_owner.enter_context(parent)
                     child_handles.enter_context(child)
@@ -481,6 +482,7 @@ LISTENER_REFUSALS = ('listener-store-mismatch', 'listener-missing-selected-view'
                      'stale-listener-generation')
 WINDOW_LOSSES = {'window-browser-loss': b'b', 'window-display-loss': b'd'}
 WINDOW_REFUSALS = {'window-wrong-pin': 25, 'window-missing-view': 24,
+                   'window-seat-unreadable-before-navigation': SEAT_REFUSED,
                    'window-seat-unreadable-at-readiness': SEAT_REFUSED}
 SEAT_RESTART_LOSS = 'window-seat-changed-before-restart'
 STARTUP_FAULTS = ('peer-loss-during-start', 'listener-loss-before-namespace', 'listener-loss-after-namespace')
@@ -631,6 +633,7 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
                     'listener-missing-selected-view': 'listener-missing-selected-view',
                     'listener-crashed-with-detached-child': 'listener-crashed-with-detached-child',
                     'window-missing-view': 'protected-window-missing-view',
+                    'window-seat-unreadable-before-navigation': 'protected-window-seat-prelaunch-loss',
                     'window-seat-unreadable-at-readiness': 'protected-window-seat-startup-loss'}.get(
                         case, 'decision-listener')
             launcher.stage_listener(selected, binding=binding, role=role)
@@ -653,7 +656,8 @@ def exercise(node, scratch, case, check_runtime=None, *, protected=False, chrome
                 assert scope.process.wait(LISTENER_SCOPE_TIMEOUT) == WINDOW_REFUSALS[case]
                 assert launcher.listener_refusal == WINDOW_STARTUP_REFUSALS[WINDOW_REFUSALS[case]]
                 assert launcher.listener is None
-                assert (scope.window.profile / 'display-slot').exists() == (case != 'window-wrong-pin')
+                before_display = ('window-wrong-pin', 'window-seat-unreadable-before-navigation')
+                assert (scope.window.profile / 'display-slot').exists() == (case not in before_display)
                 scope.stop()
                 assert not scope.window.profile.exists()
             else:
