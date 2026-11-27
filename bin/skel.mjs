@@ -30,6 +30,7 @@ import {
   clearRendered, clearSnapshot, compareWith, formatDrift, noteRendered, readRendered, readRenderedStore, readSnapshot, recordSkeleton, scanSkeleton, verifySnapshot, writeSnapshot,
 } from "../lib/snapshot.mjs";
 import { captureSourceSet, completionAdvice, coverageGap, describeCoverage, verifyCompletion } from "../lib/source-set.mjs";
+import { ownsFence, readDeepPairing } from "../lib/deeppairing.mjs";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Forward slashes on every platform: these land in shell commands and skill text.
@@ -37,6 +38,14 @@ const SELF = path.join(PKG_ROOT, "bin", "skel.mjs").split(path.sep).join("/");
 const HOOK = path.join(PKG_ROOT, "bin", "skel-hook.mjs").split(path.sep).join("/");
 const STOP_HOOK = path.join(PKG_ROOT, "bin", "skel-stop.mjs").split(path.sep).join("/");
 const CONFIG_HOOK = path.join(PKG_ROOT, "bin", "skel-config-hook.mjs").split(path.sep).join("/");
+
+function warnDeepPairing(dp) {
+  if (dp.status === "unreadable" || dp.ambiguous) {
+    console.error("note: deepPairing fence ownership could not be verified. Keep skel and deepPairing plans in separate files.");
+  } else if (dp.fresh) {
+    console.error("note: a deepPairing skeleton plan is live. Both plugins use SKEL[id] fences. Keep their plans in separate files and use /deeppairing:skeleton for deepPairing.");
+  }
+}
 
 const HELP = `skel — plan as code skeleton, fill one fenced step at a time
 
@@ -874,6 +883,7 @@ const commands = {
       console.error(`skel: warning: couldn't clear the previous skeleton's review sessions and approval record (${err.path ?? err.code ?? err.message}${err.path ? `: ${err.code}` : ""})`);
     }
     console.log(`skel: "${title}" started in ${root} (phase: scaffold, gate: ${gate})`);
+    warnDeepPairing(readDeepPairing(root));
     if (!gitignoresStateDir(root)) console.log(`note: ${STATE_DIR}/ holds local working state; you can add it to .gitignore (skel doesn't edit .gitignore here)`);
   },
 
@@ -1342,6 +1352,12 @@ const commands = {
     } catch {}
     if (review?.source === "rendered") console.log("note: no reviewed version was supplied or found in a Send record for this review round. Approving the version the page last rendered.");
     console.log(`skeleton approved: ${steps.length} steps, version ${record.version}${review ? (review.source === "rendered" ? " (the version the review page last showed)" : " (the version the human reviewed)") : ""}. Run \`skel next\` to start filling.`);
+    const dp = readDeepPairing(root);
+    warnDeepPairing(dp);
+    if (dp.status === "present" && !dp.ambiguous) {
+      const shared = record.fences.filter((f) => ownsFence(dp, f.file, f.id)).length;
+      if (shared) console.error(`warning: a live deepPairing plan also claims ${shared} fence(s) just approved. Use separate files and distinct IDs before finalizing.`);
+    }
     // This is where a record in an unguarded state dir gets used: say so, don't refuse.
     try { if (installStatus(root, skelStateDir()).status === "stale") console.log(`warning: ${await storeNotice(root)}`); }
     catch (err) { console.error(`note: approval succeeded; storage notice unavailable (${err.message})`); }
@@ -1443,6 +1459,12 @@ const commands = {
     await requireNoDrift(root, state, fenced, "finalize");
     const pending = fences.filter((f) => f.status === "todo");
     if (pending.length) die(`still pending: ${pending.map((f) => `${f.id} (${f.file}:${f.openLine})`).join(", ")}`);
+    const dp = readDeepPairing(root);
+    warnDeepPairing(dp);
+    if (dp.status === "unreadable") die("can't tell which fences belong to deepPairing. Check its project records before finalizing.");
+    if (dp.ambiguous) die("can't tell which fences belong to deepPairing. Resolve the active reshape or future scope timestamp before finalizing.");
+    const claimed = fences.filter((f) => ownsFence(dp, f.file, f.id));
+    if (claimed.length) die(`a live deepPairing plan claims ${claimed.length} fence(s) finalize would strip. Finish or close that plan before finalizing.`);
     const files = [...new Set(fences.map((f) => f.file))];
     for (const rel of files) {
       const abs = path.join(root, rel);
