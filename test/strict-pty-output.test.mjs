@@ -112,10 +112,21 @@ test("withheld() reports an unterminated control string to the launcher, outside
   assert.equal(filter.withheld().kind, "osc");
   assert.equal(filter.push(raw(BEL + "after\n")), "after\n");
   assert.equal(filter.withheld(), null);
-  // CSI and plain escapes are not strings and are never reported.
+  // A pending CSI or escape hides digits, punctuation, spaces, LF and controls until a
+  // final byte, so numeric output (progress, counters) can vanish: it is reported too.
   const csi = createStrictPtyOutput();
-  csi.push(raw(ESC + "[12"));
-  assert.equal(csi.withheld(), null);
+  assert.equal(csi.push(raw("ok\n" + ESC + "[" + "100% 42/42 3.14\n".repeat(1000))), "ok\n");
+  assert.deepEqual(csi.withheld(), { kind: "csi", bytes: 16000 });
+  csi.end();
+  assert.deepEqual(csi.withheld(), { kind: "csi", bytes: 16000 });
+  const rawCsi = createStrictPtyOutput();
+  rawCsi.push(raw("\x9b12;"));
+  assert.deepEqual(rawCsi.withheld(), { kind: "csi", bytes: 3 });
+  assert.equal(rawCsi.push(raw("mnext\n")), "next\n");
+  assert.equal(rawCsi.withheld(), null);
+  const esc = createStrictPtyOutput();
+  assert.equal(esc.push(raw("ok\n" + ESC + " " + "  \n".repeat(100))), "ok\n");
+  assert.deepEqual(esc.withheld(), { kind: "escape", bytes: 301 });
   // A UTF-8-encoded U+009D is a character, not an OSC introducer.
   const utf8 = createStrictPtyOutput();
   utf8.push(Buffer.from("\u009d", "utf-8"));
