@@ -228,7 +228,7 @@ class Listener:
 
 class NamespaceLauncher(CaptureLauncher):
     def __init__(self, node, scratch, check_runtime, stop_mode=None, *, protected=False, terminal_mode='restart',
-                 chrome_pin=None):
+                 chrome_pin=None, desktop_policy=False):
         super().__init__(node, scratch)
         self.run = lifecycle['Run'](scratch)
         self.check_runtime = check_runtime
@@ -236,6 +236,7 @@ class NamespaceLauncher(CaptureLauncher):
         self.protected = protected
         self.terminal_mode = terminal_mode
         self.chrome_pin = chrome_pin
+        self.desktop_policy = desktop_policy
         self.terminal = None
         self.listener = None
         self.listener_refusal = None
@@ -381,7 +382,8 @@ class NamespaceLauncher(CaptureLauncher):
         if not self.peers_live(generation) or not self.listener_ready(generation):
             return None
         namespace = lifecycle['start_namespace'](self.run, label, stage=stage,
-                                                 stop_mode=self.stop_mode if stage is not None else None)
+                                                 stop_mode=self.stop_mode if stage is not None else None,
+                                                 desktop_policy=self.desktop_policy)
         self.supervisor.own(namespace, namespace['process'])
         return namespace
 
