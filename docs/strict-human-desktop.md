@@ -239,8 +239,8 @@ on the Windows desktop, not from an agent pane, and report the results under
    `node test/live/strict-desktop-inventory.mjs --chrome-sha256 7ee5f9e4bf6674e3b19d8c7fb952aea78385e6ba6caa6330d62ed9821558cf6f`
    and save the JSON. Note the terminal emulator (Windows Terminal or
    other) and its version.
-2. [ ] **Start the protected launcher** once the real-desktop launcher mode
-   exists (a later slice; it doesn't yet). Note the command and the time.
+2. [ ] **Start the protected launcher** when the full contained launch and
+   restart flow is wired into the real seat. Note the command and time.
 3. [ ] **Look at the screen:** confirm a new browser window appears titled
    `Skeleton decision (prototype)`. Note the capture hash shown in the page
    status, and compare it with the hash printed in the control window.
@@ -275,18 +275,45 @@ on the Windows desktop, not from an agent pane, and report the results under
     processes remain, and that `/mnt/wslg/stderr.log` has no new lines
     (`wc -l /mnt/wslg/stderr.log` before and after).
 
-## Next: the real-desktop launcher mode
+## Operator run for the real WSLg window
 
-The design for the launcher mode that opens the owned window on this seat is
-in [real-desktop launcher](strict-real-desktop-launcher.md). It covers the
-exact candidate and ozone choice, the ownership checks, refusal codes, the
-maintainer's observations, and what Xvfb can pre-verify. It is design only;
-nothing has been run against WSLg.
+Use a fresh WSL tab in Windows Terminal on the WSLg desktop. From the
+repository checkout containing this launcher, run the commands below. Use
+the WSL Node installation on your PATH and the pinned Chrome installation
+from the [launcher design](strict-real-desktop-launcher.md).
+
+```bash
+wc -l /mnt/wslg/stderr.log
+python3 -I test/live/strict-real-seat-launcher.py --real-seat-launcher
+wc -l /mnt/wslg/stderr.log
+```
+
+Answer each attestation yourself. Once Chrome opens, check that a single
+new review window is visible, the profile is fresh, and your other browser
+windows are unchanged. Compare the phrase and capture version on the page
+with the values in the control terminal. At the restart checkpoint, repeat
+the comparison and check that the same window stayed open. After the
+launcher returns, confirm its window is gone and your existing windows
+are still present.
+
+Post the final JSON result, Windows Terminal and Node versions, and WSLg
+log line counts before and after to #79. Include which visual comparisons
+and cleanup checks you could witness. Keep the phrase and any private
+navigation data out of the issue. If the runner refuses, record its code
+and whether the owned window closed. A refusal or an increase in WSLg log
+lines needs investigation before trying again.
+
+The success code is `real-seat-window-checkpoint-passed`. This command
+serves a fixed synthetic capture with no decision codes. It checks the
+retained window, capture and phrase at the restart checkpoint. Full #79
+qualification still needs the controlled agent restart, real decision
+terminal and desktop isolation checks above. The result stays
+`strictState: unverified` with `attribution-unavailable` because WSLg's
+X server PID namespace has no verified translation.
 
 ## Not shown yet
 
 - Any real-desktop window, input or clipboard observation.
-- A launcher mode that opens the owned window on the human desktop.
 - XTEST or Wayland input-protocol reachability from the agent sandbox,
   beyond socket absence.
 - Seats other than WSLg on the measured host.
