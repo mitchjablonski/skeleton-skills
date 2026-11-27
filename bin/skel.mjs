@@ -293,10 +293,15 @@ function warnLegacyQueue(root) {
  * Progress is derived from the code (a step is filled once its fences hold no SKEL_TODO),
  * so a step filled without being started never ran \`skel done\`'s checks. Since #247 the
  * fill records each step started (\`startedSteps\`: empty at a first approve, carried over
- * on re-approval after reshape). The skeleton version doesn't cover fence bodies, so a body
+ * on re-approval after reshape for steps whose title and bodies didn't change). The skeleton version doesn't cover fence bodies, so a body
  * filled before approval is noted too. A fill approved before that has no record (and keeps
  * none through reshape, \`legacyFill\`), and gets no notice rather than a wrong one.
  */
+/** A step's title and every fence (file, title, body): what \`skel done\` checked. */
+function stepPrint(step) {
+  return crypto.createHash("sha256").update(JSON.stringify([step.id, step.title, step.fences.map((f) => [f.file, f.title, f.body])])).digest("hex");
+}
+
 function skippedStepsNote(state, earlier) {
   if (!Array.isArray(state.startedSteps)) return;
   const skipped = earlier.filter((s) => s.status === "filled" && s.id !== state.activeStep && !state.startedSteps.includes(s.id));
@@ -1337,11 +1342,14 @@ const commands = {
       // Started steps: none on a first approval. The version covers the code outside the
       // fences, not the bodies, so a body already filled here was never checked by
       // `skel done` and the note should say so. On re-approval after reshape, the steps
-      // started in the earlier round stay started (those still in the skeleton); a fill
-      // from before #247 that was reshaped (`legacyFill`) stays without a record.
-      const ids = new Set(steps.map((s) => s.id));
-      const startedSteps = Array.isArray(state.startedSteps) ? state.startedSteps.filter((id) => ids.has(id)) : state.legacyFill ? undefined : [];
-      const { startedSteps: _prior, ...rest } = state;
+      // started in the earlier round stay started only if the step is unchanged since the
+      // reshape (`startedPrints`: title and fence bodies), since bodies can change in a
+      // reshape without changing the version. A fill from before #247 that was reshaped
+      // (`legacyFill`) stays without a record.
+      const prints = state.startedPrints && typeof state.startedPrints === "object" ? state.startedPrints : {};
+      const kept = new Set(steps.filter((s) => prints[s.id] === stepPrint(s)).map((s) => s.id));
+      const startedSteps = Array.isArray(state.startedSteps) ? state.startedSteps.filter((id) => kept.has(id)) : state.legacyFill ? undefined : [];
+      const { startedSteps: _prior, startedPrints: _prints, ...rest } = state;
       const next = { ...rest, phase: "fill", activeStep: null, reviewEpoch: Date.now(), ...(startedSteps ? { startedSteps } : {}) };
       try {
         writeSnapshot(root, next, files, record, review && { version: review.version, source: review.source, at: review.at }, source.coverage);
@@ -1448,7 +1456,12 @@ const commands = {
     return withFeedbackLock(root, () => {
       const state = requireState(root);
       if (state.phase !== "fill") die(state.phase === "done" ? "this skeleton is finalized; start a new one with skel init" : "the skeleton is already open for changes");
-      writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now(), reviewRound: crypto.randomUUID(), ...(Array.isArray(state.startedSteps) ? {} : { legacyFill: true }) });
+      let record = { legacyFill: true };
+      if (Array.isArray(state.startedSteps)) {
+        const started = new Set(state.startedSteps);
+        record = { startedPrints: Object.fromEntries(snapshot(root, state).steps.filter((s) => started.has(s.id)).map((s) => [s.id, stepPrint(s)])) };
+      }
+      writeState(root, { ...state, phase: "scaffold", activeStep: null, reviewEpoch: Date.now(), reviewRound: crypto.randomUUID(), ...record });
       // The record is of the shape being reopened; approve writes the new one.
       clearSnapshot(root);
       clearConfigNotices(root);

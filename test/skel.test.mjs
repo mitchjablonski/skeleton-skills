@@ -471,6 +471,12 @@ test("#247: a body filled before approval is noted (the version doesn't cover bo
   run("approve");
   assert.deepEqual(JSON.parse(run("status", "--json")).startedSteps, ["2", "1"]);
   assert.doesNotMatch(run("status"), /note: step/);
+  // A step whose body changes during a reshape is no longer the step `skel done` checked.
+  run("reshape");
+  fs.writeFileSync(a, fs.readFileSync(a, "utf-8").replace("return [a, b];", "return [b, a];"));
+  run("approve");
+  assert.deepEqual(JSON.parse(run("status", "--json")).startedSteps, ["1"]);
+  assert.match(run("start", "2", "--force"), /STEP 2 active/);
 });
 
 test("#247: a fill from before started-steps records stays without notices through reshape", () => {

@@ -15,8 +15,8 @@ human reviews, decides, and answers Claude Code's permission prompts.
 4. **Agent:** apply every comment. After the human approves, run
    `skel approve`: bare when they said yes in chat, or
    `skel approve --reviewed <version>` with the version from the feedback
-   they pasted. Never pass a version the human didn't give you. Its
-   permission prompt is the human's approval, so run it only after their yes.
+   they pasted. Never pass a version the human didn't give you. Run it only
+   after their explicit yes; the human answers any permission prompt.
 5. **Agent, per step:** `skel next`, fill only inside the active fences,
    test, then `skel done`.
 6. **Agent:** run the full project test suite, then ask the human whether to
