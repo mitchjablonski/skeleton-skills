@@ -36,9 +36,9 @@ export function bindControlTerminal(input, output, stat = fs.fstatSync) {
 
 // Only a single short, literal answer is accepted. Never echo input or put
 // stdin in raw mode. Cooked terminal echo remains under the operator's control.
-export function confirmAtTerminal(input, output, prompt, timeout = 120_000) {
+export function confirmAtTerminal(input, output, prompt, timeout = 120_000, signal) {
   return new Promise((resolve) => {
-    if (input.readableEnded || input.destroyed || output.destroyed) {
+    if (signal?.aborted || input.readableEnded || input.destroyed || output.destroyed) {
       resolve(false);
       return;
     }
@@ -51,6 +51,7 @@ export function confirmAtTerminal(input, output, prompt, timeout = 120_000) {
       input.off("close", refused);
       input.off("error", refused);
       output.off("error", refused);
+      signal?.removeEventListener("abort", refused);
       input.pause();
       resolve(confirmed);
     };
@@ -69,6 +70,7 @@ export function confirmAtTerminal(input, output, prompt, timeout = 120_000) {
     input.once("close", refused);
     input.once("error", refused);
     output.once("error", refused);
+    signal?.addEventListener("abort", refused, { once: true });
     input.pause();
     input.on("data", read);
     try {
@@ -111,7 +113,7 @@ export async function bindOperatorSeat({ interactive, confirm, bind = bindRealSe
       }
       return refusal;
     };
-    async function confirmOnSeat(prompt, refused, check = recheck) {
+    async function confirmOnSeat(prompt, refused, check = recheck, signal) {
       if (refusal) return refusal;
       if (confirming) {
         refusal = refused;
@@ -121,7 +123,7 @@ export async function bindOperatorSeat({ interactive, confirm, bind = bindRealSe
       if (ready !== SEAT_MATCHED) return ready;
       confirming = true;
       try {
-        const confirmed = await confirm(prompt);
+        const confirmed = await confirm(prompt, signal);
         if (confirmed === true && !refusal) {
           const current = check();
           if (current === SEAT_MATCHED) return current;
@@ -145,7 +147,7 @@ export async function bindOperatorSeat({ interactive, confirm, bind = bindRealSe
         const window = prepareSeatWindow({ listener, binding: captureBinding, recheck });
         if (!window) return null;
         let matched = false;
-        async function confirmWindow(restart) {
+        async function confirmWindow(restart, signal) {
           const expected = window.comparison();
           if (!expected || (restart && !matched)) {
             refusal ??= WINDOW_REFUSED;
@@ -156,14 +158,14 @@ export async function bindOperatorSeat({ interactive, confirm, bind = bindRealSe
             ? `${comparison} Do both still match, and do all your attestations still hold for this restart?`
             : `${comparison} Do both match?`;
           const result = await confirmOnSeat(prompt, WINDOW_REFUSED,
-            () => window.comparison() === expected ? SEAT_MATCHED : WINDOW_REFUSED);
+            () => window.comparison() === expected ? SEAT_MATCHED : WINDOW_REFUSED, signal);
           matched = result === SEAT_MATCHED;
           return result;
         }
         return Object.freeze({
           ...window,
-          confirmMatch: () => confirmWindow(false),
-          confirmRestart: () => confirmWindow(true),
+          confirmMatch: (signal) => confirmWindow(false, signal),
+          confirmRestart: (signal) => confirmWindow(true, signal),
         });
       },
     });

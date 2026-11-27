@@ -10,6 +10,36 @@ import { parseUnixSocketTable, x11SocketState, x11SocketStateFromBytes } from ".
 import { bindSeatMetadata } from "./live/strict-seat-metadata.mjs";
 import { bindPinnedChromeInstallation, checkPinnedChromeInstallation } from "./live/strict-real-seat-preflight.mjs";
 import { bindControlTerminal, bindOperatorSeat, confirmAtTerminal, rehearseRealSeat } from "./live/strict-real-seat-rehearsal.mjs";
+import { matchesWindowClaim, parseDecisionWindows } from "./live/strict-wslg-window.mjs";
+
+test("real WSLg observations keep all decision-window candidates and check the exact claim", () => {
+  const tree = `
+     0x380001 "Mail": ("mail" "Mail")
+        0x400005 "Skeleton decision (prototype) - Google Chrome": ("google-chrome" "Google-chrome")
+        0x420005 "Skeleton decision (prototype)": ("google-chrome" "Google-chrome")
+  `;
+  assert.deepEqual(parseDecisionWindows(tree), ["0x400005", "0x420005"]);
+  const claim = '_NET_WM_PID(CARDINAL) = 123\nWM_CLIENT_MACHINE(STRING) = "seat"\n';
+  const geometry = "  Map State: IsViewable\n";
+  assert.equal(matchesWindowClaim(claim, geometry, 123, "seat"), true);
+  assert.equal(matchesWindowClaim(claim, geometry, 12, "seat"), false);
+  assert.equal(matchesWindowClaim(claim + claim, geometry, 123, "seat"), false);
+  assert.equal(matchesWindowClaim(claim, geometry, 123, "other"), false);
+  assert.equal(matchesWindowClaim(claim, "  Map State: IsUnmapped\n", 123, "seat"), false);
+});
+
+test("the operator WSLg entry refuses redirected input and output", { skip: process.platform !== "linux" }, () => {
+  const entry = fileURLToPath(new URL("./live/strict-real-seat-launcher.py", import.meta.url));
+  const child = spawnSync("/usr/bin/python3", ["-I", entry, "--real-seat-launcher"], {
+    input: "yes\n", encoding: "utf8", timeout: 5000,
+  });
+  assert.ifError(child.error);
+  assert.equal(child.status, 2, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), {
+    ok: false, strictState: "unverified", code: "real-desktop-invocation-invalid",
+    scope: "synthetic-window-checkpoint", windowAttribution: "attribution-unavailable",
+  });
+});
 
 test("the rehearsal requires one unchanged control terminal", () => {
   const left = { isTTY: true, fd: 0 };
@@ -41,6 +71,11 @@ test("terminal confirmation accepts one exact line, bounds input and resumes for
   assert.equal(await answer([Buffer.from([0xf9, 101, 115, 10])]), false);
   assert.doesNotMatch(output.read().toString(), /private fixture value/);
   assert.equal(await confirmAtTerminal(input, output, "Timeout question", 5), false);
+  const cancelled = new AbortController();
+  const interrupted = confirmAtTerminal(input, output, "Window lost", 1000, cancelled.signal);
+  cancelled.abort();
+  assert.equal(await interrupted, false);
+  assert.equal(await answer(["yes\n"]), true);
   const eof = confirmAtTerminal(input, output, "End question", 1000);
   input.end();
   assert.equal(await eof, false);

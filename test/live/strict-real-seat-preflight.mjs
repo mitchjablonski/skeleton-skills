@@ -3,7 +3,7 @@ import os from "node:os";
 import { sha256Descriptor } from "./strict-browser-fixture.mjs";
 import { bindSeatMetadata } from "./strict-seat-metadata.mjs";
 
-const CHROME_PATH = "/opt/google/chrome/chrome";
+export const CHROME_PATH = "/opt/google/chrome/chrome";
 const CHROME_PIN = "7ee5f9e4bf6674e3b19d8c7fb952aea78385e6ba6caa6330d62ed9821558cf6f";
 const INSTALL_PATH = ["/", "/opt", "/opt/google", "/opt/google/chrome", CHROME_PATH];
 const MAX_ELF_BYTES = 512 * 1024 * 1024;
