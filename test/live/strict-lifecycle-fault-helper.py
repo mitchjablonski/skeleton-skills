@@ -94,6 +94,18 @@ def agent(capture=False, stop_mode=None, silent_child=False, desktop_policy=Fals
         record["digests"] = digests
     if desktop_policy:
         record["desktopIsolation"] = "vsock-denied"
+        if capture:
+            if any(os.isatty(fd) for fd in (0, 1, 2)):
+                raise SystemExit(7)
+            try:
+                terminal = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+            except OSError as error:
+                if error.errno not in (errno.ENXIO, errno.ENOENT):
+                    raise SystemExit(7)
+            else:
+                os.close(terminal)
+                raise SystemExit(7)
+            record["controlTerminalAbsent"] = True
     sys.stdout.write(json.dumps(record, sort_keys=True) + "\n")
     sys.stdout.flush()
     sleep_forever()
@@ -153,6 +165,10 @@ def main():
         agent()
     elif args == ["agent-desktop-policy"]:
         agent(desktop_policy=True)
+    elif args == ["agent-capture-desktop-policy"]:
+        agent(capture=True, desktop_policy=True)
+    elif args == ["agent-capture-cooperative-desktop-policy"]:
+        agent(capture=True, stop_mode="cooperative", desktop_policy=True)
     elif args == ["agent-capture"]:
         agent(capture=True)
     elif args == ["agent-cooperative"]:

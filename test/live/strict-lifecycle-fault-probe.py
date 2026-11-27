@@ -102,9 +102,9 @@ def bwrap_argv(stage=None, *, stop_mode=None, silent_child=False, desktop_filter
         assert stage is None and stop_mode is None
         mode = "agent-silent-child"
     if desktop_filter is not None:
-        assert stage is None and stop_mode is None and not silent_child
+        assert not silent_child and (stop_mode is None or (stage is not None and stop_mode == "cooperative"))
         argv += ["--seccomp", str(desktop_filter)]
-        mode = "agent-desktop-policy"
+        mode += "-desktop-policy"
     return argv + ["--", "/usr/bin/python3", "-I", "/helper.py", mode]
 
 
@@ -317,6 +317,7 @@ def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, s
         if (exited(owned_worker["fd"])
                 or not desktop_policy_verified(record.get("desktopIsolation"),
                                                seccomp_filter_count(owned_worker["pid"]), parent_filters)
+                or (stage is not None and record.get("controlTerminalAbsent") is not True)
                 or exited(owned_worker["fd"])):
             raise RuntimeError("desktop policy proof unavailable")
     if stop_mode is not None:
