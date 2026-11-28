@@ -68,8 +68,29 @@ out["second-ready"] = outcome(lambda: r.receive(ready))
 r = fresh(); r.receive(ready); out["turn-unprompted"] = outcome(lambda: r.receive(turn))
 r = fresh(); r.receive(ready); r.prompted = True; r.receive(turn); out["turn"] = r.turn
 out["second-turn"] = outcome(lambda: r.receive(turn))
-r = fresh(); r.output.extend(b"y" * (128 * 1024 - 2))
+MAX, CHUNK = m["MAX_BUFFER"], m["PTY_CHUNK"]
+r = fresh(); r.output.extend(b"y" * (MAX - 2))
 out["output-limit"] = outcome(lambda: r.receive(frame(b"O", b"abc")))
+r = fresh(); r.output.extend(b"y" * (MAX - 3)); r.receive(frame(b"O", b"abc"))
+out["output-at-limit"] = len(r.output) == MAX
+# Acceptance exactly at each bound.
+r = fresh(); big = frame(b"O", b"z" * CHUNK)
+r.receive(big[:CHUNK]); r.receive(big[CHUNK:])
+out["frame-at-chunk"] = [len(r.output), [len(p) for p in r.text_filter.pushes]]
+r = fresh(); out["read-at-chunk"] = outcome(lambda: r.receive(b"O" + CHUNK.to_bytes(2, "big") + b"z" * (CHUNK - 3)))
+r = fresh(); out["status-at-512"] = outcome(lambda: r.receive(b"S" + (512).to_bytes(2, "big") + b"x" * 509))
+r = fresh(); full = frame(b"S", b"x" * 512)
+out["status-512-complete"] = outcome(lambda: (r.receive(full[:CHUNK]), r.receive(full[CHUNK:]) if len(full) > CHUNK else None))
+# One read that completes a split full-size frame and carries a second frame.
+r = fresh(); big = frame(b"O", b"z" * CHUNK); tail = frame(b"O", b"tail")
+r.receive(big[:CHUNK - 7]); r.receive(big[CHUNK - 7:] + tail)
+out["filter-chunks"] = [len(p) for p in r.text_filter.pushes]
+# A frame one byte short stays pending.
+r = fresh(); data = frame(b"O", b"hello")
+r.receive(data[:len(data) - 1]); out["one-short"] = bytes(r.output).decode()
+# A turn is never accepted before ready, even when prompted.
+r = fresh(); r.prompted = True
+out["turn-before-ready"] = outcome(lambda: r.receive(turn))
 print(json.dumps(out))
 `);
   assert.deepEqual(got, {
@@ -86,6 +107,14 @@ print(json.dumps(out))
     "turn-unprompted": "interactive-agent-status-refused",
     turn: true, "second-turn": "interactive-agent-status-refused",
     "output-limit": "interactive-agent-output-limit",
+    "output-at-limit": true,
+    "frame-at-chunk": [8192, [8192]],
+    "read-at-chunk": "ok",
+    "status-at-512": "ok",
+    "status-512-complete": "interactive-agent-status-refused",
+    "filter-chunks": [8192, 4],
+    "one-short": "",
+    "turn-before-ready": "interactive-agent-status-refused",
   });
 });
 
@@ -97,8 +126,8 @@ def gate(chunks, ready):
     try:
         for chunk in chunks:
             pane.sendall(chunk)
-            r.poll(0.2)
-        return ["ok", r.prompted, bytes(r.send).decode()]
+            stdin_ready = r.poll(0.2)
+        return ["ok", r.prompted, bytes(r.send).decode(), stdin_ready]
     except Refused as e:
         return ["refused:%d" % e.status, r.prompted, bytes(r.send).decode()]
     finally:
@@ -114,11 +143,13 @@ print(json.dumps({
 }))
 `);
   const P = got.PROMPT;
-  assert.deepEqual(got.exact, ["ok", true, P]);
-  assert.deepEqual(got.typed, ["ok", true, P]);
+  // stdin is /dev/null here, so poll() reports fd 0 readable.
+  assert.deepEqual(got.exact, ["ok", true, P, true]);
+  assert.deepEqual(got.typed, ["ok", true, P, true]);
   assert.deepEqual(got.wrong, ["refused:41", false, ""]);
   assert.deepEqual(got["not-ready"], ["refused:42", false, ""]);
-  assert.equal(got.again[0], "refused:41");
+  // The second poll drains PROMPT to the channel before refusing the extra byte.
+  assert.deepEqual(got.again, ["refused:41", true, ""]);
 });
 
 test("#270: pin_client copies exactly the pinned ELF bytes and refuses anything else", linux, (t) => {
@@ -134,10 +165,19 @@ test("#270: pin_client copies exactly the pinned ELF bytes and refuses anything 
   fs.symlinkSync(path.join(dir, "good"), path.join(dir, "link"));
   const got = python(`
 from pathlib import Path
+import hashlib, stat as st_mod
 src, pin = sys.argv[2], sys.argv[3]
+def own(name):
+    # Each file's own digest, so only the check under test can refuse it.
+    with open(os.path.join(src, name), "rb") as f: return hashlib.sha256(f.read()).hexdigest()
+os.mkfifo(os.path.join(src, "fifo")); os.chmod(os.path.join(src, "fifo"), 0o755)
+with open(os.path.join(src, "huge"), "wb") as f:
+    f.write(b"\x7fELF"); f.truncate(512 * 1024 * 1024 + 1)
+os.chmod(os.path.join(src, "huge"), 0o755)
 out = {}
-for label, name, digest in [("good", "good", pin), ("wrong-pin", "good", "0" * 64), ("not-executable", "plain", pin),
-                            ("not-elf", "script", pin), ("too-small", "tiny", pin), ("symlink", "link", pin)]:
+for label, name, digest in [("good", "good", pin), ("wrong-pin", "good", "0" * 64), ("not-executable", "plain", own("plain")),
+                            ("not-elf", "script", own("script")), ("too-small", "tiny", own("tiny")), ("symlink", "link", pin),
+                            ("fifo", "fifo", "0" * 64), ("oversize", "huge", "0" * 64)]:
     root = Path(src) / ("root-" + label); root.mkdir()
     try:
         target = m["pin_client"](os.path.join(src, name), digest, root)
@@ -147,10 +187,14 @@ for label, name, digest in [("good", "good", pin), ("wrong-pin", "good", "0" * 6
         out[label] = [str(e)]
     except OSError as e:
         out[label] = ["oserror"]
-root = Path(src) / "root-good"
+# A writable pre-existing target is refused by the exclusive create itself.
+root = Path(src) / "root-existing"; root.mkdir()
+(root / "pinned-client").write_bytes(b"old"); os.chmod(root / "pinned-client", 0o644)
 try:
     m["pin_client"](os.path.join(src, "good"), pin, root)
     out["existing-target"] = ["ok"]
+except FileExistsError:
+    out["existing-target"] = ["exists"]
 except OSError:
     out["existing-target"] = ["oserror"]
 print(json.dumps(out))
@@ -159,6 +203,6 @@ print(json.dumps(out))
   assert.deepEqual(got, {
     good: ["ok", "0o500", true],
     "wrong-pin": refused, "not-executable": refused, "not-elf": refused, "too-small": refused,
-    symlink: ["oserror"], "existing-target": ["oserror"],
+    fifo: refused, oversize: refused, symlink: ["oserror"], "existing-target": ["exists"],
   });
 });
