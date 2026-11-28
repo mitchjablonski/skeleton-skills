@@ -15,6 +15,20 @@ HERE = Path(__file__).resolve().parent
 RelayTextFilter = runpy.run_path(str(HERE / "strict-agent-relay-filter.py"))["RelayTextFilter"]
 
 
+class RelayRefused(RuntimeError):
+    """Fixed private driver exit statuses. Never derived from pane bytes."""
+
+    PANE_CLOSED = 40
+    INPUT_REFUSED = 41
+    NOT_READY = 42
+    CHANNEL_REFUSED = 43
+    TURN_MISSING = 44
+
+    def __init__(self, status):
+        super().__init__("interactive-agent-refused")
+        self.status = status
+
+
 def terminal_identity(details):
     if not stat.S_ISCHR(details.st_mode):
         return None
@@ -197,20 +211,20 @@ class AgentRelay:
             del self.send[:self.channel.send(self.send)]
         if self.channel in readable:
             self.receive(self.channel.recv(PTY_CHUNK))
-        if self.pane in writable:
-            del self.output[:self.pane.send(self.output)]
         if self.pane in readable:
             data = self.pane.recv(32)
             if not data:
-                raise RuntimeError("interactive-agent-pane-closed")
+                raise RelayRefused(RelayRefused.PANE_CLOSED)
             self.input.extend(data)
             if self.prompted or not b"witness\n".startswith(self.input):
-                raise RuntimeError("interactive-agent-input-refused")
+                raise RelayRefused(RelayRefused.INPUT_REFUSED)
             if self.input == b"witness\n":
                 if not self.ready:
-                    raise RuntimeError("interactive-agent-not-ready")
+                    raise RelayRefused(RelayRefused.NOT_READY)
                 self.prompted = True
                 self.send.extend(PROMPT)
+        if self.pane in writable:
+            del self.output[:self.pane.send(self.output)]
         if self.listener in readable:
             self.attach()
         return 0 in readable

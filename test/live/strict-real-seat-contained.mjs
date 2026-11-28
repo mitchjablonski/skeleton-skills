@@ -19,6 +19,13 @@ const DRIVER = fileURLToPath(new URL("./strict-real-seat-restart.py", import.met
 const REFUSED = Object.freeze({ kind: "rejected", code: "unavailable" });
 const SUCCESS = "real-seat-contained-restart-passed";
 const INTERACTIVE_SUCCESS = "real-seat-interactive-restart-passed";
+const RELAY_REFUSALS = new Map([
+  [40, "interactive-agent-pane-closed"],
+  [41, "interactive-agent-input-refused"],
+  [42, "interactive-agent-not-ready"],
+  [43, "interactive-agent-channel-refused"],
+  [44, "interactive-agent-turn-missing"],
+]);
 
 function prepareReview(scratch) {
   const candidate = path.join(scratch, "candidate");
@@ -71,16 +78,21 @@ async function waitForExit(exited, ms) {
   }
 }
 
-async function runNamespace({ scratch, receipt, terminalPin, review, output, control, client, terminal, confirmAgent }) {
+export async function runNamespace({ scratch, receipt, terminalPin, review, output, control, client, terminal, confirmAgent }, spawnDriver = spawn) {
   const { signal, windowCurrent, confirmRestart, confirmRetained } = control;
   const { reviewVersion, captureVersion } = review.binding;
   const clientArgs = client ? [client.path, client.pin, terminal] : [];
-  const child = spawn("/usr/bin/python3", ["-I", DRIVER, scratch, process.execPath, receipt,
+  const child = spawnDriver("/usr/bin/python3", ["-I", DRIVER, scratch, process.execPath, receipt,
     terminalPin, reviewVersion, captureVersion, ...clientArgs], { detached: true, env: {}, stdio: ["pipe", "pipe", "ignore"] });
   const exited = new Promise((resolve) => {
     child.once("error", () => resolve({ code: 1 }));
     child.once("close", (code) => resolve({ code }));
   });
+  const driverEnded = new AbortController();
+  const driverRefused = () => driverEnded.abort(new Fail("contained-restart-refused"));
+  child.once("error", driverRefused);
+  child.once("exit", driverRefused);
+  const promptSignal = AbortSignal.any([signal, driverEnded.signal]);
   const stop = () => child.stdin.destroy();
   child.stdin.on("error", stop);
   signal.addEventListener("abort", stop, { once: true });
@@ -88,7 +100,8 @@ async function runNamespace({ scratch, receipt, terminalPin, review, output, con
   const steps = ["1", "R", "2"];
   let phase = 0;
   let permitted = 0;
-  let status;
+  let failed = false;
+  let failure;
   try {
     for await (const data of child.stdout) {
       const step = data.toString("latin1");
@@ -102,30 +115,38 @@ async function runNamespace({ scratch, receipt, terminalPin, review, output, con
       if (step === "1") output.write("First contained worker is running from the approved capture.\n");
       if (step === "R") {
         output.write("The first worker stopped. Confirm the retained review before restart.\n");
-        await confirmRestart();
+        await confirmRestart(promptSignal);
       }
       if (step === "2") {
         output.write("A new contained worker is running from the same approved capture.\n");
-        await confirmRetained();
+        await confirmRetained(promptSignal);
       }
+      driverEnded.signal.throwIfAborted();
       if (client && (step === "1" || step === "2")) {
         // Absolute paths: the relay accepts only this exact pane command (#270).
         const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
         const pane = fileURLToPath(new URL("./strict-real-seat-agent-pane.mjs", import.meta.url));
         output.write(`In a separate WSL tab run: ${quote(process.execPath)} ${quote(pane)} ${quote(`${scratch}/agent.sock`)}\n`);
-        if (!await confirmAgent("Did the separate agent pane show its expected reply?", signal))
+        const confirmed = await confirmAgent("Did the separate agent pane show its expected reply?", promptSignal);
+        driverEnded.signal.throwIfAborted();
+        if (!confirmed)
           throw new Fail("interactive-agent-witness-refused");
       }
       if (signal.aborted || !windowCurrent()) throw new Fail("wslg-owned-window-lost");
       child.stdin.write("y");
     }
+  } catch (error) {
+    failed = true;
+    failure = driverEnded.signal.aborted ? driverEnded.signal.reason : error;
   } finally {
     signal.removeEventListener("abort", stop);
     stop();
-    status = await waitForExit(exited, 25_000);
-    if (!status || status.code === 125 || status.code === null)
-      throw new Fail("real-seat-cleanup-unproven");
   }
+  const status = await waitForExit(exited, 25_000);
+  if (!status || status.code === 125 || status.code === null)
+    throw new Fail("real-seat-cleanup-unproven");
+  if (RELAY_REFUSALS.has(status.code)) throw new Fail(RELAY_REFUSALS.get(status.code));
+  if (failed) throw failure;
   if (status.code !== 0 || phase !== steps.length) throw new Fail("contained-restart-refused");
 }
 
