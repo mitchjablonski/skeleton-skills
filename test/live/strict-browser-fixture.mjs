@@ -196,13 +196,15 @@ export function heldListeners(pids) {
 /** Files named `name` under `dir`, skipping the directories in `exclude`. */
 // Chromium creates and removes temporary directories while it runs, so a
 // subdirectory can vanish between listing its parent and reading it. That
-// scan is incomplete, not evidence: the whole scan is repeated, and a scan
-// that never completes still refuses. Any other error, or a missing root,
-// refuses at once (#270).
+// scan is incomplete, not evidence of absence: the whole scan is repeated,
+// and a scan that never completes refuses. A file already seen is evidence
+// even from an incomplete scan, so the result is the highest count any
+// attempt reached, and a positive partial count stands even if no attempt
+// completes. Any other error, or a missing root, refuses at once (#270).
 class ScanChanged extends Error {}
 
-function countNamed(dir, name, exclude, depth, read) {
-  if (depth > 12) return 1;
+function countNamed(dir, name, exclude, depth, read, seen) {
+  if (depth > 12) { seen.n++; return; }
   let entries;
   try {
     entries = read(dir, { withFileTypes: true });
@@ -210,23 +212,29 @@ function countNamed(dir, name, exclude, depth, read) {
     if (depth > 0 && (error.code === "ENOENT" || error.code === "ENOTDIR")) throw new ScanChanged(dir);
     throw error;
   }
-  let n = 0;
   for (const e of entries) {
     const full = path.join(dir, e.name);
     if (exclude.has(full)) continue;
-    if (e.name === name) n++;
-    if (e.isDirectory() && !e.isSymbolicLink()) n += countNamed(full, name, exclude, depth + 1, read);
+    if (e.name === name) seen.n++;
+    if (e.isDirectory() && !e.isSymbolicLink()) countNamed(full, name, exclude, depth + 1, read, seen);
   }
-  return n;
 }
 
 export function findNamed(dir, name, exclude = new Set(), { attempts = 3, read = fs.readdirSync } = {}) {
+  if (!Number.isInteger(attempts) || attempts < 1) throw new TypeError("attempts must be a positive integer");
+  let best = 0;
   for (let attempt = 1; ; attempt++) {
+    const seen = { n: 0 };
     try {
-      return countNamed(dir, name, exclude, 0, read);
+      countNamed(dir, name, exclude, 0, read, seen);
+      return Math.max(best, seen.n);
     } catch (error) {
       if (!(error instanceof ScanChanged)) throw error;
-      if (attempt >= attempts) throw new Error(`profile scan never completed: ${error.message} kept changing`);
+      best = Math.max(best, seen.n);
+      if (attempt >= attempts) {
+        if (best > 0) return best;
+        throw new Fail("profile-scan-incomplete");
+      }
     }
   }
 }
