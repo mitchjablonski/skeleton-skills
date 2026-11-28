@@ -175,11 +175,6 @@ test("golden edge vectors pin each parser rule", () => {
     // A doubled ESC inside DCS is quoted and can't begin ST.
     [ESC + "Pq" + ESC + ESC + "\\visible" + escapeST + "after\n", "after\n"],
   ];
-  for (const [input, want] of cases) {
-    const whole = createStrictPtyOutput();
-    assert.equal(whole.push(raw(input)), want, JSON.stringify(input));
-    // The same result byte by byte.
-    const bytes = createStrictPtyOutput();
-    assert.equal([...raw(input)].map((b) => bytes.push(Uint8Array.of(b))).join(""), want, `bytewise ${JSON.stringify(input)}`);
-  }
+  // Every two-way split, one byte per read, and end().
+  for (const [input, want] of cases) assertAcrossReads(input, want);
 });
