@@ -562,6 +562,15 @@ with tempfile.TemporaryDirectory(prefix="skel-relay-filter-") as directory:
         receive(b"start " + bytes([27, 91]))
         receive(b"31mplain" + bytes([27, 91]) + b"0m\\n")
         assert relay.output == b"start plain\\n"
+        batches = []
+        filtered = relay.text_filter.push
+        def count(data):
+            batches.append(len(data))
+            return filtered(data)
+        relay.text_filter.push = count
+        relay.receive((b"O" + bytes([0, 1]) + b"a") * 1024)
+        assert batches == [1024]
+        assert relay.output.endswith(b"a" * 1024)
         receive(bytes([27, 91]))
         relay.end_generation()
         relay.prepare()
@@ -572,6 +581,41 @@ with tempfile.TemporaryDirectory(prefix="skel-relay-filter-") as directory:
 `;
   const child = spawnSync("/usr/bin/python3", ["-I", "-c", script, relayPath, process.execPath, panePath],
     { encoding: "utf8", timeout: 10000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+});
+
+test("#270: the relay filter refuses bad replies and reaps a stalled filter", { skip: process.platform !== "linux" }, (t) => {
+  const filter = fileURLToPath(new URL("./live/strict-agent-relay-filter.py", import.meta.url));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "skel-relay-filter-fault-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const workers = [
+    "process.stdout.write(Buffer.from([0, 1, 128]));",
+    "process.stdout.write(Buffer.from([0, 2, 65]));",
+    "setInterval(() => {}, 1000);",
+  ].map((source, index) => {
+    const filename = path.join(dir, `child-${index}.mjs`);
+    fs.writeFileSync(filename, source);
+    return filename;
+  });
+  const script = `
+import runpy, sys
+Filter = runpy.run_path(sys.argv[1])["RelayTextFilter"]
+for script in sys.argv[3:]:
+    child = Filter(sys.argv[2], script)
+    try:
+        try:
+            child.push(b"abcd")
+            raise AssertionError("an invalid result reached the relay")
+        except RuntimeError as error:
+            assert str(error) == "relay-filter-failed"
+    finally:
+        child.close()
+        assert child._child.poll() is not None
+    child.close()
+`;
+  const child = spawnSync("/usr/bin/python3", ["-I", "-c", script, filter, process.execPath, ...workers],
+    { encoding: "utf8", timeout: 12000 });
   assert.ifError(child.error);
   assert.equal(child.status, 0, child.stderr);
 });

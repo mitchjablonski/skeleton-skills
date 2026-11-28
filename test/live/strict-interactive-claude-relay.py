@@ -9,6 +9,7 @@ import stat
 import struct
 
 MAX_BUFFER = 128 * 1024
+PTY_CHUNK = 8192
 PROMPT = b"Desktop witness message: DESKTOP-WITNESS\r"
 HERE = Path(__file__).resolve().parent
 RelayTextFilter = runpy.run_path(str(HERE / "strict-agent-relay-filter.py"))["RelayTextFilter"]
@@ -51,10 +52,7 @@ def pin_client(source, expected, root):
 
 
 def pane_process_matches(pid, node_identity, script, sock):
-    """True only for the reviewed pane filter: the pinned Node executable
-    running exactly [absolute pane script, this relay's socket] (#270). The
-    relay sends raw agent bytes to the pane, so anything else that connects
-    (another checkout's script, socat) must be refused."""
+    """Identify the pinned Node process running the reviewed pane script on this socket."""
     try:
         exe = os.stat(f"/proc/{pid}/exe")
         with open(f"/proc/{pid}/cmdline", "rb") as record:
@@ -156,27 +154,36 @@ class AgentRelay:
     def receive(self, block):
         if not block:
             raise RuntimeError("interactive-agent-exited")
+        if len(block) > PTY_CHUNK:
+            raise RuntimeError("interactive-agent-frame-refused")
+        pty_bytes = bytearray()
         self.pending.extend(block)
         while len(self.pending) >= 3:
             kind = self.pending[0]
             length = int.from_bytes(self.pending[1:3], "big")
-            limit = {ord("O"): 8192, ord("S"): 512}.get(kind, 0)
+            limit = {ord("O"): PTY_CHUNK, ord("S"): 512}.get(kind, 0)
             if not 0 < length <= limit:
                 raise RuntimeError("interactive-agent-frame-refused")
             if len(self.pending) < length + 3:
-                return
+                break
             payload = self.pending[3:length + 3]
             del self.pending[:length + 3]
             if kind == ord("O"):
-                self.output.extend(self.text_filter.push(bytes(payload)))
+                pty_bytes.extend(payload)
             elif payload == b'{"event":"ready"}' and not self.ready:
                 self.ready = True
             elif payload == b'{"event":"turn"}' and self.ready and self.prompted and not self.turn:
                 self.turn = True
             else:
                 raise RuntimeError("interactive-agent-status-refused")
-            if len(self.output) > MAX_BUFFER:
-                raise RuntimeError("interactive-agent-output-limit")
+        # A read can complete one earlier partial frame and bring new bytes.
+        # Batch the output so many tiny frames cannot multiply filter waits.
+        text = bytearray()
+        for offset in range(0, len(pty_bytes), PTY_CHUNK):
+            text.extend(self.text_filter.push(bytes(pty_bytes[offset:offset + PTY_CHUNK])))
+        if len(self.output) + len(text) > MAX_BUFFER:
+            raise RuntimeError("interactive-agent-output-limit")
+        self.output.extend(text)
 
     def poll(self, timeout):
         readers = [0, self.listener, self.channel]
@@ -189,7 +196,7 @@ class AgentRelay:
         if self.channel in writable:
             del self.send[:self.channel.send(self.send)]
         if self.channel in readable:
-            self.receive(self.channel.recv(8192))
+            self.receive(self.channel.recv(PTY_CHUNK))
         if self.pane in writable:
             del self.output[:self.pane.send(self.output)]
         if self.pane in readable:
