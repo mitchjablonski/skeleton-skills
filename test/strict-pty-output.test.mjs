@@ -150,3 +150,36 @@ test("withheld() is independent of how the stream is split", () => {
     assert.deepEqual(filter.withheld(), { kind: "dcs", bytes: bytes.length - 2 }, `split at ${split}`);
   }
 });
+
+// Golden edge vectors (#270/#276). The relay runs this filter on every agent
+// byte before the pane socket, so each rule below is pinned to an exact
+// output. Every vector here fails if its rule is changed.
+test("golden edge vectors pin each parser rule", () => {
+  const cases = [
+    // tmux-wrapped DCS: a bare 8-bit ST doesn't end it; ESC \ does.
+    ["\x90tmux;\x9cA" + escapeST + "B\n", "B\n"],
+    // Near-miss prefixes don't wrap, so the ST ends the string.
+    ["\x90tmuxX\x9cA\n", "A\n"],
+    ["\x90tmux\x9cA\n", "A\n"],
+    // An 8-bit ST that is a UTF-8 continuation doesn't end an OSC.
+    ["\x9d\xe2\x82\x9cA" + BEL + "B\n", "B\n"],
+    // CSI final bytes start at '@'.
+    [ESC + "[@A\n", "A\n"],
+    // DEL isn't an escape final; the next byte is.
+    [ESC + "\x7fA\n", "\n"],
+    // '/' is an intermediate; no 7-bit C1 mapping after an intermediate.
+    [ESC + "/]hidden" + BEL + "shown\n", "hiddenshown\n"],
+    [ESC + "(]x" + BEL + "y\n", "xy\n"],
+    // ED's continuation range stops at 0x9F: ED A0 isn't UTF-8, so 9D opens an OSC.
+    ["X\n\xed\xa0\x9dA\n", "X\n"],
+    // A doubled ESC inside DCS is quoted and can't begin ST.
+    [ESC + "Pq" + ESC + ESC + "\\visible" + escapeST + "after\n", "after\n"],
+  ];
+  for (const [input, want] of cases) {
+    const whole = createStrictPtyOutput();
+    assert.equal(whole.push(raw(input)), want, JSON.stringify(input));
+    // The same result byte by byte.
+    const bytes = createStrictPtyOutput();
+    assert.equal([...raw(input)].map((b) => bytes.push(Uint8Array.of(b))).join(""), want, `bytewise ${JSON.stringify(input)}`);
+  }
+});
