@@ -426,8 +426,8 @@ wc -l /mnt/wslg/stderr.log
 ```
 
 The launcher starts the pinned interactive CLI on its own private PTY in
-each admitted namespace. The agent pane shows an ASCII transcript with
-terminal controls removed. Display endpoints, session-bus settings and
+each admitted namespace. The host relay removes terminal controls before
+writing the ASCII transcript to the agent pane. Display endpoints, session-bus settings and
 WSL interop paths are absent from the worker's environment and filesystem.
 Both turns use the same predetermined prompt, a disposable HOME, and a
 local API fixture. Personal credentials, user settings, tools, plugins and

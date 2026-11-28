@@ -1,14 +1,32 @@
-"""Owned host relay. Agent bytes may only reach the separate pane filter."""
+"""Owned host relay. Only filtered plain text can reach the pane socket."""
 import hashlib
 import os
 from pathlib import Path
+import runpy
 import select
 import socket
 import stat
 import struct
 
 MAX_BUFFER = 128 * 1024
+PTY_CHUNK = 8192
 PROMPT = b"Desktop witness message: DESKTOP-WITNESS\r"
+HERE = Path(__file__).resolve().parent
+RelayTextFilter = runpy.run_path(str(HERE / "strict-agent-relay-filter.py"))["RelayTextFilter"]
+
+
+class RelayRefused(RuntimeError):
+    """Fixed private driver exit statuses. Never derived from pane bytes."""
+
+    PANE_CLOSED = 40
+    INPUT_REFUSED = 41
+    NOT_READY = 42
+    CHANNEL_REFUSED = 43
+    TURN_MISSING = 44
+
+    def __init__(self, status):
+        super().__init__("interactive-agent-refused")
+        self.status = status
 
 
 def terminal_identity(details):
@@ -48,10 +66,7 @@ def pin_client(source, expected, root):
 
 
 def pane_process_matches(pid, node_identity, script, sock):
-    """True only for the reviewed pane filter: the pinned Node executable
-    running exactly [absolute pane script, this relay's socket] (#270). The
-    relay sends raw agent bytes to the pane, so anything else that connects
-    (another checkout's script, socat) must be refused."""
+    """Identify the pinned Node process running the reviewed pane script on this socket."""
     try:
         exe = os.stat(f"/proc/{pid}/exe")
         with open(f"/proc/{pid}/cmdline", "rb") as record:
@@ -75,6 +90,7 @@ class AgentRelay:
     def __init__(self, root, control_identity, node, pane_script):
         self.path = root / "agent.sock"
         self.control_identity = control_identity
+        self.node = node
         node_stat = os.stat(node)
         self.node_identity = node_stat.st_dev, node_stat.st_ino
         self.pane_script = str(pane_script)
@@ -90,9 +106,11 @@ class AgentRelay:
             self.listener.close()
             raise
         self.channel = self.pane = self.inner = None
+        self.text_filter = None
 
     def prepare(self):
         self.end_generation()
+        self.text_filter = RelayTextFilter(self.node, HERE / "strict-agent-relay-filter.mjs")
         self.channel, self.inner = socket.socketpair()
         self.pending = bytearray()
         self.output = bytearray()
@@ -103,14 +121,21 @@ class AgentRelay:
         return self.inner
 
     def end_generation(self):
-        for peer in (self.channel, self.inner, self.pane):
-            if peer is not None:
-                peer.close()
-        self.channel = self.pane = self.inner = None
+        try:
+            for peer in (self.channel, self.inner, self.pane):
+                if peer is not None:
+                    peer.close()
+        finally:
+            self.channel = self.pane = self.inner = None
+            if self.text_filter is not None:
+                self.text_filter.close()
+                self.text_filter = None
 
     def close(self):
-        self.end_generation()
-        self.listener.close()
+        try:
+            self.end_generation()
+        finally:
+            self.listener.close()
 
     def owned_namespace(self):
         self.inner.close()
@@ -143,27 +168,36 @@ class AgentRelay:
     def receive(self, block):
         if not block:
             raise RuntimeError("interactive-agent-exited")
+        if len(block) > PTY_CHUNK:
+            raise RuntimeError("interactive-agent-frame-refused")
+        pty_bytes = bytearray()
         self.pending.extend(block)
         while len(self.pending) >= 3:
             kind = self.pending[0]
             length = int.from_bytes(self.pending[1:3], "big")
-            limit = {ord("O"): 8192, ord("S"): 512}.get(kind, 0)
+            limit = {ord("O"): PTY_CHUNK, ord("S"): 512}.get(kind, 0)
             if not 0 < length <= limit:
                 raise RuntimeError("interactive-agent-frame-refused")
             if len(self.pending) < length + 3:
-                return
+                break
             payload = self.pending[3:length + 3]
             del self.pending[:length + 3]
             if kind == ord("O"):
-                self.output.extend(payload)
+                pty_bytes.extend(payload)
             elif payload == b'{"event":"ready"}' and not self.ready:
                 self.ready = True
             elif payload == b'{"event":"turn"}' and self.ready and self.prompted and not self.turn:
                 self.turn = True
             else:
                 raise RuntimeError("interactive-agent-status-refused")
-            if len(self.output) > MAX_BUFFER:
-                raise RuntimeError("interactive-agent-output-limit")
+        # A read can complete one earlier partial frame and bring new bytes.
+        # Batch the output so many tiny frames cannot multiply filter waits.
+        text = bytearray()
+        for offset in range(0, len(pty_bytes), PTY_CHUNK):
+            text.extend(self.text_filter.push(bytes(pty_bytes[offset:offset + PTY_CHUNK])))
+        if len(self.output) + len(text) > MAX_BUFFER:
+            raise RuntimeError("interactive-agent-output-limit")
+        self.output.extend(text)
 
     def poll(self, timeout):
         readers = [0, self.listener, self.channel]
@@ -176,21 +210,21 @@ class AgentRelay:
         if self.channel in writable:
             del self.send[:self.channel.send(self.send)]
         if self.channel in readable:
-            self.receive(self.channel.recv(8192))
-        if self.pane in writable:
-            del self.output[:self.pane.send(self.output)]
+            self.receive(self.channel.recv(PTY_CHUNK))
         if self.pane in readable:
             data = self.pane.recv(32)
             if not data:
-                raise RuntimeError("interactive-agent-pane-closed")
+                raise RelayRefused(RelayRefused.PANE_CLOSED)
             self.input.extend(data)
             if self.prompted or not b"witness\n".startswith(self.input):
-                raise RuntimeError("interactive-agent-input-refused")
+                raise RelayRefused(RelayRefused.INPUT_REFUSED)
             if self.input == b"witness\n":
                 if not self.ready:
-                    raise RuntimeError("interactive-agent-not-ready")
+                    raise RelayRefused(RelayRefused.NOT_READY)
                 self.prompted = True
                 self.send.extend(PROMPT)
+        if self.pane in writable:
+            del self.output[:self.pane.send(self.output)]
         if self.listener in readable:
             self.attach()
         return 0 in readable

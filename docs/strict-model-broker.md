@@ -99,3 +99,34 @@ reservations with restart and unknown-outcome rules. The current policy accepts
 arbitrary JSON-object economic fields and does not enforce model or max_tokens
 spend limits. Real API access and credentials remain absent. This work provides
 no human authentication, completion, publication, antirollback or activation.
+
+## Host-only upstream authentication witness (#79)
+
+The opt-in command in `test/live/strict-upstream-auth-witness.mjs` reads a
+workspace-scoped API key from a bounded private input pipe. It sends one
+fixed synthetic token-count request to the Claude API. The key reaches only
+the selected public IPv4 peer after hostname and TLS verification. The
+command has no agent caller, prompt input, generation endpoint or retry.
+The receipt reports an outcome code and keeps strict `unverified`.
+[Authentication](https://platform.claude.com/docs/en/manage-claude/authentication) ·
+[Token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting)
+
+Run in a trusted Linux or WSL terminal from a reviewed checkout, with
+shell tracing off. Use the resolved path to your pinned Node executable
+and enter the API key only at the hidden shell prompt.
+
+```bash
+node=$(readlink -f "$(command -v node)")
+set +x
+if IFS= read -r -s -p 'Claude workspace API key: ' skel_auth_key; then
+  printf '\n'
+  builtin printf '%s\n' "$skel_auth_key" |
+    env -i "$node" test/live/strict-upstream-auth-witness.mjs --authenticate-count
+fi
+unset skel_auth_key
+```
+
+Success is `upstream-authenticated-count-passed`. Record only the receipt
+and checkout SHA. This witness does not start the WSLg launcher or modify
+its local mock. Live interactive model traffic and any paid generation
+still require their own admission and streaming-controller review.
