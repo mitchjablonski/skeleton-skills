@@ -126,16 +126,22 @@ def exercise(root, node, runtime, terminal_pin, review, capture, profile=None):
     except admission["RuntimeRefused"] as exc:
         if str(exc) == "runtime-observation-cleanup-unproven":
             result = 125
-    except (AssertionError, OSError, RuntimeError, ValueError, Refused, admission["lifecycle"]["Unproven"]):
-        pass
-    finally:
+    except BaseException:
+        # Any other failure, of any type, is a refusal (#270). It must not
+        # escape before cleanup is decided below, or an unproven cleanup would
+        # surface as a plain refusal.
+        result = 1
+    proven = True
+    try:
+        launcher.cleanup()
+    except BaseException:
+        proven = False
+    if relay is not None:
         try:
-            launcher.cleanup()
-        except Exception:
-            result = 125
-        if relay is not None:
             relay.close()
-    return result
+        except BaseException:
+            proven = False
+    return result if proven else 125
 
 
 def main(args):
