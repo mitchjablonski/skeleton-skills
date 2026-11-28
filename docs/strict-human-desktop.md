@@ -429,8 +429,11 @@ arbitrary prompt input are outside this run.
 2. Compare the browser phrase and capture in the control tab. Enter the
    approval there only. Keep the approval code and phrase out of the
    agent tab, clipboard and report.
-3. When the control tab prints the attach command, run it in a **separate
-   foreground WSL tab** from the same checkout. Wait for Claude's startup
+3. When the control tab prints the attach command, paste it unchanged into
+   a **separate foreground WSL tab**. It uses absolute paths, and the relay
+   accepts only that exact command: the launcher's Node running this
+   checkout's pane filter on this run's socket. Any other client (another
+   checkout's script, `socat`) gets no agent output. Wait for Claude's startup
    transcript, record the displayed version, type `witness`, and press Enter once. Check that the
    agent pane shows `DESKTOP-WITNESS` and `LOCAL-FIXTURE-REPLY`. Check
    that the typed marker and reply never appear as agent output in the

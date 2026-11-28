@@ -109,8 +109,10 @@ async function runNamespace({ scratch, receipt, terminalPin, review, output, con
         await confirmRetained();
       }
       if (client && (step === "1" || step === "2")) {
-        const node = "'" + process.execPath.replaceAll("'", "'\\''") + "'";
-        output.write(`In a separate WSL tab run: ${node} test/live/strict-real-seat-agent-pane.mjs ${scratch}/agent.sock\n`);
+        // Absolute paths: the relay accepts only this exact pane command (#270).
+        const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
+        const pane = fileURLToPath(new URL("./strict-real-seat-agent-pane.mjs", import.meta.url));
+        output.write(`In a separate WSL tab run: ${quote(process.execPath)} ${quote(pane)} ${quote(`${scratch}/agent.sock`)}\n`);
         if (!await confirmAgent("Did the separate agent pane show its expected reply?", signal))
           throw new Fail("interactive-agent-witness-refused");
       }
