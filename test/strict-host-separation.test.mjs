@@ -19,7 +19,8 @@ import json, os, runpy, subprocess, sys
 g = runpy.run_path(sys.argv[1], run_name="probe_under_test")
 held, reachable, private = g["host_terminal_held"], g["desktop_reachable"], g["namespace_devpts"]
 SLEEP = "import time; time.sleep(30)"
-def child(env=None, pass_fds=(), code=SLEEP, args=(), session=False):
+# Every child starts its own session, so none inherits the runner's controlling terminal.
+def child(env=None, pass_fds=(), code=SLEEP, args=(), session=True):
     return subprocess.Popen(["/usr/bin/python3", "-c", code, *args], env=env or {}, start_new_session=session,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=pass_fds)
 procs, fds = [], []
@@ -45,7 +46,7 @@ try:
     sandbox_nodes = keep(child(pass_fds=(null, zero)))
     # A session leader that opens a tty acquires it as controlling terminal; it then closes the fd.
     ctty = keep(child(code="import os, sys, time; os.close(os.open(sys.argv[1], os.O_RDWR)); time.sleep(30)",
-                      args=(os.ttyname(slave),), session=True))
+                      args=(os.ttyname(slave),)))
     import time; time.sleep(0.5)
     out["plain"] = held(plain.pid, None)
     out["sandboxNodes"] = held(sandbox_nodes.pid, None)
@@ -63,6 +64,12 @@ try:
     os.mkdir(sys.argv[2] + "/present")
     reachable.__globals__["DESKTOP_PATHS"] = (sys.argv[2] + "/present",)
     out["desktopPath"] = reachable(plain.pid)
+    locked = sys.argv[2] + "/locked"
+    os.mkdir(locked)
+    os.chmod(locked, 0)
+    reachable.__globals__["DESKTOP_PATHS"] = (locked + "/X0",)
+    out["unreadablePath"] = reachable(plain.pid) if os.geteuid() != 0 else True
+    os.chmod(locked, 0o700)
 finally:
     for p in procs: p.kill(); p.wait()
     for fd in fds: os.close(fd)
@@ -75,6 +82,6 @@ print(json.dumps(out))
     plain: false, sandboxNodes: false,
     hostSlave: true, hostMaster: true, hostPtmx: true, controllingTerminal: true,
     privateSlaveAllowed: false, masterStillRefused: true,
-    cleanEnv: false, displayEnv: true, busEnv: true, desktopPath: true,
+    cleanEnv: false, displayEnv: true, busEnv: true, desktopPath: true, unreadablePath: true,
   });
 });
