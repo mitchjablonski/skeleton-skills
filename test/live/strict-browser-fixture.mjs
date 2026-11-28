@@ -194,16 +194,41 @@ export function heldListeners(pids) {
   return { processes: pids.length, readable, unreadable, netUnreadable, sockets, listeningInodesSeen: listening.size, held };
 }
 /** Files named `name` under `dir`, skipping the directories in `exclude`. */
-export function findNamed(dir, name, exclude = new Set(), depth = 0) {
+// Chromium creates and removes temporary directories while it runs, so a
+// subdirectory can vanish between listing its parent and reading it. That
+// scan is incomplete, not evidence: the whole scan is repeated, and a scan
+// that never completes still refuses. Any other error, or a missing root,
+// refuses at once (#270).
+class ScanChanged extends Error {}
+
+function countNamed(dir, name, exclude, depth, read) {
   if (depth > 12) return 1;
+  let entries;
+  try {
+    entries = read(dir, { withFileTypes: true });
+  } catch (error) {
+    if (depth > 0 && (error.code === "ENOENT" || error.code === "ENOTDIR")) throw new ScanChanged(dir);
+    throw error;
+  }
   let n = 0;
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+  for (const e of entries) {
     const full = path.join(dir, e.name);
     if (exclude.has(full)) continue;
     if (e.name === name) n++;
-    if (e.isDirectory() && !e.isSymbolicLink()) n += findNamed(full, name, exclude, depth + 1);
+    if (e.isDirectory() && !e.isSymbolicLink()) n += countNamed(full, name, exclude, depth + 1, read);
   }
   return n;
+}
+
+export function findNamed(dir, name, exclude = new Set(), { attempts = 3, read = fs.readdirSync } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return countNamed(dir, name, exclude, 0, read);
+    } catch (error) {
+      if (!(error instanceof ScanChanged)) throw error;
+      if (attempt >= attempts) throw new Error(`profile scan never completed: ${error.message} kept changing`);
+    }
+  }
 }
 
 // --- sandboxed worker -------------------------------------------------------
