@@ -547,6 +547,35 @@ print(json.dumps(out))
   });
 });
 
+test("#270: only plain text enters the agent relay's pane queue", { skip: process.platform !== "linux" }, () => {
+  const relayPath = fileURLToPath(new URL("./live/strict-interactive-claude-relay.py", import.meta.url));
+  const panePath = fileURLToPath(new URL("./live/strict-real-seat-agent-pane.mjs", import.meta.url));
+  const script = `
+import pathlib, runpy, sys, tempfile
+Relay = runpy.run_path(sys.argv[1])["AgentRelay"]
+with tempfile.TemporaryDirectory(prefix="skel-relay-filter-") as directory:
+    relay = Relay(pathlib.Path(directory), None, sys.argv[2], sys.argv[3])
+    def receive(data):
+        relay.receive(b"O" + len(data).to_bytes(2, "big") + data)
+    try:
+        relay.prepare()
+        receive(b"start " + bytes([27, 91]))
+        receive(b"31mplain" + bytes([27, 91]) + b"0m\\n")
+        assert relay.output == b"start plain\\n"
+        receive(bytes([27, 91]))
+        relay.end_generation()
+        relay.prepare()
+        receive(b"fresh\\n")
+        assert relay.output == b"fresh\\n"
+    finally:
+        relay.close()
+`;
+  const child = spawnSync("/usr/bin/python3", ["-I", "-c", script, relayPath, process.execPath, panePath],
+    { encoding: "utf8", timeout: 10000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+});
+
 test("#270: the restart driver reports unproven cleanup whatever the exercise raised", { skip: process.platform !== "linux" }, () => {
   const entry = fileURLToPath(new URL("./live/strict-real-seat-restart.py", import.meta.url));
   // Load the driver without running main, stub the launcher and the runtime

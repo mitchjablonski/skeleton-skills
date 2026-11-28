@@ -1,7 +1,8 @@
-"""Owned host relay. Agent bytes may only reach the separate pane filter."""
+"""Owned host relay. Only filtered plain text can reach the pane socket."""
 import hashlib
 import os
 from pathlib import Path
+import runpy
 import select
 import socket
 import stat
@@ -9,6 +10,8 @@ import struct
 
 MAX_BUFFER = 128 * 1024
 PROMPT = b"Desktop witness message: DESKTOP-WITNESS\r"
+HERE = Path(__file__).resolve().parent
+RelayTextFilter = runpy.run_path(str(HERE / "strict-agent-relay-filter.py"))["RelayTextFilter"]
 
 
 def terminal_identity(details):
@@ -75,6 +78,7 @@ class AgentRelay:
     def __init__(self, root, control_identity, node, pane_script):
         self.path = root / "agent.sock"
         self.control_identity = control_identity
+        self.node = node
         node_stat = os.stat(node)
         self.node_identity = node_stat.st_dev, node_stat.st_ino
         self.pane_script = str(pane_script)
@@ -90,9 +94,11 @@ class AgentRelay:
             self.listener.close()
             raise
         self.channel = self.pane = self.inner = None
+        self.text_filter = None
 
     def prepare(self):
         self.end_generation()
+        self.text_filter = RelayTextFilter(self.node, HERE / "strict-agent-relay-filter.mjs")
         self.channel, self.inner = socket.socketpair()
         self.pending = bytearray()
         self.output = bytearray()
@@ -103,14 +109,21 @@ class AgentRelay:
         return self.inner
 
     def end_generation(self):
-        for peer in (self.channel, self.inner, self.pane):
-            if peer is not None:
-                peer.close()
-        self.channel = self.pane = self.inner = None
+        try:
+            for peer in (self.channel, self.inner, self.pane):
+                if peer is not None:
+                    peer.close()
+        finally:
+            self.channel = self.pane = self.inner = None
+            if self.text_filter is not None:
+                self.text_filter.close()
+                self.text_filter = None
 
     def close(self):
-        self.end_generation()
-        self.listener.close()
+        try:
+            self.end_generation()
+        finally:
+            self.listener.close()
 
     def owned_namespace(self):
         self.inner.close()
@@ -155,7 +168,7 @@ class AgentRelay:
             payload = self.pending[3:length + 3]
             del self.pending[:length + 3]
             if kind == ord("O"):
-                self.output.extend(payload)
+                self.output.extend(self.text_filter.push(bytes(payload)))
             elif payload == b'{"event":"ready"}' and not self.ready:
                 self.ready = True
             elif payload == b'{"event":"turn"}' and self.ready and self.prompted and not self.turn:
