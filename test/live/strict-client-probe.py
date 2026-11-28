@@ -40,6 +40,39 @@ FILE_TOOL_CHECKS = frozenset({
 })
 
 
+SEARCH_CORPUS = {"alpha.txt": b"SEARCH_NEEDLE\n", "beta.md": b"SEARCH_CONTROL\n"}
+SEARCH_TOOL_CHECKS = frozenset({
+    "clientExitZero", "exactSearchToolResultOrder", "globResultExact", "grepResultExact",
+    "searchCorpusUnchanged", "requestOrderExact", "noOutputOverflow",
+    "noMalformedApiRequests", "apiOfferedOnlyFixedTools",
+})
+
+
+def search_corpus_matches(work):
+    """Require exact members and bounded bytes, without following fixture links."""
+    try:
+        workspace = os.open(work, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            directory = os.open("search-corpus", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=workspace)
+            try:
+                if sorted(os.listdir(directory)) != sorted(SEARCH_CORPUS):
+                    return False
+                for name, expected in SEARCH_CORPUS.items():
+                    descriptor = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
+                    with os.fdopen(descriptor, "rb") as source:
+                        entry = os.fstat(source.fileno())
+                        if not (stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1
+                                and entry.st_size == len(expected) and source.read(len(expected) + 1) == expected):
+                            return False
+                return True
+            finally:
+                os.close(directory)
+        finally:
+            os.close(workspace)
+    except OSError:
+        return False
+
+
 def file_tool_result_matches(work):
     expected = b"FILE_EDITED\n"
     try:
@@ -138,7 +171,7 @@ def main() -> int:
     parser.add_argument("--client-sha256", required=True, help="trusted 64-character Claude CLI SHA-256")
     parser.add_argument("--node", required=True, help="absolute path to pinned Node executable")
     parser.add_argument("--node-sha256", required=True, help="trusted 64-character Node SHA-256")
-    parser.add_argument("--case", choices=("boundary", "file-tools"), default="boundary")
+    parser.add_argument("--case", choices=("boundary", "file-tools", "search-tools"), default="boundary")
     args = parser.parse_args()
 
     if not sys.platform.startswith("linux"):
@@ -168,6 +201,11 @@ def main() -> int:
             (home / ".claude").mkdir()
             work.mkdir()
             private_dir.mkdir()
+            if args.case == "search-tools":
+                corpus = work / "search-corpus"
+                corpus.mkdir()
+                for name, content in SEARCH_CORPUS.items():
+                    (corpus / name).write_bytes(content)
             (work / "inside.txt").write_text("PUBLIC_PROBE\n", encoding="utf-8")
             public_control = scratch / "public-control.txt"
             public_control.write_text("PUBLIC_CONTROL\n", encoding="utf-8")
@@ -266,12 +304,15 @@ def main() -> int:
                 }, 1)
 
             raw_inner_checks = inner.get("checks")
-            expected_checks = FILE_TOOL_CHECKS if args.case == "file-tools" else EXPECTED_INNER_CHECKS
+            expected_checks = (SEARCH_TOOL_CHECKS if args.case == "search-tools" else
+                               FILE_TOOL_CHECKS if args.case == "file-tools" else EXPECTED_INNER_CHECKS)
             check_validation = validate_inner_checks(raw_inner_checks, expected_checks)
             checks = dict(raw_inner_checks) if isinstance(raw_inner_checks, dict) else {}
             checks["innerCheckSetValid"] = check_validation["valid"]
             if args.case == "file-tools":
                 checks["fileBytesIndependentlyExact"] = file_tool_result_matches(work)
+            if args.case == "search-tools":
+                checks["searchCorpusIndependentlyUnchanged"] = search_corpus_matches(work)
             checks["outerProcessExitZero"] = process.returncode == 0
             checks["privateHostReceiptUnchanged"] = private_unchanged
             inside_namespaces = inner.get("insideNamespaces") or {}
@@ -289,6 +330,7 @@ def main() -> int:
                 process.returncode == 0
                 and private_unchanged
                 and (args.case != "file-tools" or checks["fileBytesIndependentlyExact"])
+                and (args.case != "search-tools" or checks["searchCorpusIndependentlyUnchanged"])
                 and checks["networkNamespaceDiffers"] is True
                 and checks["pidNamespaceDiffers"] is True
             )
