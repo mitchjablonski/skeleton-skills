@@ -546,3 +546,129 @@ print(json.dumps(out))
     "other-socket": false, "other-exe": false, "wrong-identity": false, "node-options": false, "symlinked-socket": true, gone: false, "relative-refused": true,
   });
 });
+
+test("#270: the restart driver reports unproven cleanup whatever the exercise raised", { skip: process.platform !== "linux" }, () => {
+  const entry = fileURLToPath(new URL("./live/strict-real-seat-restart.py", import.meta.url));
+  // Load the driver without running main, stub the launcher and the runtime
+  // check, and drive exercise() through each failure type.
+  const script = `
+import runpy, subprocess, sys, json
+g = runpy.run_path(sys.argv[1], run_name="restart_under_test")
+ex = g["exercise"]
+G = ex.__globals__
+adm = G["admission"]
+out = {}
+for label, error, cleanup_fails in [
+    ("attr-ok", AttributeError, False),
+    ("attr-fail", AttributeError, True),
+    ("key-fail", KeyError, True),
+    ("type-fail", TypeError, True),
+    ("timeout-fail", lambda m: subprocess.TimeoutExpired("probe", 1), True),
+    ("refused-fail", G["Refused"], True),
+    ("kbint-fail", KeyboardInterrupt, True),
+    ("refused-ok", G["Refused"], False),
+    ("unproven-ok", "unproven", False),
+]:
+    class Launcher:
+        def __init__(self, *a, **k): pass
+        def cleanup(self):
+            if cleanup_fails: raise OSError("namespace survived")
+    def runtime_check(*a, **k):
+        def verify():
+            if error == "unproven": raise adm["RuntimeRefused"]("runtime-observation-cleanup-unproven")
+            raise error("injected")
+        return verify
+    G["OperatorLauncher"] = Launcher
+    adm["read_runtime_selection"] = lambda runtime: None
+    adm["runtime_check"] = runtime_check
+    out[label] = ex("/root", "/node", "/runtime", "0" * 64, "r", "c")
+# Cleanup raising a BaseException (not just Exception) is unproven too.
+class Interrupting:
+    def __init__(self, *a, **k): pass
+    def cleanup(self): raise KeyboardInterrupt()
+G["OperatorLauncher"] = Interrupting
+out["cleanup-baseexception"] = ex("/root", "/node", "/runtime", "0" * 64, "r", "c")
+# With a relay: a failing relay.close() is unproven cleanup; a clean one isn't.
+inter = G["interactive"]
+for label, close_fails in [("relay-close-fail", True), ("relay-close-ok", False)]:
+    class Launcher:
+        def __init__(self, *a, **k): pass
+        def cleanup(self): pass
+    class Relay:
+        def __init__(self, *a, **k): pass
+        def close(self):
+            if close_fails: raise OSError("relay socket")
+    def no_enrollment(*a, **k): raise ValueError("stop after the relay exists")
+    G["OperatorLauncher"] = Launcher
+    G["Enrollment"] = no_enrollment
+    adm["runtime_check"] = lambda *a, **k: (lambda: None)
+    inter["pin_client"] = lambda *a, **k: "/pinned"
+    inter["AgentRelay"] = Relay
+    out[label] = ex("/root", "/node", "/runtime", "0" * 64, "r", "c", profile=("/client", "0" * 64, (1, 2, 3)))
+# Not covered: reaching result = 0 and then failing cleanup needs the full
+# launcher; the code path is the same "return result if proven else 125".
+print(json.dumps(out))
+`;
+  const child = spawnSync("/usr/bin/python3", ["-I", "-c", script, entry], { encoding: "utf8", timeout: 20000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), {
+    "attr-ok": 1, "attr-fail": 125, "key-fail": 125, "type-fail": 125,
+    "timeout-fail": 125, "refused-fail": 125, "kbint-fail": 125, "refused-ok": 1, "unproven-ok": 125,
+    "cleanup-baseexception": 125, "relay-close-fail": 125, "relay-close-ok": 1,
+  });
+});
+
+test("#270: the relay's Python text filter matches lib/strict-pty-output.mjs byte for byte", { skip: process.platform !== "linux" }, async () => {
+  const { createStrictPtyOutput } = await import("../lib/strict-pty-output.mjs");
+  const relayPath = fileURLToPath(new URL("./live/strict-interactive-claude-relay.py", import.meta.url));
+  // Deterministic PRNG so a failure reproduces.
+  let seed = 0x2701;
+  const rand = (n) => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return (seed >>> 16) % n; };
+  const ATOMS = [
+    "plain text ", "\n", "\r", "\t", "\x1b", "\x1b[", "\x1b]", "\x1bP", "\x1b_", "\x1b^", "\x1bX", "\x1b\\", "\x07",
+    "\x1b]52;c;SGVsbG8=\x07", "\x1b]0;spoof\x1b\\", "\x1b[2J", "\x1b[?2004h", "\x1bPtmux;\x1b\x1b]0;x\x07\x1b\\",
+    "\x1b(B", "\x1b#8", "é", "€", "😀", "\xc2", "\xe0\xa0", "\xed\x9f\xbf", "\xf4\x8f\xbf\xbf",
+  ];
+  const BYTES = [0x9b, 0x9d, 0x90, 0x9f, 0x9e, 0x98, 0x9c, 0x80, 0xbf, 0xc0, 0xf5, 0xff, 0x00, 0x7f, 0xc2, 0xe0, 0xa0, 0xed, 0xf0, 0x90, 0xf4, 0x8f, 0x5c];
+  // Raw byte sequences that pin edge rules: the UTF-8 surrogate bound decides
+  // whether 0x9d after ED A0 opens an OSC; a doubled ESC inside DCS quotes it,
+  // so the following backslash doesn't end the string.
+  const RAW = [[0xed, 0xa0, 0x9d], [0xed, 0x9f, 0x9d], [0xe0, 0x9f, 0x9d], [0xf0, 0x8f, 0x9d], [0xf4, 0x90, 0x9d],
+    [...Buffer.from("\x1bPq\x1b\x1b\\visible\n")], [...Buffer.from("\x1b]0;t\x1b\x1b\\shown\n")], [0x90, 0x1b, 0x1b, 0x5c, 0x41]];
+  const streams = [];
+  for (let i = 0; i < 600; i++) {
+    const parts = [];
+    for (let j = 0, n = 1 + rand(40); j < n; j++) {
+      const r = rand(8);
+      if (r < 2) parts.push(Buffer.from([BYTES[rand(BYTES.length)]]));
+      else if (r === 2) parts.push(Buffer.from(RAW[rand(RAW.length)]));
+      else parts.push(Buffer.from(ATOMS[rand(ATOMS.length)], "utf8"));
+    }
+    const stream = Buffer.concat(parts);
+    const cuts = [];
+    for (let k = 0; k < stream.length; k += 1 + rand(9)) cuts.push(k);
+    streams.push({ chunks: cuts.map((c, idx) => stream.subarray(c, cuts[idx + 1] ?? stream.length).toString("hex")) });
+  }
+  const expected = streams.map(({ chunks }) => {
+    const f = createStrictPtyOutput();
+    return chunks.map((h) => f.push(Buffer.from(h, "hex"))).join("");
+  });
+  const script = `
+import json, runpy, sys
+relay = runpy.run_path(sys.argv[1])
+out = []
+for stream in json.load(sys.stdin):
+    f = relay["PtyTextFilter"]()
+    out.append(b"".join(f.push(bytes.fromhex(h)) for h in stream["chunks"]).decode("ascii"))
+print(json.dumps(out))
+`;
+  const child = spawnSync("/usr/bin/python3", ["-I", "-c", script, relayPath], { input: JSON.stringify(streams), encoding: "utf8", timeout: 30000, maxBuffer: 16 << 20 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+  const actual = JSON.parse(child.stdout);
+  assert.equal(actual.length, expected.length);
+  for (let i = 0; i < expected.length; i++) assert.equal(actual[i], expected[i], `stream ${i}`);
+  assert.ok(expected.some((t) => t.includes("plain text")), "the corpus emits text");
+  for (const t of actual) assert.match(t, /^[\x20-\x7e\n]*$/, "only printable ASCII and LF");
+});

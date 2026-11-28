@@ -1,4 +1,5 @@
-"""Owned host relay. Agent bytes may only reach the separate pane filter."""
+"""Owned host relay. Agent bytes are reduced to plain text here, and only the
+pinned pane filter may receive that text."""
 import hashlib
 import os
 from pathlib import Path
@@ -45,6 +46,82 @@ def pin_client(source, expected, root):
             raise RuntimeError("interactive-client-pin-refused")
         os.fchmod(copy.fileno(), 0o500)
     return target
+
+
+ESC, BEL, LF, ST = 0x1B, 0x07, 0x0A, 0x9C
+OSC, DCS, APC, PM, SOS, CSI = 0x9D, 0x90, 0x9F, 0x9E, 0x98, 0x9B
+TMUX_PREFIX = b"tmux;"
+
+
+class PtyTextFilter:
+    """Byte-for-byte port of lib/strict-pty-output.mjs push(): only printable
+    ASCII and LF leave; every escape, CSI and control string (OSC, DCS, APC,
+    PM, SOS, 7- or 8-bit) is consumed, across chunk boundaries (#270). A
+    conformance test runs both over the same streams."""
+
+    def __init__(self):
+        self.state = "text"
+        self.kind = 0
+        self.string_escape = False
+        self.dcs_prefix = -1
+        self.continuation = 0
+        self.cont_min, self.cont_max = 0x80, 0xBF
+
+    def _unicode(self, byte):
+        if self.continuation and self.cont_min <= byte <= self.cont_max:
+            self.continuation -= 1
+            self.cont_min, self.cont_max = 0x80, 0xBF
+            return True
+        self.continuation = 0
+        if byte < 0xC2 or byte > 0xF4:
+            return False
+        self.continuation = 1 if byte < 0xE0 else 2 if byte < 0xF0 else 3
+        self.cont_min = 0xA0 if byte == 0xE0 else 0x90 if byte == 0xF0 else 0x80
+        self.cont_max = 0x9F if byte == 0xED else 0x8F if byte == 0xF4 else 0xBF
+        return True
+
+    def _start_string(self, kind):
+        self.state, self.kind, self.string_escape = "string", kind, False
+        self.dcs_prefix = 0 if kind == DCS else -1
+
+    def _discard(self, byte, unicode):
+        if 0 <= self.dcs_prefix < len(TMUX_PREFIX):
+            self.dcs_prefix = self.dcs_prefix + 1 if byte == TMUX_PREFIX[self.dcs_prefix] else -1
+        wrapped = self.dcs_prefix == len(TMUX_PREFIX)
+        if ((not unicode and byte == ST and not wrapped) or (byte == BEL and self.kind == OSC)
+                or (self.string_escape and byte == 0x5C)):
+            self.state = "text"
+            return
+        self.string_escape = byte == ESC and not (self.kind == DCS and self.string_escape)
+
+    def _plain(self, byte):
+        unicode = self._unicode(byte)
+        if self.state == "string":
+            self._discard(byte, unicode)
+            return False
+        if unicode:
+            return False
+        control = byte + 0x40 if self.state == "escape" and 0x40 <= byte <= 0x5F else byte
+        if byte == ESC:
+            self.state = "escape"
+        elif control == CSI:
+            self.state = "csi"
+        elif control in (OSC, DCS, APC, PM, SOS):
+            self._start_string(control)
+        elif self.state in ("escape", "escape-intermediate"):
+            if 0x20 <= byte <= 0x2F:
+                self.state = "escape-intermediate"
+            if 0x30 <= byte <= 0x7E:
+                self.state = "text"
+        elif self.state == "csi":
+            if 0x40 <= byte <= 0x7E:
+                self.state = "text"
+        else:
+            return byte == LF or 0x20 <= byte <= 0x7E
+        return False
+
+    def push(self, chunk):
+        return bytes(byte for byte in chunk if self._plain(byte))
 
 
 def pane_process_matches(pid, node_identity, script, sock):
@@ -98,6 +175,7 @@ class AgentRelay:
         self.output = bytearray()
         self.input = bytearray()
         self.send = bytearray(b"s")
+        self.text = PtyTextFilter()
         self.ready = self.prompted = self.turn = False
         self.channel.setblocking(False)
         return self.inner
@@ -155,7 +233,8 @@ class AgentRelay:
             payload = self.pending[3:length + 3]
             del self.pending[:length + 3]
             if kind == ord("O"):
-                self.output.extend(payload)
+                # Filter on the host before anything can reach the pane socket.
+                self.output.extend(self.text.push(payload))
             elif payload == b'{"event":"ready"}' and not self.ready:
                 self.ready = True
             elif payload == b'{"event":"turn"}' and self.ready and self.prompted and not self.turn:
