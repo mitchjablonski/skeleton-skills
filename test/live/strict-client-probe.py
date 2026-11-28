@@ -33,7 +33,28 @@ EXPECTED_INNER_CHECKS = frozenset({
 })
 
 
-FILE_TOOL_CHECKS = frozenset({"clientExitZero", "exactFileToolResultOrder", "fileReadInitial", "fileReadEdited", "initialFileBytesExact", "fileBytesExact", "requestOrderExact", "noOutputOverflow", "noMalformedApiRequests", "apiOfferedOnlyFixedTools"})
+FILE_TOOL_CHECKS = frozenset({
+    "clientExitZero", "exactFileToolResultOrder", "fileReadInitial", "fileReadEdited",
+    "initialFileBytesExact", "fileBytesExact", "requestOrderExact", "noOutputOverflow",
+    "noMalformedApiRequests", "apiOfferedOnlyFixedTools",
+})
+
+
+def file_tool_result_matches(work):
+    expected = b"FILE_EDITED\n"
+    try:
+        directory = os.open(work, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            descriptor = os.open("file-tools.txt", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
+            with os.fdopen(descriptor, "rb") as source:
+                entry = os.fstat(source.fileno())
+                return (stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1
+                        and entry.st_size == len(expected) and source.read(len(expected) + 1) == expected)
+        finally:
+            os.close(directory)
+    except OSError:
+        return False
+
 
 class JsonArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
@@ -245,10 +266,12 @@ def main() -> int:
                 }, 1)
 
             raw_inner_checks = inner.get("checks")
-            check_validation = validate_inner_checks(raw_inner_checks, FILE_TOOL_CHECKS if args.case == "file-tools" else EXPECTED_INNER_CHECKS)
+            expected_checks = FILE_TOOL_CHECKS if args.case == "file-tools" else EXPECTED_INNER_CHECKS
+            check_validation = validate_inner_checks(raw_inner_checks, expected_checks)
             checks = dict(raw_inner_checks) if isinstance(raw_inner_checks, dict) else {}
             checks["innerCheckSetValid"] = check_validation["valid"]
-            checks["fileBytesIndependentlyExact"] = args.case != "file-tools" or ((work / "file-tools.txt").is_file() and (work / "file-tools.txt").read_bytes() == b"FILE_EDITED\n")
+            if args.case == "file-tools":
+                checks["fileBytesIndependentlyExact"] = file_tool_result_matches(work)
             checks["outerProcessExitZero"] = process.returncode == 0
             checks["privateHostReceiptUnchanged"] = private_unchanged
             inside_namespaces = inner.get("insideNamespaces") or {}
@@ -265,7 +288,7 @@ def main() -> int:
             outer_checks_valid = (
                 process.returncode == 0
                 and private_unchanged
-                and checks["fileBytesIndependentlyExact"]
+                and (args.case != "file-tools" or checks["fileBytesIndependentlyExact"])
                 and checks["networkNamespaceDiffers"] is True
                 and checks["pidNamespaceDiffers"] is True
             )
