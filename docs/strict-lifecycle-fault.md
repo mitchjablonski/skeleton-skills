@@ -142,8 +142,8 @@ after successful verification and has no separate I/O timeout.
   coverage for a group whose leader no longer exposes that link.
 - The interactive census (used by the admission probe's interactive
   clients) accepts a later process only as a descendant of the verified
-  worker. A process with a live parent outside the namespace refuses at
-  once. A short-lived process that exits before its parent is read is gone,
+  worker. A process with a live parent outside the namespace, or whose
+  live parent's namespace can't be read, refuses at once. A short-lived process that exits before its parent is read is gone,
   not unaccounted, and ownership survives reparenting once a process has
   been seen under an owned parent. A process orphaned to the namespace init
   before any pass sees it still refuses: `cmd &` from a shell that then

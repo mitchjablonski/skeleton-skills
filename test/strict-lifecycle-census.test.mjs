@@ -28,6 +28,8 @@ def run(passes):
         return None if found == "gone" else found
     def namespace(pid):
         found = table().get(pid)
+        if pid == 998:
+            return "unreadable"
         if pid == 999 or isinstance(found, list):
             return "pid:[outside]"
         return NS if found not in (None, "gone") else None
@@ -50,6 +52,7 @@ cases = {
     "short-lived-unowned": run([{20: (INIT, 7)}, {}]),
     "foreign-parent": run([{20: (999, 7)}]),
     "foreign-parent-transient": run([{20: (WORKER, 7), 21: (999, 8)}, {20: (WORKER, 7)}]),
+    "unreadable-parent-transient": run([{20: (WORKER, 7), 21: (998, 8)}, {20: (WORKER, 7)}]),
     "foreign-grandchild": run([{20: (999, 7), 21: (20, 8)}]),
     "orphan-never-seen-owned": run([{20: (INIT, 7)}]),
     "reparented-after-owned": run([{20: (WORKER, 7), 30: (INIT, 7)}, {20: (INIT, 7)}]),
@@ -73,10 +76,10 @@ alive = identity_of(child.pid, ns)
 # A leader that exits through SYS_exit leaves its other thread running: the
 # leader reads Z, but the process is alive and must not be treated as gone.
 LEADER_EXIT = """
-import ctypes, threading, time, sys
+import ctypes, platform, threading, time, sys
 threading.Thread(target=time.sleep, args=(30,), daemon=False).start()
 sys.stdout.write("ready\\n"); sys.stdout.flush()
-ctypes.CDLL(None, use_errno=True).syscall(60, 0)
+ctypes.CDLL(None, use_errno=True).syscall({"x86_64": 60, "aarch64": 93}[platform.machine()], 0)
 """
 leader = subprocess.Popen(["/usr/bin/python3", "-c", LEADER_EXIT], stdout=subprocess.PIPE)
 leader.stdout.readline()
@@ -101,6 +104,15 @@ with open("/proc/%d/comm" % named.pid, "rb") as source:
 named_identity = identity_of(named.pid, ns)
 named.kill()
 named.wait()
+# A live process that makes itself non-dumpable hides its namespace link: unreadable, not gone.
+parent_ns = probe["parent_namespace"]
+HIDDEN = "import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); print(flush=True); time.sleep(30)"
+hidden = subprocess.Popen(["/usr/bin/python3", "-c", HIDDEN], stdout=subprocess.PIPE)
+hidden.stdout.readline()
+hidden_ns = parent_ns(hidden.pid)
+hidden.kill()
+hidden.wait()
+gone_ns = parent_ns(hidden.pid)
 child.kill()
 os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
 zombie = identity_of(child.pid, ns)
@@ -112,6 +124,10 @@ live = {
     "zombie": zombie is None,
     "leader-exited-threads-run": leader_zombie_state and leader_identity is not None and leader_identity[0] == me,
     "non-utf8-name": renamed and named_identity is not None,
+    "parent-ns-self": parent_ns(me) == ns,
+    "parent-ns-hidden": hidden_ns == "unreadable",
+    "parent-ns-gone": gone_ns is None,
+    "census-reads-parent-ns": census.__kwdefaults__["namespace"] is parent_ns,
     "reaped": identity_of(child.pid, ns) is None,
 }
 print(json.dumps({"cases": cases, "live": live}))
@@ -139,6 +155,9 @@ test("the interactive census tolerates exits but refuses anything not descended 
   refused("foreign-parent", outside);
   refused("foreign-parent-transient", outside);
   assert.equal(cases["foreign-parent-transient"].rescans, 0);
+  // A live parent whose namespace link can't be read (made non-dumpable) is treated as outside.
+  refused("unreadable-parent-transient", outside);
+  assert.equal(cases["unreadable-parent-transient"].rescans, 0);
   refused("foreign-grandchild", outside);
   refused("orphan-never-seen-owned", unaccounted);
   assert.equal(cases["orphan-never-seen-owned"].rescans, 3, "every pass is used before refusing");
@@ -149,5 +168,6 @@ test("the interactive census tolerates exits but refuses anything not descended 
   refused("worker-gone", "the verified worker has gone");
   refused("too-many", "too many interactive descendants");
 
-  assert.deepEqual(live, { self: true, "other-namespace": true, child: true, zombie: true, "leader-exited-threads-run": true, "non-utf8-name": true, reaped: true });
+  assert.deepEqual(live, { self: true, "other-namespace": true, child: true, zombie: true, "leader-exited-threads-run": true, "non-utf8-name": true,
+    "parent-ns-self": true, "parent-ns-hidden": true, "parent-ns-gone": true, "census-reads-parent-ns": true, reaped: true });
 });

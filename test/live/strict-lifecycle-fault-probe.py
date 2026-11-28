@@ -484,12 +484,24 @@ def namespace_identity(pid, pid_ns):
     return int(fields[1]), int(fields[19])
 
 
+def parent_namespace(pid):
+    """The PID namespace link of a parent, None only if it has gone. A live
+    parent whose link can't be read (another user's, or one that made itself
+    non-dumpable) reads as unreadable, which the census treats as outside."""
+    try:
+        return os.readlink("/proc/%d/ns/pid" % pid)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except PermissionError:
+        return "unreadable"
+
+
 CENSUS_PASSES = 10
 CENSUS_PAUSE = 0.05
 
 
 def interactive_census(pid_ns, since, recorded, worker, live, *, identity=namespace_identity,
-                       namespace=ns_of, rescan=scan, pause=CENSUS_PAUSE, passes=CENSUS_PASSES):
+                       namespace=parent_namespace, rescan=scan, pause=CENSUS_PAUSE, passes=CENSUS_PASSES):
     """Every unrecorded live member must descend from the verified worker.
 
     Interactive startup follows the initial census, so later processes are
@@ -526,10 +538,6 @@ def interactive_census(pid_ns, since, recorded, worker, live, *, identity=namesp
                 parent = owned.get(ppid)
                 if parent is None or parent > start:
                     continue
-                # Any namespace: a reused parent PID may now be outside it.
-                now = identity(ppid, None)
-                if now is not None and now[1] != parent:
-                    continue  # the parent PID was reused
                 owned[pid] = start
                 del pending[pid]
                 progress = True
