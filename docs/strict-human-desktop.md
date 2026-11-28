@@ -315,12 +315,15 @@ Terminal and Node versions, and WSLg log line counts before and after to
 Keep the phrase and any private
 navigation data out of the issue. If the runner refuses, record its code
 and whether the owned window closed. A refusal or an increase in WSLg log
-lines needs investigation before trying again. If the result has a
-`leftover` list (it does after `real-seat-cleanup-unproven`), first check
-that no process from the run remains (`pgrep -af skel-wslg` prints
-nothing). Then delete those directories. The `/tmp/skel-wslg-state-*`
-directory holds the protected key snapshot and, for the interactive run,
-client transcripts. Don't attach it to the issue.
+lines needs investigation before trying again. `wslg-window-teardown-unproven`
+can hide the first failure (for example after the seat changed), so check the
+window by hand. If the result has a `leftover` list, usually after
+`real-seat-cleanup-unproven`, make sure no process from the run remains
+before deleting those directories. `pgrep -af skel-wslg` printing nothing is
+only a heuristic, so also check `lsof +D <dir>` for each listed directory.
+The `/dev/shm/skel-wslg-*` scratch holds the Chrome profile. The contained
+and interactive runs' `/tmp/skel-wslg-state-*` holds the protected key
+snapshot and client transcripts. Never attach either to the issue.
 
 The success code is `real-seat-window-checkpoint-passed`. This command
 serves a fixed synthetic capture with no decision codes. It checks the
@@ -400,7 +403,7 @@ different namespace from the approved stored bytes. It checks desktop-policy and
 separation evidence in both namespaces. Report human observations and
 fixture evidence separately in #79. The interactive Claude CLI, its agent
 pane input/output and clipboard/title checks follow in the next section,
-which hasn't been run yet. The broader #79 matrix remains separate
+which has no recorded run in #79 yet. The broader #79 matrix remains separate
 qualification work. The result keeps `strictState: unverified`.
 
 ## Operator run for the interactive Claude CLI

@@ -103,10 +103,13 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
     }
   };
 
-  // The first failure is kept; teardown still runs and is checked on every
-  // path (#270). Unproven process cleanup outranks everything, then an
-  // unproven window teardown, then the original failure.
-  let failure = null;
+  // The first failure is kept; teardown still runs and is checked on refusal
+  // paths too (#270). Unproven process cleanup outranks everything, then an
+  // unproven window teardown, then the original failure. run() and the Python
+  // wrapper still report an interrupt, timeout or lost terminal as such. A
+  // lost seat makes the window uninspectable, so it reports teardown-unproven
+  // and hides the first failure: check the window by hand.
+  let failed = false, failure = null;
   try {
     await listener.start();
     const presentation = seat.prepareWindow(listener, fixed.binding);
@@ -153,12 +156,14 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
     if (!isCurrent() || !presentation.comparison()) throw new Fail("wslg-owned-window-lost");
     interrupted();
   } catch (error) {
+    failed = true;
     failure = error;
   }
   try {
     await listener.close();
   } catch (error) {
-    failure ??= error;
+    if (!failed) failure = error;
+    failed = true;
   }
   if (browser && browser.exit === null) {
     browser.proc.kill("SIGTERM");
@@ -168,7 +173,7 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
   const tornDown = await windowTeardownProven(browser, windows);
   if (failure?.label === "real-seat-cleanup-unproven") throw failure;
   if (!tornDown) throw new Fail("wslg-window-teardown-unproven");
-  if (failure) throw failure;
+  if (failed) throw failure;
 }
 
 // With no browser launched there is no owned window to prove gone.
