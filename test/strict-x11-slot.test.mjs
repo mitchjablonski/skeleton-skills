@@ -546,3 +546,75 @@ print(json.dumps(out))
     "other-socket": false, "other-exe": false, "wrong-identity": false, "node-options": false, "symlinked-socket": true, gone: false, "relative-refused": true,
   });
 });
+
+test("#270: the restart driver reports unproven cleanup whatever the exercise raised", { skip: process.platform !== "linux" }, () => {
+  const entry = fileURLToPath(new URL("./live/strict-real-seat-restart.py", import.meta.url));
+  // Load the driver without running main, stub the launcher and the runtime
+  // check, and drive exercise() through each failure type.
+  const script = `
+import runpy, subprocess, sys, json
+g = runpy.run_path(sys.argv[1], run_name="restart_under_test")
+ex = g["exercise"]
+G = ex.__globals__
+adm = G["admission"]
+out = {}
+for label, error, cleanup_fails in [
+    ("attr-ok", AttributeError, False),
+    ("attr-fail", AttributeError, True),
+    ("key-fail", KeyError, True),
+    ("type-fail", TypeError, True),
+    ("timeout-fail", lambda m: subprocess.TimeoutExpired("probe", 1), True),
+    ("refused-fail", G["Refused"], True),
+    ("kbint-fail", KeyboardInterrupt, True),
+    ("refused-ok", G["Refused"], False),
+    ("unproven-ok", "unproven", False),
+]:
+    class Launcher:
+        def __init__(self, *a, **k): pass
+        def cleanup(self):
+            if cleanup_fails: raise OSError("namespace survived")
+    def runtime_check(*a, **k):
+        def verify():
+            if error == "unproven": raise adm["RuntimeRefused"]("runtime-observation-cleanup-unproven")
+            raise error("injected")
+        return verify
+    G["OperatorLauncher"] = Launcher
+    adm["read_runtime_selection"] = lambda runtime: None
+    adm["runtime_check"] = runtime_check
+    out[label] = ex("/root", "/node", "/runtime", "0" * 64, "r", "c")
+# Cleanup raising a BaseException (not just Exception) is unproven too.
+class Interrupting:
+    def __init__(self, *a, **k): pass
+    def cleanup(self): raise KeyboardInterrupt()
+G["OperatorLauncher"] = Interrupting
+out["cleanup-baseexception"] = ex("/root", "/node", "/runtime", "0" * 64, "r", "c")
+# With a relay: a failing relay.close() is unproven cleanup; a clean one isn't.
+inter = G["interactive"]
+for label, close_fails in [("relay-close-fail", True), ("relay-close-ok", False)]:
+    class Launcher:
+        def __init__(self, *a, **k): pass
+        def cleanup(self): pass
+    class Relay:
+        def __init__(self, *a, **k): pass
+        def close(self):
+            if close_fails: raise OSError("relay socket")
+    def no_enrollment(*a, **k): raise ValueError("stop after the relay exists")
+    G["OperatorLauncher"] = Launcher
+    G["Enrollment"] = no_enrollment
+    adm["runtime_check"] = lambda *a, **k: (lambda: None)
+    inter["pin_client"] = lambda *a, **k: "/pinned"
+    inter["AgentRelay"] = Relay
+    out[label] = ex("/root", "/node", "/runtime", "0" * 64, "r", "c", profile=("/client", "0" * 64, (1, 2, 3)))
+# Not covered: reaching result = 0 and then failing cleanup needs the full
+# launcher; the code path is the same "return result if proven else 125".
+print(json.dumps(out))
+`;
+  const child = spawnSync("/usr/bin/python3", ["-I", "-c", script, entry], { encoding: "utf8", timeout: 20000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), {
+    "attr-ok": 1, "attr-fail": 125, "key-fail": 125, "type-fail": 125,
+    "timeout-fail": 125, "refused-fail": 125, "kbint-fail": 125, "refused-ok": 1, "unproven-ok": 125,
+    "cleanup-baseexception": 125, "relay-close-fail": 125, "relay-close-ok": 1,
+  });
+});
