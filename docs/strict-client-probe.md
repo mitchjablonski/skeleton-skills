@@ -74,8 +74,9 @@ Add `--case file-tools` to the pinned probe invocation to qualify native Write, 
 Add `--case search-tools` to offer exactly Glob and Grep. The local mock first
 calls Glob with `*.txt` in `/work/search-corpus`, then Grep for
 `^SEARCH_NEEDLE$` in that corpus's `alpha.txt`, with content output and line
-numbers disabled. The exact results must be `/work/search-corpus/alpha.txt`
-and `SEARCH_NEEDLE`, respectively, with no extra text. Result IDs and the three
+numbers disabled. The exact results must be `search-corpus/alpha.txt` and
+`SEARCH_NEEDLE`, respectively. The probe removes only the pinned client's
+trailing token-budget reminder before comparing them. Result IDs and the three
 API requests must follow the fixed order. No Bash or write tools are offered.
 
 The disposable corpus contains only `alpha.txt` (`SEARCH_NEEDLE\n`) and

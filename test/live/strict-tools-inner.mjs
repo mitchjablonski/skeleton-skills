@@ -208,6 +208,11 @@ try {
 const insideText = fs.readFileSync("/work/inside.txt", "utf8");
 const results = latestToolResults;
 const privatePathMissing = /(?:file does not exist|enoent|no such file or directory)/i;
+// The pinned client appends its own token-budget reminder to tool results.
+const searchResult = (result) => result?.content.replace(
+  /\n\n<system-reminder>\n<total_tokens>[0-9]{1,10} tokens left<\/total_tokens>\n<\/system-reminder>$/,
+  "",
+);
 function searchCorpusMatches() {
   let directory;
   try {
@@ -231,8 +236,8 @@ function searchCorpusMatches() {
 const checks = searchTools ? {
   clientExitZero: childExit === 0,
   exactSearchToolResultOrder: results.length === 2 && results.every((r, i) => r.toolUseId === `toolu_strict_probe_${i + 1}` && !r.isError),
-  globResultExact: results[0]?.content === "/work/search-corpus/alpha.txt",
-  grepResultExact: results[1]?.content === "SEARCH_NEEDLE",
+  globResultExact: searchResult(results[0]) === "search-corpus/alpha.txt",
+  grepResultExact: searchResult(results[1]) === "SEARCH_NEEDLE",
   searchCorpusUnchanged: searchCorpusMatches(),
   requestOrderExact: apiRequests.length === 3 && apiRequests.every((r, i) => r.priorToolResultCount === i && r.nextTool === (steps[i]?.name ?? null)),
   noOutputOverflow: !outputOverflow && !errorOverflow,
