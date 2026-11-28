@@ -107,6 +107,48 @@ print(json.dumps({k: [g["search_corpus_matches"](v), g["file_tool_result_matches
   });
 });
 
+test("#280: the host-side workspace check requires exact members and control bytes", linux, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "skel-probe-work-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const got = python(`
+import json, pathlib, runpy, sys
+matches = runpy.run_path(sys.argv[1], run_name="probe_under_test")["workspace_fixture_matches"]
+root = pathlib.Path(sys.argv[2])
+results = {}
+for member in ("file-tools.txt", "search-corpus"):
+    work = root / member
+    work.mkdir()
+    fixture = work / member
+    if member == "search-corpus":
+        fixture.mkdir()
+    else:
+        fixture.write_bytes(b"FILE_EDITED\\n")
+    control = work / "inside.txt"
+    control.write_bytes(b"PUBLIC_PROBE\\n")
+    checks = {"exact": matches(work, member)}
+    extra = work / "extra.txt"
+    extra.touch()
+    checks["extra"] = matches(work, member)
+    extra.unlink()
+    control.write_bytes(b"PUBLIC_PRObE\\n")
+    checks["changedControl"] = matches(work, member)
+    control.unlink()
+    checks["missingControl"] = matches(work, member)
+    original = root / (member + ".control")
+    original.write_bytes(b"PUBLIC_PROBE\\n")
+    control.symlink_to(original)
+    checks["linkedControl"] = matches(work, member)
+    control.unlink()
+    original.rename(control)
+    fixture.rename(root / (member + ".moved"))
+    checks["missingFixture"] = matches(work, member)
+    results[member] = checks
+print(json.dumps(results))
+`, root);
+  const expected = { exact: true, extra: false, changedControl: false, missingControl: false, linkedControl: false, missingFixture: false };
+  assert.deepEqual(got, { "file-tools.txt": expected, "search-corpus": expected });
+});
+
 test("#280: the inner script strips exactly one trailing pinned-client reminder", () => {
   const literal = /content\.replace\(\s*\/(.+)\/,/.exec(INNER);
   assert.ok(literal, "the reminder pattern is where the test expects it");
