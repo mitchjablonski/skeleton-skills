@@ -40,12 +40,21 @@ FILE_TOOL_CHECKS = frozenset({
 })
 
 
+WORK_CONTROL = b"PUBLIC_PROBE\n"
 SEARCH_CORPUS = {"alpha.txt": b"SEARCH_NEEDLE\n", "beta.md": b"SEARCH_CONTROL\n"}
 SEARCH_TOOL_CHECKS = frozenset({
     "clientExitZero", "exactSearchToolResultOrder", "globResultExact", "grepResultExact",
     "searchCorpusUnchanged", "requestOrderExact", "noOutputOverflow",
     "noMalformedApiRequests", "apiOfferedOnlyFixedTools",
 })
+
+
+def fixture_bytes_match(directory, name, expected):
+    descriptor = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
+    with os.fdopen(descriptor, "rb") as source:
+        entry = os.fstat(source.fileno())
+        return (stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1
+                and entry.st_size == len(expected) and source.read(len(expected) + 1) == expected)
 
 
 def search_corpus_matches(work):
@@ -57,14 +66,7 @@ def search_corpus_matches(work):
             try:
                 if sorted(os.listdir(directory)) != sorted(SEARCH_CORPUS):
                     return False
-                for name, expected in SEARCH_CORPUS.items():
-                    descriptor = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
-                    with os.fdopen(descriptor, "rb") as source:
-                        entry = os.fstat(source.fileno())
-                        if not (stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1
-                                and entry.st_size == len(expected) and source.read(len(expected) + 1) == expected):
-                            return False
-                return True
+                return all(fixture_bytes_match(directory, name, expected) for name, expected in SEARCH_CORPUS.items())
             finally:
                 os.close(directory)
         finally:
@@ -74,15 +76,22 @@ def search_corpus_matches(work):
 
 
 def file_tool_result_matches(work):
-    expected = b"FILE_EDITED\n"
     try:
         directory = os.open(work, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            descriptor = os.open("file-tools.txt", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
-            with os.fdopen(descriptor, "rb") as source:
-                entry = os.fstat(source.fileno())
-                return (stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1
-                        and entry.st_size == len(expected) and source.read(len(expected) + 1) == expected)
+            return fixture_bytes_match(directory, "file-tools.txt", b"FILE_EDITED\n")
+        finally:
+            os.close(directory)
+    except OSError:
+        return False
+
+
+def workspace_fixture_matches(work, expected_member):
+    try:
+        directory = os.open(work, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            return (set(os.listdir(directory)) == {"inside.txt", expected_member}
+                    and fixture_bytes_match(directory, "inside.txt", WORK_CONTROL))
         finally:
             os.close(directory)
     except OSError:
@@ -206,7 +215,7 @@ def main() -> int:
                 corpus.mkdir()
                 for name, content in SEARCH_CORPUS.items():
                     (corpus / name).write_bytes(content)
-            (work / "inside.txt").write_text("PUBLIC_PROBE\n", encoding="utf-8")
+            (work / "inside.txt").write_bytes(WORK_CONTROL)
             public_control = scratch / "public-control.txt"
             public_control.write_text("PUBLIC_CONTROL\n", encoding="utf-8")
             private_receipt = private_dir / "receipt.txt"
@@ -311,8 +320,10 @@ def main() -> int:
             checks["innerCheckSetValid"] = check_validation["valid"]
             if args.case == "file-tools":
                 checks["fileBytesIndependentlyExact"] = file_tool_result_matches(work)
-            if args.case == "search-tools":
+                checks["workspaceLayoutAndControlExact"] = workspace_fixture_matches(work, "file-tools.txt")
+            elif args.case == "search-tools":
                 checks["searchCorpusIndependentlyUnchanged"] = search_corpus_matches(work)
+                checks["workspaceLayoutAndControlExact"] = workspace_fixture_matches(work, "search-corpus")
             checks["outerProcessExitZero"] = process.returncode == 0
             checks["privateHostReceiptUnchanged"] = private_unchanged
             inside_namespaces = inner.get("insideNamespaces") or {}
@@ -331,6 +342,7 @@ def main() -> int:
                 and private_unchanged
                 and (args.case != "file-tools" or checks["fileBytesIndependentlyExact"])
                 and (args.case != "search-tools" or checks["searchCorpusIndependentlyUnchanged"])
+                and (args.case == "boundary" or checks["workspaceLayoutAndControlExact"])
                 and checks["networkNamespaceDiffers"] is True
                 and checks["pidNamespaceDiffers"] is True
             )

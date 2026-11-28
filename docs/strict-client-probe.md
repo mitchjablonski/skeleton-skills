@@ -67,12 +67,20 @@ or authorizes release claims.
 
 ### Disposable native file tools
 
-Add `--case file-tools` to the pinned probe invocation to qualify native Write, Read, and Edit using only `/work/file-tools.txt` and the local deterministic mock. The sequence is Write, Read, Edit, Read; exact offered tools, result IDs, request order, initial and final bytes are checked. The outer harness independently checks final bytes. The default remains `--case boundary`. This case makes no inference calls and does not qualify upstream authentication.
+Add `--case file-tools` to the pinned probe invocation for happy-path
+qualification of native Write, Read, and Edit using `/work/file-tools.txt` and
+the local deterministic mock. The sequence is Write, Read, Edit, Read. The mock
+checks the offered tools, result IDs, request order, and initial and final bytes.
+The outer harness requires exactly `inside.txt` and `file-tools.txt` in the
+workspace, with the control file unchanged and the final tool output matching
+the expected bytes. The default remains `--case boundary`. This case makes no
+inference calls. Upstream authentication requires the separate
+[host-only authentication witness](strict-model-broker.md#host-only-upstream-authentication-witness-79).
 
 ### Disposable native search tools
 
-Add `--case search-tools` to offer exactly Glob and Grep. The local mock first
-calls Glob with `*.txt` in `/work/search-corpus`, then Grep for
+Add `--case search-tools` for happy-path qualification of Glob and Grep. The
+local mock first calls Glob with `*.txt` in `/work/search-corpus`, then Grep for
 `^SEARCH_NEEDLE$` in that corpus's `alpha.txt`, with content output and line
 numbers disabled. The exact results must be `search-corpus/alpha.txt` and
 `SEARCH_NEEDLE`, respectively. The probe removes only the pinned client's
@@ -84,7 +92,8 @@ The disposable corpus contains only `alpha.txt` (`SEARCH_NEEDLE\n`) and
 inner process and outer harness independently require these exact members and
 bytes after the client exits, using no-follow directory/file opens, regular
 single-link files, exact sizes, and reads bounded to the expected size plus
-one byte. A changed corpus fails the run. The default boundary and file-tools
-cases are unchanged. Exact tool-result formatting is pinned-client behavior;
-this case does not qualify other CLI versions, authentication, or general
-search containment, and always retains `strictState: unverified`.
+one byte. The outer harness also requires the workspace to contain only the
+corpus directory and the unchanged `inside.txt` control file. The evidence
+applies only to the pinned CLI version and this workspace fixture. Upstream
+authentication and general search containment require separate qualification.
+The case retains `strictState: unverified`.
