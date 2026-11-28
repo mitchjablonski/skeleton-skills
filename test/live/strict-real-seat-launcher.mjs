@@ -131,13 +131,13 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
       await whileOwned((ownedSignal) => exercise({
         signal: ownedSignal,
         windowCurrent: () => isCurrent() && Boolean(presentation.comparison()),
-        async confirmRestart() {
+        async confirmRestart(promptSignal = ownedSignal) {
           await sampleBrowser(600);
-          await compare(presentation.confirmRestart, ownedSignal);
+          await compare(presentation.confirmRestart, promptSignal);
         },
-        async confirmRetained() {
+        async confirmRetained(promptSignal = ownedSignal) {
           await sampleBrowser(600);
-          await compare(presentation.confirmMatch, ownedSignal);
+          await compare(presentation.confirmMatch, promptSignal);
         },
       }));
     } else {

@@ -19,6 +19,7 @@ NamespaceLauncher = admission["NamespaceLauncher"]
 MEMBERS = admission["capture"]["MEMBERS"]
 WORKER = admission["capture"]["WORKER"]
 interactive = runpy.run_path(str(HERE / "strict-interactive-claude-relay.py"))
+RelayRefused = interactive["RelayRefused"]
 interrupted = False
 
 
@@ -44,10 +45,23 @@ def ask(step, *, timeout=8, live=lambda: True, relay=None):
         if remaining <= 0:
             return False
         interval = min(0.15, remaining)
-        readable = relay.poll(interval) if relay is not None else select.select([0], [], [], interval)[0]
+        if relay is None:
+            readable = select.select([0], [], [], interval)[0]
+        else:
+            try:
+                readable = relay.poll(interval)
+            except RelayRefused:
+                raise
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise RelayRefused(RelayRefused.CHANNEL_REFUSED) from exc
         if readable:
             return os.read(0, 2) == b"y" and not interrupted and live()
     return False
+
+
+def require_turn(relay):
+    if relay is not None and not relay.verified_turn():
+        raise RelayRefused(RelayRefused.TURN_MISSING)
 
 
 class OperatorLauncher(NamespaceLauncher):
@@ -103,7 +117,7 @@ def exercise(root, node, runtime, terminal_pin, review, capture, profile=None):
         if relay is not None:
             relay.owned_namespace()
         require(ask(b"1", timeout=130 if relay else 8, live=lambda: active(first), relay=relay))
-        require(relay is None or relay.verified_turn())
+        require_turn(relay)
         stop, observation = launcher.stop_planned(first.namespace)
         require(first.child.poll() is not None and observation.get("workerAcknowledgedTerm") is True)
         if relay is not None:
@@ -119,11 +133,13 @@ def exercise(root, node, runtime, terminal_pin, review, capture, profile=None):
         if relay is not None:
             relay.owned_namespace()
         require(ask(b"2", timeout=250 if relay else 130, live=lambda: active(second), relay=relay))
-        require(relay is None or relay.verified_turn())
+        require_turn(relay)
         launcher.stop_planned(second.namespace)
         require(second.child.poll() is not None and launcher.peers_live(generation))
         require(admission["capture"]["snapshot"]((enrollment,)) == before)
         result = 0
+    except RelayRefused as exc:
+        result = exc.status
     except admission["RuntimeRefused"] as exc:
         if str(exc) == "runtime-observation-cleanup-unproven":
             result = 125
