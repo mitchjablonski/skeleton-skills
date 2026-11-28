@@ -318,9 +318,10 @@ and whether the owned window closed. A refusal or an increase in WSLg log
 lines needs investigation before trying again. `wslg-window-teardown-unproven`
 can hide the first failure (for example after the seat changed), so check the
 window by hand. If the result has a `leftover` list, usually after
-`real-seat-cleanup-unproven`, make sure no process from the run remains
-before deleting those directories. `pgrep -af skel-wslg` printing nothing is
-only a heuristic, so also check `lsof +D <dir>` for each listed directory.
+`real-seat-cleanup-unproven`, keep those exact directories private and
+retain them until the owned process tree and its descendants have been
+independently verified stopped. Process-name searches and open-file listings
+can help diagnosis. Empty listings do not prove the process tree is gone.
 The `/dev/shm/skel-wslg-*` scratch holds the Chrome profile. The contained
 and interactive runs' `/tmp/skel-wslg-state-*` holds the protected key
 snapshot and client transcripts. Never attach either to the issue.
