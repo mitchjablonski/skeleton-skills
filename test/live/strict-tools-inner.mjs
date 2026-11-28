@@ -11,7 +11,12 @@ if (typeof privatePath !== "string" || !privatePath.startsWith("/") || /[\0\r\n]
   throw Error("missing disposable host-private fixture path");
 const shellQuote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 const fileTools = process.env.PROBE_CASE === "file-tools";
-const steps = fileTools ? [
+const searchTools = process.env.PROBE_CASE === "search-tools";
+const fixedTools = searchTools ? "Glob,Grep" : fileTools ? "Write,Read,Edit" : "Read,Edit,Bash";
+const steps = searchTools ? [
+  { name: "Glob", input: { pattern: "*.txt", path: "/work/search-corpus" } },
+  { name: "Grep", input: { pattern: "^SEARCH_NEEDLE$", path: "/work/search-corpus/alpha.txt", output_mode: "content", "-n": false } },
+] : fileTools ? [
  { name: "Write", input: { file_path: "/work/file-tools.txt", content: "FILE_INITIAL\n" } },
  { name: "Read", input: { file_path: "/work/file-tools.txt" } },
  { name: "Edit", input: { file_path: "/work/file-tools.txt", old_string: "FILE_INITIAL", new_string: "FILE_EDITED" } },
@@ -93,7 +98,7 @@ const server = http.createServer((req, res) => {
     }));
     const offeredNames = Array.isArray(body.tools) ? body.tools.map((tool) => tool.name).filter((name) => typeof name === "string") : [];
     const offeredSet = [...new Set(offeredNames)].sort();
-    const hasFixedTools = offeredSet.join(",") === (fileTools ? "Edit,Read,Write" : "Bash,Edit,Read") && offeredNames.length === 3;
+    const hasFixedTools = offeredSet.join(",") === fixedTools.split(",").sort().join(",") && offeredNames.length === fixedTools.split(",").length;
     if (fileTools && hasFixedTools && results.length === 1) {
       initialFileBytesExact = fs.existsSync("/work/file-tools.txt") && fs.readFileSync("/work/file-tools.txt").equals(Buffer.from("FILE_INITIAL\n"));
     }
@@ -163,7 +168,7 @@ try {
     "-p", "Run the deterministic fixture tool sequence.",
     "--output-format", "stream-json", "--verbose", "--max-turns", "8",
     "--model", "claude-sonnet-4-5",
-    "--tools", fileTools ? "Write,Read,Edit" : "Read,Edit,Bash", "--allowedTools", fileTools ? "Write,Read,Edit" : "Read,Edit,Bash",
+    "--tools", fixedTools, "--allowedTools", fixedTools,
     "--permission-mode", "bypassPermissions", "--no-session-persistence",
     "--strict-mcp-config", "--disable-slash-commands",
   ], { cwd: "/work", env: childEnv, stdio: ["ignore", "pipe", "pipe"], detached: true });
@@ -203,7 +208,37 @@ try {
 const insideText = fs.readFileSync("/work/inside.txt", "utf8");
 const results = latestToolResults;
 const privatePathMissing = /(?:file does not exist|enoent|no such file or directory)/i;
-const checks = fileTools ? {
+function searchCorpusMatches() {
+  let directory;
+  try {
+    directory = fs.openSync("/work/search-corpus", fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    const base = `/proc/self/fd/${directory}`;
+    const expected = { "alpha.txt": "SEARCH_NEEDLE\n", "beta.md": "SEARCH_CONTROL\n" };
+    if (JSON.stringify(fs.readdirSync(base).sort()) !== JSON.stringify(Object.keys(expected).sort())) return false;
+    return Object.entries(expected).every(([name, content]) => {
+      const descriptor = fs.openSync(`${base}/${name}`, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW);
+      try {
+        const entry = fs.fstatSync(descriptor);
+        const bytes = Buffer.alloc(Buffer.byteLength(content) + 1);
+        const length = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
+        return entry.isFile() && entry.nlink === 1 && entry.size === Buffer.byteLength(content)
+          && length === Buffer.byteLength(content) && bytes.subarray(0, length).equals(Buffer.from(content));
+      } finally { fs.closeSync(descriptor); }
+    });
+  } catch { return false; }
+  finally { if (directory !== undefined) fs.closeSync(directory); }
+}
+const checks = searchTools ? {
+  clientExitZero: childExit === 0,
+  exactSearchToolResultOrder: results.length === 2 && results.every((r, i) => r.toolUseId === `toolu_strict_probe_${i + 1}` && !r.isError),
+  globResultExact: results[0]?.content === "/work/search-corpus/alpha.txt",
+  grepResultExact: results[1]?.content === "SEARCH_NEEDLE",
+  searchCorpusUnchanged: searchCorpusMatches(),
+  requestOrderExact: apiRequests.length === 3 && apiRequests.every((r, i) => r.priorToolResultCount === i && r.nextTool === (steps[i]?.name ?? null)),
+  noOutputOverflow: !outputOverflow && !errorOverflow,
+  noMalformedApiRequests: malformedRequests === 0,
+  apiOfferedOnlyFixedTools: apiRequests.length > 0 && apiRequests.every(r => r.exactFixedToolSet),
+} : fileTools ? {
  clientExitZero: childExit === 0,
  exactFileToolResultOrder: results.length === 4 && results.every((r, i) => r.toolUseId === `toolu_strict_probe_${i + 1}` && !r.isError),
  fileReadInitial: results[1]?.content.includes("FILE_INITIAL") === true,
