@@ -74,7 +74,8 @@ checks the offered tools, result IDs, request order, and initial and final bytes
 The outer harness requires exactly `inside.txt` and `file-tools.txt` in the
 workspace, with the control file unchanged and the final tool output matching
 the expected bytes. The default remains `--case boundary`. This case makes no
-inference calls.
+inference calls. Upstream authentication requires the separate
+[host-only authentication witness](strict-model-broker.md#host-only-upstream-authentication-witness-79).
 
 ### Disposable native search tools
 
@@ -92,5 +93,7 @@ inner process and outer harness independently require these exact members and
 bytes after the client exits, using no-follow directory/file opens, regular
 single-link files, exact sizes, and reads bounded to the expected size plus
 one byte. The outer harness also requires the workspace to contain only the
-corpus directory and the unchanged `inside.txt` control file. Exact tool-result
-formatting is pinned-client behavior. The case retains `strictState: unverified`.
+corpus directory and the unchanged `inside.txt` control file. The evidence
+applies only to the pinned CLI version and this workspace fixture. Upstream
+authentication and general search containment require separate qualification.
+The case retains `strictState: unverified`.
