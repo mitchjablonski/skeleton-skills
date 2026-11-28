@@ -3,6 +3,80 @@ import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
 import {createMockModelBroker,StrictModelBrokerError,STRICT_MOCK_BROKER_LIMITS} from '../lib/strict-model-broker.mjs';
 import {createStrictModelTransport} from './fixtures/strict-model-transport.mjs';
+import {checkUpstreamAuthentication} from './live/strict-upstream-auth-witness.mjs';
+
+const witnessKey = Buffer.from('local-fixture-credential-only');
+
+function authFixture(overrides = {}) {
+  const calls = [];
+  let closed = false;
+  const transport = {
+    async resolve() { return overrides.addresses ?? ['8.8.8.8']; },
+    async connect() {
+      return {
+        peerAddress: '8.8.8.8', authorized: true, servername: 'api.anthropic.com', alpn: 'http/1.1',
+        ...overrides.connection,
+        async send(request) {
+          calls.push(request);
+          return {
+            status: 200, rawHeaders: ['Content-Type', 'application/json'],
+            body: [Buffer.from('{"input_tokens":8}')], ...overrides.response,
+          };
+        },
+        close() { closed = true; },
+      };
+    },
+  };
+  return { transport, calls, closed: () => closed };
+}
+
+test('upstream authentication submits only a fixed token count after pinned TLS and returns a redacted receipt', async () => {
+  const fixture = authFixture();
+  assert.deepEqual(await checkUpstreamAuthentication(witnessKey, fixture.transport), {
+    ok: true, code: 'upstream-authenticated-count-passed', strictState: 'unverified',
+  });
+  assert.equal(fixture.calls.length, 1);
+  const [request] = fixture.calls;
+  assert.equal(request.target, '/v1/messages/count_tokens');
+  assert.equal(request.method, 'POST');
+  assert.equal(request.headers.host, 'api.anthropic.com:443');
+  assert.equal(request.headers.authorization, `Bearer ${witnessKey.toString()}`);
+  assert.equal(request.headers['anthropic-version'], '2026-10-21');
+  assert.deepEqual(JSON.parse(request.body), {
+    model: 'claude-haiku-5-5', messages: [{ role: 'user', content: 'Count this synthetic qualification sentence.' }],
+  });
+  assert.equal(fixture.closed(), true);
+});
+
+test('upstream authentication never sends a credential with invalid input, DNS, or TLS/peer evidence', async () => {
+  for (const variant of [
+    { key: Buffer.from('untrusted\nheader'), code: 'upstream-credential-refused' },
+    { addresses: ['8.8.8.8', '127.0.0.1'], code: 'upstream-unavailable' },
+    { connection: { peerAddress: '8.8.4.4' }, code: 'upstream-tls-refused' },
+    { connection: { authorized: false }, code: 'upstream-tls-refused' },
+    { connection: { alpn: 'h2' }, code: 'upstream-tls-refused' },
+  ]) {
+    const fixture = authFixture(variant);
+    const report = await checkUpstreamAuthentication(variant.key ?? witnessKey, fixture.transport);
+    assert.deepEqual(report, { ok: false, code: variant.code, strictState: 'unverified' });
+    assert.equal(fixture.calls.length, 0);
+    if (variant.connection) assert.equal(fixture.closed(), true);
+  }
+});
+
+test('upstream authentication refuses redirects, bounded response failures, and invalid credentials without retries or response output', async () => {
+  for (const [response, code] of [
+    [{ status: 302, rawHeaders: ['Location', 'https://example.invalid/'] }, 'upstream-redirect-refused'],
+    [{ status: 401, body: [Buffer.from(witnessKey)] }, 'upstream-auth-refused'],
+    [{ body: [Buffer.alloc(16_385)] }, 'upstream-response-refused'],
+  ]) {
+    const fixture = authFixture({ response });
+    const report = await checkUpstreamAuthentication(witnessKey, fixture.transport);
+    assert.deepEqual(report, { ok: false, code, strictState: 'unverified' });
+    assert.equal(fixture.calls.length, 1);
+    assert.equal(fixture.closed(), true);
+  }
+});
 
 test('exported socket-free simulator exercises JSON, SSE and peer refusal',async()=>{
  for(const sse of [false,true]){
