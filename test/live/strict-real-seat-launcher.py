@@ -78,6 +78,7 @@ def run(argv):
     for name in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(name, mark_interrupted)
     scratch = tempfile.mkdtemp(prefix="skel-wslg-", dir="/dev/shm")
+    LEFT.append(scratch)
     workspace = None
     child = None
     timed_out = False
@@ -87,6 +88,7 @@ def run(argv):
         try:
             if flag != "--supervised-wslg-window":
                 workspace = tempfile.mkdtemp(prefix="skel-wslg-state-", dir="/tmp")
+                LEFT.append(workspace)
                 args = [workspace, *args]
             child = subprocess.Popen(
                 [node, str(directory / "strict-real-seat-launcher.mjs"), flag, scratch, *args],
@@ -169,6 +171,12 @@ def run(argv):
     return result
 
 
+# Run directories, so the result can name any left behind. Unproven cleanup
+# deliberately keeps them: a surviving process may still use them, and the
+# state directory holds the key snapshot and client transcripts (#270).
+LEFT = []
+
+
 if __name__ == "__main__":
     scope, success = {
         "--real-seat-contained": ("synthetic-contained-restart", CONTAINED_SUCCESS),
@@ -180,9 +188,11 @@ if __name__ == "__main__":
         code = "real-seat-interrupted"
     except (OSError, RuntimeError, ValueError):
         code = "real-seat-evidence-unavailable"
+    leftover = [path for path in LEFT if os.path.lexists(path)]
     print(json.dumps({
         "ok": code == success, "strictState": "unverified", "code": code,
         "scope": scope,
         "windowAttribution": "attribution-unavailable",
+        **({"leftover": leftover} if leftover else {}),
     }), flush=True)
     sys.exit(0 if code == success else 2 if code == REFUSED else 1)

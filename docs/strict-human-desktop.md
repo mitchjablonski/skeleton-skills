@@ -315,7 +315,16 @@ Terminal and Node versions, and WSLg log line counts before and after to
 Keep the phrase and any private
 navigation data out of the issue. If the runner refuses, record its code
 and whether the owned window closed. A refusal or an increase in WSLg log
-lines needs investigation before trying again.
+lines needs investigation before trying again. `wslg-window-teardown-unproven`
+can hide the first failure (for example after the seat changed), so check the
+window by hand. If the result has a `leftover` list, usually after
+`real-seat-cleanup-unproven`, keep those exact directories private and
+retain them until the owned process tree and its descendants have been
+independently verified stopped. Process-name searches and open-file listings
+can help diagnosis. Empty listings do not prove the process tree is gone.
+The `/dev/shm/skel-wslg-*` scratch holds the Chrome profile. The contained
+and interactive runs' `/tmp/skel-wslg-state-*` holds the protected key
+snapshot and client transcripts. Never attach either to the issue.
 
 The success code is `real-seat-window-checkpoint-passed`. This command
 serves a fixed synthetic capture with no decision codes. It checks the
@@ -394,8 +403,9 @@ proves the first namespace stopped after a graceful shutdown, and starts a
 different namespace from the approved stored bytes. It checks desktop-policy and control-terminal
 separation evidence in both namespaces. Report human observations and
 fixture evidence separately in #79. The interactive Claude CLI, its agent
-pane input/output and clipboard/title checks, and the broader #79 matrix
-remain separate qualification work. The result keeps `strictState: unverified`.
+pane input/output and clipboard/title checks follow in the next section,
+which has no recorded run in #79 yet. The broader #79 matrix remains separate
+qualification work. The result keeps `strictState: unverified`.
 
 ## Operator run for the interactive Claude CLI
 

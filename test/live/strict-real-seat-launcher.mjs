@@ -103,6 +103,13 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
     }
   };
 
+  // The first failure is kept; teardown still runs and is checked on refusal
+  // paths too (#270). Unproven process cleanup outranks everything, then an
+  // unproven window teardown, then the original failure. run() and the Python
+  // wrapper still report an interrupt, timeout or lost terminal as such. A
+  // lost seat makes the window uninspectable, so it reports teardown-unproven
+  // and hides the first failure: check the window by hand.
+  let failed = false, failure = null;
   try {
     await listener.start();
     const presentation = seat.prepareWindow(listener, fixed.binding);
@@ -148,25 +155,38 @@ export async function launchWindowCheckpoint({ seat, scratch, signal, environmen
     }
     if (!isCurrent() || !presentation.comparison()) throw new Fail("wslg-owned-window-lost");
     interrupted();
-  } finally {
-    try {
-      await listener.close();
-    } finally {
-      if (browser && browser.exit === null) {
-        browser.proc.kill("SIGTERM");
-        const deadline = performance.now() + 4000;
-        while (browser.exit === null && performance.now() < deadline) await sleep(50);
-      }
-    }
+  } catch (error) {
+    failed = true;
+    failure = error;
   }
+  try {
+    await listener.close();
+  } catch (error) {
+    if (!failed) failure = error;
+    failed = true;
+  }
+  if (browser && browser.exit === null) {
+    browser.proc.kill("SIGTERM");
+    const deadline = performance.now() + 4000;
+    while (browser.exit === null && performance.now() < deadline) await sleep(50);
+  }
+  const tornDown = await windowTeardownProven(browser, windows);
+  if (failure?.label === "real-seat-cleanup-unproven") throw failure;
+  if (!tornDown) throw new Fail("wslg-window-teardown-unproven");
+  if (failed) throw failure;
+}
+
+// With no browser launched there is no owned window to prove gone.
+async function windowTeardownProven(browser, windows) {
+  if (!browser) return true;
   const deadline = performance.now() + 2000;
   while (browser.exit !== null && performance.now() < deadline) {
     const remaining = windows.decisionWindows();
-    if (remaining?.length === 0) return;
-    if (!remaining) break;
+    if (remaining?.length === 0) return true;
+    if (!remaining) return false;
     await sleep(50);
   }
-  throw new Fail("wslg-window-teardown-unproven");
+  return false;
 }
 
 async function run(scratch, input, output, contained) {

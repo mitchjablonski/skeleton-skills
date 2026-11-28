@@ -1,2 +1,3 @@
 node_modules/
 .skeleton/
+__pycache__/
