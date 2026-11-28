@@ -64,3 +64,7 @@ fixtures are not a reviewed production launcher profile. The digest check
 followed by path bind is not race-free against concurrent replacement of an
 executable, so it is not TOCTOU-proof. This probe never activates strict mode
 or authorizes release claims.
+
+### Disposable native file tools
+
+Add `--case file-tools` to the pinned probe invocation to qualify native Write, Read, and Edit using only `/work/file-tools.txt` and the local deterministic mock. The sequence is Write, Read, Edit, Read; exact offered tools, result IDs, request order, initial and final bytes are checked. The outer harness independently checks final bytes. The default remains `--case boundary`. This case makes no inference calls and does not qualify upstream authentication.
