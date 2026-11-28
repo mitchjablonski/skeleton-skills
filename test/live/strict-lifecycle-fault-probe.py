@@ -21,6 +21,7 @@ import select
 import shutil
 import signal
 import socket
+import stat as stat_mod
 import subprocess
 import sys
 import tempfile
@@ -135,6 +136,41 @@ def seccomp_filter_count(pid):
 
 def desktop_policy_verified(report, worker_filters, parent_filters):
     return report == "vsock-denied" and worker_filters > parent_filters
+
+
+DESKTOP_VARS = frozenset({b"DISPLAY", b"WAYLAND_DISPLAY", b"XDG_RUNTIME_DIR", b"DBUS_SESSION_BUS_ADDRESS",
+                          b"WSL_INTEROP", b"WSLENV", b"PULSE_SERVER"})
+DESKTOP_PATHS = ("/tmp/.X11-unix", "/mnt/wslg", "/run/WSL", "/proc/sys/fs/binfmt_misc/WSLInterop")
+
+
+def host_terminal_held(pid, host_devpts):
+    """Host-side check of one member's descriptors (#270). A member may hold
+    its namespace's own devpts, but never a host pseudo-terminal, /dev/tty,
+    the console or a virtual console. Reads /proc only; connects to nothing."""
+    base = f"/proc/{pid}/fd"
+    for name in os.listdir(base):
+        try:
+            entry = os.stat(f"{base}/{name}")
+        except FileNotFoundError:
+            continue
+        if not stat_mod.S_ISCHR(entry.st_mode):
+            continue
+        major, minor = os.major(entry.st_rdev), os.minor(entry.st_rdev)
+        if entry.st_dev == host_devpts or major == 4 or (major == 5 and minor in (0, 1)):
+            return True
+    return False
+
+
+def desktop_reachable(pid):
+    """Host-side view of one member's environment and filesystem (#270): no
+    desktop variable, and no desktop path exists through /proc/<pid>/root.
+    lexists only; no socket is opened or connected."""
+    with open(f"/proc/{pid}/environ", "rb") as record:
+        environ = record.read(1024 * 1024 + 1)
+    if len(environ) > 1024 * 1024:
+        return True
+    names = {entry.split(b"=", 1)[0] for entry in environ.split(b"\0") if entry}
+    return bool(DESKTOP_VARS & names) or any(os.path.lexists(f"/proc/{pid}/root{path}") for path in DESKTOP_PATHS)
 
 
 def read_record(fd, deadline):
@@ -337,6 +373,13 @@ def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, s
                                                seccomp_filter_count(owned_worker["pid"]), parent_filters)
                 or (stage is not None and record.get("controlTerminalAbsent") is not True)
                 or (interactive is not None and record.get("desktopEndpointsAbsent") is not True)
+                # The worker's own report is backed by the host's view of every member.
+                # init (bwrap's pid 1) may carry the launcher's environment, so
+                # it is in the descriptor scan but not the desktop scan.
+                or (stage is not None and any(host_terminal_held(m["pid"], os.stat("/dev/pts").st_dev)
+                                              for m in members.values()))
+                or (interactive is not None and any(desktop_reachable(m["pid"])
+                                                    for role, m in members.items() if role != "init"))
                 or exited(owned_worker["fd"])):
             raise RuntimeError("desktop policy proof unavailable")
     if stop_mode is not None:
