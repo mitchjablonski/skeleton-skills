@@ -143,10 +143,28 @@ DESKTOP_VARS = frozenset({b"DISPLAY", b"WAYLAND_DISPLAY", b"XDG_RUNTIME_DIR", b"
 DESKTOP_PATHS = ("/tmp/.X11-unix", "/mnt/wslg", "/run/WSL", "/proc/sys/fs/binfmt_misc/WSLInterop")
 
 
-def host_terminal_held(pid, host_devpts):
-    """Host-side check of one member's descriptors (#270). A member may hold
-    its namespace's own devpts, but never a host pseudo-terminal, /dev/tty,
-    the console or a virtual console. Reads /proc only; connects to nothing."""
+# bwrap --dev provides these: null, zero, full, random, urandom.
+SANDBOX_CHAR_DEVICES = frozenset({(1, 3), (1, 5), (1, 7), (1, 8), (1, 9)})
+
+
+def namespace_devpts(worker_pid):
+    """st_dev of the namespace's own devpts, read through the worker's root.
+    None when it is the host's (no private instance), so nothing on it is allowed."""
+    private = os.stat(f"/proc/{worker_pid}/root/dev/pts").st_dev
+    return None if private == os.stat("/dev/pts").st_dev else private
+
+
+def host_terminal_held(pid, private_devpts):
+    """Host-side check of one member at census time (#270), by allowlist: a
+    character device descriptor must be one of bwrap's --dev nodes or sit on
+    the namespace's own devpts. Anything else (a host pty master or slave,
+    /dev/ptmx, /dev/tty, a console, hvc or vcs) refuses, as does a controlling
+    terminal. Reads /proc only; connects to nothing. Later descriptors and
+    descendants are not covered."""
+    with open(f"/proc/{pid}/stat") as source:
+        data = source.read(4096)
+    if int(data[data.rindex(")") + 2:].split()[4]) != 0:  # tty_nr
+        return True
     base = f"/proc/{pid}/fd"
     for name in os.listdir(base):
         try:
@@ -155,16 +173,16 @@ def host_terminal_held(pid, host_devpts):
             continue
         if not stat_mod.S_ISCHR(entry.st_mode):
             continue
-        major, minor = os.major(entry.st_rdev), os.minor(entry.st_rdev)
-        if entry.st_dev == host_devpts or major == 4 or (major == 5 and minor in (0, 1)):
+        device = (os.major(entry.st_rdev), os.minor(entry.st_rdev))
+        if device not in SANDBOX_CHAR_DEVICES and (private_devpts is None or entry.st_dev != private_devpts):
             return True
     return False
 
 
 def desktop_reachable(pid):
-    """Host-side view of one member's environment and filesystem (#270): no
-    desktop variable, and no desktop path exists through /proc/<pid>/root.
-    lexists only; no socket is opened or connected."""
+    """Host-side view of one member's initial environment and filesystem at
+    census time (#270): no desktop variable, and no desktop path exists
+    through /proc/<pid>/root. lexists only; no socket is opened or connected."""
     with open(f"/proc/{pid}/environ", "rb") as record:
         environ = record.read(1024 * 1024 + 1)
     if len(environ) > 1024 * 1024:
@@ -374,13 +392,11 @@ def start_namespace(run, label, launcher=False, *, stage=None, stop_mode=None, s
                 or (stage is not None and record.get("controlTerminalAbsent") is not True)
                 or (interactive is not None and record.get("desktopEndpointsAbsent") is not True)
                 # The worker's own report is backed by the host's view of every member.
-                # init (bwrap's pid 1) may carry the launcher's environment, so
-                # it is in the descriptor scan but not the desktop scan.
-                or (stage is not None and any(host_terminal_held(m["pid"], os.stat("/dev/pts").st_dev)
+                or (stage is not None and any(host_terminal_held(m["pid"], namespace_devpts(owned_worker["pid"]))
                                               for m in members.values()))
-                or (interactive is not None and any(desktop_reachable(m["pid"])
-                                                    for role, m in members.items() if role != "init"))
-                or exited(owned_worker["fd"])):
+                or (interactive is not None and any(desktop_reachable(m["pid"]) for m in members.values()))
+                # Each pid was read by number, so every member must still be the pinned one.
+                or any(exited(m["fd"]) for m in members.values())):
             raise RuntimeError("desktop policy proof unavailable")
     if stop_mode is not None:
         namespace["workerStatus"] = read_end
