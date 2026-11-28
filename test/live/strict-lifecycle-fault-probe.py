@@ -442,28 +442,45 @@ def alive_at_fault(namespace):
 
 
 def namespace_identity(pid, pid_ns):
-    """(ppid, start ticks) of a live, non-zombie member of pid_ns, or None.
-    With pid_ns None, of any live process.
+    """(ppid, start ticks) of a live member of pid_ns, or None. With pid_ns
+    None, of any live process.
 
-    Both reads go through one /proc/<pid> directory fd, so they describe the
-    same process; once it exits they fail instead of reading a reused PID.
+    Every read goes through one /proc/<pid> directory fd, so they describe
+    the same process; once it exits they fail instead of reading a reused
+    PID. Liveness is the whole thread group's: a leader that called
+    pthread_exit reads Z while its other threads still run, and that process
+    is alive.
     """
     try:
         dir_fd = os.open("/proc/%d" % pid, os.O_RDONLY | os.O_DIRECTORY)
     except (FileNotFoundError, ProcessLookupError):
         return None
     try:
-        with open(os.open("stat", os.O_RDONLY, dir_fd=dir_fd)) as source:
+        with open(os.open("stat", os.O_RDONLY, dir_fd=dir_fd), "rb") as source:
             data = source.read(4096)
         if pid_ns is not None and os.readlink("ns/pid", dir_fd=dir_fd) != pid_ns:
             return None
+        task_fd = os.open("task", os.O_RDONLY | os.O_DIRECTORY, dir_fd=dir_fd)
+        try:
+            live = False
+            for tid in os.listdir(task_fd):
+                try:
+                    with open(os.open(tid + "/stat", os.O_RDONLY, dir_fd=task_fd), "rb") as task:
+                        state = task.read(4096)
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                if state[state.rindex(b")") + 2:].split()[0] not in (b"Z", b"X"):
+                    live = True
+                    break
+        finally:
+            os.close(task_fd)
     except (FileNotFoundError, ProcessLookupError):
         return None
     finally:
         os.close(dir_fd)
-    fields = data[data.rindex(")") + 2:].split()
-    if fields[0] in ("Z", "X") or zombie(pid):
+    if not live:
         return None
+    fields = data[data.rindex(b")") + 2:].split()
     return int(fields[1]), int(fields[19])
 
 
@@ -472,7 +489,7 @@ CENSUS_PAUSE = 0.05
 
 
 def interactive_census(pid_ns, since, recorded, worker, live, *, identity=namespace_identity,
-                       rescan=scan, pause=CENSUS_PAUSE, passes=CENSUS_PASSES):
+                       namespace=ns_of, rescan=scan, pause=CENSUS_PAUSE, passes=CENSUS_PASSES):
     """Every unrecorded live member must descend from the verified worker.
 
     Interactive startup follows the initial census, so later processes are
@@ -481,7 +498,9 @@ def interactive_census(pid_ns, since, recorded, worker, live, *, identity=namesp
     parent read is gone rather than unaccounted. Ownership is kept by (PID,
     start time) across passes, so a child seen under an owned parent stays
     owned after that parent exits and it is reparented to init. A process
-    that is still unaccounted after the last pass refuses the census.
+    whose live parent is outside the namespace was put there from outside
+    (a setns joiner's child) and refuses at once, even if it exits later.
+    Any other process still unaccounted after the last pass refuses too.
     """
     worker_identity = identity(worker, pid_ns)
     assert worker_identity is not None, "the verified worker has gone"
@@ -497,6 +516,8 @@ def interactive_census(pid_ns, since, recorded, worker, live, *, identity=namesp
         for pid in set(live) - recorded:
             found = identity(pid, pid_ns)
             if found is not None and owned.get(pid) != found[1]:
+                parent_ns = namespace(found[0])
+                assert parent_ns is None or parent_ns == pid_ns, "interactive process with a parent outside the namespace"
                 pending[pid] = found
         progress = True
         while pending and progress:

@@ -140,6 +140,16 @@ after successful verification and has no separate I/O timeout.
   members. For entries with a readable namespace link, it checks the entire
   thread group before excluding a zombie. The scan does not establish
   coverage for a group whose leader no longer exposes that link.
+- The interactive census (used by the admission probe's interactive
+  clients) accepts a later process only as a descendant of the verified
+  worker. A process with a live parent outside the namespace refuses at
+  once. A short-lived process that exits before its parent is read is gone,
+  not unaccounted, and ownership survives reparenting once a process has
+  been seen under an owned parent. A process orphaned to the namespace init
+  before any pass sees it still refuses: `cmd &` from a shell that then
+  exits, `nohup`, or a double-forking daemon. It can't be told apart from a
+  setns joiner's grandchild. Processes in nested PID namespaces aren't
+  scanned.
 - No hostile coverage of ptrace, cgroup escape or nested user namespaces.
   Parent-death handling for a real authority, console or listener isn't
   covered either. Under candidate A the console isn't a child at all.
