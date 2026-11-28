@@ -315,7 +315,12 @@ Terminal and Node versions, and WSLg log line counts before and after to
 Keep the phrase and any private
 navigation data out of the issue. If the runner refuses, record its code
 and whether the owned window closed. A refusal or an increase in WSLg log
-lines needs investigation before trying again.
+lines needs investigation before trying again. If the result has a
+`leftover` list (it does after `real-seat-cleanup-unproven`), first check
+that no process from the run remains (`pgrep -af skel-wslg` prints
+nothing). Then delete those directories. The `/tmp/skel-wslg-state-*`
+directory holds the protected key snapshot and, for the interactive run,
+client transcripts. Don't attach it to the issue.
 
 The success code is `real-seat-window-checkpoint-passed`. This command
 serves a fixed synthetic capture with no decision codes. It checks the
@@ -394,8 +399,9 @@ proves the first namespace stopped after a graceful shutdown, and starts a
 different namespace from the approved stored bytes. It checks desktop-policy and control-terminal
 separation evidence in both namespaces. Report human observations and
 fixture evidence separately in #79. The interactive Claude CLI, its agent
-pane input/output and clipboard/title checks, and the broader #79 matrix
-remain separate qualification work. The result keeps `strictState: unverified`.
+pane input/output and clipboard/title checks follow in the next section,
+which hasn't been run yet. The broader #79 matrix remains separate
+qualification work. The result keeps `strictState: unverified`.
 
 ## Operator run for the interactive Claude CLI
 
