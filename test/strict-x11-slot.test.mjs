@@ -635,15 +635,32 @@ test("#270: the relay's Python text filter matches lib/strict-pty-output.mjs byt
   // whether 0x9d after ED A0 opens an OSC; a doubled ESC inside DCS quotes it,
   // so the following backslash doesn't end the string.
   const RAW = [[0xed, 0xa0, 0x9d], [0xed, 0x9f, 0x9d], [0xe0, 0x9f, 0x9d], [0xf0, 0x8f, 0x9d], [0xf4, 0x90, 0x9d],
-    [...Buffer.from("\x1bPq\x1b\x1b\\visible\n")], [...Buffer.from("\x1b]0;t\x1b\x1b\\shown\n")], [0x90, 0x1b, 0x1b, 0x5c, 0x41]];
+    [...Buffer.from("\x1bPq\x1b\x1b\\visible\n")], [...Buffer.from("\x1b]0;t\x1b\x1b\\shown\n")], [0x90, 0x1b, 0x1b, 0x5c, 0x41],
+    // tmux-wrapped DCS ignores a bare ST; a near-miss prefix doesn't wrap.
+    [0x90, ...Buffer.from("tmux;"), 0x9c, 0x41], [0x90, ...Buffer.from("tmuxX"), 0x9c, 0x41], [0x90, ...Buffer.from("tmux"), 0x9c, 0x41],
+    // An 8-bit ST that is a UTF-8 continuation doesn't end the string.
+    [0x9d, 0xe2, 0x82, 0x9c, 0x41], [0x9d, 0xe2, 0x9c, 0x41],
+    // Escape and CSI final-byte bounds, intermediates, and no C1 mapping after them.
+    [...Buffer.from("\x1b[@A")], [...Buffer.from("\x1b[?A")], [0x1b, 0x7f, 0x41], [0x1b, 0x2f, 0x78, 0x41],
+    [0x1b, 0x28, 0x5d, 0x41, 0x0a], [0x1b, 0x2e, 0x30, 0x41], [0x1b, 0x20, 0x5b, 0x41]];
+  // A second family: fully random bytes weighted to boundary values.
+  const EDGE = [0x00, 0x07, 0x0a, 0x0d, 0x1b, 0x1f, 0x20, 0x2e, 0x2f, 0x30, 0x3f, 0x40, 0x41, 0x5b, 0x5c, 0x5d, 0x5f, 0x50,
+    0x7e, 0x7f, 0x80, 0x8f, 0x90, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xbf, 0xc0, 0xc1, 0xc2, 0xdf, 0xe0, 0xed, 0xef,
+    0xf0, 0xf4, 0xf5, 0xff, 0x74, 0x6d, 0x75, 0x78, 0x3b];
   const streams = [];
-  for (let i = 0; i < 600; i++) {
+  for (let i = 0; i < 2000; i++) {
     const parts = [];
     for (let j = 0, n = 1 + rand(40); j < n; j++) {
       const r = rand(8);
       if (r < 2) parts.push(Buffer.from([BYTES[rand(BYTES.length)]]));
       else if (r === 2) parts.push(Buffer.from(RAW[rand(RAW.length)]));
       else parts.push(Buffer.from(ATOMS[rand(ATOMS.length)], "utf8"));
+    }
+    if (i % 2) {
+      parts.length = 0;
+      const raw = [];
+      for (let j = 0, n = 1 + rand(200); j < n; j++) raw.push(rand(3) ? EDGE[rand(EDGE.length)] : rand(256));
+      parts.push(Buffer.from(raw));
     }
     const stream = Buffer.concat(parts);
     const cuts = [];

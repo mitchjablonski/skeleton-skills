@@ -127,8 +127,8 @@ class PtyTextFilter:
 def pane_process_matches(pid, node_identity, script, sock):
     """True only for the reviewed pane filter: the pinned Node executable
     running exactly [absolute pane script, this relay's socket] (#270). The
-    relay sends raw agent bytes to the pane, so anything else that connects
-    (another checkout's script, socat) must be refused."""
+    relay already reduces agent bytes to plain text; this pin is defence in
+    depth, so another checkout's script or socat gets nothing."""
     try:
         exe = os.stat(f"/proc/{pid}/exe")
         with open(f"/proc/{pid}/cmdline", "rb") as record:
