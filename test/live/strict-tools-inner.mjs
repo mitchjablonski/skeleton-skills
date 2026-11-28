@@ -10,7 +10,13 @@ const privatePath = process.env.PROBE_PRIVATE_PATH;
 if (typeof privatePath !== "string" || !privatePath.startsWith("/") || /[\0\r\n]/.test(privatePath))
   throw Error("missing disposable host-private fixture path");
 const shellQuote = value => "'" + value.replaceAll("'", "'\\''") + "'";
-const steps = [
+const fileTools = process.env.PROBE_CASE === "file-tools";
+const steps = fileTools ? [
+ { name: "Write", input: { file_path: "/work/file-tools.txt", content: "FILE_INITIAL\n" } },
+ { name: "Read", input: { file_path: "/work/file-tools.txt" } },
+ { name: "Edit", input: { file_path: "/work/file-tools.txt", old_string: "FILE_INITIAL", new_string: "FILE_EDITED" } },
+ { name: "Read", input: { file_path: "/work/file-tools.txt" } },
+] : [
   { name: "Read", input: { file_path: "/work/inside.txt" } },
   { name: "Edit", input: { file_path: "/work/inside.txt", old_string: "PUBLIC_PROBE", new_string: "PUBLIC_EDITED" } },
   { name: "Read", input: { file_path: "/opt/public-control.txt" } },
@@ -52,6 +58,7 @@ function textOf(content) {
 const apiRequests = [];
 let latestToolResults = [];
 let malformedRequests = 0;
+let initialFileBytesExact = false;
 const server = http.createServer((req, res) => {
   let raw = "";
   req.on("data", (chunk) => {
@@ -86,7 +93,10 @@ const server = http.createServer((req, res) => {
     }));
     const offeredNames = Array.isArray(body.tools) ? body.tools.map((tool) => tool.name).filter((name) => typeof name === "string") : [];
     const offeredSet = [...new Set(offeredNames)].sort();
-    const hasFixedTools = offeredSet.join(",") === "Bash,Edit,Read" && offeredNames.length === 3;
+    const hasFixedTools = offeredSet.join(",") === (fileTools ? "Edit,Read,Write" : "Bash,Edit,Read") && offeredNames.length === 3;
+    if (fileTools && hasFixedTools && results.length === 1) {
+      initialFileBytesExact = fs.existsSync("/work/file-tools.txt") && fs.readFileSync("/work/file-tools.txt").equals(Buffer.from("FILE_INITIAL\n"));
+    }
     const stepIndex = hasFixedTools ? results.length : steps.length;
     const step = steps[stepIndex];
     const blocks = step
@@ -153,7 +163,7 @@ try {
     "-p", "Run the deterministic fixture tool sequence.",
     "--output-format", "stream-json", "--verbose", "--max-turns", "8",
     "--model", "claude-sonnet-4-5",
-    "--tools", "Read,Edit,Bash", "--allowedTools", "Read,Edit,Bash",
+    "--tools", fileTools ? "Write,Read,Edit" : "Read,Edit,Bash", "--allowedTools", fileTools ? "Write,Read,Edit" : "Read,Edit,Bash",
     "--permission-mode", "bypassPermissions", "--no-session-persistence",
     "--strict-mcp-config", "--disable-slash-commands",
   ], { cwd: "/work", env: childEnv, stdio: ["ignore", "pipe", "pipe"], detached: true });
@@ -193,7 +203,18 @@ try {
 const insideText = fs.readFileSync("/work/inside.txt", "utf8");
 const results = latestToolResults;
 const privatePathMissing = /(?:file does not exist|enoent|no such file or directory)/i;
-const checks = {
+const checks = fileTools ? {
+ clientExitZero: childExit === 0,
+ exactFileToolResultOrder: results.length === 4 && results.every((r, i) => r.toolUseId === `toolu_strict_probe_${i + 1}` && !r.isError),
+ fileReadInitial: results[1]?.content.includes("FILE_INITIAL") === true,
+ fileReadEdited: results[3]?.content.includes("FILE_EDITED") === true,
+ initialFileBytesExact,
+ fileBytesExact: fs.existsSync("/work/file-tools.txt") && fs.readFileSync("/work/file-tools.txt").equals(Buffer.from("FILE_EDITED\n")),
+ requestOrderExact: apiRequests.length === 5 && apiRequests.every((r, i) => r.priorToolResultCount === i && r.nextTool === (steps[i]?.name ?? null)),
+ noOutputOverflow: !outputOverflow && !errorOverflow,
+ noMalformedApiRequests: malformedRequests === 0,
+ apiOfferedOnlyFixedTools: apiRequests.length > 0 && apiRequests.every(r => r.exactFixedToolSet),
+} : {
   clientExitZero: childExit === 0,
   exactlyFiveToolResults: results.length === 5 && results.every((result, index) => result.toolUseId === `toolu_strict_probe_${index + 1}`),
   workspaceReadReturnedFixture: results[0]?.isError === false && results[0]?.content.includes("PUBLIC_PROBE") === true,

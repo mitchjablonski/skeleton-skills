@@ -33,6 +33,8 @@ EXPECTED_INNER_CHECKS = frozenset({
 })
 
 
+FILE_TOOL_CHECKS = frozenset({"clientExitZero", "exactFileToolResultOrder", "fileReadInitial", "fileReadEdited", "initialFileBytesExact", "fileBytesExact", "requestOrderExact", "noOutputOverflow", "noMalformedApiRequests", "apiOfferedOnlyFixedTools"})
+
 class JsonArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise SystemExit(emit({"ok": False, "code": "invalid-arguments", "error": message}, 2))
@@ -91,17 +93,17 @@ def decode_capture(data: bytes) -> str:
     return text
 
 
-def validate_inner_checks(raw_checks: object) -> dict:
+def validate_inner_checks(raw_checks: object, expected=EXPECTED_INNER_CHECKS) -> dict:
     """Require the exact known check set, with every item a literal True."""
     checks = raw_checks if isinstance(raw_checks, dict) else {}
     observed = set(checks)
-    missing = sorted(EXPECTED_INNER_CHECKS - observed)
-    unexpected = sorted(observed - EXPECTED_INNER_CHECKS)
-    non_boolean = sorted(name for name in observed & EXPECTED_INNER_CHECKS if type(checks[name]) is not bool)
-    false = sorted(name for name in observed & EXPECTED_INNER_CHECKS if type(checks[name]) is bool and checks[name] is False)
+    missing = sorted(expected - observed)
+    unexpected = sorted(observed - expected)
+    non_boolean = sorted(name for name in observed & expected if type(checks[name]) is not bool)
+    false = sorted(name for name in observed & expected if type(checks[name]) is bool and checks[name] is False)
     return {
         "valid": not (missing or unexpected or non_boolean or false),
-        "expectedNames": sorted(EXPECTED_INNER_CHECKS),
+        "expectedNames": sorted(expected),
         "missingNames": missing,
         "unexpectedNames": unexpected,
         "nonBooleanNames": non_boolean,
@@ -115,6 +117,7 @@ def main() -> int:
     parser.add_argument("--client-sha256", required=True, help="trusted 64-character Claude CLI SHA-256")
     parser.add_argument("--node", required=True, help="absolute path to pinned Node executable")
     parser.add_argument("--node-sha256", required=True, help="trusted 64-character Node SHA-256")
+    parser.add_argument("--case", choices=("boundary", "file-tools"), default="boundary")
     args = parser.parse_args()
 
     if not sys.platform.startswith("linux"):
@@ -183,6 +186,7 @@ def main() -> int:
                 "--setenv", "PATH", "/usr/bin:/bin",
                 "--setenv", "LANG", "C.UTF-8",
                 "--setenv", "PROBE_PRIVATE_PATH", str(private_receipt),
+                "--setenv", "PROBE_CASE", args.case,
                 "--chdir", "/work",
                 "--", "/opt/node", "/opt/strict-tools-inner.mjs",
             ]
@@ -241,9 +245,10 @@ def main() -> int:
                 }, 1)
 
             raw_inner_checks = inner.get("checks")
-            check_validation = validate_inner_checks(raw_inner_checks)
+            check_validation = validate_inner_checks(raw_inner_checks, FILE_TOOL_CHECKS if args.case == "file-tools" else EXPECTED_INNER_CHECKS)
             checks = dict(raw_inner_checks) if isinstance(raw_inner_checks, dict) else {}
             checks["innerCheckSetValid"] = check_validation["valid"]
+            checks["fileBytesIndependentlyExact"] = args.case != "file-tools" or ((work / "file-tools.txt").is_file() and (work / "file-tools.txt").read_bytes() == b"FILE_EDITED\n")
             checks["outerProcessExitZero"] = process.returncode == 0
             checks["privateHostReceiptUnchanged"] = private_unchanged
             inside_namespaces = inner.get("insideNamespaces") or {}
@@ -260,6 +265,7 @@ def main() -> int:
             outer_checks_valid = (
                 process.returncode == 0
                 and private_unchanged
+                and checks["fileBytesIndependentlyExact"]
                 and checks["networkNamespaceDiffers"] is True
                 and checks["pidNamespaceDiffers"] is True
             )
