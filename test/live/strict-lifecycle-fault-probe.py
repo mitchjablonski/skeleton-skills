@@ -182,13 +182,24 @@ def host_terminal_held(pid, private_devpts):
 def desktop_reachable(pid):
     """Host-side view of one member's initial environment and filesystem at
     census time (#270): no desktop variable, and no desktop path exists
-    through /proc/<pid>/root. lexists only; no socket is opened or connected."""
+    through /proc/<pid>/root. lstat only; no socket is opened or connected."""
     with open(f"/proc/{pid}/environ", "rb") as record:
         environ = record.read(1024 * 1024 + 1)
     if len(environ) > 1024 * 1024:
         return True
     names = {entry.split(b"=", 1)[0] for entry in environ.split(b"\0") if entry}
-    return bool(DESKTOP_VARS & names) or any(os.path.lexists(f"/proc/{pid}/root{path}") for path in DESKTOP_PATHS)
+    if DESKTOP_VARS & names:
+        return True
+    for path in DESKTOP_PATHS:
+        try:
+            os.lstat(f"/proc/{pid}/root{path}")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # Unreadable metadata cannot establish that the endpoint is absent.
+            return True
+        return True
+    return False
 
 
 def read_record(fd, deadline):

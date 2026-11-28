@@ -16,11 +16,12 @@ test("#270: the host refuses any member terminal outside the sandbox allowlist, 
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const child = spawnSync("/usr/bin/python3", ["-I", "-c", `
 import json, os, runpy, subprocess, sys
+from unittest.mock import patch
 g = runpy.run_path(sys.argv[1], run_name="probe_under_test")
 held, reachable, private = g["host_terminal_held"], g["desktop_reachable"], g["namespace_devpts"]
 SLEEP = "import time; time.sleep(30)"
-def child(env=None, pass_fds=(), code=SLEEP, args=(), session=False):
-    return subprocess.Popen(["/usr/bin/python3", "-c", code, *args], env=env or {}, start_new_session=session,
+def child(env=None, pass_fds=(), code=SLEEP, args=()):
+    return subprocess.Popen(["/usr/bin/python3", "-c", code, *args], env=env or {}, start_new_session=True,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=pass_fds)
 procs, fds = [], []
 def keep(p):
@@ -45,7 +46,7 @@ try:
     sandbox_nodes = keep(child(pass_fds=(null, zero)))
     # A session leader that opens a tty acquires it as controlling terminal; it then closes the fd.
     ctty = keep(child(code="import os, sys, time; os.close(os.open(sys.argv[1], os.O_RDWR)); time.sleep(30)",
-                      args=(os.ttyname(slave),), session=True))
+                      args=(os.ttyname(slave),)))
     import time; time.sleep(0.5)
     out["plain"] = held(plain.pid, None)
     out["sandboxNodes"] = held(sandbox_nodes.pid, None)
@@ -63,6 +64,11 @@ try:
     os.mkdir(sys.argv[2] + "/present")
     reachable.__globals__["DESKTOP_PATHS"] = (sys.argv[2] + "/present",)
     out["desktopPath"] = reachable(plain.pid)
+    os.symlink(sys.argv[2] + "/absent", sys.argv[2] + "/link")
+    reachable.__globals__["DESKTOP_PATHS"] = (sys.argv[2] + "/link",)
+    out["danglingDesktopPath"] = reachable(plain.pid)
+    with patch("os.lstat", side_effect=PermissionError):
+        out["unreadableDesktopPath"] = reachable(plain.pid)
 finally:
     for p in procs: p.kill(); p.wait()
     for fd in fds: os.close(fd)
@@ -76,5 +82,6 @@ print(json.dumps(out))
     hostSlave: true, hostMaster: true, hostPtmx: true, controllingTerminal: true,
     privateSlaveAllowed: false, masterStillRefused: true,
     cleanEnv: false, displayEnv: true, busEnv: true, desktopPath: true,
+    danglingDesktopPath: true, unreadableDesktopPath: true,
   });
 });
