@@ -27,7 +27,13 @@ function innerCheckSets() {
   assert.ok(start >= 0 && end > start, "the inner checks literal is where the test expects it");
   const body = INNER.slice(start + "const checks = searchTools ? {".length, end);
   const [search, file, base] = body.split(/\n\s*\}\s*:\s*(?:fileTools\s*\?\s*)?\{/);
-  const keys = (block) => [...block.matchAll(/^\s*([A-Za-z]\w*)\s*(?::|,|$)/gm)].map((m) => m[1]);
+  const keys = (block) => {
+    // Every entry must be a plain identifier key on its own line, so a quoted,
+    // computed or spread key can't hide from the comparison.
+    const lines = block.split("\n").filter((line) => line.trim());
+    for (const line of lines) assert.match(line, /^\s*[A-Za-z]\w*\s*(?::|,|$)/, `unparsed check entry: ${line.trim().slice(0, 60)}`);
+    return lines.map((line) => /^\s*([A-Za-z]\w*)/.exec(line)[1]);
+  };
   return { search: keys(search), file: keys(file), base: keys(base) };
 }
 
