@@ -437,16 +437,84 @@ def alive_at_fault(namespace):
     if not namespace.get("interactive"):
         assert live == recorded_pids, "namespace changed before the fault"
         return
-    # Interactive startup follows the initial census. Every later process
-    # must still descend from the verified worker inside the same namespace.
-    pending = set(live) - set(recorded_pids)
-    assert set(recorded_pids) <= set(live) and len(pending) <= 32
-    owned = {namespace["members"]["worker"]["pid"]}
-    while pending:
-        children = {pid for pid in pending if parent_of(pid) in owned}
-        assert children, "unaccounted interactive descendant"
-        owned.update(children)
-        pending.difference_update(children)
+    interactive_census(namespace["pidNs"], namespace["since"], recorded_pids,
+                       namespace["members"]["worker"]["pid"], live)
+
+
+def namespace_identity(pid, pid_ns):
+    """(ppid, start ticks) of a live, non-zombie member of pid_ns, or None.
+    With pid_ns None, of any live process.
+
+    Both reads go through one /proc/<pid> directory fd, so they describe the
+    same process; once it exits they fail instead of reading a reused PID.
+    """
+    try:
+        dir_fd = os.open("/proc/%d" % pid, os.O_RDONLY | os.O_DIRECTORY)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    try:
+        with open(os.open("stat", os.O_RDONLY, dir_fd=dir_fd)) as source:
+            data = source.read(4096)
+        if pid_ns is not None and os.readlink("ns/pid", dir_fd=dir_fd) != pid_ns:
+            return None
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    finally:
+        os.close(dir_fd)
+    fields = data[data.rindex(")") + 2:].split()
+    if fields[0] in ("Z", "X") or zombie(pid):
+        return None
+    return int(fields[1]), int(fields[19])
+
+
+CENSUS_PASSES = 10
+CENSUS_PAUSE = 0.05
+
+
+def interactive_census(pid_ns, since, recorded, worker, live, *, identity=namespace_identity,
+                       rescan=scan, pause=CENSUS_PAUSE, passes=CENSUS_PASSES):
+    """Every unrecorded live member must descend from the verified worker.
+
+    Interactive startup follows the initial census, so later processes are
+    expected, but only as the worker's descendants inside the same namespace.
+    A process that exits, or leaves the namespace, between the scan and its
+    parent read is gone rather than unaccounted. Ownership is kept by (PID,
+    start time) across passes, so a child seen under an owned parent stays
+    owned after that parent exits and it is reparented to init. A process
+    that is still unaccounted after the last pass refuses the census.
+    """
+    worker_identity = identity(worker, pid_ns)
+    assert worker_identity is not None, "the verified worker has gone"
+    owned = {worker: worker_identity[1]}
+    recorded = set(recorded)
+    for attempt in range(passes):
+        if attempt:
+            time.sleep(pause)
+            live = rescan(pid_ns, since)
+        assert recorded <= set(live), "a recorded member left the namespace"
+        assert len(live) - len(recorded) <= 32, "too many interactive descendants"
+        pending = {}
+        for pid in set(live) - recorded:
+            found = identity(pid, pid_ns)
+            if found is not None and owned.get(pid) != found[1]:
+                pending[pid] = found
+        progress = True
+        while pending and progress:
+            progress = False
+            for pid, (ppid, start) in list(pending.items()):
+                parent = owned.get(ppid)
+                if parent is None or parent > start:
+                    continue
+                # Any namespace: a reused parent PID may now be outside it.
+                now = identity(ppid, None)
+                if now is not None and now[1] != parent:
+                    continue  # the parent PID was reused
+                owned[pid] = start
+                del pending[pid]
+                progress = True
+        if not pending:
+            return
+    raise AssertionError("unaccounted interactive descendant")
 
 
 def selective_child_stop(namespace):
